@@ -636,13 +636,14 @@ def test_two_shot_runs_both_posts_and_builds_sglangs_next_input(fake, receiver, 
 
 
 def test_hop_b_takes_the_moe_post_only_where_sglang_would_fuse_it(fake):
-    """Hop B mirrors SGLang's one-shot post at hop-A widths: MXFP8 only for an
+    """Hop B mirrors SGLang's one-shot post at its widths: MXFP8 only for an
     MXFP8 receiver whose norm folds, else the streams; a replicated shared expert
     stays on SGLang's post (the finalize would add it on every rank)."""
     rows = 6
     updated = torch.zeros(rows, HC, HIDDEN)
     hop_a = SimpleNamespace(
         rows=(6,),
+        hop_b_rows=(6,),
         published=lambda t: False,
         finalize=Mock(return_value=(updated, torch.ones(rows, HIDDEN))),
     )

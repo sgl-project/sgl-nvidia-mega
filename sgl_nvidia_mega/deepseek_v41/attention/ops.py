@@ -98,6 +98,14 @@ def index_q_input(attn, q_lora, q_for_wqb):
 
 def qkv_a(attn, x):
     """``MQALayer``'s fused ``wqkv_a(x)``: [rows, q_lora_rank + head_dim]."""
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
+    if isinstance(x, mxfp8_ll.RowTileMxfp8):
+        # row-tile scales are not a layout SGLang's wqkv_a reads: never a silent fallback
+        raise RuntimeError(
+            "NVIDIA megakernel: SGLang's wqkv_a got row-tile MXFP8 scales "
+            f"({x.quant.shape[0]} rows)"
+        )
     out, _ = attn.wqkv_a(x)
     return out
 

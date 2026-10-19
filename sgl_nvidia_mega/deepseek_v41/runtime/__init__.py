@@ -37,6 +37,9 @@ SHIPPED_SLOTS = (
     # hc_prenorm: the mHC coefficients from DeepGEMM's TF32 prenorm (not bitwise)
     "hc_prenorm",
     "hop_b",
+    # hop_b_wide: hop B (the MoE post) at 9-48 rows on a mailbox of its own, writing
+    # row-tile scales for wqkv_a on the wide low-latency GEMM (not bitwise past 8 rows)
+    "hop_b_wide",
     "early_trigger",
     # hop_b_start_trigger: the MoE post's Lamport consumer lets the next layer's
     # first GEMM launch at its start, so its weight loads overlap the poll (bitwise)
@@ -98,6 +101,18 @@ def _requested_slots() -> frozenset:
 SLOTS = _requested_slots()
 
 
+def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
+    """Slot hop_b_wide: the layers whose chain runs wqkv_a on the low-latency GEMM, for
+    which hop B writes row-tile scales past 8 rows (none without the slot)."""
+    if "hop_b_wide" not in slots:
+        return frozenset()
+    return frozenset(
+        lid
+        for lid, step in attention.items()
+        if step.chain is not None and step.chain[0].qkv_a_ll
+    )
+
+
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
     known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
@@ -115,6 +130,8 @@ def slot_reasons() -> list[str]:
         ("hop_b", "hop_a"),
         ("early_trigger", "hop_a"),
         ("hop_b_start_trigger", "hop_b"),
+        ("hop_b_wide", "hop_b"),
+        ("hop_b_wide", "attn_qkv_a"),
         ("draft_lm_head", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
@@ -240,6 +257,7 @@ def build(model, ctx):
         binding=getattr(ctx, "binding", None),
     )
     bound = {name: pkg.build(model, pctx, group) for name, pkg in PACKAGES.items()}
+    bound["boundary"].row_tile_layers = row_tile_layers(bound["attention"], SLOTS)
     table, embed_reason = None, "not requested"
     if "embed" in SLOTS:
         table, embed_reason = embedding.replicate(
@@ -279,6 +297,10 @@ def build(model, ctx):
         ),
         "hop_b_start_trigger": "hop_b_start_trigger" in SLOTS
         and bound["boundary"].hop_b,
+        # hop B past hop A's widths, with a chain that reads its row-tile rows
+        "hop_b_wide": bound["boundary"].hop_b
+        and any(w not in hop.rows for w in hop.hop_b_rows)
+        and bool(bound["boundary"].row_tile_layers),
         # step-head work that needs no build: on when requested
         "sched_ahead": "sched_ahead" in SLOTS,
         # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is
