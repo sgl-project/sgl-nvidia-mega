@@ -26,9 +26,10 @@ def test_register_registers_every_spec_and_no_hook(hooks, monkeypatch):
     plugin.register()
     assert registry._REGISTRY == dict(plugin.SPECS)
     assert hooks == []
-    # the registered path resolves to the spec SGLang checks
-    spec, why = registry.find_spec(architectures=[plugin.SPECS[0][0]], isa="sm_103")
-    assert spec is not None, why
+    # every registered path resolves to the spec SGLang checks
+    for architecture, _ in plugin.SPECS:
+        spec, why = registry.find_spec(architectures=[architecture], isa="sm_103")
+        assert spec is not None, (architecture, why)
 
 
 def test_the_entry_point_is_the_one_sglang_checks():

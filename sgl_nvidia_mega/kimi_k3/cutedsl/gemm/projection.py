@@ -12,8 +12,9 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from ..common.host import architecture, tensor_maps, to_cute
+from ..common.host import architecture
 from ..common.host import stream as current_stream
+from ..common.host import tensor_maps, to_cute
 from .splitk import SplitKGemm, SplitKTactic
 
 

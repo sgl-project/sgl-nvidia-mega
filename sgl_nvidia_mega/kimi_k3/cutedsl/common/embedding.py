@@ -8,11 +8,15 @@ import cutlass as c
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
-
 from sglang.srt.distributed.parallel_state import get_tp_group
 
 from .host import architecture, fake
 from .primitives import launch
+
+# Names read from SGLang internals. A contract test checks these before GPU use.
+SGLANG_READS = {
+    "srt/distributed/parallel_state.py": ("get_tp_group",),
+}
 
 
 class EmbeddingGather:

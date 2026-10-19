@@ -15,10 +15,18 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request) |
+| Kimi K3 (packed MXFP4) | GB300 (SM103) | 8 | One-token decode steps of 1–8, 16, 32 and 64 rows |
 
-Larger verify steps, prefill and extend run SGLang's standard path. The DSpark draft step runs on the plugin's draft spec.
+For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run SGLang's
+standard path. The DSpark draft step runs on the plugin's draft spec. For Kimi
+K3, the plugin covers the 93-layer language model (24 MLA and 69 KDA layers) at
+the listed widths; every other call runs the standard path.
 
-### What a covered step runs
+The Kimi K3 adapter is currently a local Stage A package/API candidate. Its
+cross-GPU waits have not yet been wired to SGLang's deadline and fail-stop
+contract, so Kimi GPU execution and publication remain blocked.
+
+### What a covered DeepSeek-V4.1-Flash step runs
 
 The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/runtime`): the embedding and the Engram hashes, then per layer the mHC boundary (`boundary/`), the attention (`attention/`), the MoE (`moe/`) and Engram (`engram/`), then the head and the logits (`logits/`). Each package has a stock implementation that reproduces SGLang's decode step bit for bit, and puts this package's kernels in where the slot plan (`plan.py`) gives them a width:
 
@@ -37,7 +45,10 @@ With the megakernel on, the default 36 slots run: the ones above, the attention 
 
 - **Built at load.** Buffers, kernels and tactics for every covered width are allocated and compiled when the model is loaded, before the KV cache is sized. Nothing is compiled or allocated inside a step.
 - **Graph-safe coverage.** A step is covered by its forward mode and row count alone, so every rank decides the same and a captured graph replays the decision made at capture.
-- **Fail-stop synchronization.** Every wait on another GPU has a deadline below SGLang's watchdog. A rank that misses it faults at address 0x0, so no token from a failed step is returned.
+- **Fail-stop synchronization.** DeepSeek-V4.1-Flash waits on another GPU have
+  a deadline below SGLang's watchdog. A rank that misses it faults at address
+  0x0, so no token from a failed step is returned. Kimi K3 does not yet claim
+  this property.
 - **No silent fallback.** With `--enable-nvidia-megakernel`, an unsupported setup stops the server at startup, before the weights load, listing every reason; a model the loaded weights do not fit stops every rank after the load.
 
 ## Quick Start
@@ -46,7 +57,10 @@ With the megakernel on, the default 36 slots run: the ones above, the attention 
 
 - An SGLang with the megakernels framework (`sglang.srt.megakernels`, `--enable-nvidia-megakernel`)
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.2), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
-- 4 x GB300
+- DeepSeek-V4.1-Flash: 4 x GB300
+- Kimi K3: 8 x GB300 (SM103), BF16, context length 8192, TP8 and DP1,
+  FP8 E4M3 KV cache with page size 64, `trtllm_mla` for prefill and decode,
+  `flashinfer_mxfp4` with default precision, and full decode CUDA graphs
 
 ### Installation
 
@@ -57,6 +71,8 @@ pip install -e .
 ```
 
 ### Usage
+
+DeepSeek-V4.1-Flash:
 
 ```bash
 SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample \
@@ -81,16 +97,17 @@ sgl-nvidia-mega/
 ├── sgl_nvidia_mega/
 │   ├── plugin.py          # registers the specs with SGLang's megakernels framework
 │   ├── common/            # NVRTC builds and PDL launches; CuTe DSL sync primitives
-│   └── deepseek_v41/
-│       ├── spec.py          # the spec: the setups it serves and its build
-│       ├── plan.py          # which kernel fills each slot, per width
-│       ├── runtime/         # the build, the executor and its per-step state, the embedding
-│       ├── boundary/        # the mHC between sublayers
-│       ├── attention/       # the attention step
-│       ├── moe/             # the MoE step
-│       ├── engram/          # the Engram layers
-│       ├── logits/          # the head and the logits
-│       └── sm103/           # kernels and the build-time runner; no SGLang imports
+│   ├── deepseek_v41/
+│   │   ├── spec.py          # the spec: the setups it serves and its build
+│   │   ├── plan.py          # which kernel fills each slot, per width
+│   │   ├── runtime/         # the build, the executor and its per-step state, the embedding
+│   │   ├── boundary/        # the mHC between sublayers
+│   │   ├── attention/       # the attention step
+│   │   ├── moe/             # the MoE step
+│   │   ├── engram/          # the Engram layers
+│   │   ├── logits/          # the head and the logits
+│   │   └── sm103/           # kernels and the build-time runner; no SGLang imports
+│   └── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
     ├── unit/              # CPU: the plugin, the setup checks, the step loop and the SGLang contract
@@ -102,9 +119,11 @@ sgl-nvidia-mega/
 
 ```bash
 pytest test/unit               # CPU only
-pytest test/kernels            # 4 x GB300
-pytest test/e2e                # 4 x GB300, with SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH set
+pytest test/kernels            # DeepSeek-V4.1-Flash: 4 x GB300
+pytest test/e2e                # DeepSeek-V4.1-Flash: 4 x GB300, with SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH set
 ```
+
+Kimi K3 GPU and end-to-end suites are not yet part of these commands.
 
 ## Contributing
 

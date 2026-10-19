@@ -33,9 +33,11 @@ from ..common.primitives import (
     store_shared_words,
     store_words,
     unpack_bf16,
-    zeros,
 )
 from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
+from ..common.primitives import (
+    zeros,
+)
 from ..common.twoshot import reduce
 from .producer import OprojProducer, pack8, tree_reduce
 
