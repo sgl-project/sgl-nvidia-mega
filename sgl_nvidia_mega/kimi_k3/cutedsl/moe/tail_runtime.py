@@ -107,7 +107,16 @@ class MoeTailBox:
 
 
 @cache
-def compile_tail(tp, batch, device, mode="front", trigger=2, early=False, umma=False):
+def compile_tail(
+    tp,
+    batch,
+    device,
+    mode="front",
+    trigger=2,
+    early=False,
+    umma=False,
+    deadline_ns=0,
+):
     """front: rows complete at the PDL wait; front_poll: three 0xffff-armed G/W/S parity
     slots polled per row and re-armed after use; publish (``published``): WaveMoeTail
     over the published mailboxes, reading the weight shard directly, not by TMA;
@@ -125,10 +134,10 @@ def compile_tail(tp, batch, device, mode="front", trigger=2, early=False, umma=F
     scalars += (Int32(2), Int32(CAP))
     kernel: MoeTail
     if m8:
-        kernel = wave = WaveMoeTail(batch, tp, twoshot, early, umma)
+        kernel = wave = WaveMoeTail(batch, tp, twoshot, early, umma, deadline_ns)
         scalars += (vec(3 * CAP * 3584),) if wave.reduce else ()
     else:
-        kernel = MoeTail(tp, batch, mode=mode, trigger=trigger)
+        kernel = MoeTail(tp, batch, mode=mode, trigger=trigger, deadline_ns=deadline_ns)
     options = "" if m8 else "--ptxas-options=--maxrregcount=120"
     with torch.accelerator.device_index(device):
         args = (*tensors, *scalars, make_fake_stream())
@@ -150,7 +159,18 @@ def compile_push(batch, device, tp=8):
 class MoeTailWeights:
     """One layer's up-projection shard [7168/TP, 3584], RMS weight and TMA map."""
 
-    def __init__(self, tp, weight, gamma, eps, ordinal, count, batches, twoshots=()):
+    def __init__(
+        self,
+        tp,
+        weight,
+        gamma,
+        eps,
+        ordinal,
+        count,
+        batches,
+        twoshots=(),
+        deadline_ns=0,
+    ):
         self.weight, self.gamma = weight, gamma
         # Three parities rotate over the model's MoE layers; each launch re-arms the
         # previous MoE layer's slots of its batch (wrapping across decode steps, where
@@ -185,7 +205,15 @@ class MoeTailWeights:
             views = self.views if mode == "front" else (flat(weight), self.views[1])
             on = mode != "front" and b in umma
             views = self.umma_views if on else views
-            code = compile_tail(tp, b, device, mode, early=b in early, umma=on)
+            code = compile_tail(
+                tp,
+                b,
+                device,
+                mode,
+                early=b in early,
+                umma=on,
+                deadline_ns=deadline_ns,
+            )
             self.codes[b] = code, views, shares(tp, b, twoshot), twoshot
         shared = any(shares(tp, b, b in twoshots) for b in batches)
         if shared and resident_clusters(device) < 7:
@@ -213,14 +241,24 @@ class PreparedTail:
     (multicast, parity, rank; at ``twoshots`` the two-shot push box) and the side
     stream pushes the shared-expert output (``push``)."""
 
-    def __init__(self, op, norm, up, batches, placement):
+    def __init__(self, op, norm, up, batches, placement, *, deadline_ns):
         tp, rank = op.contract.tp_size, op.rank
         local_up = up.narrow(0, rank * (7168 // tp), 7168 // tp)
         self.tail_box, ordinal, count = placement
         eps = op.contract.rms_eps
         m8 = [b for b in batches if published(tp, b)]
         self.twoshots = twoshot_batches(tp) & set(m8)
-        args = (tp, local_up, norm, eps, ordinal, count, batches, self.twoshots)
+        args = (
+            tp,
+            local_up,
+            norm,
+            eps,
+            ordinal,
+            count,
+            batches,
+            self.twoshots,
+            deadline_ns,
+        )
         self.tail_weights = MoeTailWeights(*args)
         self.peers, _, mc, _ = self.tail_box.tail
         self.ring = (self.tail_weights.parity, Int32(rank))

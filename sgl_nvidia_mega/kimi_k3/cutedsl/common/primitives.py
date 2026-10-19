@@ -77,6 +77,44 @@ def _vector(count, first=0):
 
 div_rn = partial(cute.math.div, rounding=cute.math.RoundingMode.NEAREST_EVEN)
 
+# A remote Lamport wait samples the device timer only once per this many retry
+# passes.  The timer is started lazily, after the first read proves that a peer's
+# publication is still pending, so the completed fast path pays no timer cost.
+DEADLINE_POLL_INTERVAL = 1024
+
+
+@asm(Int64)
+def global_timer_ns():
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@asm()
+def fail_stop():
+    """Poison the CUDA context on a missed cross-GPU publication deadline."""
+    code = "{ .reg .u64 address; mov.u64 address, 0; "
+    code += "st.volatile.global.u32 [address], 0; trap; }"
+    return code, "", ()
+
+
+@cute.jit
+def wait_deadline_start(deadline_ns: cutlass.Constexpr[int]):
+    """Start a remote-wait deadline only after an initial read found pending data."""
+    started = Int64(0)
+    if cutlass.const_expr(deadline_ns > 0):
+        started = global_timer_ns()
+    return started
+
+
+@cute.jit
+def wait_deadline_check(started, polls, deadline_ns: cutlass.Constexpr[int]):
+    """Advance one retry and fail-stop after a sampled deadline violation."""
+    polls += Int32(1)
+    if cutlass.const_expr(deadline_ns > 0):
+        if (polls & Int32(DEADLINE_POLL_INTERVAL - 1)) == 0:
+            if global_timer_ns() - started > Int64(deadline_ns):
+                fail_stop()
+    return polls
+
 
 @asm(Float32, pure=True)
 def add_rn(a, b):

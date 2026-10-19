@@ -39,9 +39,56 @@ _MAX_BATCH = max(_BATCHES)
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
-    "srt/megakernels/binding.py": ("HybridPoolView",),
+    "srt/distributed/parallel_state.py": ("device_group",),
+    "srt/arg_groups/fields/parallel.py": ("tp_group", "tp_rank", "tp_size"),
+    "srt/megakernels/binding.py": (
+        "HybridPoolView",
+        "cache",
+        "capacity",
+        "conv",
+        "kda",
+        "layer_mapping",
+        "logical_dtype",
+        "mla",
+        "page_size",
+        "post_capture_active",
+        "reserved_capacity",
+        "serving_capacity",
+        "state",
+        "storage_dtype",
+        "temporal",
+    ),
     "srt/runtime_context.py": ("get_parallel",),
 }
+
+
+def _validate_pool_tensor(
+    name: str,
+    value: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    stride: tuple[int, ...],
+    device: torch.device,
+) -> None:
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"{name} is not a tensor")
+    if value.device.type != "cuda" or value.device != device:
+        raise ValueError(
+            f"{name} must be on CUDA device {device}, found {value.device}"
+        )
+    if value.dtype != dtype:
+        raise ValueError(f"{name} has dtype {value.dtype}, expected {dtype}")
+    if tuple(value.shape) != shape:
+        raise ValueError(f"{name} has shape {tuple(value.shape)}, expected {shape}")
+    if tuple(value.stride()) != stride:
+        raise ValueError(
+            f"{name} has stride {tuple(value.stride())}, expected {stride}"
+        )
+    if not value.is_contiguous():
+        raise ValueError(f"{name} is not contiguous")
+    if int(value.data_ptr()) % 16:
+        raise ValueError(f"{name} is not 16-byte aligned")
 
 
 def _digest(value: Any) -> str:
@@ -377,6 +424,7 @@ class ResourceSet:
     compilation_inventory: list[dict[str, Any]]
     memory_before: dict[str, int]
     memory_after: dict[str, int]
+    deadline_ns: int
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
@@ -418,14 +466,33 @@ class ResourceSet:
             raise ValueError("full-attention pool mapping differs from Kimi config")
         if set(mamba_mapping) != set(linear_ids):
             raise ValueError("linear-attention pool mapping differs from Kimi config")
+        if set(full_mapping.values()) != set(range(len(full_ids))):
+            raise ValueError("full-attention pool mapping is not dense")
+        if set(mamba_mapping.values()) != set(range(len(linear_ids))):
+            raise ValueError("linear-attention pool mapping is not dense")
 
         page_size = int(hybrid.mla.page_size)
         if page_size != 64:
             raise ValueError(f"unsupported MLA page size: {page_size}")
+        if hybrid.mla.logical_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "unsupported MLA logical dtype: "
+                f"{hybrid.mla.logical_dtype}; expected {torch.float8_e4m3fn}"
+            )
+        if hybrid.mla.storage_dtype != torch.uint8:
+            raise ValueError(
+                "unsupported MLA storage dtype: "
+                f"{hybrid.mla.storage_dtype}; expected {torch.uint8}"
+            )
         reserved_capacity = int(hybrid.mla.reserved_capacity)
         serving_capacity = int(hybrid.mla.serving_capacity)
         if reserved_capacity <= 0:
             raise ValueError("Kimi K3 MLA reserved capacity is empty")
+        if reserved_capacity % page_size:
+            raise ValueError(
+                "Kimi K3 MLA reserved capacity is not page aligned: "
+                f"{reserved_capacity}"
+            )
         if serving_capacity <= 0 or serving_capacity > reserved_capacity:
             raise ValueError(
                 "Kimi K3 MLA serving capacity is outside its reservation: "
@@ -435,15 +502,31 @@ class ResourceSet:
         if kda_capacity <= 0:
             raise ValueError("Kimi K3 KDA state capacity is empty")
 
+        first_cache = hybrid.mla.cache(full_ids[0])
+        first_parameter = next(iter(self.model.parameters()), None)
+        device = (
+            first_cache.device if first_parameter is None else first_parameter.device
+        )
+        expected_mla_shape = (
+            reserved_capacity // page_size + 1,
+            page_size,
+            576,
+        )
+        expected_conv_shape = (kda_capacity + 1, 3, 4608)
+        expected_temporal_shape = (kda_capacity + 1, 12, 128, 128)
+
         local_identities: dict[str, int] = {}
         local_layouts: list[dict[str, Any]] = []
         for layer_id in full_ids:
             cache_view = hybrid.mla.cache(layer_id)
-            if cache_view.dim() != 3 or int(cache_view.shape[1]) != page_size:
-                raise ValueError(
-                    f"layer {layer_id} MLA cache is not [pages, {page_size}, width]: "
-                    f"{tuple(cache_view.shape)}"
-                )
+            _validate_pool_tensor(
+                f"layer {layer_id} MLA cache",
+                cache_view,
+                dtype=torch.uint8,
+                shape=expected_mla_shape,
+                stride=(page_size * 576, 576, 1),
+                device=device,
+            )
             local_identities[f"mla.{layer_id}"] = int(cache_view.data_ptr())
             local_layouts.append(
                 {
@@ -462,6 +545,22 @@ class ResourceSet:
                 )
             conv_view = state.conv[0]
             temporal_view = state.temporal
+            _validate_pool_tensor(
+                f"layer {layer_id} KDA convolution state",
+                conv_view,
+                dtype=torch.bfloat16,
+                shape=expected_conv_shape,
+                stride=(3 * 4608, 4608, 1),
+                device=device,
+            )
+            _validate_pool_tensor(
+                f"layer {layer_id} KDA temporal state",
+                temporal_view,
+                dtype=torch.float32,
+                shape=expected_temporal_shape,
+                stride=(12 * 128 * 128, 128 * 128, 128, 1),
+                device=device,
+            )
             local_identities[f"kda_conv.{layer_id}"] = int(conv_view.data_ptr())
             local_identities[f"kda_temporal.{layer_id}"] = int(temporal_view.data_ptr())
             local_layouts.extend(
@@ -537,7 +636,11 @@ class ResourceSet:
 
 
 def build_resources(
-    model: Any, *, context_length: int, memory_before: dict[str, int]
+    model: Any,
+    *,
+    context_length: int,
+    memory_before: dict[str, int],
+    deadline_ns: int,
 ) -> ResourceSet:
     """Build every frozen TP8/B1-B8/B16/B32/B64 provider after all-rank consensus."""
 
@@ -742,7 +845,13 @@ def build_resources(
                 (1,),
             )
         output = oproj_module.PreparedOproj(
-            layer, mailbox, _BATCHES, is_mla, front, oproj_twoshot
+            layer,
+            mailbox,
+            _BATCHES,
+            is_mla,
+            front,
+            oproj_twoshot,
+            deadline_ns=deadline_ns,
         )
         attention[layer_id] = PreparedAttention(
             layer_id, kind, projection_weight, projection, core, output
@@ -787,6 +896,7 @@ def build_resources(
             layer.mlp.routed_expert_up_proj.weight,
             _BATCHES,
             (tail_box, ordinal, len(moe_layers)),
+            deadline_ns=deadline_ns,
         )
         moe = SimpleNamespace(
             shared_experts=layer.mlp.shared_experts,
@@ -814,6 +924,7 @@ def build_resources(
             plan=moe_state.plan,
             counters=moe_state.shared,
             q=1,
+            deadline_ns=deadline_ns,
         )
         chain = chain_module.SmallBatchChain(
             small_box,
@@ -824,6 +935,7 @@ def build_resources(
             beta,
             linear_beta,
             None,
+            deadline_ns=deadline_ns,
         )
         prepared_moe = prepared_moe_module.PreparedMoE(
             generic_front,
@@ -855,12 +967,14 @@ def build_resources(
 
     before = {
         int(layer.layer_idx): attnres_module.PreparedAttnRes.for_target(
-            _layer_proxy(layer), has_delta=layer is not layers[0]
+            _layer_proxy(layer),
+            has_delta=layer is not layers[0],
+            deadline_ns=deadline_ns,
         )
         for layer in layers
     }
     final = attnres_module.PreparedAttnRes.for_target(
-        _final_proxy(backbone), final=True
+        _final_proxy(backbone), final=True, deadline_ns=deadline_ns
     )
     compilation.extend(
         {"kind": "attn_res", "layer_id": int(layer.layer_idx), "name": "input"}
@@ -893,6 +1007,7 @@ def build_resources(
         compilation_inventory=compilation,
         memory_before=memory_before,
         memory_after=_cuda_memory(),
+        deadline_ns=deadline_ns,
     )
     resources.refresh_inventory()
     return resources

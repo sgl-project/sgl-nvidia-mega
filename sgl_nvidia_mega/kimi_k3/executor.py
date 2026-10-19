@@ -12,8 +12,122 @@ from sglang.srt.megakernels.binding import HybridStepView
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
-    "srt/megakernels/binding.py": ("HybridStepView", "track_decode_state"),
+    "srt/megakernels/binding.py": (
+        "HybridStepView",
+        "block_table",
+        "kda",
+        "mla",
+        "sequence_lengths",
+        "state_indices",
+        "track_decode_state",
+        "write_slots",
+    ),
 }
+
+
+def _require_tensor(
+    name: str,
+    value: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    device: torch.device,
+    strides: tuple[int, ...] | None = None,
+) -> None:
+    if not isinstance(value, torch.Tensor):
+        raise RuntimeError(f"Kimi K3 megakernel {name} is not a tensor")
+    if value.dtype != dtype:
+        raise RuntimeError(
+            f"Kimi K3 megakernel {name} has dtype {value.dtype}, expected {dtype}"
+        )
+    if tuple(value.shape) != shape:
+        raise RuntimeError(
+            f"Kimi K3 megakernel {name} has shape {tuple(value.shape)}, "
+            f"expected {shape}"
+        )
+    if value.device != device:
+        raise RuntimeError(
+            f"Kimi K3 megakernel {name} is on {value.device}, expected {device}"
+        )
+    if strides is not None and tuple(value.stride()) != strides:
+        raise RuntimeError(
+            f"Kimi K3 megakernel {name} has stride {tuple(value.stride())}, "
+            f"expected {strides}"
+        )
+
+
+def _validate_step_inputs(
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor | None,
+    view: HybridStepView,
+    *,
+    batch: int,
+    device: torch.device,
+) -> None:
+    if device.type != "cuda":
+        raise RuntimeError(
+            f"Kimi K3 megakernel execution requires CUDA resources, found {device}"
+        )
+    _require_tensor(
+        "input_ids",
+        input_ids,
+        dtype=torch.int64,
+        shape=(batch,),
+        device=device,
+        strides=(1,),
+    )
+    if inputs_embeds is not None:
+        _require_tensor(
+            "inputs_embeds",
+            inputs_embeds,
+            dtype=torch.bfloat16,
+            shape=(batch, 7168),
+            device=device,
+            strides=(7168, 1),
+        )
+    _require_tensor(
+        "MLA write slots",
+        view.mla.write_slots,
+        dtype=torch.int64,
+        shape=(batch,),
+        device=device,
+        strides=(1,),
+    )
+    _require_tensor(
+        "MLA sequence lengths",
+        view.mla.sequence_lengths,
+        dtype=torch.int32,
+        shape=(batch,),
+        device=device,
+        strides=(1,),
+    )
+    _require_tensor(
+        "KDA state indices",
+        view.kda.state_indices,
+        dtype=torch.int32,
+        shape=(batch,),
+        device=device,
+        strides=(1,),
+    )
+    table = view.mla.block_table
+    if not isinstance(table, torch.Tensor):
+        raise RuntimeError("Kimi K3 megakernel MLA block table is not a tensor")
+    if table.dtype != torch.int32 or table.device != device:
+        raise RuntimeError(
+            "Kimi K3 megakernel MLA block table must be int32 on "
+            f"{device}, found {table.dtype} on {table.device}"
+        )
+    if table.dim() != 2 or int(table.shape[0]) != batch or int(table.shape[1]) <= 0:
+        raise RuntimeError(
+            "Kimi K3 megakernel MLA block table must be a nonempty "
+            f"[{batch}, pages] tensor, found {tuple(table.shape)}"
+        )
+    rows, columns = int(table.stride(0)), int(table.stride(1))
+    if columns != 1 or rows < int(table.shape[1]):
+        raise RuntimeError(
+            "Kimi K3 megakernel MLA block table has unsupported stride "
+            f"{tuple(table.stride())}"
+        )
 
 
 class KimiK3MegakernelExecutor:
@@ -38,14 +152,14 @@ class KimiK3MegakernelExecutor:
         batch = int(input_ids.shape[0])
         if batch not in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64):
             raise RuntimeError(f"unsupported Kimi K3 megakernel batch: {batch}")
-        if mla_slots is None or mla_slots.numel() != batch:
-            raise RuntimeError(
-                f"Kimi K3 megakernel requires {batch} physical MLA write slots"
-            )
-        if kda_slots.numel() != batch:
-            raise RuntimeError(
-                f"Kimi K3 megakernel requires {batch} physical KDA state slots"
-            )
+        device = resources.scratch["hidden.0"].device
+        _validate_step_inputs(
+            input_ids,
+            inputs_embeds,
+            view,
+            batch=batch,
+            device=device,
+        )
         for layer_id, attention in resources.attention.items():
             if attention.kind == "mla" and attention.cache is None:
                 raise RuntimeError(f"MLA cache for layer {layer_id} is not bound")

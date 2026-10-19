@@ -70,9 +70,19 @@ def arm_exchanges(bars, counts):
 
 
 class ClusterAttnRes:
-    def __init__(self, nb, *, slots=1, has_delta=True, write=-1, final=False):
+    def __init__(
+        self,
+        nb,
+        *,
+        slots=1,
+        has_delta=True,
+        write=-1,
+        final=False,
+        deadline_ns=0,
+    ):
         self.nb, self.slots, self.has_delta = nb, slots, has_delta
         self.write, self.final = write, final
+        self.deadline_ns = deadline_ns
         self.npre = 2 * nb
         self.npost = (2 if final else 4) if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
@@ -206,7 +216,12 @@ class ClusterAttnRes:
         else:
             cur.fill(0)
             base = delta.iterator + token * 7168 + col
-            got = poll(base, delta.shape[1] * 7168, self.slots)
+            got = poll(
+                base,
+                delta.shape[1] * 7168,
+                self.slots,
+                self.deadline_ns,
+            )
             for slot in cutlass.range_constexpr(self.slots):
                 rearm(base + slot * delta.shape[1] * 7168)
                 part = cute.make_rmem_tensor((1, 8), Float32)

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from sglang.srt.megakernels.spec import (
@@ -33,6 +34,13 @@ SGLANG_READS = {
         "Requirements",
         "Step",
         "TOLERANCE",
+        "binding",
+        "deadline_s",
+        "mode",
+        "rows",
+        "tokens_per_request",
+        "view",
+        "widths",
     ),
     "srt/runtime_context.py": ("get_model",),
     "srt/arg_groups/fields/*.py": (
@@ -40,6 +48,8 @@ SGLANG_READS = {
         "cuda_graph_config",
         "decode_attention_backend",
         "dp_size",
+        "enable_page_major_kv_layout",
+        "enable_unified_memory",
         "flashinfer_mxfp4_moe_precision",
         "kv_cache_dtype",
         "moe_runner_backend",
@@ -53,6 +63,30 @@ SGLANG_READS = {
         "lm_head",
     ),
 }
+
+
+def _deadline_ns(seconds: Any) -> int:
+    """Validate the build deadline once and freeze it into compiled-kernel keys."""
+    if isinstance(seconds, bool):
+        raise ValueError(
+            f"Kimi K3 megakernel needs a finite positive deadline: {seconds!r}"
+        )
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Kimi K3 megakernel needs a finite positive deadline: {seconds!r}"
+        ) from error
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"Kimi K3 megakernel needs a finite positive deadline: {seconds!r}"
+        )
+    if value > ((1 << 63) - 1) / 1_000_000_000:
+        raise ValueError(f"Kimi K3 megakernel deadline is out of range: {seconds!r}")
+    nanoseconds = int(value * 1_000_000_000)
+    if nanoseconds <= 0 or nanoseconds > (1 << 63) - 1:
+        raise ValueError(f"Kimi K3 megakernel deadline is out of range: {seconds!r}")
+    return nanoseconds
 
 
 def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
@@ -180,12 +214,17 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
         )
     if context.binding is None:
         raise ValueError("Kimi K3 megakernel received no SGLang runtime binding")
+    deadline_ns = _deadline_ns(context.deadline_s)
+    from .compat import validate_runtime_compatibility
+
+    validate_runtime_compatibility()
     from .providers import _cuda_memory, build_resources
 
     resources = build_resources(
         model.language_model,
         context_length=int(get_model().context_length),
         memory_before=_cuda_memory(),
+        deadline_ns=deadline_ns,
     )
     return _Built(model, resources, widths)
 
@@ -206,6 +245,8 @@ SPEC = MegakernelSpec(
             "decode_attention_backend": frozenset({"trtllm_mla"}),
             "page_size": frozenset({64}),
             "dp_size": frozenset({1}),
+            "enable_unified_memory": frozenset({False}),
+            "enable_page_major_kv_layout": frozenset({False}),
         },
         hf_config={"language_only": True, "encoder_only": False},
     ),

@@ -52,6 +52,8 @@ from ..common.primitives import (
     thread,
     view,
     wait,
+    wait_deadline_check,
+    wait_deadline_start,
     wait_tmem,
     zeros,
 )
@@ -102,8 +104,9 @@ class MoeTail:
     threads = 128
     options: dict = {}
 
-    def __init__(self, tp: int, batch: int, *, mode="front", trigger=2):
+    def __init__(self, tp: int, batch: int, *, mode="front", trigger=2, deadline_ns=0):
         self.tp, self.batch, self.mode, self.trigger = tp, batch, mode, trigger
+        self.deadline_ns = deadline_ns
         self.cluster, self.tokens = (7 if tp == 8 else 8), min(batch, 2)
         self.poll_ns, self.front_poll_ns = (0, 0) if tp == 8 else (64, 128)
         self.cols, self.shard = 3584 // self.cluster, 7168 // tp
@@ -123,7 +126,11 @@ class MoeTail:
         for source in cutlass.range_constexpr(16):
             if self.tp == 16 or source < 8 or dual:
                 pending |= self.poll_source(values, source, sources)
+        started, polls = Int64(0), Int32(0)
+        if pending != 0:
+            started = wait_deadline_start(self.deadline_ns)
         while pending != 0:
+            polls = wait_deadline_check(started, polls, self.deadline_ns)
             if cutlass.const_expr(self.poll_ns):
                 sleep_ns(Uint32(self.poll_ns))
             next_pending = Uint32(0)
@@ -449,8 +456,16 @@ class WaveMoeTail(MoeTail):
 
     threads, options = 256, dict(min_blocks_per_mp=1)
 
-    def __init__(self, batch, tp=8, twoshot=False, early=False, umma=False):
-        super().__init__(tp, batch, mode="publish")
+    def __init__(
+        self,
+        batch,
+        tp=8,
+        twoshot=False,
+        early=False,
+        umma=False,
+        deadline_ns=0,
+    ):
+        super().__init__(tp, batch, mode="publish", deadline_ns=deadline_ns)
         assert not twoshot or batch > 8
         assert not umma or batch > 8
         # ``early``: release the next AttnRes at entry, so its block statistics and
@@ -656,7 +671,11 @@ class WaveMoeTail(MoeTail):
         for source in cutlass.range_constexpr(self.tp):
             words = (values[source, k] for k in range(4))
             pending |= Uint32(reduce(or_, (v == 0x80000000 for v in words))) << source
+        started, polls = Int64(0), Int32(0)
+        if pending != 0:
+            started = wait_deadline_start(self.deadline_ns)
         while pending != 0:
+            polls = wait_deadline_check(started, polls, self.deadline_ns)
             sleep_ns(Uint32(self.poll_ns))
             again = Uint32(0)
             for source in cutlass.range_constexpr(self.tp):

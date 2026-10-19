@@ -77,7 +77,17 @@ def producer(k, batch, tp, mla, twoshot=False, kind=None):
 
 @cache
 def compile_oproj(
-    kind, k, batch, tp, nb, has_delta, mla, front=False, cap=64, twoshot=False
+    kind,
+    k,
+    batch,
+    tp,
+    nb,
+    has_delta,
+    mla,
+    front=False,
+    cap=64,
+    twoshot=False,
+    deadline_ns=0,
 ):
     """Producer, consumer or fused kernel over a [TP, cap, 7168] parity view;
     ``front``: the consumer also publishes x_moe [1, 4, 7168] and the epoch hint.
@@ -97,7 +107,13 @@ def compile_oproj(
     if kind == "consumer":  # B64: one 128-thread group per CTA polls every rank
         options = dict(has_delta=has_delta)
         groups = 4 if batch <= 32 and not twoshot else 1
-        kernel = OprojConsumer(nb, groups=groups, twoshot=twoshot, **options)
+        kernel = OprojConsumer(
+            nb,
+            groups=groups,
+            twoshot=twoshot,
+            deadline_ns=deadline_ns,
+            **options,
+        )
         extra = (recv, mc, slot) if twoshot else ()
         return cute.compile(kernel, box, *rows, *extra, make_fake_stream())
     kernel = OprojFused(nb, has_delta=has_delta)
@@ -107,7 +123,17 @@ def compile_oproj(
 class PreparedOproj:
     """One decoder layer's o-projection + all-reduce + post-attention AttnRes."""
 
-    def __init__(self, decoder, mailbox, batches, mla, front=None, twoshot=None):
+    def __init__(
+        self,
+        decoder,
+        mailbox,
+        batches,
+        mla,
+        front=None,
+        twoshot=None,
+        *,
+        deadline_ns,
+    ):
         weight = decoder.self_attn.o_proj.weight
         norm, out_norm = decoder.mlp_res_norm, decoder.post_attention_layernorm
         weights = (norm.weight, decoder.mlp_res_proj.weight.squeeze(0), out_norm.weight)
@@ -138,7 +164,14 @@ class PreparedOproj:
             twoshot = b in self.twoshots and not fused
             shape = (k, b, tp, nb, delta, mla)
             self.codes[b] = tuple(
-                compile_oproj(kind, *shape, publish and kind != "producer", 64, twoshot)
+                compile_oproj(
+                    kind,
+                    *shape,
+                    publish and kind != "producer",
+                    64,
+                    twoshot,
+                    deadline_ns,
+                )
                 for kind in kinds
             )
 

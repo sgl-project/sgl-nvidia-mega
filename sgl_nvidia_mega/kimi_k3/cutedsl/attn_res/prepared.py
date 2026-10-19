@@ -21,10 +21,17 @@ from .kernel import ClusterAttnRes
 
 
 @cache
-def compile_consumer(nb, delta, write, final, slots, cap, arch, aux=False):
+def compile_consumer(nb, delta, write, final, slots, cap, arch, deadline_ns, aux=False):
     row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
     source = fake((slots, cap, 7168), (cap * 7168, 7168, 1)) if slots else row
-    kernel = ClusterAttnRes(nb, slots=slots, has_delta=delta, write=write, final=final)
+    kernel = ClusterAttnRes(
+        nb,
+        slots=slots,
+        has_delta=delta,
+        write=write,
+        final=final,
+        deadline_ns=deadline_ns,
+    )
     args = (source, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
     args += (row,) * aux  # the updated prefix row, also stored to an aux stream
     return cute.compile(kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}")
@@ -33,20 +40,21 @@ def compile_consumer(nb, delta, write, final, slots, cap, arch, aux=False):
 class PreparedAttnRes:
     """Ordinary-input code plus the Lamport variant of its bound mailbox ring."""
 
-    def __init__(self, weights, key, eps):
+    def __init__(self, weights, key, eps, deadline_ns):
         self.device = weights[0].device
         self.views = tuple(to_cute(w.reshape(-1)) for w in weights)
         self.key, self.eps = key, tuple(map(cutlass.Float32, eps))
+        self.deadline_ns = deadline_ns
         self.code = self._compile(0, 0)
         self.ring: Any = None
         self.aux: Any = None
 
     def _compile(self, slots, cap, aux=False):
         arch = architecture(self.device)
-        return compile_consumer(*self.key, slots, cap, arch, aux)
+        return compile_consumer(*self.key, slots, cap, arch, self.deadline_ns, aux)
 
     @classmethod
-    def for_target(cls, target, *, final=False, has_delta=True):
+    def for_target(cls, target, *, deadline_ns, final=False, has_delta=True):
         if final:
             norm, query = target.output_attn_res_norm, target.output_attn_res_proj
             output, nb, write = target.norm, target.num_attn_res_blocks, -1
@@ -57,7 +65,7 @@ class PreparedAttnRes:
             write = target.block_write_idx if target.is_block_write_layer else -1
         weights = (norm.weight, query.weight, output.weight)
         eps = (norm.variance_epsilon, output.variance_epsilon)
-        return cls(weights, (nb, has_delta, write, final), eps)
+        return cls(weights, (nb, has_delta, write, final), eps, deadline_ns)
 
     def bind_ring(self, mailbox):
         """Lamport input: sum the [slots, capacity, 7168] mailbox rows, then re-arm."""

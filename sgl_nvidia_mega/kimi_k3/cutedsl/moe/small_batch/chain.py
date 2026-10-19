@@ -100,7 +100,19 @@ class SmallBatchChain:
     """One MoE layer's small-batch chain; MoE tail weights come from the layer's
     prepared tail."""
 
-    def __init__(self, box, moe, experts, tail, layer_idx, beta, linear_beta, prefetch):
+    def __init__(
+        self,
+        box,
+        moe,
+        experts,
+        tail,
+        layer_idx,
+        beta,
+        linear_beta,
+        prefetch,
+        *,
+        deadline_ns,
+    ):
         self.box, self.tail_weights, self.tail_box = (
             box,
             tail.tail_weights,
@@ -120,7 +132,13 @@ class SmallBatchChain:
         if box.tp == 8:
             tensors = head + (u32(box.scores), box.ids, box.w, down, box.h2.buffer)
             tensors += (box.latent, gate_up, u32(box.hg))
-            self.front = _launch("front", tensors, grid=box.sms - 8, renorm=renorm)
+            self.front = _launch(
+                "front",
+                tensors,
+                grid=box.sms - 8,
+                renorm=renorm,
+                deadline_ns=deadline_ns,
+            )
             tables = box.situ_tables(beta, linear_beta)
             tensors = (box.xmoe, shared_down, tables, u32(box.hg), box.s)
             self.shared = _launch("shared", tensors, grid=box.sms - 96)
@@ -129,7 +147,14 @@ class SmallBatchChain:
                 "experts_tp8", tensors + (box.g[self.slot, :16], box.counter)
             )
             self.routed = routed, args + experts.scalars
-            self.tail = compile_tail(8, 1, box.device.index, "front_poll", 3)
+            self.tail = compile_tail(
+                8,
+                1,
+                box.device.index,
+                "front_poll",
+                3,
+                deadline_ns=deadline_ns,
+            )
             return
         maps, self.codes = experts.maps[:256].view(2, 128), {}
         for b in self.batches:

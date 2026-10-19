@@ -5,7 +5,7 @@ latent multicast and gather, shared gate/up) and the shared-expert finisher."""
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int32, Uint8, Uint32, Uint64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
 from ...common.primitives import (
     alloc,
@@ -38,6 +38,8 @@ from ...common.primitives import (
     unpack_bf16,
     view,
     wait,
+    wait_deadline_check,
+    wait_deadline_start,
     warp_sum,
     zeros,
 )
@@ -179,9 +181,10 @@ class MoeFrontTP8:
     row_bytes = 14400
     shared_bytes = 15 * row_bytes + (16 * 16 + 16 * 4) * 4 + 24
 
-    def __init__(self, grid=140, *, renorm=True):
+    def __init__(self, grid=140, *, renorm=True, deadline_ns=0):
         self.grid = grid
         self.renorm = renorm
+        self.deadline_ns = deadline_ns
 
     @cute.jit
     def __call__(self, *args):
@@ -344,7 +347,11 @@ class MoeFrontTP8:
                     pointer = latent.iterator + par * 8 * 3584 + vector * 8
                     words = mailbox_load(pointer, count=4, scope="sys")
                     ready = published(words)
+                    started, polls = Int64(0), Int32(0)
+                    if not ready:
+                        started = wait_deadline_start(self.deadline_ns)
                     while not ready:
+                        polls = wait_deadline_check(started, polls, self.deadline_ns)
                         words = mailbox_load(pointer, count=4, scope="sys")
                         ready = published(words)
                     mailbox_store(latent_out.iterator + vector * 8, words)

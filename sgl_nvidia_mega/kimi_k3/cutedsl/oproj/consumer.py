@@ -8,7 +8,7 @@ receive slots into it (args 11-13: receive view, gather multicast address, rank)
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 
 from ..attn_res.kernel import arm_exchanges, rstd
 from ..common.mailbox import rearm
@@ -33,11 +33,11 @@ from ..common.primitives import (
     store_shared_words,
     store_words,
     unpack_bf16,
-)
-from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
-from ..common.primitives import (
+    wait_deadline_check,
+    wait_deadline_start,
     zeros,
 )
+from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
 from ..common.twoshot import reduce
 from .producer import OprojProducer, pack8, tree_reduce
 
@@ -114,11 +114,13 @@ class OprojConsumer:
         has_delta=True,
         groups=4,
         twoshot=False,
+        deadline_ns=0,
     ):
         if not 0 <= nb <= 8:
             raise ValueError("Output-projection AttnRes supports zero to eight blocks")
         self.nb, self.has_delta = nb, has_delta
         self.groups, self.twoshot = groups, twoshot
+        self.deadline_ns = deadline_ns
         self.kpre = 1 << max(0, (2 * nb - 1).bit_length())
         self.npost = 4 if nb > 0 else 1
 
@@ -242,7 +244,11 @@ class OprojConsumer:
             if rank < count:  # noqa: SIM102
                 if not published(raw[rank, j] for j in range(4)):
                     pending |= 1 << rank
+        started, polls = Int64(0), Int32(0)
+        if pending != 0:
+            started = wait_deadline_start(self.deadline_ns)
         while pending != 0:
+            polls = wait_deadline_check(started, polls, self.deadline_ns)
             for rank in cutlass.range_constexpr(n):
                 if (pending & (1 << rank)) != 0:
                     fetch(raw, rank, at(mailbox, first + rank, token, h))
@@ -298,7 +304,15 @@ class OprojConsumer:
             if cutlass.const_expr(self.twoshot):
                 recv, gather_mc, me = args[11:14]
                 if h // recv.shape[2] == me:
-                    reduce(recv, mailbox, gather_mc, me, token, h)
+                    reduce(
+                        recv,
+                        mailbox,
+                        gather_mc,
+                        me,
+                        token,
+                        h,
+                        self.deadline_ns,
+                    )
             if cutlass.const_expr(self.has_delta):
                 old = self.fragment(pf, 3, tid)
             attn = self.poll_sum(mailbox, token, h, 0, min(S, mailbox.shape[0]))

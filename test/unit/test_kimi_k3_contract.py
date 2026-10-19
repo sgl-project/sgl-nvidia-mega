@@ -16,7 +16,7 @@ import torch
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 FROZEN_PAYLOAD_SHA256 = (
-    "941e0db2146b528912c188266772a7bbf4cec623db9f9de60b87c6fa07554597"
+    "c3fde49433b5a43efd9cd75f68db1ce09d41581506492938a29664255d6327c2"
 )
 
 
@@ -74,6 +74,8 @@ class TestKimiK3Contract(unittest.TestCase):
                 "decode_attention_backend": frozenset({"trtllm_mla"}),
                 "page_size": frozenset({64}),
                 "dp_size": frozenset({1}),
+                "enable_unified_memory": frozenset({False}),
+                "enable_page_major_kv_layout": frozenset({False}),
             },
         )
         self.assertEqual(
@@ -123,6 +125,7 @@ class TestKimiK3Contract(unittest.TestCase):
     def test_build_filters_the_dense_capture_range_to_frozen_widths(self):
         from sglang.srt.megakernels.spec import BuildContext
 
+        from sgl_nvidia_mega.kimi_k3 import compat, providers
         from sgl_nvidia_mega.kimi_k3 import spec as kimi_spec
 
         model = SimpleNamespace(language_model=SimpleNamespace())
@@ -135,13 +138,19 @@ class TestKimiK3Contract(unittest.TestCase):
         resources = object()
         with (
             patch.object(
+                compat,
+                "validate_runtime_compatibility",
+                return_value="runtime-contract",
+            ),
+            patch.object(
                 kimi_spec,
                 "get_model",
                 return_value=SimpleNamespace(context_length=8192),
             ),
-            patch("sgl_nvidia_mega.kimi_k3.providers._cuda_memory", return_value={}),
-            patch(
-                "sgl_nvidia_mega.kimi_k3.providers.build_resources",
+            patch.object(providers, "_cuda_memory", return_value={}),
+            patch.object(
+                providers,
+                "build_resources",
                 return_value=resources,
             ) as build_resources,
         ):
@@ -150,7 +159,10 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertIsNone(built.draft_sampler)
         self.assertIn("TP8", built.summary())
         build_resources.assert_called_once_with(
-            model.language_model, context_length=8192, memory_before={}
+            model.language_model,
+            context_length=8192,
+            memory_before={},
+            deadline_ns=30_000_000_000,
         )
 
     def test_exact_widths_plan_and_every_other_call_falls_back(self):
@@ -322,6 +334,7 @@ class TestKimiK3TypedBinding(unittest.TestCase):
             compilation_inventory=[],
             memory_before=memory,
             memory_after=memory,
+            deadline_ns=30_000_000_000,
         )
         return resources, hybrid, live, mla_cache, conv, temporal, mla_core, kda_core
 
@@ -344,6 +357,7 @@ class TestKimiK3TypedBinding(unittest.TestCase):
                 "sgl_nvidia_mega.kimi_k3.providers._cuda_memory", return_value=memory
             ),
             patch.object(torch.cuda, "synchronize"),
+            patch("sgl_nvidia_mega.kimi_k3.providers._validate_pool_tensor"),
         ):
             built.prepare_before_cuda_graph_capture(PreparationView(hybrid=hybrid))
             fingerprint = resources.binding_fingerprint
@@ -379,6 +393,7 @@ class TestKimiK3TypedBinding(unittest.TestCase):
                 "sgl_nvidia_mega.kimi_k3.providers._cuda_memory", return_value=memory
             ),
             patch.object(torch.cuda, "synchronize"),
+            patch("sgl_nvidia_mega.kimi_k3.providers._validate_pool_tensor"),
         ):
             built.prepare_before_cuda_graph_capture(PreparationView(hybrid=hybrid))
             replaced = HybridPoolView(
@@ -465,16 +480,17 @@ class TestKimiK3TypedStep(unittest.TestCase):
             mla=MlaStepView(
                 block_table=torch.zeros(batch, 1, dtype=torch.int32),
                 sequence_lengths=torch.ones(batch, dtype=torch.int32),
-                write_slots=torch.zeros(batch, dtype=torch.int32),
+                write_slots=torch.zeros(batch, dtype=torch.int64),
             ),
             kda=KdaStepView(
                 state_indices=torch.zeros(batch, dtype=torch.int32),
                 track_decode_state=tracked.append,
             ),
         )
-        result = KimiK3MegakernelExecutor(resources).run(
-            torch.zeros(batch, dtype=torch.int64), torch.zeros(batch, width), view
-        )
+        with patch("sgl_nvidia_mega.kimi_k3.executor._validate_step_inputs"):
+            result = KimiK3MegakernelExecutor(resources).run(
+                torch.zeros(batch, dtype=torch.int64), torch.zeros(batch, width), view
+            )
         self.assertEqual(result.data_ptr(), scratch["hidden.out"].data_ptr())
         self.assertEqual(tuple(result.shape), (batch, width))
         self.assertEqual(tracked, list(range(1, 93)))

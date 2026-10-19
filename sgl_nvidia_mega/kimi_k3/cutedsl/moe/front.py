@@ -50,7 +50,7 @@ def ordered(score):
 
 class RouteSitu:
     def __init__(
-        self, batch, shared, renorm, early, roles, polled, plan=False
+        self, batch, shared, renorm, early, roles, polled, plan=False, deadline_ns=0
     ):  # fmt: skip
         # B>8: few registers, so routing CTAs co-reside with the front and the fused
         # shared expert, and polled logits skip the front's completion wait.
@@ -60,6 +60,7 @@ class RouteSitu:
         # polled: logits arrive as FP32 words in mailbox columns [3584, 5376) (Lamport);
         # plan: the copy role also writes the latent as MXFP8 into the experts' plan.
         self.early, self.polled, self.plan = early, polled, plan
+        self.deadline_ns = deadline_ns
         self.roles = tuple(r for r, on in zip(("route", "copy", "situ"), roles) if on)
 
     @cute.jit
@@ -195,7 +196,7 @@ class RouteSitu:
 
     @cute.jit
     def copy(self, base, latent, token, tid, count: c.Constexpr[int], plan=None):
-        got = poll(base, 2048, count)
+        got = poll(base, 2048, count, self.deadline_ns)
         for i in c.range_constexpr(count):
             dst = latent.iterator + token * latent.stride[0] + (tid + 256 * i) * 8
             words = [got[i, k] for k in range(4)]
@@ -231,7 +232,7 @@ class RouteSitu:
         if c.const_expr(self.polled):
             if tid < 224:
                 cell = mailbox.iterator + token * mailbox.shape[2] + 3584 + tid * 8
-                got = poll(cell, 0, 1)
+                got = poll(cell, 0, 1, self.deadline_ns)
                 rearm(cell)
                 for i in c.range_constexpr(4):
                     raw[i] = bits_float(got[0, i])
@@ -406,8 +407,26 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None):
 
 
 @functools.cache
-def compile_route(batch, shared, renorm, roles, device, polled=False, plan=False):
-    kernel = RouteSitu(batch, shared, renorm, batch <= 2, roles, polled, plan)
+def compile_route(
+    batch,
+    shared,
+    renorm,
+    roles,
+    device,
+    polled=False,
+    plan=False,
+    deadline_ns=0,
+):
+    kernel = RouteSitu(
+        batch,
+        shared,
+        renorm,
+        batch <= 2,
+        roles,
+        polled,
+        plan,
+        deadline_ns,
+    )
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
     args += (fake((batch, 16), None, c.Int32), fake((batch, 16)), fake((1, 64, WIDTH)))
@@ -432,7 +451,7 @@ def compile_publish(n, split, valid, batch, device, ks, geometry=None):
 class SharedFront:
     def __init__(
         self, moe, packed, box, storage, batches, beta, linear_beta, plan=None,
-        counters=None, q=1,
+        counters=None, q=1, deadline_ns=0,
     ):  # fmt: skip
         """``plan``: the experts' plan buffer, written by the routing kernel at B>8;
         ``counters``: the fused shared expert's model-owned barrier counters; ``q``: the
@@ -477,8 +496,17 @@ class SharedFront:
             front = compile_publish(n, n - shard, valid, b, dev, front_ks(b, n))
             planned = plan is not None and b > 8
             roles = (True, True, False)
-            route = compile_route(b, shared, renorm, roles, dev, True, planned)
-            situ = compile_route(b, shared, renorm, (False, False, True), dev)
+            route = compile_route(
+                b, shared, renorm, roles, dev, True, planned, deadline_ns
+            )
+            situ = compile_route(
+                b,
+                shared,
+                renorm,
+                (False, False, True),
+                dev,
+                deadline_ns=deadline_ns,
+            )
             args = (logits, bias, ids, weights, self.box[0], latent, gate, h)
             extra = (to_cute(plan),) if planned else ()
             code = None

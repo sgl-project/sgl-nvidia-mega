@@ -36,6 +36,8 @@ from .primitives import (
     published,
     store_relaxed,
     unpack_bf16,
+    wait_deadline_check,
+    wait_deadline_start,
     zeros,
 )
 
@@ -83,7 +85,15 @@ def push(recv, peers, slot, token, column, words):
 
 
 @cute.jit
-def reduce(recv, gather, gather_mc, rank, token, column):
+def reduce(
+    recv,
+    gather,
+    gather_mc,
+    rank,
+    token,
+    column,
+    deadline_ns: cutlass.Constexpr[int],
+):
     """Owner of (token, column): the TP slots summed in FP32 in rank order, rounded
     once (no negative zero, the sentinel), multicast to every gather row; slots
     re-armed. Returns nothing; callers then poll ``gather`` like a one-slot mailbox."""
@@ -91,7 +101,17 @@ def reduce(recv, gather, gather_mc, rank, token, column):
     local = column - rank * recv.shape[2]
     raw = zeros((tp, 4), Uint32)
     pending = Int32((1 << tp) - 1)
+    for slot in cutlass.range_constexpr(tp):
+        words = load_vector(at(recv, slot, token, local), cache="volatile")
+        for j in cutlass.range_constexpr(4):
+            raw[slot, j] = words[j]
+        if published(words):
+            pending &= ~(1 << slot)
+    started, polls = Int64(0), Int32(0)
+    if pending != 0:
+        started = wait_deadline_start(deadline_ns)
     while pending != 0:
+        polls = wait_deadline_check(started, polls, deadline_ns)
         for slot in cutlass.range_constexpr(tp):
             if (pending & (1 << slot)) != 0:
                 words = load_vector(at(recv, slot, token, local), cache="volatile")
