@@ -146,7 +146,7 @@ def test_every_shipped_slot_reports_its_build():
     """The build checks each requested slot against this table; a slot missing
     from it stops the server at build."""
     slots = {6: SimpleNamespace(hop_a=True, fast_gate=True)}
-    moe = SimpleNamespace(slots={0: SimpleNamespace(gate=True)})
+    moe = SimpleNamespace(slots={0: SimpleNamespace(gate=True, shared=object())})
     layers = {0: SimpleNamespace(chain=None), 1: SimpleNamespace(chain=object())}
     facts = SimpleNamespace(routed=True)
     built = runtime.built_slots(
@@ -154,7 +154,7 @@ def test_every_shipped_slot_reports_its_build():
     )
     # the slots this table reports; the boundary build reports two_shot and the
     # hops, the DSpark step its own slots
-    target = {"hop_a", "moe", "gate", "attn", "embed", "engram"}
+    target = {"hop_a", "moe", "gate", "attn", "embed", "engram", "shared_ll"}
     assert set(built) == target and all(built.values())
     stock = {0: SimpleNamespace(chain=None)}
     assert not runtime.built_slots(

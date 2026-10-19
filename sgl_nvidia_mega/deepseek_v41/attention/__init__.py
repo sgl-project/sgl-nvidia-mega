@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from sgl_nvidia_mega.deepseek_v41.attention import chain, sched_ahead
+from sgl_nvidia_mega.deepseek_v41.attention import chain, indexer, sched_ahead
 from sgl_nvidia_mega.deepseek_v41.attention.step import AttentionStep, disable_reason
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,12 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
     qkv_a_bf16 = qkv_a_ll and "attn_qkv_a_bf16" in SLOTS
     steps, skipped = {}, []
     kinds: Counter = Counter()
+    # slot attn_indexer: one plugin indexer for every layer it takes
+    step_indexer = (
+        indexer.StepIndexer(model.config)
+        if chain_on and "attn_indexer" in SLOTS
+        else None
+    )
     for i in range(m.start_layer, m.end_layer):
         attn = m.layers[i].self_attn
         reason = disable_reason(attn)
@@ -65,6 +71,13 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             kv_before_wait="kv_before_wait" in SLOTS,
         )
         if chain_on:
+            ops0 = step_.chain[0]
+            if (
+                step_indexer is not None
+                and ops0.wq_b_ll
+                and not indexer.reason(attn, model.config)
+            ):
+                ops0.indexer = step_indexer
             chain.precompile(attn, ctx.widths, qkv_a_ll=qkv_a_ll)
             kinds[_chain_kind(attn, step_)] += 1
     logger.info(
@@ -86,6 +99,8 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
         )
     if step_.chain[0].index_q_mxfp8_in:
         parts.append("indexer wq_b on the chain's q_lora quant 1-8")
+    if step_.chain[0].indexer is not None:
+        parts.append("indexer top-k in the plugin 1-64 (query on stream 1)")
     parts.append("wq_b low-latency 1-48" if step_.chain[0].wq_b_ll else "wq_b SGLang's")
     swapab = "swap-AB 1-24" if step_.swapab else "no swap-AB"
     if step_.swapab and step_.kv_before_wait and step_.low_ratio:

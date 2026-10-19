@@ -249,6 +249,7 @@ def test_the_routed_pair_replaces_only_the_top_k_and_the_routed_call(
         gate=True,
         select=logged("fast_gate", "gate_topk"),
         run=logged("pair", "deferred"),
+        shared=None,
     )
     st = SimpleNamespace(
         fb=SimpleNamespace(moe_num_token_non_padded=lambda: "nnp"),
@@ -320,6 +321,179 @@ def test_the_slot_calls_the_pair_with_its_signature(fast_gate, ready):
     if fast_gate:
         assert gemm.gate_topk_and_gemms.call_args.args[5] is None  # no fill kernel
     assert out.top_k == 6 and out.gemm2_out is pair_out[0]
+
+
+# ------------------------------------------------------------------------------------
+# Slot shared_ll: the shared expert's gate_up on the low-latency GEMM, from the routed
+# input quant, then SGLang's clamped SwiGLU and down_proj.
+
+
+def _shared_mlp(log, n=256, k=256, **overrides):
+    def down_proj(h):
+        log.append(("down_proj", tuple(h.shape)))
+        return "shared_out", None
+
+    gate_up = SimpleNamespace(
+        weight=torch.zeros(n, k, dtype=torch.float8_e4m3fn),
+        weight_scale_inv_swizzled=torch.zeros(n * k // 32, dtype=torch.uint8),
+    )
+    shared = SimpleNamespace(
+        swiglu_limit=10.0,
+        use_fused_clamp_act_mul=False,
+        allow_fused_down=True,
+        gate_up_proj=gate_up,
+        down_proj=_Callable(
+            down_proj, weight=torch.zeros(k, n // 2, dtype=torch.float8_e4m3fn)
+        ),
+    )
+    shared.__dict__.update(overrides)
+    return SimpleNamespace(shared_experts=shared, num_fused_shared_experts=0)
+
+
+def test_shared_ll_runs_sglangs_clamped_mlp_on_its_own_quant(monkeypatch):
+    from sglang.kernels.ops.moe import dsv4
+
+    from sgl_nvidia_mega.deepseek_v41.moe import shared_ll
+
+    log = []
+    layer = shared_ll.SharedLL(_shared_mlp(log), max_rows=48)
+    x = torch.zeros(12, 256, dtype=torch.bfloat16)
+    gate_up_out = torch.zeros(12, 256, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        shared_ll,
+        "mxfp8_row_tiles",
+        lambda rows: log.append(("quant", rows is x)) or ("q", "s"),
+    )
+    monkeypatch.setattr(
+        shared_ll.mxfp8_ll,
+        "linear",
+        lambda a, a_scale, w, w_scale: (
+            log.append(("gate_up", a, a_scale)) or gate_up_out
+        ),
+    )
+    monkeypatch.setattr(
+        dsv4,
+        "silu_and_mul_clamp",
+        lambda x, out, limit: log.append(("clamp", x is gate_up_out, out.shape, limit)),
+    )
+    assert layer(x) == "shared_out"
+    assert log == [
+        ("quant", True),
+        ("gate_up", "q", "s"),
+        ("clamp", True, (12, 128), 10.0),
+        ("down_proj", (12, 128)),
+    ]
+
+
+def test_shared_ll_applies_only_to_sglangs_cuda_clamped_path(monkeypatch):
+    from sgl_nvidia_mega.deepseek_v41.moe import shared_ll
+
+    monkeypatch.setattr(shared_ll.mxfp8_ll, "supported", lambda: True)
+    assert shared_ll.why_not(_shared_mlp([])) == ""
+    uint8_down = _Callable(
+        None, weight=torch.zeros(1, dtype=torch.uint8), weight_scale_inv=None
+    )
+    no_view = SimpleNamespace(weight=torch.zeros(256, 256, dtype=torch.float8_e4m3fn))
+    for overrides, why in (
+        (dict(swiglu_limit=None), "clamped SwiGLU"),
+        (dict(use_fused_clamp_act_mul=True), "clamped SwiGLU"),
+        (dict(_enable_nvfp4_gemm_swiglu_fusion=True), "clamped SwiGLU"),
+        (dict(down_proj=uint8_down), "fused down_proj"),
+        (dict(gate_up_proj=no_view), "no MXFP8 view"),
+    ):
+        assert why in shared_ll.why_not(_shared_mlp([], **overrides)), overrides
+    assert "multiples of 128" in shared_ll.why_not(_shared_mlp([], n=192))
+    fused = _shared_mlp([])
+    fused.num_fused_shared_experts = 1
+    assert "no separate shared expert" in shared_ll.why_not(fused)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("quant_routed", [False, True])
+@pytest.mark.parametrize("quant_once", [False, True])
+def test_shared_ll_takes_the_shared_expert_at_the_fork(
+    capture, quant_routed, quant_once, caplog, monkeypatch
+):
+    """The shared expert on the alternate stream from the layer's rows, with no wait on
+    the routed quant (which would launch it behind the routed GEMMs); the routed pair
+    keeps SGLang's pre-quant."""
+    step_mod = importlib.import_module("sgl_nvidia_mega.deepseek_v41.moe.step")
+    monkeypatch.setattr(step_mod, "_SHARED_LL_SERVED", set())
+    log = []
+    mlp, x, cur = _block(
+        log, inplace=False, quant_once=quant_once, quant_routed=quant_routed
+    )
+
+    def pair(x_, topk, pre_quant):
+        pre = None if pre_quant is None else tuple(pre_quant)
+        log.append(("pair", cur["stream"], pre))
+        return "deferred"
+
+    def shared(rows):
+        log.append(("shared_ll", cur["stream"], rows is x))
+        return "shared_ll_out"
+
+    slot = SimpleNamespace(gate=False, run=pair, shared=shared)
+    st = SimpleNamespace(
+        fb=SimpleNamespace(moe_num_token_non_padded=lambda: "nnp"),
+        transport=SimpleNamespace(
+            input_ids_global="ids_g", do_shared_local=False, return_moe_output=True
+        ),
+        slots=SimpleNamespace(routed=True, fast_gate=False),
+        bound={"moe": SimpleNamespace(slots={7: slot})},
+    )
+    with _sglang(log, cur, capture=capture), caplog.at_level("INFO"):
+        out = moe.step(SimpleNamespace(mlp=mlp, layer_id=7), x, st)
+    names = [e[0] for e in log]
+    served = [r.getMessage() for r in caplog.records if "low-latency" in r.getMessage()]
+    if quant_once:  # SGLang's fp8 input for both: its shared expert, as before
+        assert "shared_ll" not in names and "shared" in names and not served
+        assert out.shared == "shared_out"[: x.shape[0]]  # SGLang's padded-row slice
+        return
+    assert "shared" not in names
+    assert ("shared_ll", "alt", True) in log
+    # the alternate stream forks before the routed branch and joins nothing else
+    alt_waits = [e for e in log if e[0] == "wait" and e[1] == "alt"]
+    assert alt_waits == [("wait", "alt", "main")]
+    assert log.index(("wait", "alt", "main")) < names.index("shared_ll")
+    assert names.count("quantize_routed") == (1 if quant_routed else 0)
+    pre = ("xq", "xsf", "event:rq") if quant_routed else None
+    assert ("pair", "main", pre) in log
+    assert served == [
+        "NVIDIA megakernel: shared expert gate_up on the low-latency GEMM serves 3 rows"
+    ]
+    assert out.routed == "deferred" and out.shared == "shared_ll_out"
+
+
+def test_shared_ll_binds_where_it_applies_and_falls_back_whole(monkeypatch):
+    from sgl_nvidia_mega.deepseek_v41.moe import routed, shared_ll
+
+    built = []
+
+    class Built:
+        def __init__(self, mlp, max_rows):
+            self.mlp, self.max_rows = mlp, max_rows
+
+        def precompile(self, widths):
+            built.append((self.mlp, self.max_rows, tuple(widths)))
+
+    monkeypatch.setattr(shared_ll, "SharedLL", Built)
+    monkeypatch.setattr(
+        shared_ll, "why_not", lambda mlp: "" if mlp != "draft" else "no MXFP8 view"
+    )
+    slots = {i: routed.MoeSlot.__new__(routed.MoeSlot) for i in range(3)}
+    for i, slot in slots.items():
+        slot.mlp, slot.shared = ("draft" if i == 2 else f"mlp{i}"), None
+    assert routed._bind_shared(slots, (6, 12)) == "layer 2: no MXFP8 view"
+    assert built == [("mlp0", 48, (6, 12)), ("mlp1", 48, (6, 12))]
+    assert slots[2].shared is None and slots[0].shared.mlp == "mlp0"
+
+    def boom(widths):
+        raise RuntimeError("no kernel")
+
+    monkeypatch.setattr(Built, "precompile", lambda self, widths: boom(widths))
+    assert routed._bind_shared(slots, (6,)) == "RuntimeError: no kernel"
+    assert all(s.shared is None for s in slots.values())
 
 
 # ------------------------------------------------------------------------------------

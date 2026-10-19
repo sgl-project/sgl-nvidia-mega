@@ -216,11 +216,12 @@ class TestMegakernelVerify(CustomTestCase):
     # prefetch at batch 1, the two-shot hops from batch 9), every width up to 384 rows
     ACTIVE = re.compile(
         r"NVIDIA megakernel: active \(DeepSeek-V4\.1: slots \["
-        r"'attn', 'attn_qkv_a', 'attn_qkv_a_bf16', 'aux_mean_stats', 'early_trigger', "
+        r"'attn', 'attn_indexer', 'attn_qkv_a', 'attn_qkv_a_bf16', 'aux_mean_stats', "
+        r"'early_trigger', "
         r"'embed', 'engram', 'gate', 'gate_wide', 'hc_prenorm', 'hop_a', "
         r"'hop_a_batch2', 'hop_b', 'hop_b_start_trigger', 'index_q_mxfp8_in', "
         r"'kv_before_wait', 'moe', 'req_pos_once', "
-        r"'sched_ahead', 'two_shot'\]; "
+        r"'sched_ahead', 'shared_ll', 'two_shot'\]; "
         r"hop A at \[6, 12\] rows, fast gate at \[6, 12, 18, 24, 30, 36, 42, 48\] rows, "
         r"Engram prefetch at \[6\] rows \(built, checked bit for bit\); boundary: "
         r"hop A at \[6, 12\] rows \(built\); hop B on; two-shot at 49-384 rows "

@@ -560,3 +560,135 @@ def test_each_router_follows_live_inputs_in_a_graph(router, rows, count):
         torch.cuda.synchronize()
         for got, want in zip(out, ref):
             assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+
+
+# ------------------------------------------- the shared expert on the low-latency GEMM
+
+SHARED_N, SHARED_K, SHARED_I = 1152, 5120, 576  # TP4 gate_up [2 x 576, 5120]
+SWIGLU_LIMIT = 10.0  # text_config.swiglu_limit
+# gate_up: FP32 summation order only (split-K, K tile), as the attention projections
+SHARED_GATE_UP_REL = 5e-4
+SHARED_OUT_REL = 1e-2
+
+
+def _shared_ready() -> bool:
+    if not _moe_ready():
+        return False
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
+    return mxfp8_ll.supported()
+
+
+@pytest.fixture(scope="module")
+def shared_layer():
+    """A TP4 shared expert with SGLang's MXFP8 view (codes, swizzled scales), its
+    down_proj on SGLang's dense MXFP8 linear, and slot shared_ll's layer over it."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.quantization.fp8_utils import (
+        flashinfer_mxfp8_blockscaled_linear,
+    )
+
+    from sgl_nvidia_mega.deepseek_v41.moe import shared_ll
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
+    gen = torch.Generator(device="cuda").manual_seed(5)
+
+    def weight(n, k):
+        w = torch.randn(n, k, device="cuda", generator=gen) / k**0.5
+        q, sf = mxfp8_ll.quantize(w.bfloat16())
+        return q.contiguous(), sf.reshape(-1).contiguous()
+
+    def dense(x, w):
+        return flashinfer_mxfp8_blockscaled_linear(
+            x, w[0], w[1], backend="cute-dsl", pin_tactic=True
+        )
+
+    gate_up, down = weight(SHARED_N, SHARED_K), weight(SHARED_K, SHARED_I)
+    shared = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(
+            weight=gate_up[0], weight_scale_inv_swizzled=gate_up[1]
+        ),
+        down_proj=lambda h: (dense(h, down), None),
+        swiglu_limit=SWIGLU_LIMIT,
+    )
+    layer = shared_ll.SharedLL(SimpleNamespace(shared_experts=shared), max_rows=48)
+    return layer, lambda x: dense(x, gate_up), shared.down_proj
+
+
+def _shared_rows(rows, gen):
+    """Post-norm rows with a few massive channels, BF16."""
+    gain = torch.exp(0.75 * torch.randn(SHARED_K, device="cuda", generator=gen))
+    gain[torch.randperm(SHARED_K, device="cuda", generator=gen)[:8]] *= 30.0
+    h = torch.randn(rows, SHARED_K, device="cuda", generator=gen) * gain
+    return (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)).bfloat16()
+
+
+def _clamped_down(gate_up, down_proj):
+    """SGLang's shared MLP past gate_up: the clamped SwiGLU, then down_proj."""
+    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
+
+    h = gate_up.new_empty((gate_up.shape[0], SHARED_I))
+    silu_and_mul_clamp(gate_up, h, SWIGLU_LIMIT)
+    return down_proj(h)[0]
+
+
+def _rel(out, ref):
+    d = (out.float() - ref.float()).abs()
+    return (d.norm() / ref.float().norm()).item()
+
+
+@pytest.mark.skipif(not _shared_ready(), reason="needs an SM100-family GPU")
+@pytest.mark.parametrize("rows", [1, 6, 8, 12, 24, 30, 40, 48])
+@pytest.mark.parametrize("graph", [False, True])
+def test_shared_ll_matches_sglangs_shared_expert(shared_layer, rows, graph):
+    """Slot shared_ll against SGLang's shared expert on the same rows: its quant is the
+    shared linear's own (codes, and scales moved into row tiles, bit for bit); its
+    gate_up differs from SGLang's dense gate_up by summation order only; the clamped
+    SwiGLU and down_proj are SGLang's, bit for bit on that gate_up. In a graph it
+    follows live inputs."""
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import (
+        mxfp8_row_tiles,
+    )
+
+    layer, gate_up_dense, down_proj = shared_layer
+    layer.precompile([rows])
+    gen = torch.Generator(device="cuda").manual_seed(100 + rows)
+    x = _shared_rows(rows, gen)
+    if graph:
+        layer(x)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = layer(x)
+    r = torch.arange(rows, device="cuda")[:, None]
+    c = torch.arange(SHARED_K // 32, device="cuda")[None, :]
+    tiled = ((r // 8) * (SHARED_K // 128) + c // 4) * 512 + (r % 8) * 16 + c % 4
+    swizzled = (c // 4) * 512 + ((r % 32) * 4 + (r // 32) % 4) * 4 + c % 4
+    for _ in range(3 if graph else 1):
+        if graph:
+            x.copy_(_shared_rows(rows, gen))
+            g.replay()
+        else:
+            x = _shared_rows(rows, gen)
+            out = layer(x)
+        q, s = mxfp8_row_tiles(x)
+        sg_q, sg_s = mxfp8_ll.quantize(x)
+        assert torch.equal(q.view(torch.uint8), sg_q.view(torch.uint8)), rows
+        assert torch.equal(s[tiled], sg_s.view(torch.uint8).flatten()[swizzled]), rows
+        ref_gate_up = gate_up_dense(x)
+        gate_up = mxfp8_ll.linear(q, s, layer.weight, layer.weight_scale)
+        ref, mine = (_clamped_down(t, down_proj) for t in (ref_gate_up, gate_up))
+        torch.cuda.synchronize()
+        gate_up_rel, out_rel = _rel(gate_up, ref_gate_up), _rel(out, ref)
+        print(
+            f"SHARED_LL rows={rows} graph={graph} gate_up_rel={gate_up_rel:.3e} "
+            f"out_rel={out_rel:.3e}"
+        )
+        assert gate_up_rel <= SHARED_GATE_UP_REL, rows
+        # past the quant the slot is the low-latency GEMM, then SGLang's code
+        assert torch.equal(out, mine), rows
+        # down_proj's MXFP8 requant of h turns the gate_up rounding into a code flip
+        # now and then (1.7e-3 at most in 32 draws)
+        assert out_rel <= SHARED_OUT_REL, rows

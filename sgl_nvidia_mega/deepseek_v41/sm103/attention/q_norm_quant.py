@@ -162,3 +162,58 @@ def rmsnorm_mxfp8(
         **({"ROW_TILES": True} if row_tiles else {}),
     )
     return y, q, s
+
+
+@triton.jit
+def _mxfp8_row_tiles_kernel(
+    X,
+    Q,
+    S,
+    SX: tl.constexpr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUPS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    # Let the GEMM that reads Q launch now and stream its weights.
+    tl.extra.cuda.gdc_launch_dependents()
+    tl.extra.cuda.gdc_wait()
+    h = tl.arange(0, BLOCK)
+    if row < M:
+        v = tl.load(X + row * SX + h, h < K, 0)
+        mxfp8_epilogue(v, row, Q, S, K, BLOCK, GROUPS, True)
+    else:
+        # Rows past M in the last 8-row tile: zero scales (one program per such row).
+        GP: tl.constexpr = BLOCK // 32
+        g = tl.arange(0, GP)
+        off = ((row // 8) * (K // 128) + g // 4) * 512 + (row % 8) * 16 + (g % 4)
+        tl.store(S + off, 0, g < GROUPS)
+
+
+def mxfp8_row_tiles(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 rows as MXFP8 ``(q, sf)`` with the scales in the row-tile layout (the
+    low-latency GEMM's activation layout; FlashInfer's 128x4 swizzle at 1-8 rows), the
+    epilogue above without the norm: bitwise ``mxfp8_quantize(x, is_sf_swizzled_layout=True)``
+    with its scales moved. Launched as a programmatic dependent that triggers its own
+    dependent at once."""
+    m, k = x.shape
+    assert 0 < m <= 128 and k % 128 == 0
+    assert x.dtype == torch.bfloat16 and x.stride(1) == 1
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    tiles = triton.cdiv(m, 8)
+    s = torch.empty(tiles * (k // 128) * 512, dtype=torch.uint8, device=x.device)
+    _mxfp8_row_tiles_kernel[(tiles * 8,)](
+        x,
+        q,
+        s,
+        SX=x.stride(0),
+        M=m,
+        K=k,
+        BLOCK=triton.next_power_of_2(k),
+        GROUPS=k // 32,
+        num_warps=8,
+        enable_fp_fusion=False,
+        launch_pdl=True,
+    )
+    return q, s
