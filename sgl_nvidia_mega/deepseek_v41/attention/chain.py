@@ -219,6 +219,9 @@ class ChainOps:
     ):
         self.rope_in_attention = rope_in_attention
         self.wq_b_ll = wq_b_ll_applies(attn)
+        # slot attn_indexer: the process's plugin indexer (attention/indexer.py), set by
+        # the attention build for the layers it takes
+        self.indexer = None
         self.qkv_a_ll = qkv_a_ll and qkv_a_ll_applies(attn)
         # slot attn_qkv_a_bf16: BF16 input (no MXFP8 rows from the boundary) is
         # quantized for the low-latency GEMM too, with FlashInfer's MXFP8 quantize

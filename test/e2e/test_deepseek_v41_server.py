@@ -216,7 +216,8 @@ class TestMegakernelVerify(CustomTestCase):
     # prefetch at batch 1, the two-shot hops from batch 9), every width up to 384 rows
     ACTIVE = re.compile(
         r"NVIDIA megakernel: active \(DeepSeek-V4\.1: slots \["
-        r"'attn', 'attn_qkv_a', 'attn_qkv_a_bf16', 'aux_mean_stats', 'early_trigger', "
+        r"'attn', 'attn_indexer', 'attn_qkv_a', 'attn_qkv_a_bf16', 'aux_mean_stats', "
+        r"'early_trigger', "
         r"'embed', 'engram', 'gate', 'gate_wide', 'hc_prenorm', 'hop_a', "
         r"'hop_a_batch2', 'hop_b', 'hop_b_start_trigger', 'index_q_mxfp8_in', "
         r"'kv_before_wait', 'moe', 'req_pos_once', "

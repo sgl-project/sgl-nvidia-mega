@@ -192,6 +192,64 @@ def test_the_engram_prefetch_takes_only_the_per_rank_table():
     assert "scale tiles" in reason(_engram(columns=25600 + 128))
 
 
+def test_the_engram_prefetch_holds_the_reduced_rows_until_gather(monkeypatch):
+    """reduce()'s all-reduced rows are read on the side stream after reduce() returns.
+    An out-of-place all-reduce's record_stream does not keep them (the allocator ignores
+    it on DLPack tensors), so the prefetch holds them until gather() joins wkv_done."""
+    import gc
+    import weakref
+
+    waits, refs = [], []
+
+    class Stream:
+        def wait_event(self, event):
+            waits.append((event, refs[-1]() is not None if refs else None))
+
+        def wait_stream(self, other):
+            pass
+
+    class Event:
+        def record(self, stream=None):
+            pass
+
+    class Rows:  # an out-of-place all-reduce result
+        def record_stream(self, stream):
+            pass  # what the caching allocator does for a tensor it did not allocate
+
+        def __getitem__(self, j):
+            return self
+
+    def reduce_owned_rows(looked):
+        out = Rows()
+        refs.append(weakref.ref(out))
+        return out
+
+    main = Stream()
+    monkeypatch.setattr(prefetch.torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(
+        prefetch.torch.cuda, "stream", lambda s: contextlib.nullcontext()
+    )
+    engram = SimpleNamespace(
+        embed=SimpleNamespace(_reduce_owned_rows=reduce_owned_rows)
+    )
+    layer = SimpleNamespace(
+        engram=engram, n=4, cols=slice(0, 4), quarter=lambda rows: torch.ones(2, 4)
+    )
+    p = object.__new__(prefetch.EngramPrefetch)
+    p.layers, p.stream, p.rows, p.hash_cols, p.dim = {3: layer}, Stream(), 2, 1, 4
+    p.looked, p.parts = torch.zeros(8), torch.zeros(8)
+    p.looked_up, p.reduced, p.wkv_done = Event(), Event(), Event()
+    p.group, p.kv, p._emb = SimpleNamespace(all_reduce=lambda x: x), None, None
+
+    p.reduce()
+    gc.collect()
+    assert refs[0]() is not None  # held past reduce(), while the side stream reads it
+    p.gather()
+    gc.collect()
+    # still held when main waits for the side stream's WKV; released after
+    assert (p.wkv_done, True) in waits and refs[0]() is None
+
+
 def _batch(mode="TARGET_VERIFY"):
     is_verify = mode == "TARGET_VERIFY"
     return SimpleNamespace(
@@ -278,6 +336,7 @@ def test_slot_selection_is_validated(monkeypatch):
         ("early_trigger", "needs slot 'hop_a'"),
         ("hop_a_batch2", "needs slot 'hop_a'"),
         ("hop_a,hop_b_start_trigger", "needs slot 'hop_b'"),
+        ("attn_indexer", "needs slot 'attn'"),
     ):
         monkeypatch.setattr(runtime, "SLOTS", frozenset(raw.split(",")))
         assert any(want in r for r in runtime.slot_reasons()), raw

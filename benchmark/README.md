@@ -32,8 +32,11 @@ python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --t
 
 The three `SGLANG_SIMULATE_ACC_*` variables fix the acceptance length at 3.51, so both arms
 run the same number of verify steps; never set them for an accuracy run. With DSpark
-block 5 a verify step has 6 rows per request, so batch 1–8 runs the megakernel and batch
-16–64 runs SGLang's standard path in both arms.
+block 5 a verify step has 6 rows per request. The on arm runs the plugin's step at every
+captured batch: batch 1–8 (6–48 rows) with the routed-expert GEMMs, and batch 10–64
+(60–384 rows, 19 captured widths) with the two-shot attention and MoE posts (`plan.py`:
+two-shot from 49 rows up to `MAX_ROWS`, 384). The off arm runs SGLang's standard path at
+every batch.
 
 Client, two passes per launch:
 
