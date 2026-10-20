@@ -517,7 +517,7 @@ def _mlp(**config):
         scoring_func="sqrtsoftplus",
         sqrtsoftplus_log1p=True,
         renormalize=True,
-        num_fused_shared_experts=0,
+        num_shared_topk_slots=0,
         use_grouped_topk=False,
         custom_routing_function=None,
         correction_bias=torch.zeros(128),
