@@ -35,9 +35,11 @@ from ..common.primitives import (
     unpack_bf16,
     wait_deadline_check,
     wait_deadline_start,
-    zeros,
 )
 from ..common.primitives import wait_phase_zero_cluster as wait_phase_zero
+from ..common.primitives import (
+    zeros,
+)
 from ..common.twoshot import reduce
 from .producer import OprojProducer, pack8, tree_reduce
 
