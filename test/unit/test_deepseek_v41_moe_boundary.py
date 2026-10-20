@@ -635,14 +635,71 @@ def test_two_shot_runs_both_posts_and_builds_sglangs_next_input(fake, receiver, 
         assert st.hc.input.swizzled.data is q
 
 
+@pytest.mark.parametrize("receiver", ["closed", "unfusable", "normed", "mxfp8"])
+@pytest.mark.parametrize("rows", [64, 129, 153, 384])
+def test_two_shot_norm_wide_hands_on_its_input_past_sglangs_caps(
+    fake, caplog, receiver, rows
+):
+    """Slot two_shot_norm_wide: past 152 rows the attention post still hands on its
+    normed rows, past 128 the MoE post its MXFP8 (or normed) input; up to the caps
+    and for a closed / unfusable receiver it builds what the slot-off post does."""
+    updated, normed = torch.zeros(rows, HC, HIDDEN), torch.ones(rows, HIDDEN)
+    hop = SimpleNamespace(
+        fits=lambda r, h: 49 <= r <= 384 and h == HIDDEN,
+        attn_post=Mock(return_value=(updated, normed)),
+        moe_post=Mock(return_value=(updated, normed)),
+        moe_post_only=Mock(return_value=updated),
+        scale_bytes=lambda r: 160 * 128 * -(-r // 128),
+    )
+    b, layers, _, norm = _hop_boundary(
+        fake, rows, two_shot=hop, two_shot_norm_wide=True
+    )
+    st = b.start(torch.randn(rows, HC, HIDDEN))
+    b.pre(layers[0], "attn", st, object())
+    with (
+        patch.object(torch.cuda, "current_stream"),
+        patch(
+            "sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe.can_fuse_all_reduce",
+            side_effect=lambda r, h: r <= 152,
+        ),
+        caplog.at_level("INFO"),
+    ):
+        b.post(layers[0], "attn", torch.randn(rows, HIDDEN), st)
+    assert isinstance(st.hc.input, mhc.HcNormed) and st.hc.input.rows is normed
+    assert ("attention post (normed, wide)" in caplog.text) is (rows > 152)
+
+    b._attn_next[0] = {
+        "closed": None,
+        "unfusable": SimpleNamespace(norm=norm, norm_fusable=False, accepts_mxfp8=True),
+        "normed": SimpleNamespace(norm=norm, norm_fusable=True, accepts_mxfp8=False),
+        "mxfp8": SimpleNamespace(norm=norm, norm_fusable=True, accepts_mxfp8=True),
+    }[receiver]
+    b.pre(layers[0], "ffn", st, object())
+    with patch.object(torch.cuda, "current_stream"), caplog.at_level("INFO"):
+        b.post(layers[0], "ffn", _deferred(rows), st)
+    wide = rows > 128 and receiver in ("normed", "mxfp8")
+    if receiver == "mxfp8":
+        q, sf = hop.moe_post.call_args.kwargs["mxfp8_out"]
+        assert q.shape == (rows, HIDDEN) and sf.numel() == hop.scale_bytes(rows)
+        assert st.hc.input.swizzled.data is q
+    elif wide:
+        assert "mxfp8_out" not in hop.moe_post.call_args.kwargs
+        assert isinstance(st.hc.input, mhc.HcNormed) and st.hc.input.rows is normed
+    else:
+        hop.moe_post.assert_not_called()
+        assert st.hc.input is None
+    assert ("MoE post (" in caplog.text) is wide
+
+
 def test_hop_b_takes_the_moe_post_only_where_sglang_would_fuse_it(fake):
-    """Hop B mirrors SGLang's one-shot post at hop-A widths: MXFP8 only for an
+    """Hop B mirrors SGLang's one-shot post at its widths: MXFP8 only for an
     MXFP8 receiver whose norm folds, else the streams; a replicated shared expert
     stays on SGLang's post (the finalize would add it on every rank)."""
     rows = 6
     updated = torch.zeros(rows, HC, HIDDEN)
     hop_a = SimpleNamespace(
         rows=(6,),
+        hop_b_rows=(6,),
         published=lambda t: False,
         finalize=Mock(return_value=(updated, torch.ones(rows, HIDDEN))),
     )

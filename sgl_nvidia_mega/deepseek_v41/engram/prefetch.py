@@ -178,6 +178,7 @@ class EngramPrefetch:
         self.wkv_done = torch.cuda.Event()
         self.rows = 0
         self.kv = None  # this step's rows [layers, rows, n], from ``gather``
+        self._emb = None  # ``reduce``'s all-reduced rows, read by the side stream
 
     def _looked(self, rows: int) -> torch.Tensor:
         n = len(self.layers)
@@ -211,7 +212,10 @@ class EngramPrefetch:
         main.wait_event(self.looked_up)
         first = next(iter(self.layers.values())).engram
         emb = first.embed._reduce_owned_rows(self._looked(self.rows))
+        # An out-of-place all-reduce returns a DLPack tensor, whose record_stream the
+        # caching allocator ignores: hold it until ``gather`` joins the side stream.
         emb.record_stream(self.stream)
+        self._emb = emb
         self.reduced.record(main)
         parts = self._parts(self.rows)
         with torch.cuda.stream(self.stream):
@@ -225,6 +229,7 @@ class EngramPrefetch:
         """Main stream at ``gather_at``: the zero-padded quarters summed into every
         layer's rows (this also joins the side stream)."""
         torch.cuda.current_stream().wait_event(self.wkv_done)
+        self._emb = None  # the side stream's reads of it are now ordered before main
         self.kv = self.group.all_reduce(self._parts(self.rows))
 
     def gate(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:

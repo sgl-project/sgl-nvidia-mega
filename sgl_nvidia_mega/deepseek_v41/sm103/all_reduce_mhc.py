@@ -78,6 +78,7 @@ from sgl_nvidia_mega.common.sync import (
     to_cute,
     to_cute_dynamic,
 )
+from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 
 LAMPORT_GENERATIONS = 3
 
@@ -108,6 +109,20 @@ FRAGMENTS_PER_MXFP8_BLOCK = MXFP8_BLOCK // VEC_BF16
 # The swizzled scale layout tiles 128 rows by 4 scale columns.
 SCALE_TILE_ROWS = 128
 SCALE_TILE_COLS = 4
+# The row-tile layout (mxfp8_ll, past 8 rows): every 8-row tile owns a 128-row atom
+ROW_TILE_ROWS = 8
+
+
+@cute.jit
+def _sf_index_row_tiles(
+    row: Int32, col: Int32, scale_cols: cutlass.Constexpr[int]
+) -> Int32:
+    """Byte offset of row ``row``'s scale column ``col`` in the row-tile layout: rows at
+    the top of their tile's atom, as FlashInfer's 128x4 swizzle places rows 0-7."""
+    atom = (row // ROW_TILE_ROWS) * (
+        scale_cols // SCALE_TILE_COLS
+    ) + col // SCALE_TILE_COLS
+    return atom * 512 + (row % ROW_TILE_ROWS) * 16 + col % SCALE_TILE_COLS
 
 
 @cute.jit
@@ -595,6 +610,7 @@ class _LamportMHCDeviceKernel:
         residual_only: bool = False,
         deadline_ns: int = 0,
         early_trigger: bool | str = False,
+        row_tile_scales: bool = False,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -610,6 +626,8 @@ class _LamportMHCDeviceKernel:
         if quantize and residual_only:
             raise ValueError("a residual-only consumer has no layer input to quantize")
         self.quantize = quantize
+        # the MXFP8 output's scales per 8-row tile (the wide low-latency GEMM's input)
+        self.row_tile_scales = quantize and row_tile_scales
         self.write_layer_input = not residual_only
         self.scale_cols = hidden // MXFP8_BLOCK
         self.hidden = hidden
@@ -982,31 +1000,40 @@ class _LamportMHCDeviceKernel:
                             ),
                         )
                         if fragment % FRAGMENTS_PER_MXFP8_BLOCK == 0:
-                            quant_scales[
-                                compute_sf_index_swizzled_128x4_gpu(
-                                    token,
-                                    fragment // FRAGMENTS_PER_MXFP8_BLOCK,
-                                    Int32(self.scale_cols),
+                            col = fragment // FRAGMENTS_PER_MXFP8_BLOCK
+                            if cutlass.const_expr(self.row_tile_scales):
+                                offset = _sf_index_row_tiles(
+                                    token, col, self.scale_cols
                                 )
-                            ] = scale.to(Uint8)
+                            else:
+                                offset = compute_sf_index_swizzled_128x4_gpu(
+                                    token, col, Int32(self.scale_cols)
+                                )
+                            quant_scales[offset] = scale.to(Uint8)
 
             if cutlass.const_expr(self.quantize):
                 # Zero the scales of the padding rows, as FlashInfer's quantize
-                # does, one 4-column word per store, spread over the whole grid.
+                # does, one 4-column word per store, spread over the whole grid
+                # (row tiles: only the last tile's rows past m are read).
                 m, _, _ = cute.arch.grid_dim()
                 words_per_row = self.scale_cols // SCALE_TILE_COLS
-                padded_m = (
-                    (m + SCALE_TILE_ROWS - 1) // SCALE_TILE_ROWS * SCALE_TILE_ROWS
+                pad_to = (
+                    ROW_TILE_ROWS
+                    if cutlass.const_expr(self.row_tile_scales)
+                    else SCALE_TILE_ROWS
                 )
+                padded_m = (m + pad_to - 1) // pad_to * pad_to
                 pad_words = (padded_m - m) * words_per_row
                 word = (token * self.cluster_size + cluster_rank) * self.threads + tidx
                 while word < pad_words:
                     row = m + word // words_per_row
-                    offset = compute_sf_index_swizzled_128x4_gpu(
-                        row,
-                        word % words_per_row * SCALE_TILE_COLS,
-                        Int32(self.scale_cols),
-                    )
+                    col = word % words_per_row * SCALE_TILE_COLS
+                    if cutlass.const_expr(self.row_tile_scales):
+                        offset = _sf_index_row_tiles(row, col, self.scale_cols)
+                    else:
+                        offset = compute_sf_index_swizzled_128x4_gpu(
+                            row, col, Int32(self.scale_cols)
+                        )
                     store_global_u32(quant_scales.iterator + offset, Uint32(0))
                     word = word + m * self.cluster_size * self.threads
 
@@ -1041,6 +1068,7 @@ class AllReduceMHC:
         residual_only: bool = False,
         early_trigger: bool = False,
         hop_b_start_trigger: bool = False,
+        row_tile_layer_input: bool = False,
     ) -> None:
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
@@ -1121,7 +1149,9 @@ class AllReduceMHC:
             no_quant_cute = to_cute(self._no_quant_output, 16)
             self._no_quant_args = (no_quant_cute, no_quant_cute)
 
-            def compile_collective(quantize: bool, residual_only: bool = False):
+            def compile_collective(
+                quantize: bool, residual_only: bool = False, row_tiles: bool = False
+            ):
                 if quantize:
                     quant_fakes = (
                         make_fake_dynamic_compact_tensor(
@@ -1153,6 +1183,7 @@ class AllReduceMHC:
                             if hop_b_start_trigger and (quantize or residual_only)
                             else early_trigger
                         ),
+                        row_tile_scales=row_tiles,
                     ),
                     make_fake_compact_tensor(
                         BFloat16,
@@ -1188,6 +1219,12 @@ class AllReduceMHC:
             self._collective = compile_collective(quantize=False)
             self._collective_quant = (
                 compile_collective(quantize=True) if quantize_layer_input else None
+            )
+            # the layer input's scales per 8-row tile, for the wide low-latency GEMM
+            self._collective_quant_rt = (
+                compile_collective(quantize=True, row_tiles=True)
+                if quantize_layer_input and row_tile_layer_input
+                else None
             )
             self._collective_residual = (
                 compile_collective(quantize=False, residual_only=True)
@@ -1395,14 +1432,24 @@ class AllReduceMHC:
             if mxfp8_out is None:
                 collective, quant_args = self._collective, self._no_quant_args
             else:
-                if self._collective_quant is None:
-                    raise ValueError("built without quantize_layer_input")
+                # a RowTileMxfp8 asks for the row-tile scale layout
+                row_tiles = isinstance(mxfp8_out, mxfp8_ll.RowTileMxfp8)
+                collective = (
+                    self._collective_quant_rt if row_tiles else self._collective_quant
+                )
+                if collective is None:
+                    raise ValueError(
+                        "built without quantize_layer_input"
+                        + (" / row_tile_layer_input" if row_tiles else "")
+                    )
                 values, scales = mxfp8_out
-                if values.shape != (m, hidden) or scales.numel() != (
-                    mxfp8_scale_bytes(m, hidden)
-                ):
+                scale_bytes = (
+                    mxfp8_ll.scale_bytes(m, hidden)
+                    if row_tiles
+                    else mxfp8_scale_bytes(m, hidden)
+                )
+                if values.shape != (m, hidden) or scales.numel() != scale_bytes:
                     raise ValueError("mxfp8_out does not match the layer input")
-                collective = self._collective_quant
                 quant_args = (
                     to_cute_dynamic(
                         values.view(torch.uint8).flatten(), 16, divisibility=hidden

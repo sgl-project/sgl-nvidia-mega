@@ -37,6 +37,9 @@ SHIPPED_SLOTS = (
     # hc_prenorm: the mHC coefficients from DeepGEMM's TF32 prenorm (not bitwise)
     "hc_prenorm",
     "hop_b",
+    # hop_b_wide: hop B (the MoE post) at 9-48 rows on a mailbox of its own, writing
+    # row-tile scales for wqkv_a on the wide low-latency GEMM (not bitwise past 8 rows)
+    "hop_b_wide",
     "early_trigger",
     # hop_b_start_trigger: the MoE post's Lamport consumer lets the next layer's
     # first GEMM launch at its start, so its weight loads overlap the poll (bitwise)
@@ -81,8 +84,10 @@ DRAFT_SLOTS = frozenset(
         "draft_wo_b_ll",
     }
 )
-# draft_embed: the draft's tokens from the target's gathered table; runs only when listed
-OPT_IN_SLOTS = ("draft_embed",)
+# draft_embed: the draft's tokens from the target's gathered table; two_shot_norm_wide:
+# the two-shot hands on its normed / MXFP8 next input past SGLang's 128 / 152-row caps
+# (not bitwise there). Each runs only when listed.
+OPT_IN_SLOTS = ("draft_embed", "two_shot_norm_wide")
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -96,6 +101,18 @@ def _requested_slots() -> frozenset:
 
 
 SLOTS = _requested_slots()
+
+
+def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
+    """Slot hop_b_wide: the layers whose chain runs wqkv_a on the low-latency GEMM, for
+    which hop B writes row-tile scales past 8 rows (none without the slot)."""
+    if "hop_b_wide" not in slots:
+        return frozenset()
+    return frozenset(
+        lid
+        for lid, step in attention.items()
+        if step.chain is not None and step.chain[0].qkv_a_ll
+    )
 
 
 def slot_reasons() -> list[str]:
@@ -115,6 +132,9 @@ def slot_reasons() -> list[str]:
         ("hop_b", "hop_a"),
         ("early_trigger", "hop_a"),
         ("hop_b_start_trigger", "hop_b"),
+        ("hop_b_wide", "hop_b"),
+        ("hop_b_wide", "attn_qkv_a"),
+        ("two_shot_norm_wide", "two_shot"),
         ("draft_lm_head", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
@@ -220,6 +240,9 @@ def build(model, ctx):
 
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
+    from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import (
+        SGLANG_QUANT_MAX_ROWS as QUANT_MAX_ROWS,
+    )
     from sgl_nvidia_mega.deepseek_v41.runtime import embedding
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
         PACKAGES,
@@ -240,6 +263,7 @@ def build(model, ctx):
         binding=getattr(ctx, "binding", None),
     )
     bound = {name: pkg.build(model, pctx, group) for name, pkg in PACKAGES.items()}
+    bound["boundary"].row_tile_layers = row_tile_layers(bound["attention"], SLOTS)
     table, embed_reason = None, "not requested"
     if "embed" in SLOTS:
         table, embed_reason = embedding.replicate(
@@ -265,6 +289,9 @@ def build(model, ctx):
     built = {
         **built_slots(slots, bound, facts),
         "two_shot": any(s.two_shot for s in slots.values()),
+        # a two-shot width past the MoE post's 128-row quant cap
+        "two_shot_norm_wide": getattr(bound["boundary"], "norm_wide", False)
+        and any(s.two_shot and w > QUANT_MAX_ROWS for w, s in slots.items()),
         "hop_b": bound["boundary"].hop_b,
         "attn_qkv_a": attn_qkv_a_built(bound["attention"], pctx.widths),
         "attn_qkv_a_bf16": attn_qkv_a_built(bound["attention"], pctx.widths)
@@ -279,6 +306,10 @@ def build(model, ctx):
         ),
         "hop_b_start_trigger": "hop_b_start_trigger" in SLOTS
         and bound["boundary"].hop_b,
+        # hop B past hop A's widths, with a chain that reads its row-tile rows
+        "hop_b_wide": bound["boundary"].hop_b
+        and any(w not in hop.rows for w in hop.hop_b_rows)
+        and bool(bound["boundary"].row_tile_layers),
         # step-head work that needs no build: on when requested
         "sched_ahead": "sched_ahead" in SLOTS,
         # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is
