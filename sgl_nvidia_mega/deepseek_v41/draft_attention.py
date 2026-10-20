@@ -78,7 +78,6 @@ SGLANG_READS = {
         "fused_q_norm_rope",
         "fused_rope_inplace",
     ),
-    "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
 }
 
 _SCALE_ROWS = 128  # the swizzled UE8M0 scales are tiled 128 weight rows at a time
@@ -123,13 +122,11 @@ class FusedQkvA:
         return self.fused.quant_method.apply(self.fused, x, None)
 
     def kv(self, qkv_a):
-        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-            is_unified_kv_triton,
-        )
+        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
         kv = qkv_a[:, self.split :]
         # the unified-KV store norms + ropes kv in place and scatters contiguous rows only
-        return kv.contiguous() if is_unified_kv_triton() else kv
+        return kv.contiguous() if sglang_ops.unified_kv_triton() else kv
 
 
 def qkv_a_fusable(wq_a, wkv) -> str:
@@ -186,12 +183,10 @@ def wo_a_applies(attn) -> bool:
 def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
     """Each ported stage's kernels by layer id; a stage left out keeps SGLang's call
     (slot draft_attn off, or SGLang's draft without its fast kernels)."""
-    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-        is_unified_kv_triton,
-    )
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     # unified KV writes the draft window through a ring the binding does not offer
-    if "draft_attn" not in slots or is_unified_kv_triton():
+    if "draft_attn" not in slots or sglang_ops.unified_kv_triton():
         return {}
     kernels = {}
     for stage in stages:

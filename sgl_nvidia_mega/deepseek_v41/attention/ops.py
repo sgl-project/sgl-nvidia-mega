@@ -32,11 +32,7 @@ SGLANG_READS = {
         "fused_q_norm_rope",
         "fused_rope_inplace",
     ),
-    "kernels/ops/quantization/fp8_group_major_quant_ue8m0.py": (
-        "sglang_per_token_group_quant_fp8_dsv4_wo_a",
-    ),
     "kernels/ops/attention/dsv4/wo_a.py": ("fused_rope_wo_a_bf16",),
-    "kernels/ops/layernorm/rmsnorm_mxfp8.py": ("rmsnorm_mxfp8",),
     "kernels/ops/quantization/fp8_kernel.py": ("sglang_per_token_group_quant_fp8",),
     "srt/layers/quantization/fp8_utils.py": (
         "Mxfp8DenseGemmBackend",
@@ -60,11 +56,12 @@ SGLANG_READS = {
 def normalize_q_lora(attn, q):
     """``MQALayer._normalize_q_lora``: the BF16 normed row (the indexer's) and wq_b's
     input, quantized with SGLang's fused norm + MXFP8 epilogue at 1-8 rows."""
-    from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.runtime_context import get_exec
+
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     method = attn.wq_b.quant_method
     if (
@@ -85,7 +82,7 @@ def normalize_q_lora(attn, q):
             or get_exec().deterministic.enable_deterministic_inference
         )
     ):
-        y, quant, scale = rmsnorm_mxfp8(
+        y, quant, scale = sglang_ops.rmsnorm_mxfp8(
             q, attn.q_norm.weight, attn.q_norm.variance_epsilon
         )
         return y, Mxfp8SwizzledInput(quant, scale)
@@ -100,6 +97,14 @@ def index_q_input(attn, q_lora, q_for_wqb):
 
 def qkv_a(attn, x):
     """``MQALayer``'s fused ``wqkv_a(x)``: [rows, q_lora_rank + head_dim]."""
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
+    if isinstance(x, mxfp8_ll.RowTileMxfp8):
+        # row-tile scales are not a layout SGLang's wqkv_a reads: never a silent fallback
+        raise RuntimeError(
+            "NVIDIA megakernel: SGLang's wqkv_a got row-tile MXFP8 scales "
+            f"({x.quant.shape[0]} rows)"
+        )
     out, _ = attn.wqkv_a(x)
     return out
 
@@ -166,9 +171,6 @@ def wo_a(attn, o, positions, fb):
     wo_a, as wo_b's input (FlashInfer-swizzled MXFP8 when wo_b takes it)."""
     from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
     from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
-    from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
-        sglang_per_token_group_quant_fp8_dsv4_wo_a,
-    )
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
@@ -180,6 +182,8 @@ def wo_a(attn, o, positions, fb):
         _fp8_wo_a_einsum,
     )
     from sglang.srt.runtime_context import get_forward
+
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     fuse_mxfp8_quant = attn.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
     fuse_rope_wo_a = attn.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
@@ -206,7 +210,7 @@ def wo_a(attn, o, positions, fb):
         t, g, d = o.shape
         r = attn.o_lora_rank
         if _FP8_WO_A_UE8M0:
-            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+            o_fp8, o_s = sglang_ops.per_token_group_quant_fp8_wo_a(o)
             recipe = (1, 1, 128)
         else:
             o_fp8, o_s = sglang_per_token_group_quant_fp8(

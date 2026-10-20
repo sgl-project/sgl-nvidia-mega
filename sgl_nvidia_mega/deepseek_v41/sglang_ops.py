@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""SGLang operators the plugin calls, read wherever the running SGLang keeps them: SGLang's
+regroup of its kernels by computation moved these modules and renamed ``hc_combine``.
+Each resolves once, newest location first; test_deepseek_v41_sglang_ops pins that every one
+resolves on the SGLang under test."""
+
+from __future__ import annotations
+
+import functools
+import importlib
+
+# (module, attribute) candidates per operator, newest SGLang first
+CANDIDATES = {
+    "rmsnorm_mxfp8": (
+        ("sglang.kernels.ops.layernorm.rmsnorm_mxfp8", "rmsnorm_mxfp8"),
+        ("sglang.kernels.ops.layernorm.mxfp8_epilogue", "rmsnorm_mxfp8"),
+    ),
+    "per_token_group_quant_fp8_wo_a": (
+        (
+            "sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0",
+            "sglang_per_token_group_quant_fp8_dsv4_wo_a",
+        ),
+        (
+            "sglang.kernels.ops.attention.dsv4",
+            "sglang_per_token_group_quant_fp8_dsv4_wo_a",
+        ),
+    ),
+    "hc_combine": (
+        ("sglang.kernels.ops.layernorm.mhc", "mhc_combine"),
+        ("sglang.kernels.ops.layernorm.mhc", "hc_combine"),
+    ),
+    "silu_and_mul_clamp": (
+        ("sglang.kernels.ops.activation.silu_and_mul_clamp", "silu_and_mul_clamp"),
+        ("sglang.kernels.ops.moe.dsv4", "silu_and_mul_clamp"),
+    ),
+    "is_unified_kv_triton": (
+        ("sglang.srt.layers.attention.dsv4.unified_kv_gate", "is_unified_kv_triton"),
+        (
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate",
+            "is_unified_kv_triton",
+        ),
+    ),
+}
+
+
+@functools.cache
+def resolve(name: str):
+    """The first of ``name``'s candidates the running SGLang provides."""
+    for module, attr in CANDIDATES[name]:
+        try:
+            return getattr(importlib.import_module(module), attr)
+        except (ImportError, AttributeError):
+            continue
+    raise ImportError(f"SGLang provides none of {CANDIDATES[name]}")
+
+
+def rmsnorm_mxfp8(*args, **kwargs):
+    return resolve("rmsnorm_mxfp8")(*args, **kwargs)
+
+
+def per_token_group_quant_fp8_wo_a(*args, **kwargs):
+    return resolve("per_token_group_quant_fp8_wo_a")(*args, **kwargs)
+
+
+def hc_combine(*args, **kwargs):
+    return resolve("hc_combine")(*args, **kwargs)
+
+
+def silu_and_mul_clamp(*args, **kwargs):
+    return resolve("silu_and_mul_clamp")(*args, **kwargs)
+
+
+def unified_kv_triton() -> bool:
+    return resolve("is_unified_kv_triton")()

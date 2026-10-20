@@ -219,6 +219,9 @@ class ChainOps:
     ):
         self.rope_in_attention = rope_in_attention
         self.wq_b_ll = wq_b_ll_applies(attn)
+        # slot attn_indexer: the process's plugin indexer (attention/indexer.py), set by
+        # the attention build for the layers it takes
+        self.indexer = None
         self.qkv_a_ll = qkv_a_ll and qkv_a_ll_applies(attn)
         # slot attn_qkv_a_bf16: BF16 input (no MXFP8 rows from the boundary) is
         # quantized for the low-latency GEMM too, with FlashInfer's MXFP8 quantize
@@ -249,6 +252,14 @@ class ChainOps:
         here; SGLang's call otherwise."""
         from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 
+        # hop B's row-tile rows past 8 rows: the wide low-latency GEMM (only for a chain
+        # with qkv_a_ll, which the boundary checks before writing them)
+        if self.qkv_a_ll and isinstance(x, mxfp8_ll.RowTileMxfp8):
+            QKV_A_ENGAGEMENT.note(attn.layer_id, x.quant.shape[0], True)
+            w = attn.wqkv_a
+            return mxfp8_ll.linear(
+                x.quant, x.scale, w.weight, w.weight_scale_inv_swizzled
+            )
         # SGLang's forward may hand a plain (codes, scales) tuple: still SGLang's call
         rows = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
         fits = self.qkv_a_ll and 0 < rows <= mxfp8_ll.MAX_ROWS
@@ -438,8 +449,15 @@ def precompile(attn, widths, *, qkv_a_ll: bool = False) -> None:
     The swap-AB kernels specialize on the pool's page geometry and the step's index
     widths, which exist only after KV sizing: they compile in SGLang's warm-up runs
     before graph capture."""
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
     if qkv_a_ll and qkv_a_ll_applies(attn):
         ll_rows = [w for w in widths if w <= mxfp8_ll.MAX_ROWS]
+        if "hop_b_wide" in SLOTS:
+            # hop B's row-tile rows past 8 rows (plan.HOP_B_MAX_ROWS)
+            ll_rows += [
+                w for w in widths if mxfp8_ll.MAX_ROWS < w <= slot_plan.HOP_B_MAX_ROWS
+            ]
         if ll_rows:
             mxfp8_ll.precompile(attn.wqkv_a.weight, ll_rows)
     rows = [w for w in widths if w <= NORM_QUANT_MAX_ROWS]
@@ -464,8 +482,6 @@ def precompile(attn, widths, *, qkv_a_ll: bool = False) -> None:
     if attn.use_fused_wo_a:
         wo_a_kernel.precompile(min(max(rows), WO_A_MAX_ROWS))
         # hop A's publishing wo_b past 8 rows reads row-tile scales
-        from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
-
         tiled = [w for w in rows if mxfp8_ll.MAX_ROWS < w <= slot_plan.HOP_A_MAX_ROWS]
         if tiled and {"hop_a", "hop_a_batch2"} <= SLOTS:
             wo_a_kernel.precompile(max(tiled), row_tile_scales=True)

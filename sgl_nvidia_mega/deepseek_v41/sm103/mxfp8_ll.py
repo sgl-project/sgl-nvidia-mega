@@ -115,8 +115,8 @@ class RowTileMxfp8(NamedTuple):
     scale: torch.Tensor
 
 
-# Tactics per (SM, N, K, row bucket) for the buckets PINNED_TACTICS (bucket 8) leaves
-# out; a bucket is the row count rounded up to a power of two.
+# Tactics per (SM, N, K, row bucket), ahead of PINNED_TACTICS (bucket 8); a bucket is
+# the row count rounded up to a power of two.
 # 1 / 2 / 4: the GB300 table chain-picked for SGLang's autotune
 # (flashinfer_autotune_configs/NVIDIA_GB300.json, SGLang 26fd68fcd34, FlashInfer 0.7.2,
 # whose low-latency kernel source equals 0.7.0.post1's). BEST tunes these at boot.
@@ -136,6 +136,12 @@ BUCKET_TACTICS: dict[tuple[int, int, int, int], Tactic] = {
     (103, 8192, 1280, 16): (128, 6, 1, 1),
     (103, 8192, 1280, 32): (128, 5, 1, 1),
     (103, 8192, 1280, 64): (128, 4, 1, 1),
+    # the shared expert's gate_up (slot shared_ll): best of 84-92 at 6 / 12 / 24 / 48
+    # rows in a cold 40-layer chain; 1 / 2 / 4 take FlashInfer's default
+    (103, 1152, 5120, 8): (128, 8, 1, 8),
+    (103, 1152, 5120, 16): (128, 12, 1, 4),
+    (103, 1152, 5120, 32): (128, 8, 1, 4),
+    (103, 1152, 5120, 64): (128, 9, 1, 2),
 }
 _COMPILED: dict[tuple[int, Tactic], object] = {}
 
@@ -167,11 +173,9 @@ def offered_tactics(n: int, k: int, rows: int) -> list[Tactic]:
 def select_tactic(sm_version: int, n: int, k: int, bucket: int) -> Tactic:
     """The pinned tactic of this row bucket if FlashInfer offers it, else FlashInfer's
     default (its first tactic): fixed per bucket, never tuned per process."""
-    pinned = (
-        PINNED_TACTICS.get((sm_version, n, k))
-        if bucket == MAX_ROWS
-        else BUCKET_TACTICS.get((sm_version, n, k, bucket))
-    )
+    pinned = BUCKET_TACTICS.get((sm_version, n, k, bucket))
+    if pinned is None and bucket == MAX_ROWS:
+        pinned = PINNED_TACTICS.get((sm_version, n, k))
     offered = offered_tactics(n, k, min(bucket, MAX_ROWS))
     if pinned in offered:
         return pinned

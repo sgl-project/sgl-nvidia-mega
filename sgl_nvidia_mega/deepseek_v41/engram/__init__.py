@@ -36,6 +36,7 @@ SGLANG_READS = {
     ),
     "srt/models/deepseek_v4.py": ("engram_hasher", "engram", "config"),
     "srt/configs/deepseek_v41.py": ("vision_n_layers",),
+    "srt/model_executor/forward_batch_info.py": ("contains_mm_inputs",),
 }
 
 
@@ -95,7 +96,13 @@ def apply(layer, st) -> None:
         out = engram_gate(
             x, kv, engram.q_weight, engram.k_weight, engram.eps, engram.clamp_value
         )
-    if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+    # Only multimodal placeholders become image_token_id, so a text-only batch (every
+    # decode / verify graph among them) skips the full-residual select.
+    if (
+        config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+        and st.fb.contains_mm_inputs()
+    ):
         image = st.input_ids == config.image_token_id
         out = torch.where(image[:, None, None], x, out)
     boundary.set_residual(st, out)

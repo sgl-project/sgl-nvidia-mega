@@ -27,6 +27,9 @@ SHIPPED_SLOTS = (
     "aux_mean_stats",
     # gate_wide: the fast gate top-k at every routed width (1-48), target and draft
     "gate_wide",
+    # shared_ll: the shared expert's gate_up on the low-latency GEMM, quantized at the
+    # MoE fork on the alternate stream (moe/shared_ll.py; not bitwise: summation order)
+    "shared_ll",
     # hop_a_batch2: hop A at 9-16 rows (batch 2) on the fused wo_a's row-tile scales
     "hop_a_batch2",
     "engram",
@@ -34,9 +37,15 @@ SHIPPED_SLOTS = (
     "attn_qkv_a_bf16",
     # index_q_mxfp8_in: the indexer wq_b reads the chain's q_lora quant (bitwise)
     "index_q_mxfp8_in",
+    # attn_indexer: a covered step's indexer top-k in the plugin's forward, the index
+    # query and head weights on the layer's second stream (attention/indexer.py; bitwise)
+    "attn_indexer",
     # hc_prenorm: the mHC coefficients from DeepGEMM's TF32 prenorm (not bitwise)
     "hc_prenorm",
     "hop_b",
+    # hop_b_wide: hop B (the MoE post) at 9-48 rows on a mailbox of its own, writing
+    # row-tile scales for wqkv_a on the wide low-latency GEMM (not bitwise past 8 rows)
+    "hop_b_wide",
     "early_trigger",
     # hop_b_start_trigger: the MoE post's Lamport consumer lets the next layer's
     # first GEMM launch at its start, so its weight loads overlap the poll (bitwise)
@@ -81,8 +90,19 @@ DRAFT_SLOTS = frozenset(
         "draft_wo_b_ll",
     }
 )
-# draft_embed: the draft's tokens from the target's gathered table; runs only when listed
-OPT_IN_SLOTS = ("draft_embed",)
+# Slots that run only when listed (draft_embed: the draft's tokens from the target's
+# gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
+# mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
+# target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
+# hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
+# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned)
+OPT_IN_SLOTS = (
+    "draft_embed",
+    "hop_b_cap16",
+    "target_lm_head",
+    "hop_b_quad_trigger",
+    "lm_head_pinned_tactic",
+)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -98,6 +118,18 @@ def _requested_slots() -> frozenset:
 SLOTS = _requested_slots()
 
 
+def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
+    """Slot hop_b_wide: the layers whose chain runs wqkv_a on the low-latency GEMM, for
+    which hop B writes row-tile scales past 8 rows (none without the slot)."""
+    if "hop_b_wide" not in slots:
+        return frozenset()
+    return frozenset(
+        lid
+        for lid, step in attention.items()
+        if step.chain is not None and step.chain[0].qkv_a_ll
+    )
+
+
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
     known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
@@ -107,14 +139,20 @@ def slot_reasons() -> list[str]:
     ]
     for slot, needs in (
         ("gate", "moe"),
+        ("shared_ll", "moe"),
         ("gate_wide", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
+        ("attn_indexer", "attn"),
         ("attn_qkv_a_bf16", "attn_qkv_a"),
         ("index_q_mxfp8_in", "attn"),
         ("hop_b", "hop_a"),
         ("early_trigger", "hop_a"),
         ("hop_b_start_trigger", "hop_b"),
+        ("hop_b_wide", "hop_b"),
+        ("hop_b_wide", "attn_qkv_a"),
+        ("hop_b_cap16", "hop_b_wide"),
+        ("hop_b_quad_trigger", "hop_b"),
         ("draft_lm_head", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
@@ -135,6 +173,14 @@ def slot_reasons() -> list[str]:
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
+    if "lm_head_pinned_tactic" in SLOTS and not SLOTS & {
+        "draft_lm_head",
+        "target_lm_head",
+    }:
+        reasons.append(
+            f"{SLOTS_ENV}: slot 'lm_head_pinned_tactic' needs slot 'draft_lm_head' "
+            "or 'target_lm_head'"
+        )
     return reasons
 
 
@@ -199,7 +245,12 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         and any(slot.gate for slot in getattr(bound["moe"], "slots", {}).values()),
         "attn": any(step.chain is not None for step in bound["attention"].values()),
         "embed": bound["embedding"] is not None,
+        "shared_ll": any(
+            slot.shared is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
         "engram": bound["engram"].prefetch is not None,
+        "target_lm_head": bound.get("logits") is not None,
     }
 
 
@@ -240,6 +291,7 @@ def build(model, ctx):
         binding=getattr(ctx, "binding", None),
     )
     bound = {name: pkg.build(model, pctx, group) for name, pkg in PACKAGES.items()}
+    bound["boundary"].row_tile_layers = row_tile_layers(bound["attention"], SLOTS)
     table, embed_reason = None, "not requested"
     if "embed" in SLOTS:
         table, embed_reason = embedding.replicate(
@@ -279,6 +331,14 @@ def build(model, ctx):
         ),
         "hop_b_start_trigger": "hop_b_start_trigger" in SLOTS
         and bound["boundary"].hop_b,
+        # hop B past 8 rows, with a chain that reads its row-tile rows
+        "hop_b_wide": bound["boundary"].hop_b
+        and any(w > slot_plan.HOP_A_BATCH1_ROWS for w in hop.hop_b_rows)
+        and bool(bound["boundary"].row_tile_layers),
+        # hop B on hop A's widths only
+        "hop_b_cap16": bound["boundary"].hop_b
+        and all(w in hop.rows for w in hop.hop_b_rows),
+        "hop_b_quad_trigger": bound["boundary"].hop_b,
         # step-head work that needs no build: on when requested
         "sched_ahead": "sched_ahead" in SLOTS,
         # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is
@@ -291,6 +351,10 @@ def build(model, ctx):
             s.fast_gate and w not in slot_plan.FAST_GATE_ROWS for w, s in slots.items()
         ),
         "req_pos_once": "req_pos_once" in SLOTS,
+        "attn_indexer": any(
+            a.chain is not None and a.chain[0].indexer is not None
+            for a in bound["attention"].values()
+        ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
         "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)
         and any(
@@ -304,7 +368,8 @@ def build(model, ctx):
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "
             f"(hop A: {facts.hop_a_reason or 'built'}; MoE: "
-            f"{getattr(bound['moe'], 'reason', '') or 'built'}; embedding: "
+            f"{getattr(bound['moe'], 'reason', '') or 'built'}; shared_ll: "
+            f"{getattr(bound['moe'], 'shared_reason', '') or 'built'}; embedding: "
             f"{embed_reason or 'built'}; Engram prefetch: {engram.reason or 'built'})"
         )
     summary = (

@@ -200,6 +200,9 @@ NUMERICS = Numerics(
         # as TF32, against an exact projection through the same reduce + Sinkhorn; 3.81e-4
         # measured at 6-48 rows on synthetic inputs (SGLang's split-K: 4.8e-7)
         "hc_prenorm.coeff.max_abs": 3.9e-4,
+        # slot target_lm_head: the target's logits shard on the low-M kernel against
+        # SGLang's matmul, checked at build on every rank (the K summation order differs)
+        "target_lm_head.logits.rel": 2**-7,
     },
 )
 

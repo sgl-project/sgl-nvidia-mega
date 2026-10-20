@@ -19,6 +19,10 @@ TWO_SHOT_MIN_ROWS = 49  # measured slower than SGLang's fused kernel at 37 rows
 # hop_a_batch2, 9-16 on the fused wo_a's row-tile scales; the mailbox holds this many rows
 HOP_A_MAX_ROWS = 16
 HOP_A_BATCH1_ROWS = 8
+# hop B (the MoE post) serves hop A's widths; with slot hop_b_wide up to the routed pair's
+# widest step, and past 8 rows it writes the next input's scales per 8-row tile for
+# wqkv_a's wide low-latency GEMM
+HOP_B_MAX_ROWS = 48
 FAST_GATE_MAX_SMALL_ROWS = 16
 FAST_GATE_ROWS = frozenset(range(1, FAST_GATE_MAX_SMALL_ROWS + 1)) | {ROUTED_MAX_ROWS}
 # slot gate_wide: every routed width, to re-measure the 17-47-row cap (one launch per arm)
@@ -57,6 +61,45 @@ def max_rows(two_shot: bool) -> int:
 
 def hop_a_max_rows(batch2: bool) -> int:
     return HOP_A_MAX_ROWS if batch2 else HOP_A_BATCH1_ROWS
+
+
+def hop_b_max_rows(wide: bool, hop_a_rows: int) -> int:
+    """Hop B's widest step: hop A's, or with slot hop_b_wide the routed pair's."""
+    return HOP_B_MAX_ROWS if wide else hop_a_rows
+
+
+class HopLayout(msgspec.Struct, frozen=True):
+    """Hop A / hop B widths and the mailboxes that hold them: hop A's widths (and hop B
+    at them) on a mailbox of hop A's capacity; hop B's wider widths (slot hop_b_wide)
+    on a second one, so the batch-1 / batch-2 hops never address the 48-row mailbox."""
+
+    hop_a_rows: tuple
+    hop_b_rows: tuple
+    capacity: int  # the hop A mailbox
+    wide_capacity: int  # the hop_b_wide mailbox; 0 when no hop B width is past hop A's
+    row_tiles: bool  # hop B on the hop A mailbox writes row-tile scales past 8 rows
+    wide_row_tiles: bool
+
+
+def hop_layout(
+    widths, *, hop_b: bool, batch2: bool, hop_b_wide: bool, cap16: bool = False
+) -> HopLayout:
+    capacity = hop_a_max_rows(batch2)
+    hop_a_rows = tuple(w for w in widths if w <= capacity)
+    # slot hop_b_cap16: hop B stays on hop A's widths, so no wide mailbox is built
+    hop_b_max = hop_b_max_rows(hop_b_wide and not cap16, capacity)
+    hop_b_rows = tuple(w for w in widths if w <= hop_b_max) if hop_b else ()
+    wide = [w for w in hop_b_rows if w > capacity]
+    return HopLayout(
+        hop_a_rows=hop_a_rows,
+        hop_b_rows=hop_b_rows,
+        capacity=capacity,
+        wide_capacity=max(wide) if wide else 0,
+        # only slot hop_b_wide's chains read row tiles (runtime.row_tile_layers)
+        row_tiles=hop_b_wide
+        and any(HOP_A_BATCH1_ROWS < w <= capacity for w in hop_b_rows),
+        wide_row_tiles=bool(wide),
+    )
 
 
 def fast_gate_rows(wide: bool) -> frozenset:

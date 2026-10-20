@@ -90,9 +90,28 @@ def env():
                 quantize_layer_input=True,
                 residual_only=True,
                 early_trigger=early == "poll",
-                hop_b_start_trigger=early == "start",
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
             )
-            for early in ("end", "poll", "start")
+            for early in ("end", "poll", "start", "quad", "quad8")
+        }
+        # hop B up to the routed pair's 48 rows, with the row-tile scale variant
+        wide = {
+            early: AllReduceMHC(
+                hidden_size=HIDDEN,
+                hc_mult=HC,
+                max_num_tokens=48,
+                top_k=TOP_K,
+                device=device,
+                group=tp.device_group,
+                quantize_layer_input=True,
+                residual_only=True,
+                early_trigger=early == "poll",
+                hop_b_start_trigger=early in ("start", "quad", "quad8"),
+                row_tile_layer_input=True,
+                publish_trigger_max_rows={"quad": 48, "quad8": 8}.get(early, 0),
+            )
+            for early in ("end", "poll", "start", "quad", "quad8")
         }
     yield SimpleNamespace(
         rank=rank,
@@ -101,6 +120,7 @@ def env():
         group=tp.device_group,
         cpu_group=tp.cpu_group,
         hops=hops,
+        wide=wide,
     )
     ps.destroy_model_parallel()
     ps.destroy_distributed_environment()
@@ -341,6 +361,70 @@ def test_hop_a_and_finalize_interleave_on_one_instance(env, early):
         # Eager hops between replays move the generation the graph starts from.
         if replay % 4 == 3:
             compare(run(plan[:1]), "eager between replays")
+    torch.cuda.synchronize()
+
+
+if __name__ == "__main__":
+    multigpu_pytest_main(__name__, __file__, num_gpus=(4,), timeout=2400)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
+def test_row_tile_finalize_relays_the_swizzled_scales(env, early):
+    """Hop B past 8 rows for wqkv_a's wide low-latency GEMM: the same streams, row and
+    MXFP8 values as the 128x4 variant, each row's scales at its tile's atom, and the
+    last tile's rows past ``rows`` zero though the scale buffer starts as 0xFF."""
+    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
+    hop = env.wide[early]
+    scale_cols = HIDDEN // 32
+    for rows in (9, 12, 20, 24, 40, 48):
+        inp = _inputs(rows, 300 + rows, env.rank, env.device)
+        streams, normed, values, scales = _run(hop, "quant", inp)
+        tiled = mxfp8_ll.RowTileMxfp8(
+            torch.empty(rows, HIDDEN, dtype=torch.float8_e4m3fn, device=env.device),
+            torch.full(
+                (mxfp8_ll.scale_bytes(rows, HIDDEN),),
+                0xFF,
+                dtype=torch.uint8,
+                device=env.device,
+            ),
+        )
+        mix = (inp.residual, inp.post, inp.comb)
+        rt_streams, rt_normed = hop.finalize(
+            inp.gemm2,
+            inp.weights,
+            inp.idx,
+            inp.shared,
+            *mix,
+            inp.pre,
+            inp.norm_weight,
+            EPS,
+            mxfp8_out=tiled,
+        )
+        assert _same(rt_streams, streams) and _same(rt_normed, normed), rows
+        assert _same(tiled.quant, values), f"values differ: rows={rows}"
+        g = torch.arange(scale_cols, device=env.device)
+        padded = (rows + 7) // 8 * 8
+        r = torch.arange(padded, device=env.device)[:, None]
+        at = ((r // 8) * (scale_cols // 4) + g // 4) * 512 + (r % 8) * 16 + g % 4
+        swz = (g // 4) * 512 + ((r[:rows] % 32) * 4 + (r[:rows] // 32) % 4) * 4 + g % 4
+        assert torch.equal(tiled.scale[at[:rows]], scales[swz]), f"scales: rows={rows}"
+        assert not tiled.scale[at[rows:]].any(), f"pad rows: rows={rows}"
+    torch.cuda.synchronize()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("early", ["end", "poll", "start", "quad"])
+def test_wide_mailbox_changes_no_bit_up_to_8_rows(env, early):
+    """The 48-row mailbox serves batch 1 exactly as the 16-row one: hop A and both
+    finalize variants at 1-8 rows, bitwise."""
+    for rows in range(1, 9):
+        inp = _inputs(rows, 500 + rows, env.rank, env.device)
+        for kind in ("aquant", "norm", "quant", "residual"):
+            narrow = _run(env.hops[early], kind, inp)
+            wide = _run(env.wide[early], kind, inp)
+            assert all(_same(a, b) for a, b in zip(narrow, wide)), (kind, rows)
     torch.cuda.synchronize()
 
 

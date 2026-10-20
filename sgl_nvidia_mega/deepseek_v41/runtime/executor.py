@@ -95,6 +95,7 @@ PACKAGES = {
     "attention": attention,
     "moe": moe,
     "engram": engram,
+    "logits": logits,
 }
 
 

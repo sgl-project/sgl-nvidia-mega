@@ -138,6 +138,20 @@ def _log_fast_gate(rows: int) -> None:
         logger.info("NVIDIA megakernel: fast gate top-k serves %d rows", rows)
 
 
+# engagement of slot shared_ll, as above
+_SHARED_LL_SERVED: set = set()
+
+
+def _log_shared_ll(rows: int) -> None:
+    if rows not in _SHARED_LL_SERVED:
+        _SHARED_LL_SERVED.add(rows)
+        logger.info(
+            "NVIDIA megakernel: shared expert gate_up on the low-latency GEMM "
+            "serves %d rows",
+            rows,
+        )
+
+
 def _route(mlp, x, input_ids_global, num_token_non_padded, use_vision_topk):
     """The router logits and top-k, as SGLang computes them on CUDA."""
     from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
@@ -214,7 +228,8 @@ def _dual_stream(
     router and routed experts on the main stream, the routed MXFP8 input on its own
     stream, the shared expert on the alternate stream after the routed branch. With
     ``slot`` the routed experts run on the GEMM pair (a deferred finalize), and with
-    ``fast_gate`` its top-k takes SGLang's router logits."""
+    ``fast_gate`` its top-k takes SGLang's router logits; with ``slot.shared`` the
+    shared expert runs on the low-latency GEMM, from the same fork."""
     from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopKOutputFormat
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
@@ -236,6 +251,13 @@ def _dual_stream(
     if quant_routed:
         mlp.routed_quant_stream.wait_stream(current)
     has_shared = x.shape[0] > 0 and mlp.num_fused_shared_experts == 0
+    # slot shared_ll: not with SGLang's fp8 quant-once input, which its shared expert
+    # would read (never on MXFP4 experts)
+    shared_ll = (
+        slot.shared
+        if slot is not None and has_shared and pre_quant_input is None
+        else None
+    )
 
     if fast_gate:
         _log_fast_gate(x.shape[0])
@@ -292,7 +314,13 @@ def _dual_stream(
         routed = mlp.experts(x, topk_output)
 
     with torch.cuda.stream(mlp.alt_stream):
-        shared = mlp._forward_shared_experts(x, None, pre_quant_input=pre_quant_input)
+        if shared_ll is not None:
+            _log_shared_ll(x.shape[0])
+            shared = shared_ll(x)
+        else:
+            shared = mlp._forward_shared_experts(
+                x, None, pre_quant_input=pre_quant_input
+            )
     current.wait_stream(mlp.alt_stream)
 
     if deferred and fwd.defer_moe_finalize:

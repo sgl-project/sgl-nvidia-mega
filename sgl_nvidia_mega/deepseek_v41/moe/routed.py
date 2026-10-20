@@ -75,12 +75,13 @@ class _GateTopK(msgspec.Struct):
 
 class MoeSlot:
     """One MoE layer's routed-expert pair: the router's top-k (fast gate) and the
-    routed experts, returning SGLang's deferred-finalize output."""
+    routed experts, returning SGLang's deferred-finalize output; with slot shared_ll,
+    its shared expert on the low-latency GEMM (``shared``, else None)."""
 
-    def __init__(self, mlp: torch.nn.Module, gemm, *, gate: bool):
+    def __init__(self, mlp: torch.nn.Module, gemm, *, gate: bool, shared=None):
         from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
 
-        self.mlp, self.gemm, self.gate = mlp, gemm, gate
+        self.mlp, self.gemm, self.gate, self.shared = mlp, gemm, gate, shared
         config = mlp.topk.topk_config
         self.scale = (
             float(config.routed_scaling_factor)
@@ -163,10 +164,19 @@ class MoeSlot:
 
 class Bound(msgspec.Struct):
     """``moe.build``'s result: the slot of each layer whose pair built, by layer id,
-    and why none was built ("" when built)."""
+    and why none was built ("" when built); why no shared expert took slot shared_ll."""
 
     slots: dict = msgspec.field(default_factory=dict)
     reason: str = ""
+    shared_reason: str = ""
+
+
+def shared_topk_slots(config) -> int:
+    """The trailing top-k columns SGLang's router fills with fused shared experts:
+    ``TopKConfig.num_shared_topk_slots``, named ``num_fused_shared_experts`` before
+    SGLang split its two meanings; read by name so both serve."""
+    slots = getattr(config, "num_shared_topk_slots", None)
+    return getattr(config, "num_fused_shared_experts", 0) if slots is None else slots
 
 
 def gate_applies(mlp: torch.nn.Module) -> bool:
@@ -178,7 +188,7 @@ def gate_applies(mlp: torch.nn.Module) -> bool:
         and config.scoring_func == "sqrtsoftplus"
         and getattr(config, "sqrtsoftplus_log1p", False)
         and config.renormalize
-        and config.num_shared_topk_slots == 0
+        and shared_topk_slots(config) == 0
         and not config.use_grouped_topk
         and config.custom_routing_function is None
         and config.correction_bias is not None
@@ -186,16 +196,24 @@ def gate_applies(mlp: torch.nn.Module) -> bool:
     )
 
 
-def build(model: torch.nn.Module, group, *, gate_topk: bool) -> Bound:
+def build(
+    model: torch.nn.Module, group, *, gate_topk: bool, shared_ll=False, widths=()
+) -> Bound:
     """A routed-expert GEMM pair per MoE layer; every rank agrees, or none is built."""
     m = model.model
     layers = [m.layers[i] for i in range(m.start_layer, m.end_layer)]
-    return build_layers(layers, group, gate_topk=gate_topk)
+    return build_layers(
+        layers, group, gate_topk=gate_topk, shared_ll=shared_ll, widths=widths
+    )
 
 
-def build_layers(layers, group, *, gate_topk: bool) -> Bound:
+def build_layers(
+    layers, group, *, gate_topk: bool, shared_ll: bool = False, widths=()
+) -> Bound:
     """``build`` over a list of decoder layers (the target's, or the draft's stages),
-    keyed by ``layer_id``."""
+    keyed by ``layer_id``. With ``shared_ll``, each built layer's shared expert on the
+    low-latency GEMM where it applies, compiled for ``widths``; every rank agrees on
+    those layers too, or none takes it."""
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
     )
@@ -232,14 +250,42 @@ def build_layers(layers, group, *, gate_topk: bool) -> Bound:
             slots[i] = MoeSlot(mlp, gemm, gate=gate)
     except Exception as e:  # gathered, then the slot is off on every rank
         reason, slots = f"{type(e).__name__}: {e}", {}
+    shared_reason = _bind_shared(slots, widths) if shared_ll else "not requested"
+    shared = sorted(i for i, s in slots.items() if s.shared is not None)
     gathered = [None] * group.world_size
     torch.distributed.all_gather_object(
-        gathered, (reason, sorted(slots)), group=group.cpu_group
+        gathered, (reason, sorted(slots), shared), group=group.cpu_group
     )
-    failed = [f"rank {r}: {e}" for r, (e, _) in enumerate(gathered) if e]
-    if failed or any(s != sorted(slots) for _, s in gathered):
+    failed = [f"rank {r}: {e}" for r, (e, _, _) in enumerate(gathered) if e]
+    if failed or any(s != sorted(slots) for _, s, _ in gathered):
         reason = (
             "; ".join(failed) or f"the ranks disagree on the MoE layers: {gathered}"
         )
         slots = {}
-    return Bound(slots=slots, reason=reason)
+    elif any(s != shared for _, _, s in gathered):
+        shared_reason = f"the ranks disagree on the shared_ll layers: {gathered}"
+        for slot in slots.values():
+            slot.shared = None
+    return Bound(slots=slots, reason=reason, shared_reason=shared_reason)
+
+
+def _bind_shared(slots: dict, widths) -> str:
+    """Slot shared_ll on each built layer whose shared expert takes it; why some did not
+    ("" when all did). A failed build leaves every layer to SGLang's shared expert."""
+    from sgl_nvidia_mega.deepseek_v41.moe import shared_ll
+    from sgl_nvidia_mega.deepseek_v41.plan import ROUTED_MAX_ROWS
+
+    skipped = {}
+    try:
+        for i, slot in slots.items():
+            why = shared_ll.why_not(slot.mlp)
+            if why:
+                skipped[i] = why
+                continue
+            slot.shared = shared_ll.SharedLL(slot.mlp, ROUTED_MAX_ROWS)
+            slot.shared.precompile(widths)
+    except Exception as e:
+        for slot in slots.values():
+            slot.shared = None
+        return f"{type(e).__name__}: {e}"
+    return "; ".join(f"layer {i}: {why}" for i, why in sorted(skipped.items()))
