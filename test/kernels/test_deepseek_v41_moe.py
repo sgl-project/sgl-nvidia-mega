@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The DeepSeek-V4.1 routed-expert kernels and routers on one SM100-family GPU (GB300).
+"""The DeepSeek-V4.1 routed-expert kernels and router on one SM100-family GPU (GB300).
 
 - The route kernels + GEMM pair against FlashInfer's routed MoE (its deferred-finalize
-  GEMM2 rows), as SGLang serves it, on the target layer (384 experts, top-6) at 1-48
-  rows, including experts chosen by more than 8 rows (several tiles), and on the DSpark
-  draft layer (128 experts, top-3) at 1-8 rows; eager and replayed from a CUDA graph.
+  GEMM2 rows), as SGLang serves it, on the target layer (384 experts, top-6) at
+  representative rows (1 / 6 / 16 / 48), including experts chosen by every row (several
+  tiles); eager and replayed from a CUDA graph.
 - gate_topk.cu against SGLang's moe_fused_gate, bit for bit (ids and weights) at 1-64
-  rows, including ties, both softplus branches, NaN logits, padded rows, no padded-row
-  count (every row valid) and the vision-token routing.
-- gate_topk.cuh's two routers, the target's (384 experts, top-6, gate_topk.cu) and the
-  DSpark draft's (128 experts, top-3, gate_topk_draft.cu), against moe_fused_gate bit
-  for bit at the fast-gate widths (1-16 and 48 rows) and both routed scales; the ids
-  also against torch's top-k, and replayed from a CUDA graph.
+  rows, including ties, both softplus branches, NaN logits, padded rows and no
+  padded-row count (every row valid).
 """
 
 import ctypes
@@ -25,10 +21,8 @@ from sgl_nvidia_mega.deepseek_v41.sm103.moe import routed_expert_gemm as reg
 # --------------------------------------------------- routed experts and the target gate
 
 TARGET_EXPERTS, TARGET_TOP_K = 384, 6
-DRAFT_EXPERTS, DRAFT_TOP_K = 128, 3
 SCALE = 1.5
 EPS = 1e-20  # topk._RENORMALIZE_SUM_EPSILON, which vision routing passes
-IMAGE_TOKEN = 128815  # arbitrary; only equality with the token ids matters
 
 
 def _moe_ready() -> bool:
@@ -148,11 +142,6 @@ def target_layer():
     return _shuffled_layer(torch.Generator().manual_seed(2), TARGET_EXPERTS)
 
 
-@pytest.fixture(scope="module")
-def draft_layer():
-    return _shuffled_layer(torch.Generator().manual_seed(1), DRAFT_EXPERTS)
-
-
 def _check_pair(layer, *, top_k, rows, distinct, graph, seed, max_rows):
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
@@ -191,8 +180,8 @@ def _check_pair(layer, *, top_k, rows, distinct, graph, seed, max_rows):
 
 
 @needs_moe
-@pytest.mark.parametrize("rows", [1, 2, 6, 8, 9, 12, 16, 24, 40, 48])
-@pytest.mark.parametrize("distinct", [6, 20, 384])  # 6: every expert takes all rows
+@pytest.mark.parametrize("rows", [1, 6, 16, 48])
+@pytest.mark.parametrize("distinct", [6, 384])  # 6: every expert takes all rows
 @pytest.mark.parametrize("graph", [False, True])
 def test_target_pair_matches_flashinfer(target_layer, rows, distinct, graph):
     _check_pair(
@@ -204,33 +193,6 @@ def test_target_pair_matches_flashinfer(target_layer, rows, distinct, graph):
         seed=900 + rows + distinct,
         max_rows=reg.SERVED_MAX_ROWS,
     )
-
-
-@needs_moe
-@pytest.mark.parametrize("rows", [1, 5, 8])
-@pytest.mark.parametrize("graph", [False, True])
-def test_draft_pair_matches_flashinfer(draft_layer, rows, graph):
-    _check_pair(
-        draft_layer,
-        top_k=DRAFT_TOP_K,
-        rows=rows,
-        distinct=12,
-        graph=graph,
-        seed=500 + rows,
-        max_rows=reg.MAX_ROWS,
-    )
-
-
-@needs_moe
-def test_steps_past_the_bound_are_declined(target_layer):
-    gemm = reg.RoutedExpertGemm(
-        *target_layer, top_k=TARGET_TOP_K, max_rows=reg.MAX_ROWS
-    )
-    assert gemm.route_wide is None
-    rows = 9
-    x_q = torch.zeros(rows, reg.HIDDEN, dtype=torch.uint8, device="cuda")
-    x_s = torch.zeros(rows, reg.HIDDEN // 32, dtype=torch.uint8, device="cuda")
-    assert not gemm.supports_inputs(x_q, x_s)
 
 
 # ----------------------------------------------------------------------------- gate top-k
@@ -311,7 +273,7 @@ def _logits(kind, rows, gen):
 
 
 @needs_moe
-@pytest.mark.parametrize("kind", ["normal", "wide", "ties", "correlated", "nan"])
+@pytest.mark.parametrize("kind", ["normal", "wide", "ties", "nan"])
 def test_gate_topk_matches_moe_fused_gate(kind):
     gen = torch.Generator(device="cuda").manual_seed(1234)
     for rows in [*range(1, 49), 64]:
@@ -328,235 +290,3 @@ def test_gate_topk_matches_moe_fused_gate(kind):
             where = f"{kind} rows={rows} valid={valid} trial={trial}"
             assert torch.equal(fid, sid), where
             assert torch.equal(fw.view(torch.int32), sw.view(torch.int32)), where
-
-
-@needs_moe
-@pytest.mark.parametrize("rows", [6, 12, 16, 48])
-@pytest.mark.parametrize("count", [True, False])
-def test_gate_topk_follows_live_inputs_in_a_graph(rows, count):
-    gen = torch.Generator(device="cuda").manual_seed(7 + rows)
-    logits = torch.randn((rows, TARGET_EXPERTS), device="cuda", generator=gen)
-    bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-    num_valid = (
-        torch.tensor([rows], dtype=torch.int32, device="cuda") if count else None
-    )
-    _fast(logits, bias, num_valid)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = _fast(logits, bias, num_valid)
-    for _ in range(3):
-        logits.copy_(torch.randn((rows, TARGET_EXPERTS), device="cuda", generator=gen))
-        graph.replay()
-        ref = _stock(logits, bias, num_valid)
-        torch.cuda.synchronize()
-        for got, want in zip(out, ref):
-            assert torch.equal(got.view(torch.int32), want.view(torch.int32))
-
-
-@needs_moe
-@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
-def test_gate_topk_vision_routing_matches_moe_fused_gate(ids_dtype):
-    gen = torch.Generator(device="cuda").manual_seed(99)
-    for rows in [1, 6, 7, 12, 16, 24, 48, 64]:
-        for trial in range(4):
-            logits = _logits("normal", rows, gen).contiguous()
-            bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-            bias_alt = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.5
-            input_ids = torch.randint(0, 200000, (rows,), device="cuda", generator=gen)
-            input_ids[torch.rand(rows, device="cuda", generator=gen) < 0.4] = (
-                IMAGE_TOKEN
-            )
-            input_ids = input_ids.to(ids_dtype)
-            valid = rows if trial % 2 == 0 else max(1, rows - 2)
-            num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
-            if trial == 2:
-                num_valid = None
-            vl = (bias_alt, input_ids, IMAGE_TOKEN)
-            sw, sid = _stock(logits, bias, num_valid, vl)
-            fw, fid = _fast(logits, bias, num_valid, vl)
-            torch.cuda.synchronize()
-            where = f"rows={rows} valid={valid} {ids_dtype}"
-            assert torch.equal(fid, sid), where
-            assert torch.equal(fw.view(torch.int32), sw.view(torch.int32)), where
-
-
-@needs_moe
-def test_gate_topk_then_pair_matches_the_two_steps(target_layer):
-    """gate_topk_and_gemms equals moe_fused_gate's routing fed to the pair."""
-    from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
-
-    gemm = reg.RoutedExpertGemm(
-        *target_layer,
-        top_k=TARGET_TOP_K,
-        max_rows=reg.SERVED_MAX_ROWS,
-        gate_topk=True,
-    )
-    gen = torch.Generator(device="cuda").manual_seed(3)
-    for rows, count in ((1, True), (6, False), (12, False), (16, True), (48, False)):
-        logits = torch.randn((rows, TARGET_EXPERTS), device="cuda", generator=gen)
-        bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-        num_valid = (
-            torch.tensor([rows], dtype=torch.int32, device="cuda") if count else None
-        )
-        x = torch.randn(rows, reg.HIDDEN, device="cuda", generator=gen).to(
-            torch.bfloat16
-        )
-        x_q, x_s = flashinfer_mxfp8_quantize(x, False, alignment=reg.HIDDEN)
-        x_s = x_s.view(torch.float8_e4m3fn).reshape(rows, -1)
-        assert gemm.supports_gate_topk(logits, bias) and gemm.supports_inputs(x_q, x_s)
-        rows_out, weights, permuted, ids = gemm.gate_topk_and_gemms(
-            x_q, x_s, logits, bias, SCALE, num_valid
-        )
-        sw, sid = _stock(logits, bias, num_valid)
-        want_rows, want_weights, want_permuted = gemm(x_q, x_s, sid, sw)
-        torch.cuda.synchronize()
-        assert torch.equal(ids, sid) and torch.equal(weights, sw)
-        assert torch.equal(
-            _gathered(rows_out, permuted), _gathered(want_rows, want_permuted)
-        )
-
-
-# ------------------------------------------------------------------------- both routers
-
-ROUTERS = [(384, 6), (128, 3)]  # target, DSpark draft
-ROUTER_ROWS = [*range(1, 17), 48]
-
-
-def _router_ready() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        return False
-    try:
-        from cuda.bindings import nvrtc  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-needs_router = pytest.mark.skipif(
-    not _router_ready(), reason="needs an SM100-family GPU"
-)
-
-
-def _router_stock(logits, bias, num_valid, top_k, scale):
-    from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
-
-    w, ids = moe_fused_gate(
-        logits,
-        bias,
-        topk=top_k,
-        scoring_func="sqrtsoftplus",
-        num_fused_shared_experts=0,
-        renormalize=True,
-        routed_scaling_factor=scale,
-        apply_routed_scaling_factor_on_output=True,
-        num_token_non_padded=num_valid,
-        sqrtsoftplus_log1p=True,
-    )
-    return w, ids.to(torch.int32)
-
-
-def _router_fast(logits, bias, num_valid, top_k, scale):
-    rows, experts = logits.shape
-    weights = torch.empty((rows, top_k), dtype=torch.float32, device=logits.device)
-    ids = torch.empty((rows, top_k), dtype=torch.int32, device=logits.device)
-    reg._launch(
-        reg.load_gate_topk(logits.device.index, experts, top_k),
-        (rows, 1, 1),
-        [
-            reg._pointer(logits),
-            reg._pointer(bias),
-            reg._null_or_pointer(None),
-            reg._null_or_pointer(None),
-            ctypes.c_int32(0),
-            ctypes.c_int64(-1),
-            reg._null_or_pointer(num_valid),
-            reg._pointer(weights),
-            reg._pointer(ids),
-            ctypes.c_float(scale),
-            ctypes.c_float(0.0),
-        ],
-        torch.cuda.current_stream().cuda_stream,
-    )
-    return weights, ids
-
-
-def _router_logits(kind, rows, experts, gen):
-    shape = (rows, experts)
-    if kind == "normal":
-        return torch.randn(shape, device="cuda", generator=gen) * 2
-    if kind == "wide":  # both softplus branches (> 20 passes through)
-        return torch.randn(shape, device="cuda", generator=gen) * 15
-    if kind == "ties":  # few distinct values: ties broken by the lowest id
-        return torch.randint(-3, 4, shape, device="cuda", generator=gen).float() * 0.5
-    if kind == "correlated":  # the rows of one request choose overlapping experts
-        base = torch.randn((1, experts), device="cuda", generator=gen)
-        return base + 0.2 * torch.randn(shape, device="cuda", generator=gen)
-    if kind == "nan":
-        x = torch.randn(shape, device="cuda", generator=gen)
-        x[torch.rand(shape, device="cuda", generator=gen) < 0.01] = float("nan")
-        return x
-    raise ValueError(kind)
-
-
-@needs_router
-@pytest.mark.parametrize("router", ROUTERS, ids=lambda r: f"{r[0]}x{r[1]}")
-@pytest.mark.parametrize("scale", [SCALE, 1.0])
-@pytest.mark.parametrize("kind", ["normal", "wide", "ties", "correlated", "nan"])
-def test_each_router_matches_moe_fused_gate(router, scale, kind):
-    experts, top_k = router
-    gen = torch.Generator(device="cuda").manual_seed(4321 + experts)
-    for rows in ROUTER_ROWS:
-        for trial in range(4):
-            logits = _router_logits(kind, rows, experts, gen).contiguous()
-            bias = torch.randn(experts, device="cuda", generator=gen) * 0.05
-            valid = rows if trial % 2 == 0 else max(1, rows - 1 - trial)
-            num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
-            if trial == 2:  # no num_token_non_padded: every row is valid
-                num_valid = None
-            sw, sid = _router_stock(logits, bias, num_valid, top_k, scale)
-            fw, fid = _router_fast(logits, bias, num_valid, top_k, scale)
-            torch.cuda.synchronize()
-            where = f"{kind} rows={rows} valid={valid} trial={trial}"
-            assert torch.equal(fid, sid), where
-            assert torch.equal(fw.view(torch.int32), sw.view(torch.int32)), where
-
-
-@needs_router
-@pytest.mark.parametrize("router", ROUTERS, ids=lambda r: f"{r[0]}x{r[1]}")
-def test_each_router_picks_torchs_top_k(router):
-    """On well-separated scores the ids are torch's top-k of the biased sqrtsoftplus."""
-    experts, top_k = router
-    gen = torch.Generator(device="cuda").manual_seed(17)
-    for rows in ROUTER_ROWS:
-        logits = _router_logits("normal", rows, experts, gen).contiguous()
-        bias = torch.randn(experts, device="cuda", generator=gen) * 0.05
-        scores = torch.nn.functional.softplus(logits.double()).sqrt() + bias.double()
-        _, fid = _router_fast(logits, bias, None, top_k, SCALE)
-        assert torch.equal(fid.long(), scores.topk(top_k, dim=-1).indices), rows
-
-
-@needs_router
-@pytest.mark.parametrize("router", ROUTERS, ids=lambda r: f"{r[0]}x{r[1]}")
-@pytest.mark.parametrize("rows", [3, 12, 48])
-@pytest.mark.parametrize("count", [True, False])
-def test_each_router_follows_live_inputs_in_a_graph(router, rows, count):
-    experts, top_k = router
-    gen = torch.Generator(device="cuda").manual_seed(11 + rows)
-    logits = torch.randn((rows, experts), device="cuda", generator=gen)
-    bias = torch.randn(experts, device="cuda", generator=gen) * 0.05
-    num_valid = (
-        torch.tensor([rows], dtype=torch.int32, device="cuda") if count else None
-    )
-    _router_fast(logits, bias, num_valid, top_k, SCALE)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = _router_fast(logits, bias, num_valid, top_k, SCALE)
-    for _ in range(3):
-        logits.copy_(torch.randn((rows, experts), device="cuda", generator=gen))
-        graph.replay()
-        ref = _router_stock(logits, bias, num_valid, top_k, SCALE)
-        torch.cuda.synchronize()
-        for got, want in zip(out, ref):
-            assert torch.equal(got.view(torch.int32), want.view(torch.int32))

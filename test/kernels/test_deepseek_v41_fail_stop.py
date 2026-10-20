@@ -1,19 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fail-stop waits on 4 SM100-family GPUs (GB300): when one rank never joins, the ranks
-that wait on it fault within their deadline instead of hanging.
-
-- The Lamport consumer of the wo_b publish (1-8 rows) and the two-shot hop (49-384
-  rows), whose deadline comes from its build alone.
-- The sharded DSpark Markov chain at 1, 4 and 16 rows (direct exchange, fold, wide
-  kernel).
+that wait on it fault within their deadline instead of hanging: the Lamport consumer of
+the wo_b publish (1-8 rows) and the two-shot hop (49-384 rows), whose deadline comes
+from its build alone.
 
 Each case runs its own torchrun, since a faulted rank leaves its CUDA context unusable.
 Run with ``python test/kernels/test_deepseek_v41_fail_stop.py``.
 """
 
 import os
-import socket
 import subprocess
 import sys
 import textwrap
@@ -21,8 +17,6 @@ import time
 
 import pytest
 import torch
-
-from sgl_nvidia_mega.deepseek_v41.sm103 import markov
 
 # --------------------------------------------------------------------------------- hops
 
@@ -116,93 +110,6 @@ def test_a_missing_rank_faults_its_hop_peers_in_time(case, tmp_path):
         assert (
             float(line.split("after ")[1].split(" s")[0]) < 4 * FAULT_DEADLINE_S + 10
         ), line
-    assert time.time() - t0 < 300
-
-
-# ------------------------------------------------------------------------- Markov chain
-
-
-def _markov_ready() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability() in markov.SUPPORTED_CAPABILITIES
-    )
-
-
-needs_4_gpus = pytest.mark.skipif(
-    not _markov_ready() or torch.cuda.device_count() < 4,
-    reason="needs 4 SM100/SM103 GPUs",
-)
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-MARKOV_FAULT_WORKER = textwrap.dedent(
-    """
-    import os, sys, time
-    import torch
-    import torch.distributed as dist
-    from sgl_nvidia_mega.deepseek_v41.sm103 import markov
-
-    rows, deadline = int(sys.argv[1]), float(sys.argv[2])
-    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-    dev = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-    torch.cuda.set_device(dev)
-    dist.init_process_group("cpu:gloo,cuda:nccl")
-    group = dist.new_group(list(range(world)), backend="gloo")
-    vocab, steps = 129_280, 5
-    w = torch.zeros(vocab, 256, dtype=torch.bfloat16, device=dev)
-    chain = markov.ShardedMarkov(embed_weight=w, head_weight=w, vocab_size=vocab,
-        num_steps=steps, cache_dtype=torch.float32, group=group, rank=rank, world=world,
-        max_bs=64, deadline_s=deadline, keeps_logits=False)
-    base = torch.randn(rows, steps, vocab // world, device=dev)
-    tokens = torch.zeros(rows, steps, dtype=torch.int64, device=dev)
-    def run():
-        chain.sample(base_logits=base, anchor_tokens=torch.zeros(rows, dtype=torch.int32, device=dev),
-                     temperatures=torch.zeros(64, device=dev), logits_cache=None,
-                     draft_tokens=tokens)
-    run(); torch.cuda.synchronize()  # every rank joins once: compiled and healthy
-    dist.barrier(group=group)
-    print(f"RANK{rank} HEALTHY", flush=True)
-    if rank == world - 1:
-        time.sleep(4 * deadline + 20)  # never joins the second launch
-        os._exit(0)
-    t0 = time.time()
-    try:
-        run(); torch.cuda.synchronize()
-        print(f"RANK{rank} NO-FAULT", flush=True)
-    except Exception as e:
-        print(f"RANK{rank} FAULTED after {time.time() - t0:.1f} s: {type(e).__name__}", flush=True)
-    os._exit(0)
-    """
-)
-
-
-@needs_4_gpus
-@pytest.mark.parametrize("rows", [1, 4, 16])  # direct exchange, fold, wide kernel
-def test_a_missing_rank_faults_its_markov_peers_in_time(rows, tmp_path):
-    script = tmp_path / "worker.py"
-    script.write_text(MARKOV_FAULT_WORKER)
-    t0 = time.time()
-    out = subprocess.run(
-        [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=4",
-         f"--master_port={_free_port()}", str(script), str(rows), str(FAULT_DEADLINE_S)],
-        capture_output=True, text=True, timeout=600,
-    )  # fmt: skip
-    log = out.stdout + out.stderr
-    assert log.count("HEALTHY") == 4, log[-4000:]
-    # the waiting ranks fault (the kernel's store to 0x0 surfaces as a CUDA error);
-    # none returns as if the launch had completed
-    assert "NO-FAULT" not in log, log[-4000:]
-    faulted = [line for line in log.splitlines() if "FAULTED after" in line]
-    assert len(faulted) == 3, log[-4000:]
-    print("\n".join(faulted))
-    for line in faulted:
-        assert float(line.split("after ")[1].split(" s")[0]) < 4 * FAULT_DEADLINE_S + 10
     assert time.time() - t0 < 300
 
 

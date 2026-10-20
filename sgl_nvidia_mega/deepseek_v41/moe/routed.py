@@ -23,7 +23,7 @@ SGLANG_READS = {
         "correction_bias_for_dtype",
         "scoring_func",
         "renormalize",
-        "num_fused_shared_experts",
+        "num_shared_topk_slots",
         "use_grouped_topk",
         "custom_routing_function",
         "correction_bias",
@@ -178,7 +178,7 @@ def gate_applies(mlp: torch.nn.Module) -> bool:
         and config.scoring_func == "sqrtsoftplus"
         and getattr(config, "sqrtsoftplus_log1p", False)
         and config.renormalize
-        and config.num_fused_shared_experts == 0
+        and config.num_shared_topk_slots == 0
         and not config.use_grouped_topk
         and config.custom_routing_function is None
         and config.correction_bias is not None
