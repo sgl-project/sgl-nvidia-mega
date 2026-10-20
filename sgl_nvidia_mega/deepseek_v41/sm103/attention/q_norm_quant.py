@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Adapted from SGLang's python/sglang/kernels/ops/layernorm/mxfp8_epilogue.py (Apache-2.0).
+# Adapted from SGLang's python/sglang/kernels/ops/layernorm/rmsnorm_mxfp8.py and
+# python/sglang/kernels/ops/quantization/mxfp8_epilogue.py (Apache-2.0).
 """The query-LoRA RMSNorm with its MXFP8 quantization as an epilogue.
 
 At the speculative BS=1 shapes the standalone FlashInfer ``mxfp8_quantize`` launch

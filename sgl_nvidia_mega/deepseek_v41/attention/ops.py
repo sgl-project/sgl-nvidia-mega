@@ -31,10 +31,12 @@ SGLANG_READS = {
         "fused_norm_rope_inplace",
         "fused_q_norm_rope",
         "fused_rope_inplace",
+    ),
+    "kernels/ops/quantization/fp8_group_major_quant_ue8m0.py": (
         "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     ),
     "kernels/ops/attention/dsv4/wo_a.py": ("fused_rope_wo_a_bf16",),
-    "kernels/ops/layernorm/mxfp8_epilogue.py": ("rmsnorm_mxfp8",),
+    "kernels/ops/layernorm/rmsnorm_mxfp8.py": ("rmsnorm_mxfp8",),
     "kernels/ops/quantization/fp8_kernel.py": ("sglang_per_token_group_quant_fp8",),
     "srt/layers/quantization/fp8_utils.py": (
         "Mxfp8DenseGemmBackend",
@@ -58,7 +60,7 @@ SGLANG_READS = {
 def normalize_q_lora(attn, q):
     """``MQALayer._normalize_q_lora``: the BF16 normed row (the indexer's) and wq_b's
     input, quantized with SGLang's fused norm + MXFP8 epilogue at 1-8 rows."""
-    from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
+    from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
@@ -162,11 +164,11 @@ def kv_to_cache(attn, x, positions, fb, view, qkv_a):
 def wo_a(attn, o, positions, fb):
     """The CUDA arm of ``MQALayer.forward`` after attention: the inverse RoPE and
     wo_a, as wo_b's input (FlashInfer-swizzled MXFP8 when wo_b takes it)."""
-    from sglang.kernels.ops.attention.dsv4 import (
-        fused_rope_inplace,
+    from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
+    from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
+    from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
         sglang_per_token_group_quant_fp8_dsv4_wo_a,
     )
-    from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )

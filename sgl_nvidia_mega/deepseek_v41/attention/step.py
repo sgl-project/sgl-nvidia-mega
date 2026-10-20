@@ -70,14 +70,14 @@ SGLANG_READS = {
         "fused_norm_rope_inplace",
         "fused_q_norm_rope",
         "fused_rope_inplace",
+    ),
+    "kernels/ops/quantization/fp8_group_major_quant_ue8m0.py": (
         "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     ),
     "kernels/ops/attention/dsv4/wo_a.py": ("fused_rope_wo_a_bf16",),
-    "kernels/ops/layernorm/mxfp8_epilogue.py": ("rmsnorm_mxfp8",),
+    "kernels/ops/layernorm/rmsnorm_mxfp8.py": ("rmsnorm_mxfp8",),
     "kernels/ops/quantization/fp8_kernel.py": ("sglang_per_token_group_quant_fp8",),
-    "kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py": (
-        "is_unified_kv_triton",
-    ),
+    "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
     "srt/layers/quantization/fp8_utils.py": (
         "Mxfp8DenseGemmBackend",
         "FLASHINFER_CUTEDSL",
@@ -124,7 +124,7 @@ SGLANG_READS = {
 
 def disable_reason(attn) -> str:
     """Why the stock step cannot stand in for ``attn``'s forward, or ""."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
     from sglang.srt.models.deepseek_v4 import (

@@ -91,7 +91,7 @@ def test_the_stages_run_in_order():
             "get_global_expert_distribution_recorder",
             return_value=recorder,
         ),
-        patch("sglang.kernels.ops.layernorm.mhc.hc_combine", return_value="x"),
+        patch("sglang.kernels.ops.layernorm.mhc.mhc_combine", return_value="x"),
     ):
         out = d._forward(
             SimpleNamespace(rows=10),
@@ -179,8 +179,7 @@ def test_unified_kv_keeps_sglangs_draft_attention():
     from sgl_nvidia_mega.deepseek_v41 import draft_attention
 
     with patch(
-        "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
-        ".is_unified_kv_triton",
+        "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
         return_value=True,
     ):
         assert draft_attention.build([_stage(40)], frozenset({"draft_attn"})) == {}

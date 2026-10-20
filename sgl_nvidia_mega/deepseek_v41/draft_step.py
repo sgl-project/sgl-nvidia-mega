@@ -37,7 +37,7 @@ SGLANG_READS = {
     ),
     "srt/models/deepseek_v4.py": ("maybe_use_decode_attn_tp", "self_attn", "layer_id"),
     "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "hidden_states"),
-    "kernels/ops/layernorm/mhc.py": ("hc_combine",),
+    "kernels/ops/layernorm/mhc.py": ("mhc_combine",),
     "srt/eplb/expert_distribution.py": (
         "get_global_expert_distribution_recorder",
         "disable_this_region",
@@ -126,7 +126,7 @@ class DraftDecode(DraftProposal):
             )
             for w in self.widths
         }
-        # hc_combine widens each load to FP32: the BF16 streams give the same result
+        # mhc_combine widens each load to FP32: the BF16 streams give the same result
         self._tail_bf16 = "draft_tail" in slots
         # the ported attention reads the draft forward's KV pool and metadata through
         # the binding; without one (an SGLang that offers none) SGLang's call runs
@@ -215,7 +215,7 @@ class DraftDecode(DraftProposal):
 
     def _forward(self, step, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV4ForCausalLMDSpark.forward`` for a covered draft block."""
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sglang.kernels.ops.layernorm.mhc import mhc_combine
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
@@ -252,7 +252,7 @@ class DraftDecode(DraftProposal):
         streams = residual.flatten(1)
         if not self._tail_bf16:
             streams = streams.float()
-        x = hc_combine(streams, pre, lm.hc_mult, residual.dtype)
+        x = mhc_combine(streams, pre, lm.hc_mult, residual.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 

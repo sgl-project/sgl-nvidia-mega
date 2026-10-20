@@ -224,7 +224,7 @@ def test_wqkv_a_reads_the_boundarys_mxfp8_rows(weights):
     """Slot attn_qkv_a feeds the low-latency GEMM the MXFP8 rows SGLang's fused RMSNorm
     epilogue writes at the attention boundary, not FlashInfer's quantize: the same
     operands through SGLang's MXFP8 linear must agree to the GEMM bound at 1-8 rows."""
-    from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
+    from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
 
     n, k = SHAPES["wqkv_a"]
     w, w_sf = weights["wqkv_a"]
@@ -760,7 +760,7 @@ def test_swapab_graph_replay(b):
 @pytest.mark.parametrize("b", [1, 2, 4, 5, 6, 8, 12, 16, 24, 64])
 def test_swapab_q_rope_and_kv_before_wait(b):
     try:
-        from sglang.kernels.ops.attention.dsv4.elementwise import fused_q_norm_rope
+        from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope
     except ImportError:
         pytest.skip("this SGLang has no fused_q_norm_rope")
     kv, _ = _make_cache(64)
@@ -844,7 +844,7 @@ def test_rmsnorm_mxfp8_pdl(m, stride):
     got = rmsnorm_mxfp8(x, w, 1e-6, pdl=True)
     _same(got, rmsnorm_mxfp8(x, w, 1e-6))
     try:
-        from sglang.kernels.ops.layernorm.mxfp8_epilogue import (
+        from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import (
             rmsnorm_mxfp8 as main_rmsnorm_mxfp8,
         )
     except ImportError:

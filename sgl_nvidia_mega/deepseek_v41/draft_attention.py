@@ -78,9 +78,7 @@ SGLANG_READS = {
         "fused_q_norm_rope",
         "fused_rope_inplace",
     ),
-    "kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py": (
-        "is_unified_kv_triton",
-    ),
+    "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
 }
 
 _SCALE_ROWS = 128  # the swizzled UE8M0 scales are tiled 128 weight rows at a time
@@ -125,7 +123,7 @@ class FusedQkvA:
         return self.fused.quant_method.apply(self.fused, x, None)
 
     def kv(self, qkv_a):
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -188,7 +186,7 @@ def wo_a_applies(attn) -> bool:
 def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
     """Each ported stage's kernels by layer id; a stage left out keeps SGLang's call
     (slot draft_attn off, or SGLang's draft without its fast kernels)."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
 
