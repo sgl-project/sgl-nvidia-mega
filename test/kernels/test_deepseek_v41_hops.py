@@ -19,6 +19,9 @@ SGLang one-shot plane, so it keeps its own process.
   torch reference; unchanged over 50 back-to-back calls of mixed row counts and over 20
   replays of one CUDA graph with a late rank.
 
+The two tests share one torchrun process, in order: two_shot must run after
+wo_b_publish, because two_shot registers SGLang's comm plane process-wide.
+
 Run with ``python test/kernels/test_deepseek_v41_hops.py --num-gpu 4 -s``.
 """
 
@@ -34,6 +37,11 @@ from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
 from sgl_nvidia_mega.deepseek_v41.spec import NUMERICS
+
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ,
+    reason="run via torchrun: python test/kernels/test_deepseek_v41_hops.py --num-gpu 4 -s",
+)
 
 # ----------------------------------------------------------------- wo_b publish (hop A)
 
