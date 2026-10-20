@@ -4,6 +4,7 @@
 binding reaches every reader, the slots' reads follow SGLang's real init order
 (scheduler_init.py), and the Engram prefetch takes its host table from the binding."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest import mock
 
