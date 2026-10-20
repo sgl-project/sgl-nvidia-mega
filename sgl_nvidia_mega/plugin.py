@@ -19,6 +19,9 @@ SPECS = (
     ("DeepseekV4ForCausalLM", "sgl_nvidia_mega.deepseek_v41.spec:SPEC"),
     # the DSpark draft: SGLang's forward, the megakernel's folded proposal
     ("DeepseekV4ForCausalLMDSpark", "sgl_nvidia_mega.deepseek_v41.draft:SPEC"),
+    ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm_dsa.spec:SPEC"),
+    # the NextN draft: the fused draft forward and its top-1 logits
+    ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm_dsa.draft_spec:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
@@ -61,3 +64,9 @@ def register() -> None:
 
         for target, kind, hook in TEST_HOOKS:
             HookRegistry.register(target, pkgutil.resolve_name(hook), HookType[kind])
+    from sgl_nvidia_mega.spec_step import switches
+
+    if switches.any_enabled():
+        from sgl_nvidia_mega.spec_step import hooks
+
+        hooks.register()

@@ -15,8 +15,27 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request) |
+| GLM-5 DSA (NVFP4) | GB300 (SM103), Rubin (SM107) | 8 | EAGLE topk-1 target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request), NextN draft and draft-extend steps of 1 to 16 rows |
 
 Larger verify steps, prefill and extend run SGLang's standard path. The DSpark draft step runs on the plugin's draft spec.
+
+GLM-5 DSA needs `--kv-cache-dtype fp8_e4m3 --page-size 64 --attention-backend dsa --dsa-decode-backend trtllm --moe-runner-backend flashinfer_trtllm --speculative-algorithm EAGLE --speculative-eagle-topk 1 --speculative-num-steps 3 --speculative-num-draft-tokens 4` and `SGLANG_ENABLE_EMBED_REPLICATION=1`. Without NVLink multicast (no all-reduce fusion), set `SGLANG_NVIDIA_MEGAKERNEL_GLM_ALLOW_NO_AR_FUSION=1`.
+
+### Speculative step graph (any EAGLE v2 model)
+
+Off by default; each switch installs its SGLang hooks only when set to `1`.
+
+| Switch | Effect |
+| --- | --- |
+| `SGLANG_NVIDIA_MEGAKERNEL_SPEC_STEP_GRAPH` | One CUDA graph per topk-1 decode step (draft, target verify, draft extend and the work between them), batch size 1 to 8 |
+| `SGLANG_SPEC_STEP_GRAPH_FUSED_INPUT_COPY` | The step graph's input copies in one launch |
+| `SGLANG_SPEC_PACKED_VERIFY_BROADCAST` | One TP broadcast of the verify result instead of three |
+| `SGLANG_SPEC_LEAN_SAMPLED_VERIFY` | Chain sampled verify without the expanded temperatures and zero-filled draft probs |
+| `SGLANG_SPEC_CHUNKED_VERIFY_SAMPLING` | With the lean verify: the sampling passes split over vocabulary chunks |
+| `SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL` | The topk-1 draft-extend argmax, probs and DSA seed gather in two launches |
+| `SGLANG_SPEC_FUSED_RELAY` | The relay stash in one scatter, row views for a single request |
+
+Every fusion's outputs are bitwise identical to the path it replaces.
 
 ### What a covered step runs
 
