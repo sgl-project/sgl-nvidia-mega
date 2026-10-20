@@ -22,9 +22,13 @@ standard path. The DSpark draft step runs on the plugin's draft spec. For Kimi
 K3, the plugin covers the 93-layer language model (24 MLA and 69 KDA layers) at
 the listed widths; every other call runs the standard path.
 
-The Kimi K3 adapter is currently a local Stage A package/API candidate. Its
-cross-GPU waits have not yet been wired to SGLang's deadline and fail-stop
-contract, so Kimi GPU execution and publication remain blocked.
+The Kimi K3 adapter is experimental. On the pinned GB300/TP8 configuration
+below, every listed CUDA-graph width and padding boundary passed dummy-weight
+capture/replay, B1 and B16 passed stock-versus-plugin real-weight canaries, and a
+specialized-route/captured-replay canary passed, and the GSM8K quality protocol
+matched its frozen stock-path reference score. This is bounded functional and
+quality evidence; it does not claim performance, unlisted configurations, production
+readiness, or publication readiness.
 
 ### What a covered DeepSeek-V4.1-Flash step runs
 
@@ -47,8 +51,9 @@ With the megakernel on, the default 36 slots run: the ones above, the attention 
 - **Graph-safe coverage.** A step is covered by its forward mode and row count alone, so every rank decides the same and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** DeepSeek-V4.1-Flash waits on another GPU have
   a deadline below SGLang's watchdog. A rank that misses it faults at address
-  0x0, so no token from a failed step is returned. Kimi K3 does not yet claim
-  this property.
+  0x0, so no token from a failed step is returned. Kimi K3 validates SGLang's
+  finite build deadline and compiles it into all six reachable TP8 remote-wait
+  paths; expiry likewise stores through address 0x0 and traps.
 - **No silent fallback.** With `--enable-nvidia-megakernel`, an unsupported setup stops the server at startup, before the weights load, listing every reason; a model the loaded weights do not fit stops every rank after the load.
 
 ## Quick Start
