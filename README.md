@@ -95,6 +95,7 @@ sgl-nvidia-mega/
 │       ├── logits/          # the head and the logits
 │       └── sm103/           # kernels and the build-time runner; no SGLang imports
 ├── benchmark/             # the static decode table behind the speed numbers
+├── docs/                  # the developer guide
 └── test/
     ├── unit/              # CPU: the plugin, the setup checks, the step loop and the SGLang contract
     ├── kernels/           # GPU: each kernel against SGLang's or FlashInfer's op, fail-stop
@@ -111,7 +112,7 @@ pytest test/e2e                # 4 x GB300, with SGLANG_NVIDIA_MEGAKERNEL_E2E_MO
 
 ## Contributing
 
-Open a pull request against `main`. The PR title follows `[Type] scope: title` (see `.github/pull_request_template.md`), and `pre-commit run --all-files` must pass.
+See the [developer guide](docs/developer_guide.md) for how the plugin plugs into SGLang, what a covered step gets, and how to add a model. Open a pull request against `main`. The PR title follows `[Type] scope: title` (see `.github/pull_request_template.md`), and `pre-commit run --all-files` must pass.
 
 ## License
 
