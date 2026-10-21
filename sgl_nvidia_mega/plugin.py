@@ -19,6 +19,9 @@ SPECS = (
     ("DeepseekV4ForCausalLM", "sgl_nvidia_mega.deepseek_v41.spec:SPEC"),
     # the DSpark draft: SGLang's forward, the megakernel's folded proposal
     ("DeepseekV4ForCausalLMDSpark", "sgl_nvidia_mega.deepseek_v41.draft:SPEC"),
+    ("Qwen3_5MoeForConditionalGeneration", "sgl_nvidia_mega.qwen3_5.spec:SPEC"),
+    # the MTP draft: SGLang's forward; its built object offers no EAGLE entry yet
+    ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check

@@ -6,14 +6,21 @@ calling, pinned on CPU against the installed SGLang.
 The megakernel lives outside SGLang, so it reads SGLang by name (its specs plug into
 ``sglang.srt.megakernels``). Every module that imports from
 ``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one fails here, naming the file to
-repair, instead of failing at a GPU server's startup. The checks are static
-(AST): no module of this package is imported. Run it against each SGLang this
-package supports, and nightly against SGLang main.
+repair, instead of failing at a GPU server's startup. A module whose stock step mirrors
+the body of an SGLang function lists it in ``SGLANG_MIRRORS`` with the digest of its
+code (its tokens without comments or docstring; a tuple of digests where the supported
+SGLangs differ), so a changed branch fails here too.
+The checks are static (AST and tokens): no module of this package is imported. Run it
+against each SGLang this package supports, and nightly against SGLang main.
 """
 
 import ast
+import hashlib
+import io
+import tokenize
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import sglang
@@ -173,3 +180,80 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         untolerated = names - callables - data
         untolerated = {n for n in untolerated if not n.startswith("get_")}
         assert not untolerated, f"{_id(path)}: {sorted(untolerated)}"
+
+
+def _mirrors(path: Path) -> dict:
+    """The module's ``SGLANG_MIRRORS``, or {} without one."""
+    for node in _tree(path).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "SGLANG_MIRRORS" for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    return {}
+
+
+def mirror_digest(path: Path, qualname: str) -> Optional[str]:
+    """The digest of a function's code in ``path`` (``Class.method`` or ``function``):
+    its decorators, signature and body as tokens, without comments, blank lines or
+    docstring; None when the file does not define it."""
+    scope = _tree(path).body
+    *owners, name = qualname.split(".")
+    for owner in owners:
+        cls = next(
+            (n for n in scope if isinstance(n, ast.ClassDef) and n.name == owner), None
+        )
+        if cls is None:
+            return None
+        scope = cls.body
+    node = next(
+        (
+            n
+            for n in scope
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+    lines = path.read_text().splitlines(keepends=True)[first - 1 : node.end_lineno]
+    doc = node.body[0]
+    has_doc = (
+        isinstance(doc, ast.Expr)
+        and isinstance(doc.value, ast.Constant)
+        and isinstance(doc.value.value, str)
+    )
+    skip = (doc.lineno - first + 1, doc.end_lineno - first + 1) if has_doc else None
+    digest = hashlib.sha256()
+    for tok in tokenize.generate_tokens(io.StringIO("".join(lines)).readline):
+        if tok.type in (tokenize.COMMENT, tokenize.NL):
+            continue
+        if skip and skip[0] <= tok.start[0] and tok.end[0] <= skip[1]:
+            continue
+        # indentation depth is structure, not text
+        text = "" if tok.type in (tokenize.INDENT, tokenize.NEWLINE) else tok.string
+        digest.update(f"{tok.type}:{text}\n".encode())
+    return digest.hexdigest()[:16]
+
+
+MIRRORS = [
+    (path, key, digest)
+    for path in sorted(PACKAGE.rglob("*.py"))
+    for key, digest in _mirrors(path).items()
+]
+
+
+@pytest.mark.parametrize(
+    "path, key, digest", MIRRORS, ids=[f"{_id(p)}::{k}" for p, k, _ in MIRRORS]
+)
+def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
+    pattern, qualname = key.split(":")
+    files = sorted(ROOT.glob(pattern))
+    assert len(files) == 1, f"{_id(path)}: {pattern} matches {len(files)} files"
+    got = mirror_digest(files[0], qualname)
+    assert got is not None, f"{_id(path)}: SGLang no longer defines {key}"
+    assert got in ((digest,) if isinstance(digest, str) else digest), (
+        f"SGLang changed {key}, whose body {_id(path)} mirrors: re-read it, update "
+        f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
+        "supported SGLangs differ)"
+    )
