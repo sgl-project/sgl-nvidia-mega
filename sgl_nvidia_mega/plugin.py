@@ -17,6 +17,7 @@ FLAG_CLI = "--enable-nvidia-megakernel"
 # HF architecture -> its spec, by "module:attribute" (imported only with the flag)
 SPECS = (
     ("DeepseekV4ForCausalLM", "sgl_nvidia_mega.deepseek_v41.spec:SPEC"),
+    ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm_5.spec:SPEC"),
     # the DSpark draft: SGLang's forward, the megakernel's folded proposal
     ("DeepseekV4ForCausalLMDSpark", "sgl_nvidia_mega.deepseek_v41.draft:SPEC"),
 )

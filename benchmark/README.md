@@ -54,6 +54,39 @@ Protocol:
 - Check the startup line `NVIDIA megakernel: active (DeepSeek-V4.1: …; widths [6, 12, …, 384]; …)` on every rank in the switch-on arm, and its absence in the switch-off arm.
 - A difference inside the run-to-run band (≈ 1.5 % at batch 1 and 4, ≈ 1 % elsewhere) is not a result.
 
+## GLM5 MLA/MoE microbenchmark
+
+SM10x backend requirements: NVCC >= 13.0, a C++ compiler and external CUTLASS headers.
+Run from the repository root:
+
+~~~bash
+pip install -e ".[ffi]"
+export CUTLASS_INCLUDE_DIR=/path/to/cutlass/include
+python benchmark/bench_glm5.py --mode single --op mla --tp-size 8
+python benchmark/bench_glm5.py --mode single --op moe --tp-size 8
+python benchmark/bench_glm5.py --mode mixed --tp-size 8
+~~~
+
+| Parameter | Purpose |
+| --- | --- |
+| --mode single\|mixed | Repeat one hot operator or alternate independent MoE/MLA states; default single. |
+| --op mla\|moe\|both | Single requires mla or moe (default mla); mixed requires both (default both). |
+| --execution eager\|graph | Direct launches or CUDA Graph replay; default graph. |
+| --draft-tokens / --tp-size / --batch-size | Draft tokens 4/8, TP4/8, batch 1/2; defaults 4/4/1. Batch 2 requires four draft tokens. |
+| --layers | Steps per batch; single repeats one state, mixed uses this many MLA states. Default 56. |
+| --moe-states | Independent MoE states rotated in mixed mode; default 4. |
+| --max-seq-len | Cache rows per request; defaults 4096 for single, 8192 for mixed. |
+| --warmup-replays / --profile-replays / --rounds | Warmup batches, sampled batches and profiling rounds; defaults 100/4/2 for single, 60/4/4 for mixed. |
+| --layout / --seed | Cache layout (sglang or legacy) and input seed; defaults sglang / 20260929. |
+| --local | Run one TP shard on one GPU; otherwise use real TP peers. |
+| --list-configs / --check-sources | Inspect configurations or source availability without timing. |
+| SGLANG_CACHE_DIR | JIT cache root; default ~/.cache/sglang. |
+
+Both execution modes report CUPTI GPU kernel durations in microseconds, including
+fused TP AllReduce. TP Graph sampling merges replays and discards the startup Graph.
+Mixed runs MoE -> MLA with independent synthetic inputs; it measures workload
+interference. Preparation, JIT and warmup are excluded.
+
 ## Accuracy
 
 `test/e2e/test_deepseek_v41_server.py` runs GSM8K-200 past the largest covered width, KL
