@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sglang.srt.megakernels.spec import (
     BuildContext,
+    BuiltMegakernel,
     Feature,
     MegakernelSpec,
     Numerics,
@@ -18,6 +19,9 @@ from sglang.srt.megakernels.spec import (
 )
 from sglang.srt.runtime_context import get_model
 
+if TYPE_CHECKING:
+    from sglang.srt.megakernels.binding import PreparationView
+
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 # Keep this independent of the host constant so find_spec rejects incompatibility.
 REQUIRED_MEGAKERNEL_API_VERSION = 1
@@ -26,6 +30,7 @@ REQUIRED_MEGAKERNEL_API_VERSION = 1
 SGLANG_READS = {
     "srt/megakernels/spec.py": (
         "BuildContext",
+        "BuiltMegakernel",
         "Feature",
         "MULTI_NODE_TP",
         "MegakernelSpec",
@@ -37,11 +42,13 @@ SGLANG_READS = {
         "binding",
         "deadline_s",
         "mode",
+        "prepare",
         "rows",
         "tokens_per_request",
         "view",
         "widths",
     ),
+    "srt/megakernels/binding.py": ("PreparationView",),
     "srt/runtime_context.py": ("get_model",),
     "srt/arg_groups/fields/*.py": (
         "context_length",
@@ -155,12 +162,6 @@ class _Built:
     def summary(self) -> str:
         return "TP8 one-token decode at rows 1-8, 16, 32, and 64"
 
-    def prepare_before_cuda_graph_capture(self, view: Any) -> None:
-        """Bind typed SGLang-owned pools after allocation, before graph warmup."""
-        if view.hybrid is None:
-            raise ValueError("Kimi K3 megakernel requires a hybrid MLA/KDA pool")
-        self.resources.bind(view.hybrid)
-
     def plan(
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
     ) -> Step | None:
@@ -202,6 +203,13 @@ class _Built:
             forward_batch,
             None,
         )
+
+
+def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
+    """Bind typed SGLang-owned pools after allocation, before graph warmup."""
+    if view.hybrid is None:
+        raise ValueError("Kimi K3 megakernel requires a hybrid MLA/KDA pool")
+    cast(_Built, built).resources.bind(view.hybrid)
 
 
 def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
@@ -257,6 +265,7 @@ SPEC = MegakernelSpec(
     ),
     max_rows=max(WIDTHS),
     build=_build,
+    prepare=_prepare,
     api_version=REQUIRED_MEGAKERNEL_API_VERSION,
     model_disable_reasons=_model_disable_reasons,
     config_disable_reasons=_config_disable_reasons,

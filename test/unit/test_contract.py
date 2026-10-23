@@ -160,6 +160,7 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "ForwardView",
         "HybridPoolView",
         "HybridStepView",
+        "PreparationView",
         "block_table",
         "cache",
         "capacity",

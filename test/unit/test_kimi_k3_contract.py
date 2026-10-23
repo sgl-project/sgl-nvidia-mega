@@ -64,6 +64,7 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertEqual(SPEC.requires.decode_graph_backends, frozenset({"full"}))
         self.assertEqual(SPEC.features, frozenset({Feature.MULTI_NODE_TP}))
         self.assertEqual(SPEC.max_rows, 64)
+        self.assertIsNotNone(SPEC.prepare)
         self.assertEqual(
             SPEC.requires.server_args,
             {
@@ -344,7 +345,7 @@ class TestKimiK3TypedBinding(unittest.TestCase):
         )
         from sglang.srt.megakernels.binding import PreparationView
 
-        from sgl_nvidia_mega.kimi_k3.spec import _Built
+        from sgl_nvidia_mega.kimi_k3.spec import SPEC, _Built
 
         built = object.__new__(_Built)
         built.resources = resources
@@ -359,10 +360,10 @@ class TestKimiK3TypedBinding(unittest.TestCase):
             patch.object(torch.cuda, "synchronize"),
             patch("sgl_nvidia_mega.kimi_k3.providers._validate_pool_tensor"),
         ):
-            built.prepare_before_cuda_graph_capture(PreparationView(hybrid=hybrid))
+            SPEC.prepare(built, PreparationView(hybrid=hybrid))
             fingerprint = resources.binding_fingerprint
             live[0] = 64
-            built.prepare_before_cuda_graph_capture(PreparationView(hybrid=hybrid))
+            SPEC.prepare(built, PreparationView(hybrid=hybrid))
         self.assertEqual(resources.binding_fingerprint, fingerprint)
         self.assertIs(resources.attention[1].cache, mla)
         self.assertIs(resources.attention[0].caches[0], conv)
@@ -379,7 +380,7 @@ class TestKimiK3TypedBinding(unittest.TestCase):
             PreparationView,
         )
 
-        from sgl_nvidia_mega.kimi_k3.spec import _Built
+        from sgl_nvidia_mega.kimi_k3.spec import SPEC, _Built
 
         built = object.__new__(_Built)
         built.resources = resources
@@ -395,7 +396,7 @@ class TestKimiK3TypedBinding(unittest.TestCase):
             patch.object(torch.cuda, "synchronize"),
             patch("sgl_nvidia_mega.kimi_k3.providers._validate_pool_tensor"),
         ):
-            built.prepare_before_cuda_graph_capture(PreparationView(hybrid=hybrid))
+            SPEC.prepare(built, PreparationView(hybrid=hybrid))
             replaced = HybridPoolView(
                 mla=MlaPoolView(
                     reserved_capacity=hybrid.mla.reserved_capacity,
@@ -410,9 +411,18 @@ class TestKimiK3TypedBinding(unittest.TestCase):
                 kda=hybrid.kda,
             )
             with self.assertRaisesRegex(RuntimeError, "pool binding changed"):
-                built.prepare_before_cuda_graph_capture(
-                    PreparationView(hybrid=replaced)
-                )
+                SPEC.prepare(built, PreparationView(hybrid=replaced))
+
+    def test_spec_preparation_requires_a_hybrid_pool(self):
+        from sglang.srt.megakernels.binding import PreparationView
+
+        from sgl_nvidia_mega.kimi_k3.spec import SPEC, _Built
+
+        built = object.__new__(_Built)
+        built.resources = SimpleNamespace(bind=Mock())
+        with self.assertRaisesRegex(ValueError, "requires a hybrid MLA/KDA pool"):
+            SPEC.prepare(built, PreparationView())
+        built.resources.bind.assert_not_called()
 
 
 class _NoOp:
