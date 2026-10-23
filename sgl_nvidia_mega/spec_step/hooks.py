@@ -88,6 +88,9 @@ def _keep_graph_class(base):
         def __new__(cls, keep_graph=False, *args, **kwargs):
             return super().__new__(cls, True, *args, **kwargs)
 
+        def __init__(self, keep_graph=False, *args, **kwargs):
+            super().__init__(True, *args, **kwargs)
+
     return KeepGraph
 
 

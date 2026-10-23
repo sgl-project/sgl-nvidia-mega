@@ -164,7 +164,7 @@ def construction_reasons(config, server_args, *, device_capability=None) -> List
             "requires speculative decoding (EAGLE / NEXTN with the MTP layer); "
             "plain decode is not supported"
         )
-    elif str(algo).upper() != "EAGLE":
+    elif str(algo).upper() not in ("EAGLE", "NEXTN"):
         reasons.append(
             f"speculative algorithm {algo!r} is not supported (EAGLE / NEXTN only)"
         )

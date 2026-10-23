@@ -12,6 +12,8 @@ to that module under the same names. Keep each body in sync with its original: a
 diff against SGLang's function shows only the fusion.
 """
 
+from __future__ import annotations
+
 import logging
 
 from sgl_nvidia_mega.spec_step import switches as _spec_switches
@@ -273,47 +275,12 @@ def eagle_sample(
             tp_group, verify_outputs, predict, accept_index, num_correct_drafts
         )
     else:
-        if _is_npu:
-            from sgl_kernel_npu.sample import (
-                chain_speculative_sampling_triton,
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-                tree_speculative_sampling_target_only,
-            )
-        else:
-            from sglang.kernels.ops.speculative.reject_sampling import (
-                chain_speculative_sampling_triton,
-            )
-
-        # if/else, not a ternary: the CUDA-only name still has to resolve in the
-        # branch not taken, and HIP only reaches here with rejection sampling on.
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
             if get_spec().speculative_use_block_verification:
                 sampling_fn = partial(sampling_fn, block_verification=True)
         else:
-            if _is_cuda:
-                from sglang.kernels.ops.speculative.sampling import (
-                    tree_speculative_sampling_target_only,
-                )
-            elif not _is_npu:
-                from sgl_kernel import tree_speculative_sampling_target_only
-
             sampling_fn = tree_speculative_sampling_target_only
-
-        if _is_hip:
-            # Same names, same contract: dflash_utils.py aliases these too.
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_k_renorm_probs_triton as top_k_renorm_prob,
-            )
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_p_renorm_probs_triton as top_p_renorm_prob,
-            )
-        elif _is_cuda:
-            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-        elif not _is_npu:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
         # Lean form (CUDA, chains, no rejection sampling): the same division
         # broadcast per request instead of expanding the temperatures, and no
@@ -667,6 +634,8 @@ def _draft_extend_for_decode(
             draft_logits_output.next_token_logits,
             batch.sampling_info.temperatures,
             batch.sampling_info.top_ks,
+            sampling_seed=batch.sampling_info.sampling_seed,
+            positions=batch_result.new_seq_lens,
         )
     elif self.topk == 1 and _is_hip:
         ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
