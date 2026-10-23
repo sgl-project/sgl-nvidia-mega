@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
+from msgspec.structs import replace
 
 
 class _ContractTensor(torch.Tensor):
@@ -578,29 +579,39 @@ class TestKimiK3StepGuards(unittest.TestCase):
 
         input_ids = _ContractTensor(dtype=torch.int64, shape=(batch,), stride=(1,))
         cases = []
-        wrong_write = self._view(batch=batch)
-        object.__setattr__(
-            wrong_write.mla,
-            "write_slots",
-            _ContractTensor(dtype=torch.int32, shape=(batch,), stride=(1,)),
+        view = self._view(batch=batch)
+        wrong_write = replace(
+            view,
+            mla=replace(
+                view.mla,
+                write_slots=_ContractTensor(
+                    dtype=torch.int32, shape=(batch,), stride=(1,)
+                ),
+            ),
         )
         cases.append(
             ("write dtype", input_ids, wrong_write, "MLA write slots has dtype")
         )
 
-        empty_table = self._view(batch=batch)
-        object.__setattr__(
-            empty_table.mla,
-            "block_table",
-            _ContractTensor(dtype=torch.int32, shape=(batch, 0), stride=(1, 1)),
+        empty_table = replace(
+            view,
+            mla=replace(
+                view.mla,
+                block_table=_ContractTensor(
+                    dtype=torch.int32, shape=(batch, 0), stride=(1, 1)
+                ),
+            ),
         )
         cases.append(("empty table", input_ids, empty_table, "nonempty"))
 
-        strided_table = self._view(batch=batch)
-        object.__setattr__(
-            strided_table.mla,
-            "block_table",
-            _ContractTensor(dtype=torch.int32, shape=(batch, 8), stride=(7, 1)),
+        strided_table = replace(
+            view,
+            mla=replace(
+                view.mla,
+                block_table=_ContractTensor(
+                    dtype=torch.int32, shape=(batch, 8), stride=(7, 1)
+                ),
+            ),
         )
         cases.append(("table stride", input_ids, strided_table, "unsupported stride"))
 
