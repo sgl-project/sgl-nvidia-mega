@@ -20,6 +20,10 @@ SPECS = (
     # the DSpark draft: SGLang's forward, the megakernel's folded proposal
     ("DeepseekV4ForCausalLMDSpark", "sgl_nvidia_mega.deepseek_v41.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
+    # GLM-5.3: the MTP target verify step
+    ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm5_3.spec:SPEC"),
+    # the NextN draft (ModelConfig names a GLM draft's architecture this way)
+    ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check

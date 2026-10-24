@@ -7,6 +7,10 @@ decode step of DeepSeek-V4.1 (the layer loop, the mHC boundaries, the attention,
 MoE, Engram and the head) follows SGLang's own model code (Apache License 2.0,
 Copyright SGLang Team). Each adapted file names its origin in its header.
 
+The stock verify step of GLM-5.3 (the layer loop, the residual steps, the attention,
+the MoE and the logits) is adapted from SGLang's own model code in the same way
+(Apache License 2.0, Copyright SGLang Team).
+
 Portions are adapted from FlashInfer (https://github.com/flashinfer-ai/flashinfer):
 the Lamport all-reduce primitives and the low-latency all-reduce (Apache License
 2.0, Copyright (c) 2026 by FlashInfer team), and the epilogue of the wo_b GEMM
