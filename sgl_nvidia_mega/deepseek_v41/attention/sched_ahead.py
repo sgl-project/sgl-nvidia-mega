@@ -32,19 +32,45 @@ SGLANG_READS = {
         "low_ratios",
         '"tile_scheduler_metadata"',
         "num_splits",
+        "_flashmla_v41_splits_kv",
     ),
+    "kernels/ops/attention/flash_mla_interface.py": ("SPLIT_KV_MIN_TOPK",),
+    "kernels/ops/attention/dsv4/kv_layout.py": ("is_interleaved",),
     "kernels/ops/attention/dsv4/flashmla_sched_meta.py": (
         "META_INTS",
         "flashmla_sched_meta",
     ),
-    "kernels/ops/attention/dsv4/decode_attention_sm100.py": ("MAX_BATCH",),
-    "srt/runtime_context.py": ("get_platform", '"is_blackwell"'),
+    "kernels/ops/attention/dsv4/decode_attention_sm100.py": (
+        "can_use_swapab_attention",
+        "can_use_swapab_attention(q)",
+        "can_use_swapab_attention(kv)",
+        "can_use_swapab_attention(extra_kv)",
+        "can_use_swapab_attention(num_heads)",
+        "can_use_swapab_attention(head_dim_v)",
+        "can_use_swapab_attention(softmax_scale)",
+    ),
+    "srt/models/deepseek_v4.py": (
+        "is_dsv41",
+        "attn_mqa",
+        "head_dim",
+        "softmax_scale",
+        "compress_ratio",
+        "layer_id",
+    ),
+    "srt/layers/radix_attention.py": ("tp_q_head_num", "v_head_dim"),
+    "srt/mem_cache/deepseek_v4_memory_pool.py": (
+        "get_swa_key_bytes_per_token",
+        "get_extra_key_bytes_per_token",
+        "get_swa_key_layout",
+    ),
+    "srt/runtime_context.py": ("get_platform", '"is_blackwell"', '"is_sm100"'),
     "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "ForwardView",
         "metadata",
         "kv_pool",
         "trtllm_attn",
         "request_window",
+        "pool",
     ),
 }
 
@@ -66,18 +92,45 @@ class _Streams:
     streams: Optional[list] = None
 
 
-def first_flashmla_rows(swapab_rows: int) -> int:
-    """The fewest rows whose attention runs FlashMLA: past the chain's swap-AB
-    (``swapab_rows``, 0 without it) and past SGLang's own swap-AB."""
-    from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import MAX_BATCH
+def sglang_takes_swapab(attn, view, rows: int) -> bool:
+    """Whether SGLang's backend runs swap-AB instead of FlashMLA for ``attn``'s layer
+    at ``rows`` rows: its own gate on shape-only stand-ins for the query and the
+    caches (start() checks the forward mode)."""
+    from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+        can_use_swapab_attention,
+    )
+    from sglang.srt.runtime_context import get_platform
 
-    return max(swapab_rows, MAX_BATCH) + 1
+    if not (attn.is_dsv41 and get_platform().is_sm100):
+        return False
+    pool, layer = view.kv_pool, attn.attn_mqa
+
+    def stand_in(*shape, dtype=torch.uint8):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    extra = None
+    if attn.compress_ratio != 0:
+        extra = stand_in(0, pool.get_extra_key_bytes_per_token(attn.layer_id))
+    return can_use_swapab_attention(
+        q=stand_in(rows, 1, layer.tp_q_head_num, attn.head_dim, dtype=torch.bfloat16),
+        kv=stand_in(0, pool.get_swa_key_bytes_per_token()),
+        extra_kv=extra,
+        num_heads=layer.tp_q_head_num,
+        head_dim_v=layer.v_head_dim,
+        softmax_scale=attn.softmax_scale,
+    )
 
 
-def _inputs(core, rows: int) -> list:
+def _inputs(core, rows: int, runs_flashmla, interleaved: bool) -> list:
     """(schedule object, SWA lengths, SWA width, extra lengths, extra width) per
-    ratio, as SGLang's FlashMLA layer passes them (lengths padded to the rows)."""
-    from sglang.srt.layers.attention.deepseek_v4_backend import _pad_tensor_to_size
+    ratio whose layers run FlashMLA with a split-KV schedule, as SGLang's FlashMLA
+    layer passes them (lengths padded to the rows). On the interleaved KV layout
+    SGLang builds no schedule below FlashMLA's split-KV top-k."""
+    from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _flashmla_v41_splits_kv,
+        _pad_tensor_to_size,
+    )
 
     def match(x):
         if x is None or x.shape[0] == rows:
@@ -88,10 +141,16 @@ def _inputs(core, rows: int) -> list:
     for ratio in (0, *core.low_ratios, 4, 128):
         if ratio != 0 and ratio not in core.present_ratios:
             continue
+        if not runs_flashmla(ratio):
+            continue
         fm = core.get_flashmla_metadata(ratio)
         if fm is None or getattr(fm, "tile_scheduler_metadata", None) is not None:
             continue
         extra = None if ratio == 0 else core.sparse_page_indices(ratio)
+        if interleaved and not _flashmla_v41_splits_kv(
+            core.swa_page_indices, extra, SPLIT_KV_MIN_TOPK
+        ):
+            continue
         out.append(
             (
                 fm,
@@ -104,9 +163,9 @@ def _inputs(core, rows: int) -> list:
     return out
 
 
-def start(view, fb, rows: int, first_rows: int) -> list[_Job]:
-    """Fork this step's schedules onto the side streams ([] when the step's attention
-    does not run FlashMLA's decode kernel)."""
+def start(view, fb, rows: int, runs_flashmla) -> list[_Job]:
+    """Fork this step's schedules onto the side streams, for each compress ratio
+    whose layers run FlashMLA's decode kernel (``runs_flashmla(ratio)``)."""
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
@@ -121,14 +180,15 @@ def start(view, fb, rows: int, first_rows: int) -> list[_Job]:
 
     core = getattr(view.metadata, "core_attn_metadata", None)
     if (
-        rows < first_rows
-        or not get_platform().is_blackwell
+        not get_platform().is_blackwell
         or view.trtllm_attn
         or not fb.forward_mode.is_target_verify()
         or not isinstance(core, DSV4AttnMetadata)
         or view.kv_pool.request_window is not None
     ):
         return []
+    # KvPoolView has no layout getter, and V41 / V41_NEW share their bytes per token
+    interleaved = view.kv_pool.pool.get_swa_key_layout().is_interleaved
     device = fb.positions.device
     # one query per row (s_q 1), as SGLang's lazy build sizes it
     num_sm_parts = max(_num_sms(device.index), 1)
@@ -139,7 +199,7 @@ def start(view, fb, rows: int, first_rows: int) -> list[_Job]:
     current = torch.cuda.current_stream()
     jobs = []
     for i, (fm, lengths, width, extra_lengths, extra_width) in enumerate(
-        _inputs(core, rows)
+        _inputs(core, rows, runs_flashmla, interleaved)
     ):
         meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=device)
         num_splits = torch.empty((rows + 1,), dtype=torch.int32, device=device)

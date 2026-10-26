@@ -7,7 +7,7 @@ place of single ops, each launched as a programmatic dependent (PDL) of the last
 - at 1-24 rows the query keeps the 16 local heads, unroped, and the swap-AB sparse
   attention ropes it as it loads it; its narrow combine triggers wo_a at entry;
 - the fused inverse RoPE + wo_a + MXFP8, which triggers wo_b at entry (1-48 rows).
-At 25-48 rows the attention itself is SGLang's FlashMLA on the 64-head query."""
+At 25-48 rows the attention itself is SGLang's, on the 64-head query."""
 
 from __future__ import annotations
 

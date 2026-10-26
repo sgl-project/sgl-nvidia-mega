@@ -238,6 +238,15 @@ class AttentionStep:
         tp_slice = slice(0, attn.n_local_heads)
         return heads, q_padded, q_padded[:, tp_slice, :], tp_slice
 
+    def takes_swapab(self, rows: int, fb, view) -> bool:
+        """Whether this step's attention runs the chain's swap-AB at ``rows`` rows."""
+        return (
+            self.chain is not None
+            and rows <= chain.NORM_QUANT_MAX_ROWS
+            and self.swapab
+            and chain.swapab_takes(rows, fb, view)
+        )
+
     def run(self, x, positions, fb, x_quant=None, publish=None, *, view) -> Any:
         """The layer's TP-partial attention output (``mhc.AttnOutput``) for input
         ``x`` (``x_quant``: the same input as MXFP8); ``publish``: see ``ops.wo_b``."""
@@ -245,7 +254,7 @@ class AttentionStep:
         assert not view.kv_pool.uniform_fp8, "the uniform-FP8 pool"
         rows = x.shape[0]
         use_chain = self.chain is not None and rows <= chain.NORM_QUANT_MAX_ROWS
-        swapab = use_chain and self.swapab and chain.swapab_takes(rows, fb, view)
+        swapab = self.takes_swapab(rows, fb, view)
         with attn.maybe_use_decode_attn_tp(fb):
             path = self._prepare_path(rows, fb)
             if swapab:

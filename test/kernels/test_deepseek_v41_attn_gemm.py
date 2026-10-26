@@ -674,7 +674,12 @@ def _view(core: _Core) -> SimpleNamespace:
     return SimpleNamespace(
         metadata=SimpleNamespace(core_attn_metadata=core),
         trtllm_attn=False,
-        kv_pool=SimpleNamespace(request_window=None),
+        kv_pool=SimpleNamespace(
+            request_window=None,
+            pool=SimpleNamespace(
+                get_swa_key_layout=lambda: SimpleNamespace(is_interleaved=False)
+            ),
+        ),
     )
 
 
@@ -686,11 +691,11 @@ def _ahead(core: _Core, rows: int, graph: bool) -> dict:
     )
     with mock.patch.object(backend, "DSV4AttnMetadata", _Core):
         if not graph:
-            sched_ahead.join(sched_ahead.start(view, fb, rows, 0))
+            sched_ahead.join(sched_ahead.start(view, fb, rows, lambda ratio: True))
         else:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
-                sched_ahead.join(sched_ahead.start(view, fb, rows, 0))
+                sched_ahead.join(sched_ahead.start(view, fb, rows, lambda ratio: True))
             # replay into the captured buffers after scribbling over them
             for r in RATIOS:
                 core.get_flashmla_metadata(r).tile_scheduler_metadata.fill_(-7)

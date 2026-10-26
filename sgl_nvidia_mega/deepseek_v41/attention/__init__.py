@@ -34,7 +34,11 @@ SGLANG_READS = {
         "metadata",
     ),
     "srt/models/deepseek_v4.py": (
+        "layers",
+        "start_layer",
+        "end_layer",
         "self_attn",
+        "compress_ratio",
         "maybe_use_decode_attn_tp",
         "_run_boundary_attention",
         "layer_id",
@@ -123,9 +127,29 @@ def head(st) -> None:
     if "req_pos_once" in SLOTS:
         _req_pos_once(view.metadata, st.fb, rows)
     if "sched_ahead" in SLOTS:
-        swapab = any(a.swapab for a in st.bound["attention"].values())
-        first = sched_ahead.first_flashmla_rows(chain.SWAPAB_MAX_ROWS if swapab else 0)
-        st.flashmla_sched = sched_ahead.start(view, st.fb, rows, first)
+        st.flashmla_sched = sched_ahead.start(
+            view, st.fb, rows, lambda ratio: _runs_flashmla(st, view, rows, ratio)
+        )
+
+
+def _runs_flashmla(st, view, rows: int, ratio: int) -> bool:
+    """Whether ratio ``ratio``'s layers run FlashMLA at ``rows`` rows: neither the
+    chain's swap-AB nor SGLang's takes the ratio's first layer."""
+    m = st.model
+    attn = next(
+        (
+            m.layers[i].self_attn
+            for i in range(m.start_layer, m.end_layer)
+            if m.layers[i].self_attn.compress_ratio == ratio
+        ),
+        None,
+    )
+    if attn is None:
+        return False
+    step_ = st.bound["attention"].get(attn.layer_id)
+    if step_ is not None and step_.takes_swapab(rows, st.fb, view):
+        return False
+    return not sched_ahead.sglang_takes_swapab(attn, view, rows)
 
 
 def _req_pos_once(meta, fb, rows: int) -> None:
