@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """SGLang operators the plugin calls, read wherever the running SGLang keeps them: SGLang's
-regroup of its kernels by computation moved these modules and renamed ``hc_combine``.
+regroup of its kernels by computation moved these modules and renamed ``hc_combine``, and
+its layer-boundary push-plane fusion moved ``MoeDeferredFinalize``.
 Each resolves once, newest location first; test_deepseek_v41_sglang_ops pins that every one
 resolves on the SGLang under test."""
 
@@ -33,6 +34,13 @@ CANDIDATES = {
     "silu_and_mul_clamp": (
         ("sglang.kernels.ops.activation.silu_and_mul_clamp", "silu_and_mul_clamp"),
         ("sglang.kernels.ops.moe.dsv4", "silu_and_mul_clamp"),
+    ),
+    "MoeDeferredFinalize": (
+        (
+            "sglang.srt.layers.layer_boundary.fusions.moe_finalize",
+            "MoeDeferredFinalize",
+        ),
+        ("sglang.srt.layers.layer_boundary.fusions.cutedsl", "MoeDeferredFinalize"),
     ),
     "is_unified_kv_triton": (
         ("sglang.srt.layers.attention.dsv4.unified_kv_gate", "is_unified_kv_triton"),
@@ -73,3 +81,7 @@ def silu_and_mul_clamp(*args, **kwargs):
 
 def unified_kv_triton() -> bool:
     return resolve("is_unified_kv_triton")()
+
+
+def moe_deferred_finalize_from_flashinfer(*args, **kwargs):
+    return resolve("MoeDeferredFinalize").from_flashinfer(*args, **kwargs)
