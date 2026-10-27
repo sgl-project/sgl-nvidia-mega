@@ -43,6 +43,7 @@ from .projection_storage import (
     coalesce_mla_projection_storage,
 )
 from .shape_policy import MAX_ROWS, mla_max_seq_len, token_widths
+from .weight_prefetch import PrefetchController
 
 PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
 _MAX_BATCH = MAX_ROWS
@@ -479,6 +480,7 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    prefetch: Any | None = None
     tokens_per_request: int = 1
     aux_capture_layers: tuple[int, ...] | None = None
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
@@ -817,6 +819,7 @@ def build_resources(
     prepared_moe_module = _module("moe.prepared", origins)
     chain_module = _module("moe.small_batch.chain", origins)
     tail_module = _module("moe.tail_runtime", origins)
+    _module("common.prefetch", origins)
 
     parallel = get_parallel()
     tp, rank = int(parallel.tp_size), int(parallel.tp_rank)
@@ -1139,6 +1142,17 @@ def build_resources(
         consumer.bind_ring(tail_box.out.buffer)
         fused_before[int(layer.layer_idx)] = consumer
 
+    # Final coalesced attention and packed-front storage must precede range
+    # preparation.  One retained controller owns all graph stream/event handles.
+    prefetch = PrefetchController(
+        attention, layers, moe_front_weights, device=device, batches=batches
+    )
+    for layer in moe_layers:
+        prepared = feed_forward[int(layer.layer_idx)]
+        prepared.prefetch = prefetch
+        prepared.small_batch.prefetch = prefetch
+    compilation.append({"kind": "weight_prefetch", "name": "tp8"})
+
     torch.cuda.synchronize()
     resources = ResourceSet(
         model=model,
@@ -1158,6 +1172,7 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        prefetch=prefetch,
         tokens_per_request=tokens_per_request,
     )
     resources.refresh_inventory()

@@ -220,6 +220,7 @@ class KimiK3MegakernelExecutor:
         view: HybridStepView,
     ) -> torch.Tensor:
         resources = self.resources
+        prefetch = getattr(resources, "prefetch", None)
         if resources.binding_fingerprint is None:
             raise RuntimeError(
                 "Kimi K3 megakernel pools were not bound before graph warmup"
@@ -307,23 +308,30 @@ class KimiK3MegakernelExecutor:
                     lengths=mla_lengths,
                     q=q,
                 )
-            elif q > 1:
-                # Verification only writes checkpoints. Stock DSpark exclusively
-                # owns acceptance selection and the eventual persistent commit.
-                attention.core.run_verify(
-                    projected,
-                    local,
-                    caches=attention.caches,
-                    slots=kda_slots,
-                    intermediates=attention.intermediates,
-                    scratch_indices=view.kda.verify_scratch_indices,
-                )
+                if prefetch is not None:
+                    prefetch.fork("attention_moe", layer_id, batch)
             else:
-                attention.core.run(
-                    projected, local, caches=attention.caches, slots=kda_slots
-                )
-                view.kda.track_decode_state(layer_id)
+                if prefetch is not None:
+                    prefetch.fork("attention_moe", layer_id, batch)
+                if q > 1:
+                    # Verification only writes checkpoints. Stock DSpark exclusively
+                    # owns acceptance selection and the eventual persistent commit.
+                    attention.core.run_verify(
+                        projected,
+                        local,
+                        caches=attention.caches,
+                        slots=kda_slots,
+                        intermediates=attention.intermediates,
+                        scratch_indices=view.kda.verify_scratch_indices,
+                    )
+                else:
+                    attention.core.run(
+                        projected, local, caches=attention.caches, slots=kda_slots
+                    )
+                    view.kda.track_decode_state(layer_id)
             attention.output.run(local, prefix, blocks, second)
+            if prefetch is not None:
+                prefetch.fork("oproj_down", layer_id, batch)
 
             consumer = resources.fused_before.get(layer_id)
             next_input_ready = consumer is not None
@@ -342,6 +350,8 @@ class KimiK3MegakernelExecutor:
                 {"aux": auxiliary[last_layer_id]} if last_layer_id in auxiliary else {}
             )
             resources.final.run(hidden, prefix, blocks, output, **kwargs)
+        if prefetch is not None:
+            prefetch.join()
         if last_layer_id != 92:
             raise RuntimeError(f"Kimi K3 megakernel stopped at layer {last_layer_id}")
         return output
