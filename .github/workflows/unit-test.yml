@@ -4,10 +4,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  # nightly against SGLang's newest nightly wheel, so a rename on SGLang main
-  # fails here before it reaches a pinned bump
-  schedule:
-    - cron: "0 9 * * *"
   workflow_dispatch:
 
 permissions:
@@ -18,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # PRs and pushes test against this SGLang nightly (a sgl-project/whl release
-  # tag); bump it to move the pin. The package needs SGLang main from
+  # Every run installs this SGLang nightly (a sgl-project/whl release tag); a PR
+  # that edits this line moves it. The package needs SGLang main from
   # sgl-project/sglang#45389 on, which no tagged release has yet.
   SGLANG_NIGHTLY_TAG: nightly-2026-10-28-15d39bd840
 
@@ -36,18 +32,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Resolve the SGLang nightly
-        id: sglang
+      - name: Download the SGLang nightly
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="$SGLANG_NIGHTLY_TAG"
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            tag=$(gh release list -R sgl-project/whl --limit 50 --json tagName \
-              --jq '[.[].tagName | select(startswith("nightly-"))][0]')
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          gh release download "$tag" -R sgl-project/whl \
+          gh release download "$SGLANG_NIGHTLY_TAG" -R sgl-project/whl \
             --pattern 'sglang-*-cp312-*x86_64.whl' --dir "$RUNNER_TEMP/whl"
           ls "$RUNNER_TEMP/whl"
 
