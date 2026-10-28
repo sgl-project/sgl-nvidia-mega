@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import contextlib
+import copy
 import gc
 import math
 import sys
@@ -257,6 +259,263 @@ def _host_runtime(test):
         streams=streams,
         event_factory=event_factory,
     )
+
+
+class TestPrefetchAdmission(unittest.TestCase):
+    def test_private_keyword_defaults_off_and_public_build_does_not_enable_it(self):
+        tree = ast.parse((ROOT / "providers.py").read_text())
+        build = next(
+            node
+            for node in tree.body
+            if getattr(node, "name", None) == "build_resources"
+        )
+        defaults = dict(
+            zip((arg.arg for arg in build.args.kwonlyargs), build.args.kw_defaults)
+        )
+        self.assertIs(ast.literal_eval(defaults["enable_prefetch"]), False)
+        imports = [
+            node
+            for statement in tree.body
+            if not isinstance(statement, (ast.FunctionDef, ast.ClassDef))
+            for node in ast.walk(statement)
+            if isinstance(node, ast.ImportFrom)
+        ]
+        self.assertFalse(any(node.module == "weight_prefetch" for node in imports))
+        gate = next(
+            node
+            for node in build.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "enable_prefetch"
+        )
+        optional = [
+            node
+            for node in ast.walk(build)
+            if (isinstance(node, ast.ImportFrom) and node.module == "weight_prefetch")
+            or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_module"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "common.prefetch"
+            )
+        ]
+        self.assertEqual(len(optional), 2)
+        self.assertTrue(all(node in list(ast.walk(gate)) for node in optional))
+        spec = ast.parse((ROOT / "spec.py").read_text())
+        calls = [
+            node
+            for node in ast.walk(spec)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_resources"
+        ]
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("enable_prefetch", [kw.arg for kw in calls[0].keywords])
+        self.assertNotIn(None, [kw.arg for kw in calls[0].keywords])
+        # Existing MoE owners start disabled; only the final opt-in block binds them.
+        for name in ("PreparedMoE", "SmallBatchChain"):
+            call = next(
+                node
+                for node in ast.walk(build)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+            )
+            value = (
+                next(kw.value for kw in call.keywords if kw.arg == "prefetch")
+                if name == "PreparedMoE"
+                else call.args[-1]
+            )
+            self.assertIsNone(ast.literal_eval(value))
+
+    def test_invalid_option_fails_at_actual_provider_entry_before_preparation(self):
+        modules, widths = Mock(), Mock()
+        namespace = _definitions(
+            "providers.py",
+            {"build_resources"},
+            {"_module": modules, "token_widths": widths},
+        )
+        for value in (None, 0, 1, "false", "true", [], object()):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "enable_prefetch must be a bool"
+                ):
+                    namespace["build_resources"](
+                        None,
+                        context_length=8192,
+                        memory_before={},
+                        deadline_ns=1,
+                        enable_prefetch=value,
+                    )
+        modules.assert_not_called()
+        widths.assert_not_called()
+
+    def _preparation_boundary(self, q, enabled):
+        """Run the actual final provider block with already-prepared host owners.
+
+        Ordinary model preparation is outside this fixture. The import trap is
+        effective even though other tests already imported weight_prefetch.
+        """
+        tree = ast.parse((ROOT / "providers.py").read_text())
+        build = copy.deepcopy(
+            next(
+                node
+                for node in tree.body
+                if getattr(node, "name", None) == "build_resources"
+            )
+        )
+        start = next(
+            index
+            for index, node in enumerate(build.body)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "prefetch"
+                for target in node.targets
+            )
+        )
+        build.body = build.body[start:]
+        events, origins, compilation = [], {}, []
+        controller = object()
+        layers = (SimpleNamespace(layer_idx=1), SimpleNamespace(layer_idx=2))
+        attention, packed = {1: object(), 2: object()}, {1: object(), 2: object()}
+        feed_forward = {
+            layer.layer_idx: SimpleNamespace(
+                prefetch=None, small_batch=SimpleNamespace(prefetch=None)
+            )
+            for layer in layers
+        }
+
+        def construct(*args, **kwargs):
+            self.assertEqual(args, (attention, layers, packed))
+            self.assertEqual(kwargs, {"device": "cuda:0", "batches": token_widths(q)})
+            events.append("construct")
+            return controller
+
+        factory = Mock(side_effect=construct)
+
+        def import_module(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "__future__":
+                return builtins.__import__(name, globals, locals, fromlist, level)
+            self.assertTrue(enabled, "Disabled preparation imported an optional module")
+            self.assertEqual(
+                (name, fromlist, level), ("weight_prefetch", ("PrefetchController",), 1)
+            )
+            events.append("import")
+            return SimpleNamespace(PrefetchController=factory)
+
+        def payload(name, saved_origins):
+            self.assertTrue(enabled, "Disabled preparation loaded an optional payload")
+            self.assertEqual(name, "common.prefetch")
+            self.assertIs(saved_origins, origins)
+            origins[name] = "fixture-prefetch.py"
+            events.append("payload")
+
+        def resources(**kwargs):
+            value = SimpleNamespace(**kwargs)
+
+            def inventory():
+                expected = controller if enabled else None
+                self.assertIs(value.prefetch, expected)
+                for prepared in value.feed_forward.values():
+                    self.assertIs(prepared.prefetch, expected)
+                    self.assertIs(prepared.small_batch.prefetch, expected)
+                events.append("inventory")
+
+            value.refresh_inventory = inventory
+            return value
+
+        namespace = {
+            "__builtins__": {**vars(builtins), "__import__": import_module},
+            "_module": payload,
+            "ResourceSet": resources,
+            "torch": SimpleNamespace(
+                cuda=SimpleNamespace(synchronize=lambda: events.append("sync"))
+            ),
+            "_cuda_memory": lambda: {},
+            "attention": attention,
+            "layers": layers,
+            "moe_layers": layers,
+            "moe_front_weights": packed,
+            "feed_forward": feed_forward,
+            "origins": origins,
+            "compilation": compilation,
+            "device": "cuda:0",
+            "batches": token_widths(q),
+            "before": {},
+            "final": None,
+            "fused_before": {},
+            "boxes": {},
+            "scratch": {},
+            "workspaces": {},
+            "runtime_handles": {},
+        }
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                build,
+            ],
+            type_ignores=[],
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(module),
+                "<provider preparation boundary>",
+                "exec",
+            ),
+            namespace,
+        )  # noqa: S102
+        return namespace["build_resources"], factory, events, origins, compilation
+
+    def test_default_and_explicit_off_skip_optional_preparation_for_decode_and_verify(
+        self,
+    ):
+        for q in (1, 6):
+            for option in ({}, {"enable_prefetch": False}):
+                with self.subTest(q=q, option=option):
+                    build, factory, events, origins, compilation = (
+                        self._preparation_boundary(q, False)
+                    )
+                    result = build(
+                        None,
+                        context_length=8192,
+                        memory_before={},
+                        deadline_ns=1,
+                        tokens_per_request=q,
+                        **option,
+                    )
+                    self.assertIsNone(result.prefetch)
+                    factory.assert_not_called()
+                    self.assertEqual(events, ["sync", "inventory"])
+                    self.assertEqual(origins, {})
+                    self.assertEqual(compilation, [])
+
+    def test_opt_in_prepares_once_and_shares_controller_before_inventory(self):
+        for q in (1, 6):
+            with self.subTest(q=q):
+                build, factory, events, origins, compilation = (
+                    self._preparation_boundary(q, True)
+                )
+                result = build(
+                    None,
+                    context_length=8192,
+                    memory_before={},
+                    deadline_ns=1,
+                    tokens_per_request=q,
+                    enable_prefetch=True,
+                )
+                self.assertIsNotNone(result.prefetch)
+                self.assertEqual(factory.call_count, 1)
+                self.assertEqual(
+                    events, ["import", "payload", "construct", "sync", "inventory"]
+                )
+                self.assertEqual(origins, {"common.prefetch": "fixture-prefetch.py"})
+                self.assertEqual(
+                    compilation, [{"kind": "weight_prefetch", "name": "tp8"}]
+                )
 
 
 class TestPrefetchPolicy(unittest.TestCase):
@@ -737,11 +996,19 @@ class TestPrefetchHooks(unittest.TestCase):
                     )
                 expected.extend((("final",), ("join",)))
                 self.assertEqual(events, expected)
+                # Default-off resources retain an explicit None, including q6.
+                resources.prefetch = None
+                events.clear()
+                executor.run(torch.zeros(rows, dtype=torch.int64), tensor(), view)
+                disabled = [
+                    event for event in expected if event[0] not in ("fork", "join")
+                ]
+                self.assertEqual(events, disabled)
                 # Existing source-isolated fixtures have no prefetch attribute.
                 del resources.prefetch
                 events.clear()
                 executor.run(torch.zeros(rows, dtype=torch.int64), tensor(), view)
-                self.assertFalse(any(event[0] in ("fork", "join") for event in events))
+                self.assertEqual(events, disabled)
 
     def test_both_moe_paths_fork_after_experts_and_before_tail(self):
         events = []
