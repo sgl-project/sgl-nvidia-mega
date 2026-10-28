@@ -19,6 +19,9 @@ SPECS = (
     ("DeepseekV4ForCausalLM", "sgl_nvidia_mega.deepseek_v41.spec:SPEC"),
     # the DSpark draft: SGLang's forward, the megakernel's folded proposal
     ("DeepseekV4ForCausalLMDSpark", "sgl_nvidia_mega.deepseek_v41.draft:SPEC"),
+    ("Qwen3_5MoeForConditionalGeneration", "sgl_nvidia_mega.qwen3_5.spec:SPEC"),
+    # The MTP draft offers EAGLE draft-loop and draft-extend entries.
+    ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
 )
 

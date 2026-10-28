@@ -59,6 +59,10 @@ class DraftProposal:
     """The draft spec's built object: SGLang's forward on every step, and the proposal."""
 
     widths: tuple[int, ...] = ()
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(self, lm, *, deadline_s: float, slots: frozenset[str]):
         self.lm, self.deadline_s = lm, deadline_s

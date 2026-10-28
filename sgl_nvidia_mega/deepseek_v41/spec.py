@@ -64,7 +64,7 @@ SGLANG_READS = {
 
 ARCHITECTURE = "DeepseekV4ForCausalLM"
 # the SGLang megakernel contract this spec is written against
-API_VERSION = 1
+API_VERSION = 2
 # The FlashInfer low-latency GEMM file the wo_b publish epilogue subclasses, by the
 # sha256 of its source; it is byte-identical in FlashInfer 0.7.0, 0.7.1 and 0.7.2
 FLASHINFER_LL_GEMM = "gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py"

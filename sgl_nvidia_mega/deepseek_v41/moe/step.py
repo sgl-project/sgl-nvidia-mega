@@ -19,6 +19,8 @@ import logging
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import sglang_ops
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
@@ -325,8 +327,6 @@ def _dual_stream(
 
     if deferred and fwd.defer_moe_finalize:
         from sglang.srt.layers.moe.utils import sum_post_experts_output
-
-        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
         return sglang_ops.moe_deferred_finalize_from_flashinfer(
             routed,

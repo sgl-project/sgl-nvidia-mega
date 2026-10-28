@@ -107,8 +107,12 @@ class MegakernelDecode:
     """One rank's covered steps: the model, each width's slots and each package's
     build result."""
 
-    # the target offers no draft sampler (BuiltMegakernel)
+    # the target offers no speculative entries or graph variants (BuiltMegakernel)
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(
         self,

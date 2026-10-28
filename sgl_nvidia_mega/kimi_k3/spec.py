@@ -147,6 +147,10 @@ class _Built:
     """Top-level model-forward replacement for the exact decode shapes served."""
 
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(self, model: Any, resources: Any, widths: tuple[int, ...]):
         from .executor import KimiK3MegakernelExecutor

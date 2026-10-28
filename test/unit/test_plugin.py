@@ -30,10 +30,16 @@ def test_register_registers_every_spec_and_no_hook(hooks, monkeypatch):
     plugin.register()
     assert registry._REGISTRY == dict(plugin.SPECS)
     assert hooks == []
-    # every registered path resolves to the spec SGLang checks
+    # Every registered path resolves to the spec SGLang checks.
     for architecture, _ in plugin.SPECS:
         spec, why = registry.find_spec(architectures=[architecture], isa="sm_103")
         assert spec is not None, (architecture, why)
+
+
+def test_the_parity_sort_hook_registers_only_for_its_test(hooks, monkeypatch):
+    monkeypatch.setenv(plugin.PARITY_SORT_ENV, "1")
+    plugin.register()
+    assert hooks == [target for target, _, _ in plugin.TEST_HOOKS]
 
 
 def test_the_entry_point_is_the_one_sglang_checks():

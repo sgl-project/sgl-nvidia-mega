@@ -4,4 +4,5 @@
 # Per model: one owner for its step code, kernels and tests. Each new model's PR
 # adds its line.
 **/*deepseek_v41* @YAMY1234
+**/*qwen3_5* @YAMY1234
 **/*kimi_k3* @leejnau
