@@ -14,6 +14,27 @@ from typing import Any, NamedTuple, Optional
 
 import torch
 
+# Keep CPU-only test collection independent of SGLang's CUDA backend imports.
+_CUDA_AVAILABLE = torch.cuda.is_available()
+if _CUDA_AVAILABLE:
+    from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+        can_use_swapab_attention,
+    )
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        META_INTS,
+        flashmla_sched_meta,
+    )
+    from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _FLASHMLA_SCHED_BLOCK_SIZE_N,
+        _FLASHMLA_SCHED_FIXED_OVERHEAD,
+        DSV4AttnMetadata,
+        _flashmla_v41_splits_kv,
+        _num_sms,
+        _pad_tensor_to_size,
+    )
+    from sglang.srt.runtime_context import get_platform
+
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/layers/attention/deepseek_v4_backend.py": (
@@ -96,12 +117,7 @@ def sglang_takes_swapab(attn, view, rows: int) -> bool:
     """Whether SGLang's backend runs swap-AB instead of FlashMLA for ``attn``'s layer
     at ``rows`` rows: its own gate on shape-only stand-ins for the query and the
     caches (start() checks the forward mode)."""
-    from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
-        can_use_swapab_attention,
-    )
-    from sglang.srt.runtime_context import get_platform
-
-    if not (attn.is_dsv41 and get_platform().is_sm100):
+    if not _CUDA_AVAILABLE or not (attn.is_dsv41 and get_platform().is_sm100):
         return False
     pool, layer = view.kv_pool, attn.attn_mqa
 
@@ -126,11 +142,6 @@ def _inputs(core, rows: int, runs_flashmla, interleaved: bool) -> list:
     ratio whose layers run FlashMLA with a split-KV schedule, as SGLang's FlashMLA
     layer passes them (lengths padded to the rows). On the interleaved KV layout
     SGLang builds no schedule below FlashMLA's split-KV top-k."""
-    from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        _flashmla_v41_splits_kv,
-        _pad_tensor_to_size,
-    )
 
     def match(x):
         if x is None or x.shape[0] == rows:
@@ -166,18 +177,8 @@ def _inputs(core, rows: int, runs_flashmla, interleaved: bool) -> list:
 def start(view, fb, rows: int, runs_flashmla) -> list[_Job]:
     """Fork this step's schedules onto the side streams, for each compress ratio
     whose layers run FlashMLA's decode kernel (``runs_flashmla(ratio)``)."""
-    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
-        META_INTS,
-        flashmla_sched_meta,
-    )
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        _FLASHMLA_SCHED_BLOCK_SIZE_N,
-        _FLASHMLA_SCHED_FIXED_OVERHEAD,
-        DSV4AttnMetadata,
-        _num_sms,
-    )
-    from sglang.srt.runtime_context import get_platform
-
+    if not _CUDA_AVAILABLE:
+        return []
     core = getattr(view.metadata, "core_attn_metadata", None)
     if (
         not get_platform().is_blackwell

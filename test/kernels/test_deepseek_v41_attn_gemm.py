@@ -689,7 +689,7 @@ def _ahead(core: _Core, rows: int, graph: bool) -> dict:
         forward_mode=SimpleNamespace(is_target_verify=lambda: True),
         positions=torch.zeros(rows, dtype=torch.int64, device="cuda"),
     )
-    with mock.patch.object(backend, "DSV4AttnMetadata", _Core):
+    with mock.patch.object(sched_ahead, "DSV4AttnMetadata", _Core):
         if not graph:
             sched_ahead.join(sched_ahead.start(view, fb, rows, lambda ratio: True))
         else:
