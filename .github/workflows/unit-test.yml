@@ -1,0 +1,52 @@
+name: Unit Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every run installs this SGLang nightly (a sgl-project/whl release tag); a PR
+  # that edits this line moves it. The package needs SGLang main from
+  # sgl-project/sglang#45389 on, which no tagged release has yet.
+  SGLANG_NIGHTLY_TAG: nightly-2026-10-28-15d39bd840
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # the nightly wheels are cp312 only
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the SGLang nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$SGLANG_NIGHTLY_TAG" -R sgl-project/whl \
+            --pattern 'sglang-*-cp312-*x86_64.whl' --dir "$RUNNER_TEMP/whl"
+          ls "$RUNNER_TEMP/whl"
+
+      # The CUDA wheels (torch, FlashInfer, CuTe DSL, the CUDA Python bindings)
+      # install and import without a GPU; the unit tests mock the device.
+      - name: Install SGLang and the package
+        run: |
+          python -m pip install uv
+          uv pip install --system --prerelease allow "$RUNNER_TEMP"/whl/sglang-*.whl pytest
+          uv pip install --system --no-deps -e .
+
+      - name: Run unit tests
+        run: python -m pytest test/unit -v -rfE --continue-on-collection-errors
