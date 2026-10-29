@@ -18,6 +18,11 @@ verify kernel, which SGLang ported from the vLLM ReplaySSM reference implementat
 (Apache License 2.0, Copyright contributors to the vLLM project). Each adapted file
 names its origin in its header.
 
+Portions are adapted from SGLang (https://github.com/sgl-project/sglang): the covered
+verify step of MiniMax-M3.1 (the embedding, the dense layers' hand-off, the layer loop
+and the head) and its DSpark draft block follow SGLang's own model code (Apache License
+2.0, Copyright SGLang Team). Each adapted file names its origin in its header.
+
 Portions are adapted from FlashInfer (https://github.com/flashinfer-ai/flashinfer):
 the Lamport all-reduce primitives and the low-latency all-reduce (Apache License
 2.0, Copyright (c) 2026 by FlashInfer team), and the epilogue of the wo_b GEMM

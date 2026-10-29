@@ -17,6 +17,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request) |
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103) | 8 | One-token decode steps of 1–8, 16, 32 and 64 rows |
+| MiniMax-M3.1-Flash (NVFP4) | GB300 (SM103) | 4 | One request's 8-row DSpark target verify step, and its 7-row draft block |
 
 For DeepSeek-V4.1-Flash and Qwen3.5, larger verify steps, prefill and extend run
 SGLang's standard path. Their draft specs provide the DSpark proposal and the
@@ -70,6 +71,12 @@ These slots change the arithmetic (numeric: each sums in another order than SGLa
 
 The sampling and acceptance after the verify, and the GatedDeltaNet extend of prefill, stay SGLang's own code. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
 
+### What a covered MiniMax-M3.1-Flash step runs
+
+The embedding and the three dense layers run SGLang's modules. Each of the 57 MoE layers is two persistent launches (`minimax_m31/sm103`): MegaAttention (input RMSNorm, the MXFP8 Q/K/V/index projection, head norms and RoPE, the NVFP4 cache writes, the indexer's top-16 pages, the sparse attention, the output projection with its TP4 all-reduce in an NVLink multicast mailbox, the residual add and the post-attention norm), then the token-parallel MoE (the router, the MXFP8 shared expert, the NVFP4 top-4 of 128 routed experts and the TP4 all-reduce). SGLang's final norm and logits processor close the step. The DSpark draft's block runs the draft backbone: the embedding, the five dense layers and the final norm in one cooperative launch; SGLang's draft head samples it. Prefill, plain decode and batches of more than one request run SGLang's standard path.
+
+The kernels read SGLang's weights, KV pages and step data in place, except the routed experts: the plugin keeps a copy (54.1 GiB a GPU) in its own layout, recovered from the `flashinfer_trtllm_routed` layout SGLang keeps for its own path.
+
 ### Design
 
 - **Built at load.** Buffers, kernels and tactics for every covered width are allocated and compiled when the model is loaded, before the KV cache is sized. Nothing is compiled or allocated inside a step.
@@ -78,7 +85,9 @@ The sampling and acceptance after the verify, and the GatedDeltaNet extend of pr
   a deadline below SGLang's watchdog. A rank that misses it faults at address
   0x0, so no token from a failed step is returned. Kimi K3 validates SGLang's
   finite build deadline and compiles it into all six reachable TP8 remote-wait
-  paths; expiry likewise stores through address 0x0 and traps.
+  paths; expiry likewise stores through address 0x0 and traps. MiniMax-M3.1's
+  three kernels compile SGLang's deadline into every poll on another GPU and trap
+  when it expires.
 - **No silent fallback.** With `--enable-nvidia-megakernel`, an unsupported setup stops the server at startup, before the weights load, listing every reason; a model the loaded weights do not fit stops every rank after the load.
 
 ## Quick Start
@@ -92,6 +101,7 @@ The sampling and acceptance after the verify, and the GatedDeltaNet extend of pr
 - Kimi K3: 8 x GB300 (SM103), BF16, context length 8192, TP8 and DP1,
   FP8 E4M3 KV cache with page size 64, `trtllm_mla` for prefill and decode,
   `flashinfer_mxfp4` with default precision, and full decode CUDA graphs
+- MiniMax-M3.1-Flash: 4 x GB300, a CUDA toolkit (`nvcc`) >= 13.4 at `CUDA_HOME`, and the MSA kernels SGLang's MiniMax-M3.1 support imports
 
 ### Installation
 
@@ -139,6 +149,25 @@ python -m sglang.launch_server \
   --enable-nvidia-megakernel
 ```
 
+MiniMax-M3.1-Flash:
+
+```bash
+CUDA_HOME=/usr/local/cuda-13.4 SGLANG_FORCE_COARSE_WAR_BARRIER=1 \
+python -m sglang.launch_server \
+  --model-path MiniMaxAI/MiniMax-M3.1-Flash --trust-remote-code \
+  --tp 4 \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --page-size 128 \
+  --speculative-algorithm DSPARK --speculative-use-block-verification \
+  --speculative-num-steps 1 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7 \
+  --disable-attn-tp-gather \
+  --mem-fraction-static 0.8 \
+  --enable-nvidia-megakernel
+```
+
+MegaAttention keeps all 148 of its CTAs resident: `SGLANG_FORCE_COARSE_WAR_BARRIER=1` (or `--disable-overlap-schedule`) keeps the next batch's preparation kernels from running beside it, and the GPUs must not be shared.
+
 ## Repository Structure
 
 ```text
@@ -157,7 +186,8 @@ sgl-nvidia-mega/
 │   │   ├── logits/          # the head and the logits
 │   │   └── sm103/           # kernels and the build-time runner; no SGLang imports
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
-│   └── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   ├── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   └── minimax_m31/          # the MiniMax-M3.1 specs, verify and draft steps, weights and SM103 kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
     ├── unit/              # CPU: the plugin, the setup checks, the step loop and the SGLang contract
@@ -174,6 +204,8 @@ pytest test/e2e                # DeepSeek-V4.1-Flash: 4 x GB300, with SGLANG_NVI
 ```
 
 Qwen3.5 runs TP8, which spans two GB300 trays: its e2e tests read a server launched on them through `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` and the files its ranks log to (`SGLANG_NVIDIA_MEGAKERNEL_E2E_LOGS`, comma-separated).
+
+MiniMax-M3.1-Flash's suites (`test_minimax_m31_*`) run on 4 x GB300 with a CUDA 13.4 toolkit at `CUDA_HOME`; its serving tests launch the checkpoint at `SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH`.
 
 Kimi K3 GPU and end-to-end suites are not yet part of these commands.
 
