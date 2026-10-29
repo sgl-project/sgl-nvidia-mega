@@ -42,15 +42,15 @@ from .projection_storage import (
     coalesce_kda_projection_storage,
     coalesce_mla_projection_storage,
 )
-from .shape_policy import MAX_ROWS, mla_max_seq_len, token_widths
+from .shape_policy import MAX_ROWS, mla_max_seq_len, prepared_widths
 
 PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
 _MAX_BATCH = MAX_ROWS
 
 
-def _kda_policy(tokens_per_request: int) -> dict:
+def _kda_policy(tokens_per_request: int, widths: tuple[int, ...] | None = None) -> dict:
     # Verify keys are (requests, q), unlike all row-wise projection/MoE policies.
-    widths = token_widths(tokens_per_request)
+    widths = prepared_widths(tokens_per_request, widths)
     if tokens_per_request > 1:
         return {
             (rows // tokens_per_request, tokens_per_request): (6288, 1)
@@ -481,6 +481,7 @@ class ResourceSet:
     deadline_ns: int
     prefetch: Any | None = None
     tokens_per_request: int = 1
+    widths: tuple[int, ...] = ()
     aux_capture_layers: tuple[int, ...] | None = None
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
@@ -800,12 +801,13 @@ def build_resources(
     deadline_ns: int,
     tokens_per_request: int = 1,
     enable_prefetch: bool = False,
+    widths: tuple[int, ...] | None = None,
 ) -> ResourceSet:
     """Build TP8 providers after all-rank consensus; prefetch is opt-in at build."""
 
     if type(enable_prefetch) is not bool:
         raise ValueError("enable_prefetch must be a bool")
-    batches = token_widths(tokens_per_request)
+    batches = prepared_widths(tokens_per_request, widths)
     max_seq_len = mla_max_seq_len(context_length, tokens_per_request)
     memory_before = dict(memory_before)
     origins: dict[str, str] = {}
@@ -985,7 +987,7 @@ def build_resources(
             ).prepare()
             core = kda_module.PreparedKda(
                 proxy,
-                _kda_policy(tokens_per_request),
+                _kda_policy(tokens_per_request, batches),
                 False,
             )
             kind = "kda"
@@ -1080,17 +1082,19 @@ def build_resources(
             q=tokens_per_request,
             deadline_ns=deadline_ns,
         )
-        chain = chain_module.SmallBatchChain(
-            small_box,
-            moe,
-            experts,
-            tail,
-            layer_id,
-            beta,
-            linear_beta,
-            None,
-            deadline_ns=deadline_ns,
-        )
+        chain = None
+        if 1 in batches:
+            chain = chain_module.SmallBatchChain(
+                small_box,
+                moe,
+                experts,
+                tail,
+                layer_id,
+                beta,
+                linear_beta,
+                None,
+                deadline_ns=deadline_ns,
+            )
         prepared_moe = prepared_moe_module.PreparedMoE(
             generic_front,
             experts,
@@ -1110,7 +1114,11 @@ def build_resources(
                     "name": "b1_b8_b16_b32_b64",
                 },
                 {"kind": "moe_tail", "layer_id": layer_id, "name": "b1_b8_b16_b32_b64"},
-                {"kind": "moe_small_batch", "layer_id": layer_id, "name": "b1"},
+                *(
+                    ({"kind": "moe_small_batch", "layer_id": layer_id, "name": "b1"},)
+                    if chain is not None
+                    else ()
+                ),
                 {
                     "kind": "moe_prepared",
                     "layer_id": layer_id,
@@ -1156,7 +1164,8 @@ def build_resources(
         for layer in moe_layers:
             prepared = feed_forward[int(layer.layer_idx)]
             prepared.prefetch = prefetch
-            prepared.small_batch.prefetch = prefetch
+            if prepared.small_batch is not None:
+                prepared.small_batch.prefetch = prefetch
         compilation.append({"kind": "weight_prefetch", "name": "tp8"})
 
     torch.cuda.synchronize()
@@ -1180,6 +1189,7 @@ def build_resources(
         deadline_ns=deadline_ns,
         prefetch=prefetch,
         tokens_per_request=tokens_per_request,
+        widths=batches,
     )
     resources.refresh_inventory()
     return resources

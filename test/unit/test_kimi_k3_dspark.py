@@ -392,6 +392,7 @@ def test_build_filters_token_rows_and_freezes_query_width(q):
     assert built.tokens_per_request == q
     assert built.draft_sampler is None
     assert build.call_args.kwargs["tokens_per_request"] == q
+    assert build.call_args.kwargs["widths"] == token_widths(q)
 
 
 @pytest.mark.parametrize("q", VERIFY_QUERIES)

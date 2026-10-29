@@ -232,6 +232,7 @@ class TestKimiK3Contract(unittest.TestCase):
             memory_before={},
             deadline_ns=30_000_000_000,
             tokens_per_request=1,
+            widths=WIDTHS,
         )
 
     def test_exact_widths_plan_and_every_other_call_falls_back(self):

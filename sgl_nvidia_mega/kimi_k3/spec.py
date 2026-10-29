@@ -39,7 +39,13 @@ except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
         Step,
     )
 
-from .shape_policy import DECODE_WIDTHS, VERIFY_QUERIES, mla_max_seq_len, token_widths
+from .shape_policy import (
+    DECODE_WIDTHS,
+    VERIFY_QUERIES,
+    mla_max_seq_len,
+    prepared_widths,
+    token_widths,
+)
 
 if TYPE_CHECKING:
     try:
@@ -238,7 +244,7 @@ class _Built:
                 f"TP8 fixed DSPARK q{self.tokens_per_request} target verify "
                 f"at request batches {requests}"
             )
-        return "TP8 one-token decode at rows 1-8, 16, 32, and 64"
+        return f"TP8 one-token decode at rows {list(self.widths)}"
 
     def plan(
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
@@ -304,6 +310,7 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
         raise ValueError(
             f"Kimi K3 megakernel found no supported width in {list(context.widths)}"
         )
+    widths = prepared_widths(context.tokens_per_request, widths)
     if context.binding is None:
         raise ValueError("Kimi K3 megakernel received no SGLang runtime binding")
     deadline_ns = _deadline_ns(context.deadline_s)
@@ -318,6 +325,7 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
         memory_before=_cuda_memory(),
         deadline_ns=deadline_ns,
         tokens_per_request=context.tokens_per_request,
+        widths=widths,
     )
     return _Built(model, resources, widths)
 

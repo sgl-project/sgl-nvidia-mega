@@ -20,6 +20,23 @@ def token_widths(tokens_per_request: int) -> tuple[int, ...]:
     return tuple(range(tokens_per_request, MAX_ROWS + 1, tokens_per_request))
 
 
+def prepared_widths(
+    tokens_per_request: int, widths: tuple[int, ...] | None = None
+) -> tuple[int, ...]:
+    """Select supported token rows, retaining the full policy for legacy callers."""
+    supported = token_widths(tokens_per_request)
+    if widths is None:
+        return supported
+    if (
+        not isinstance(widths, tuple)
+        or not widths
+        or any(type(rows) is not int or rows not in supported for rows in widths)
+        or len(set(widths)) != len(widths)
+    ):
+        raise ValueError("Kimi K3 prepared widths must be a nonempty supported subset")
+    return tuple(sorted(widths))
+
+
 def mla_max_seq_len(context_length: int, tokens_per_request: int) -> int:
     """Bound MLA scheduling, without changing native tail-inclusive KV lengths."""
     token_widths(tokens_per_request)

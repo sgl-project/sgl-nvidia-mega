@@ -335,7 +335,7 @@ class TestPrefetchAdmission(unittest.TestCase):
         namespace = _definitions(
             "providers.py",
             {"build_resources"},
-            {"_module": modules, "token_widths": widths},
+            {"_module": modules, "prepared_widths": widths},
         )
         for value in (None, 0, 1, "false", "true", [], object()):
             with self.subTest(value=value):
@@ -382,7 +382,8 @@ class TestPrefetchAdmission(unittest.TestCase):
         attention, packed = {1: object(), 2: object()}, {1: object(), 2: object()}
         feed_forward = {
             layer.layer_idx: SimpleNamespace(
-                prefetch=None, small_batch=SimpleNamespace(prefetch=None)
+                prefetch=None,
+                small_batch=SimpleNamespace(prefetch=None) if q == 1 else None,
             )
             for layer in layers
         }
@@ -420,7 +421,8 @@ class TestPrefetchAdmission(unittest.TestCase):
                 self.assertIs(value.prefetch, expected)
                 for prepared in value.feed_forward.values():
                     self.assertIs(prepared.prefetch, expected)
-                    self.assertIs(prepared.small_batch.prefetch, expected)
+                    if prepared.small_batch is not None:
+                        self.assertIs(prepared.small_batch.prefetch, expected)
                 events.append("inventory")
 
             value.refresh_inventory = inventory
@@ -691,6 +693,55 @@ class TestPrefetchRanges(unittest.TestCase):
 
 
 class TestPrefetchController(unittest.TestCase):
+    def test_requested_subsets_keep_only_eligible_tables_and_reuse_resources(self):
+        runtime = _host_runtime(self)
+        pointer = 4096
+
+        def tensor(shape):
+            nonlocal pointer
+            value = _Tensor(shape, pointer=pointer)
+            pointer += 4096
+            return value
+
+        attention, layers, packed = _resources(tensor)
+        for widths in ((2, 8, 64), (6, 12, 60), (16, 32, 64)):
+            with self.subTest(widths=widths):
+                controller = prefetch.PrefetchController(
+                    attention, layers, packed, device="cuda:0", batches=widths
+                )
+                expected = {
+                    (point, layer.layer_idx, rows)
+                    for layer in layers
+                    for point in POINTS
+                    for rows in widths
+                    if prefetch.prefetch_policy(
+                        point, attention[layer.layer_idx].kind, rows
+                    )
+                    is not None
+                    and not (point == "next_attention" and layer is layers[-1])
+                }
+                self.assertEqual(set(controller.tables), expected)
+                counts = (
+                    runtime.kernel.compile_kernel.call_count,
+                    runtime.allocate.call_count,
+                    runtime.event_factory.call_count,
+                )
+                for rows in (1, 2, 4, 6, 8, 12, 16, 32, 60, 64):
+                    for layer in layers:
+                        for point in POINTS:
+                            key = (point, layer.layer_idx, rows)
+                            self.assertEqual(controller.fork(*key), key in expected)
+                    controller.join()
+                    self.assertFalse(controller.pending)
+                self.assertEqual(
+                    counts,
+                    (
+                        runtime.kernel.compile_kernel.call_count,
+                        runtime.allocate.call_count,
+                        runtime.event_factory.call_count,
+                    ),
+                )
+
     def test_resource_inventory_counts_shared_table_and_owned_handles_once(self):
         class Stream:
             pass
