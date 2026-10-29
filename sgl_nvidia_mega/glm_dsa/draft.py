@@ -35,7 +35,7 @@ from sgl_nvidia_mega.glm_dsa import (
     runtime,
 )
 from sgl_nvidia_mega.glm_dsa.eligibility import HIDDEN, TP_SIZE
-from sgl_nvidia_mega.glm_dsa.providers import compile_cached, cu_stream
+from sgl_nvidia_mega.glm_dsa.runtime.compile import compile_cached, cu_stream
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

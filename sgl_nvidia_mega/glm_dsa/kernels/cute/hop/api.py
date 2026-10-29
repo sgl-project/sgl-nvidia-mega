@@ -156,17 +156,23 @@ def _args_apply():
     return (*[_z()] * 4, Float32(1e-5), Int32(1), cu.CUstream(0))
 
 
-def unit_specs(*, plain_allreduce: bool = False):
+def unit_specs(*, plain_allreduce: bool = False, consume_pad_smem: int = 0):
     """The compile units of the forward hops (instance A: up to 8 rows; instance B:
-    9..16)."""
+    9..16). ``consume_pad_smem``: the o_proj consumers' padded launch shared memory
+    (``OProjArConsume``; 0: unpadded)."""
+    pad = consume_pad_smem
     specs = [
         UnitSpec(
             "allreduce_norm", AllreduceNormHop(residual=True, norm=True), _args_ar()
         ),
         UnitSpec("o_proj_produce", OProjArProduce(), _args_produce()),
-        UnitSpec("o_proj_consume", OProjArConsume(), _args_consume()),
+        UnitSpec("o_proj_consume", OProjArConsume(pad_smem=pad), _args_consume()),
         UnitSpec("o_proj_produce_router", OProjArProduce(router=True), _args_produce()),
-        UnitSpec("o_proj_consume_router", OProjArConsume(router=True), _args_consume()),
+        UnitSpec(
+            "o_proj_consume_router",
+            OProjArConsume(router=True, pad_smem=pad),
+            _args_consume(),
+        ),
         UnitSpec("moe_fold_split", MoeFoldArNorm(split=True), _args_fold()),
         UnitSpec("moe_fold_plain", MoeFoldArNorm(split=False), _args_fold()),
         UnitSpec(
@@ -176,7 +182,7 @@ def unit_specs(*, plain_allreduce: bool = False):
         ),
         UnitSpec(
             "o_proj_consume_router16",
-            OProjArConsume(router=True, max_rows=16),
+            OProjArConsume(router=True, max_rows=16, pad_smem=pad),
             _args_consume(),
         ),
         UnitSpec("moe_fold_block_sums16", MoeFoldArBsum(), _args_bsum()),

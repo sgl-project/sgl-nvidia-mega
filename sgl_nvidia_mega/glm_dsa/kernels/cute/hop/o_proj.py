@@ -635,7 +635,12 @@ class OProjArConsume(Consumer):
         residual: bool = True,
         norm: bool = True,
         max_rows: int = 8,
+        pad_smem: int = 0,
     ):
+        """``pad_smem``: dynamic shared memory per CTA at launch (0: what the kernel
+        allocates). A larger size limits how many CTAs share an SM
+        (``launch.spread_smem``): they then compete less for its memory bandwidth
+        while they poll. The kernel never touches the padding; outputs are unchanged."""
         if residual and not norm:
             raise ValueError("residual without RMSNorm is not provided")
         if router and not (residual and norm):
@@ -650,6 +655,10 @@ class OProjArConsume(Consumer):
             norm,
             max_rows,
         )
+        self.pad_smem = pad_smem
+
+    def launch_options(self) -> dict:
+        return {"smem": self.pad_smem} if self.pad_smem else {}
 
     @cute.jit
     def __call__(
@@ -711,6 +720,7 @@ class OProjArConsume(Consumer):
             cluster=[8, 1, 1],
             use_pdl=True,
             stream=stream,
+            **self.launch_options(),
         )
 
     @cute.jit

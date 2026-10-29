@@ -138,18 +138,40 @@ class HopFamily:
         if not reason:
             import cutlass.cute as cute
 
-            for spec in (s for s in self.api.unit_specs() if s.name in names):
+            from sgl_nvidia_mega.glm_dsa.kernels.cute import launch
+
+            idx = self.device.index
+            per_sm = switches.hop_ctas_per_sm()
+            pad = launch.spread_smem(idx, per_sm) if per_sm else 0
+            carveout = switches.hop_max_shared_carveout()
+            specs = self.api.unit_specs(consume_pad_smem=pad)
+            for spec in (s for s in specs if s.name in names):
                 compiled[spec.name] = compile_cached(
                     spec.obj,
                     spec.constexprs,
                     lambda spec=spec: cute.compile(spec.obj, *spec.args),
                 )
+                padded = getattr(spec.obj, "pad_smem", 0)
+                if carveout or padded:
+                    launch.set_shared_memory_attributes(
+                        compiled[spec.name],
+                        idx,
+                        max_carveout=carveout,
+                        max_dynamic_smem=padded,
+                    )
                 if spec.name == "moe_fold_split" and not hasattr(
                     compiled[spec.name], "library"
                 ):
                     # The occupancy query needs the driver library, which a
                     # cache-loaded unit may not keep: query a fresh compile.
                     probe = cute.compile(spec.obj, *spec.args)
+            if carveout or pad:
+                logger.info(
+                    "GLM DSA fused decode: hops prefer the max shared carveout: %s; "
+                    "o_proj consumer CTAs per SM: %s",
+                    carveout,
+                    f"<= {per_sm} ({pad} B launch shared memory)" if pad else "unpadded",
+                )
         ok = torch.tensor([0 if reason else 1], dtype=torch.int32)
         dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self.group.cpu_group)
         if int(ok.item()) == 0:

@@ -27,6 +27,7 @@ _SM_ACCEPTED = ((10, 3), (10, 7))
 # what the refusals name as the switch that asked for the path
 SWITCH = "--enable-nvidia-megakernel (GLM-5 DSA)"
 
+
 # GLM-5 DSA checkpoint shapes the path is built for.
 _EXPECTED_SHAPES = {
     "hidden_size": HIDDEN,
@@ -191,17 +192,23 @@ def construction_reasons(config, server_args, *, device_capability=None) -> List
     return reasons
 
 
-def check_construction(model) -> None:
-    """Tier 1. Raise ``ValueError`` listing every unsupported setting."""
+def model_construction_reasons(model, config=None) -> List[str]:
+    """Tier 1 for a constructed model: ``construction_reasons`` of its config (or
+    ``config``) and the running server's arguments, and its shared-experts fusion."""
     from sglang.srt.runtime_context import get_server_args
 
-    reasons = construction_reasons(model.config, get_server_args())
+    reasons = construction_reasons(config or model.config, get_server_args())
     if getattr(model, "num_fused_shared_experts", 0) != 0:
         reasons.append(
             "requires shared-experts fusion off (num_fused_shared_experts == 0; "
             "pass --disable-shared-experts-fusion)"
         )
-    _refuse(SWITCH, "the configuration", reasons)
+    return reasons
+
+
+def check_construction(model) -> None:
+    """Tier 1. Raise ``ValueError`` listing every unsupported setting."""
+    _refuse(SWITCH, "the configuration", model_construction_reasons(model))
 
 
 def check_loaded(model) -> None:

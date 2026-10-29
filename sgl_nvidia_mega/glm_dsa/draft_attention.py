@@ -34,11 +34,8 @@ from sgl_nvidia_mega.glm_dsa.attention import (
     FusedAttention,
     kernel_rows,
 )
-from sgl_nvidia_mega.glm_dsa.providers import (
-    AttentionDecode,
-    StepContext,
-)
-from sgl_nvidia_mega.glm_dsa.runtime import DerivedWeights
+from sgl_nvidia_mega.glm_dsa.attention.step import AttentionDecode, StepContext
+from sgl_nvidia_mega.glm_dsa.runtime.executor import DerivedWeights
 
 
 @dataclass
