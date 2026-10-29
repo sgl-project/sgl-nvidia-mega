@@ -199,6 +199,9 @@ NUMERICS = Numerics(
         "two_shot.residual.max_abs": 0.0,
         "two_shot.normed.ulp": 0,
         "two_shot.mxfp8.max_abs": 0.0,
+        # slot two_shot_norm_wide: the in-kernel norm against SGLang's unfused combine +
+        # norm past its fused posts' caps (reduction order): 2-15 elements, 1 ulp at 64-384
+        "two_shot.normed_vs_combine.ulp": 1,
         # hop B against SGLang's fused MoE post: the Lamport consumer's mHC-post
         # rounding order, as hop A's; an MXFP8 value follows its normed element
         "hop_b.residual.ulp": 1,

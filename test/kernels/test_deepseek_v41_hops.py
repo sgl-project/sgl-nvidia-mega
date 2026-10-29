@@ -650,5 +650,104 @@ def test_two_shot_mhc(rank):
         log("CUDA graph (16 hops) x 20 replays: bitwise equal", flush=True)
 
 
+# 129-152: the attention post's fused collective covers them, the MoE quant does not
+WIDE_ROWS = (64, 129, 144, 152, 153, 192, 384)
+WQKV_A_N = 2048
+
+
+def _dequant(q, sf):
+    rows = q.shape[0]
+    exponent = sf[_scale_offsets(rows, q.device)].int()
+    scale = torch.exp2((exponent - 127).float()).repeat_interleave(32, dim=1)
+    return q.float() * scale
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10),
+    reason="Requires SM100/SM103",
+)
+def test_two_shot_next_input_matches_sglangs_unfused_path(rank):
+    """Slot two_shot_norm_wide: what SGLang builds past its fused posts' caps (the
+    combine + norm on the summed streams; the receiving linear's own MXFP8 quant)
+    against the two-shot's normed / MXFP8 next input; and SGLang's MXFP8 linear fed
+    that input past 128 rows (the 128x4 swizzle over several row tiles)."""
+    from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
+    from sglang.srt.layers.quantization.fp8_utils import (
+        flashinfer_mxfp8_blockscaled_linear,
+        flashinfer_mxfp8_quantize,
+    )
+
+    from sgl_nvidia_mega.deepseek_v41.sm103.two_shot_mhc import MAX_ROWS, TwoShotMHC
+
+    tp = ps.get_tp_group()
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    log = print if rank == 0 else (lambda *_, **__: None)
+    tol = NUMERICS.tolerances["two_shot.normed_vs_combine.ulp"]
+    with torch.inference_mode():
+        hop = TwoShotMHC(
+            hidden_size=HIDDEN,
+            hc_mult=HC,
+            max_num_tokens=MAX_ROWS,
+            top_k=TOP_K,
+            device=device,
+            group=tp.device_group,
+            deadline_s=30.0,
+        )
+        gen = torch.Generator(device=device).manual_seed(2000 + rank)
+        weight = torch.randn(WQKV_A_N, HIDDEN, device=device, generator=gen) / 16
+        wq, wsf = flashinfer_mxfp8_quantize(
+            weight.bfloat16(), is_sf_swizzled_layout=True, alignment=32
+        )
+        w_ref = _dequant(wq, wsf.flatten())
+        for rows in WIDE_ROWS:
+            a = _inputs(rows, device, gen)
+            line = f"rows={rows:3d}"
+            for variant in ("attn", "moe", "quant"):
+                got = _run(hop, a, variant)
+                updated, normed = got[0], got[1]
+                ref = hc_combine_norm(updated.flatten(1), a.pre, a.norm_weight, EPS)
+                diff = _bits(normed).view(torch.int16) != _bits(ref).view(torch.int16)
+                ulps = _bf16_ulps(normed, ref) if diff.any() else 0
+                assert ulps <= tol, (rows, variant, ulps)
+                line += (
+                    f" | {variant} normed {int(_max_over_ranks(float(diff.sum())))} elems"
+                    f" <= {int(_max_over_ranks(float(ulps)))} ulp"
+                )
+                if variant != "quant":
+                    continue
+                q, sf = got[2], got[3]
+                # the receiving linear's own quant of these normed rows: bit for bit
+                own_q, own_sf = flashinfer_mxfp8_quantize(
+                    normed, is_sf_swizzled_layout=True, alignment=32
+                )
+                offsets = _scale_offsets(rows, device)
+                assert _equal(q, own_q), (rows, "codes differ from the linear's quant")
+                assert torch.equal(sf[offsets], own_sf.flatten()[offsets]), rows
+                # against SGLang's normed: a code differs only where its row's norm does
+                sg_q, _ = flashinfer_mxfp8_quantize(
+                    ref, is_sf_swizzled_layout=True, alignment=32
+                )
+                qd = (_bits(q) != _bits(sg_q)).view(rows, HIDDEN).any(dim=1)
+                assert not (qd & ~diff.any(dim=1)).any(), (rows, "quant off the norm")
+                # SGLang's MXFP8 linear on the handed-on input vs on the normed rows
+                fed = flashinfer_mxfp8_blockscaled_linear(
+                    input=q,
+                    weight=wq,
+                    weight_scale=wsf,
+                    input_scale=sf,
+                    output_dtype=torch.bfloat16,
+                    pin_tactic=True,
+                )
+                own = flashinfer_mxfp8_blockscaled_linear(
+                    input=normed, weight=wq, weight_scale=wsf, pin_tactic=True
+                )
+                exact = _dequant(q, sf) @ w_ref.t()
+                rel = ((fed.float() - exact).norm() / exact.norm()).item()
+                assert rel <= 1e-2, (rows, rel)
+                assert _equal(fed, own), (rows, "the fed linear differs from its own")
+                line += f" | linear fed = own quant, rel {_max_over_ranks(rel):.2e}"
+            log(line, flush=True)
+
+
 if __name__ == "__main__":
     multigpu_pytest_main(__name__, __file__, num_gpus=(4,), timeout=2400)

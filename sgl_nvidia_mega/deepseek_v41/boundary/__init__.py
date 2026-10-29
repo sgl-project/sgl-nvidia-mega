@@ -77,6 +77,7 @@ def build(model, ctx, group) -> Boundaries:
         hop_a_reason=reason,
         two_shot=two_shot,
         two_shot_reason=two_shot_reason,
+        two_shot_norm_wide="two_shot_norm_wide" in runtime.SLOTS,
         hop_b="hop_b" in runtime.SLOTS,
         prenorm=use_prenorm,
     )

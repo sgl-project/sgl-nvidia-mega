@@ -133,6 +133,7 @@ class Boundaries:
         hop_a_reason: str = "",
         two_shot=None,
         two_shot_reason: str = "",
+        two_shot_norm_wide: bool = False,
         hop_b: bool = False,
         mhc_fusions: Optional[bool] = None,
         prenorm: bool = False,
@@ -153,6 +154,8 @@ class Boundaries:
         self.hop_a_reason = hop_a_reason
         self.two_shot = two_shot  # sm103.two_shot_mhc.TwoShotMHC, or None
         self.two_shot_reason = two_shot_reason
+        # past SGLang's caps the two-shot still hands on its normed / MXFP8 input
+        self.norm_wide = two_shot_norm_wide and two_shot is not None
         self.hop_b = hop_b and hop_a is not None  # the MoE post on hop A's mailbox
         self._served: set = set()
         self._attn_mxfp8 = {}
@@ -429,13 +432,16 @@ class Boundaries:
         # past SGLang's fused collective its FFN combine norms the streams itself;
         # the streams match, the in-kernel norm can differ from it by an ULP
         if not can_fuse_all_reduce(partial.shape[0], layer.hc_cfg.hidden):
-            return mhc.HcState(updated, pre)
+            if not self.norm_wide:
+                return mhc.HcState(updated, pre)
+            self._log_served("two-shot attention post (normed, wide)", partial.shape[0])
         return mhc.HcState(updated, pre, mhc.HcNormed(normed))
 
     def _two_shot_moe(self, layer, out, opened, nxt):
         """The two-shot MoE post; the next input as SGLang's MoE post builds it:
         MXFP8 where its fused quant would (an MXFP8 receiver whose norm folds, at
-        up to 128 rows), else the streams only."""
+        up to 128 rows), else the streams only. With slot two_shot_norm_wide, past
+        128 rows: MXFP8 for an MXFP8 receiver, normed for another whose norm folds."""
         self._log_served("two-shot MoE post", out.routed.expert_weights.shape[0])
         mhc = self._mhc
         pre, post_mix, comb = self._triplet(layer.ffn_hc, opened)
@@ -443,9 +449,16 @@ class Boundaries:
         args = (r.gemm2_out, r.expanded_idx_to_permuted_idx, r.expert_weights, r.top_k)
         args += (out.shared, opened.streams, post_mix, comb)
         rows = r.expert_weights.shape[0]
-        if not (nxt is not None and _quantizes(nxt, rows)):
+        wide = self.norm_wide and rows > SGLANG_QUANT_MAX_ROWS and nxt is not None
+        if not (nxt is not None and _quantizes(nxt, rows) or wide and nxt.norm_fusable):
             return mhc.HcState(self.two_shot.moe_post_only(*args), pre)
         norm = (pre, nxt.norm.weight, nxt.norm.variance_epsilon)
+        if not nxt.accepts_mxfp8:
+            self._log_served("two-shot MoE post (normed, wide)", rows)
+            updated, normed = self.two_shot.moe_post(*args, *norm)
+            return mhc.HcState(updated, pre, mhc.HcNormed(normed))
+        if wide:
+            self._log_served("two-shot MoE post (MXFP8, wide)", rows)
         q, sf = _mxfp8_buffers(
             r.expert_weights, opened.streams, self.two_shot.scale_bytes
         )

@@ -102,6 +102,7 @@ OPT_IN_SLOTS = (
     "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
+    "two_shot_norm_wide",
 )
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
@@ -151,6 +152,7 @@ def slot_reasons() -> list[str]:
         ("hop_b_start_trigger", "hop_b"),
         ("hop_b_wide", "hop_b"),
         ("hop_b_wide", "attn_qkv_a"),
+        ("two_shot_norm_wide", "two_shot"),
         ("hop_b_cap16", "hop_b_wide"),
         ("hop_b_quad_trigger", "hop_b"),
         ("draft_lm_head", "markov"),
@@ -275,6 +277,9 @@ def build(model, ctx):
 
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
+    from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import (
+        SGLANG_QUANT_MAX_ROWS as QUANT_MAX_ROWS,
+    )
     from sgl_nvidia_mega.deepseek_v41.runtime import embedding
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
         PACKAGES,
@@ -321,6 +326,9 @@ def build(model, ctx):
     built = {
         **built_slots(slots, bound, facts),
         "two_shot": any(s.two_shot for s in slots.values()),
+        # a two-shot width past the MoE post's 128-row quant cap
+        "two_shot_norm_wide": getattr(bound["boundary"], "norm_wide", False)
+        and any(s.two_shot and w > QUANT_MAX_ROWS for w, s in slots.items()),
         "hop_b": bound["boundary"].hop_b,
         "attn_qkv_a": attn_qkv_a_built(bound["attention"], pctx.widths),
         "attn_qkv_a_bf16": attn_qkv_a_built(bound["attention"], pctx.widths)
