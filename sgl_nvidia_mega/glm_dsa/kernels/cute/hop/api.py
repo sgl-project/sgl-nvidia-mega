@@ -39,8 +39,8 @@ from .o_proj import ROUTER_K, OProjArConsume, OProjArProduce, router_partial_byt
 from .transport import ErrorRecord, HopMailbox
 
 MIN_PTX_ISA = (9, 2)
-# The split fold serves 1..4 rows (the plain fold above): the rows it is gated at.
-SPLIT_MAX_ROWS = 4
+# The split fold serves 1..6 rows (the plain fold above): the rows it is gated at.
+SPLIT_MAX_ROWS = 6
 MIN_PTX_COMPILER = (13, 2)
 
 

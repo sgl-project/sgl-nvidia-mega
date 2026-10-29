@@ -113,7 +113,9 @@ class GlmDsaFusedDecode:
         global TARGET
         eligibility.check_loaded(self.model)
         self.providers, self.families = build_providers(
-            self.model, eligibility.SUPPORTED_ROWS, self.derived
+            self.model,
+            eligibility.supported_rows(eligibility.tokens_per_request()),
+            self.derived,
         )
         rank = runtime_context.get_parallel().tp_rank
         self._agree_on_composition(rank)

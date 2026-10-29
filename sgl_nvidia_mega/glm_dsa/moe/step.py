@@ -12,6 +12,21 @@ import torch
 
 from sgl_nvidia_mega.glm_dsa.attention.step import StepContext
 
+# The engine's row groups: at most 4 groups of at most 4 rows (one group: g1, two: g2,
+# three or four: the four-group engine)
+GROUP_ROWS = 4
+MAX_GROUPS = 4
+
+
+def moe_split(rows: int) -> tuple:
+    """The engine's row groups for ``rows`` verify rows: groups of 4 rows, the
+    remainder last (4 -> (4,), 6 -> (4, 2), 12 -> (4, 4, 4)). The engine's groups are
+    token sets over one expert list, so they need not follow the request boundaries."""
+    split = (GROUP_ROWS,) * (rows // GROUP_ROWS) + (
+        (rows % GROUP_ROWS,) if rows % GROUP_ROWS else ()
+    )
+    assert sum(split) == rows and len(split) <= MAX_GROUPS, (rows, split)
+    return split
 
 class MlpSteps:
     """Stock dense MLP / MoE of a layer, leaving the output's sum to the next step."""
@@ -141,7 +156,7 @@ class MoeSteps(MlpSteps):
 
     def __init__(self, glue: MoeGlue, rows: int) -> None:
         self.glue, self.rows = glue, rows
-        self.split = (VERIFY_TOKENS_PER_REQUEST,) * (rows // VERIFY_TOKENS_PER_REQUEST)
+        self.split = moe_split(rows)
 
     def forward(self, layer, x, buffer: Optional[torch.Tensor], step):
         glue = self.glue

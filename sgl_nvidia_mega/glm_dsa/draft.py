@@ -42,8 +42,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# draft decode: one row per request; draft extend: 4 per request
-EH_ROWS = (1, 2, 3, 4, 8, 12, 16)
+# draft decode: one row per request (1-4 requests); the draft extend: the covered
+# widths, one row per verify token (eh_rows)
+DECODE_EH_ROWS = (1, 2, 3, 4)
 # the draft-extend graphs select one row per request before the lm_head, so both consumers see B <= 4 rows
 TOP1_DECODE_ROWS = 8
 TOP1_EXTEND_ROWS = 8
@@ -72,6 +73,18 @@ NAN_REPLACEMENT_BITS = 0xF149F2CA
 ONE_HOT_FILL = -torch.finfo(torch.float32).max
 
 
+def eh_rows(widths) -> tuple:
+    """The eh_proj shard's row counts: the draft decode's (``DECODE_EH_ROWS``) and the
+    draft extend's at the covered widths (4 rows a request: 1, 2, 3, 4, 8, 12, 16; 6:
+    1, 2, 3, 4, 6, 12)."""
+    return tuple(sorted({*DECODE_EH_ROWS, *widths}))
+
+
+def served_eh_rows() -> tuple:
+    """``eh_rows`` at the running server's draft length."""
+    return eh_rows(eligibility.supported_rows(eligibility.tokens_per_request()))
+
+
 class FusedDraft:
     """Kernels, derived weights and top-1 mailboxes of the NextN draft layer."""
 
@@ -87,6 +100,7 @@ class FusedDraft:
         self._nextn = None
         self._attn_family = None  # the draft layer's attention (draft_attention)
         self._attn_agreed = {}  # (mode, rows) -> every rank serves the kernels there
+        self.eh_rows = DECODE_EH_ROWS
 
     def arm(self, nextn) -> None:
         """After the target's embedding / lm_head are shared: derive, compile, rendezvous."""
@@ -110,12 +124,13 @@ class FusedDraft:
                 f"GLM-DSA fused draft: eh_proj {tuple(w.shape)} {w.dtype} is not the GLM-5 shape"
             )
         self.eh_weight = w[self.col_off : self.col_off + self.n_local].contiguous()
+        self.eh_rows = served_eh_rows()
         specs = compile_specs(
-            eh_rows=EH_ROWS,
+            eh_rows=self.eh_rows,
             top1_rows=(TOP1_DECODE_ROWS, TOP1_EXTEND_ROWS),
             eh_norm=EH_NORM_OPTIONS,
         )
-        for rows in EH_ROWS:
+        for rows in self.eh_rows:
             spec = specs[f"eh_proj_shard_{rows}"]
             self._eh[rows] = (spec[0], _compile(*spec))
         self._front = _compile(*specs["embed_eh_norm"])
@@ -141,7 +156,7 @@ class FusedDraft:
         logger.info(
             "GLM-DSA fused draft armed: eh_proj shard rows %s, top-1 rows <= %d / %d; derived eh_proj shard %.1f MB; "
             "hops on the target's mailbox: %s; attention kernels: %s.",
-            EH_ROWS,
+            self.eh_rows,
             TOP1_DECODE_ROWS,
             TOP1_EXTEND_ROWS,
             self.eh_weight.numel() * 2 / 1e6,
@@ -155,7 +170,7 @@ class FusedDraft:
         family, why = None, None
         try:
             family = draft_attention.DraftAttentionGlue(nextn)
-            family.compile(EH_ROWS)
+            family.compile(self.eh_rows)
         except ValueError as e:
             family, why = None, str(e)
         whys = runtime.tp_gather([] if why is None else [why])
@@ -183,7 +198,9 @@ class FusedDraft:
             # the eh gather is the family's plain all-reduce unit (its own cache key)
             hops.compiled["allreduce"] = _compile(spec.obj, spec.constexprs, spec.args)
         # static: only this rank's columns are ever written, the others stay +0
-        self._pad = torch.zeros(max(EH_ROWS), HIDDEN, dtype=torch.bfloat16, device=dev)
+        self._pad = torch.zeros(
+            max(self.eh_rows), HIDDEN, dtype=torch.bfloat16, device=dev
+        )
         self._hops = hops
         # the draft's waits write the target's record: one record, one reporter per process
         self.error_record = hops.err

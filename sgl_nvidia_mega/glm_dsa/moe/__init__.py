@@ -29,14 +29,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from sgl_nvidia_mega.glm_dsa.eligibility import (
-    HIDDEN,
-    SUPPORTED_ROWS,
-    VERIFY_TOKENS_PER_REQUEST,
-)
+from sgl_nvidia_mega.glm_dsa.eligibility import HIDDEN, MAX_ROWS
 from sgl_nvidia_mega.glm_dsa.runtime.compile import compile_cached, cu_stream
 from sgl_nvidia_mega.glm_dsa.moe.step import (
     MlpSteps,
+    moe_split,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,10 +60,7 @@ class MoeGlue:
     def compile(self, rows: Tuple[int, ...]) -> None:
         import cutlass.cute as cute
 
-        per = VERIFY_TOKENS_PER_REQUEST
-        modes = {
-            self.api.mode_for((per,) * (m // per)) for m in rows if m in SUPPORTED_ROWS
-        }
+        modes = {self.api.mode_for(moe_split(m)) for m in rows if 1 <= m <= MAX_ROWS}
         for name in sorted({"route", "finalize"} | modes):
             kernel, args = self.specs[name]
             self.fn[name] = compile_cached(
@@ -110,7 +104,11 @@ class MoeGlue:
         )
 
     def for_rows(self, m: int) -> Optional[MoeSteps]:
-        if m not in SUPPORTED_ROWS or self.engine is None:
+        if (
+            self.engine is None
+            or not 1 <= m <= MAX_ROWS
+            or self.api.mode_for(moe_split(m)) not in self.fn
+        ):
             return None
         return MoeSteps(self, m)
 

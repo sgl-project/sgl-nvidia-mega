@@ -98,9 +98,14 @@ class GlmDsaFusedDecode:
         from sgl_nvidia_mega.glm_dsa.plan import build_providers
 
         eligibility.check_loaded(self.model)
-        self.providers, self.families = build_providers(
-            self.model, eligibility.SUPPORTED_ROWS, self.derived
-        )
+        tokens = eligibility.tokens_per_request()
+        rows = eligibility.supported_rows(tokens)
+        if not rows:
+            raise RuntimeError(
+                f"GLM DSA fused decode: {tokens} verify rows a request is not served "
+                f"(served: {list(eligibility.SERVED_TOKENS_PER_REQUEST)})"
+            )
+        self.providers, self.families = build_providers(self.model, rows, self.derived)
         rank = runtime_context.get_parallel().tp_rank
         self._agree_on_composition(rank)
         self.derived.log(rank)

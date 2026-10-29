@@ -29,11 +29,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from sgl_nvidia_mega.glm_dsa.eligibility import (
-    HIDDEN,
-    SUPPORTED_ROWS,
-    VERIFY_TOKENS_PER_REQUEST,
-)
+from sgl_nvidia_mega.glm_dsa.eligibility import HIDDEN, MAX_ROWS
+from sgl_nvidia_mega.glm_dsa.moe.step import moe_split
 from sgl_nvidia_mega.glm_dsa.providers import (
     MlpSteps,
     compile_cached,
@@ -151,7 +148,7 @@ class MoeSteps(MlpSteps):
 
     def __init__(self, glue: MoeGlue, rows: int) -> None:
         self.glue, self.rows = glue, rows
-        self.split = (VERIFY_TOKENS_PER_REQUEST,) * (rows // VERIFY_TOKENS_PER_REQUEST)
+        self.split = moe_split(rows)
 
     def forward(self, layer, x, buffer: Optional[torch.Tensor], step):
         glue = self.glue
@@ -202,10 +199,7 @@ class MoeGlue:
     def compile(self, rows: Tuple[int, ...]) -> None:
         import cutlass.cute as cute
 
-        per = VERIFY_TOKENS_PER_REQUEST
-        modes = {
-            self.api.mode_for((per,) * (m // per)) for m in rows if m in SUPPORTED_ROWS
-        }
+        modes = {self.api.mode_for(moe_split(m)) for m in rows if 1 <= m <= MAX_ROWS}
         for name in sorted({"route", "finalize"} | modes):
             kernel, args = self.specs[name]
             self.fn[name] = compile_cached(
@@ -249,7 +243,11 @@ class MoeGlue:
         )
 
     def for_rows(self, m: int) -> Optional[MoeSteps]:
-        if m not in SUPPORTED_ROWS or self.engine is None:
+        if (
+            self.engine is None
+            or not 1 <= m <= MAX_ROWS
+            or self.api.mode_for(moe_split(m)) not in self.fn
+        ):
             return None
         return MoeSteps(self, m)
 

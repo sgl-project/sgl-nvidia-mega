@@ -18,15 +18,49 @@ from typing import List
 
 import torch
 
-# Verify rows per forward: 1-4 requests x 4 tokens (3 draft tokens + 1).
-VERIFY_TOKENS_PER_REQUEST = 4
-SUPPORTED_ROWS = (4, 8, 12, 16)
+# Verify rows a request: MTP / EAGLE with top-1 drafts verifies speculative_num_steps
+# draft tokens + 1 (speculative_num_draft_tokens). The values served: 3 and 5 steps.
+SERVED_TOKENS_PER_REQUEST = (4, 6)
+# The widest covered step (the kernels' row cap)
+MAX_ROWS = 16
 TP_SIZE = 8
 HIDDEN = 6144
 _SM_ACCEPTED = ((10, 3), (10, 7))
 # what the refusals name as the switch that asked for the path
 SWITCH = "--enable-nvidia-megakernel (GLM-5 DSA)"
 
+
+def supported_rows(tokens_per_request: int) -> tuple:
+    """The covered widths of verify steps of ``tokens_per_request`` rows a request:
+    every whole number of requests up to ``MAX_ROWS`` rows (4 rows: 4 / 8 / 12 / 16;
+    6 rows: 6 / 12); none for a value that is not served. Steps with more requests run
+    SGLang's path."""
+    if tokens_per_request not in SERVED_TOKENS_PER_REQUEST:
+        return ()
+    return tuple(range(tokens_per_request, MAX_ROWS + 1, tokens_per_request))
+
+
+def tokens_per_request(server_args=None) -> int:
+    """Verify rows a request of the running server (speculative_num_draft_tokens)."""
+    if server_args is None:
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+    return int(getattr(server_args, "speculative_num_draft_tokens", None) or 0)
+
+
+def draft_length_reason(server_args) -> List[str]:
+    """Why the server's draft length is not served (empty if it is): top-1 drafts
+    verify speculative_num_steps + 1 tokens, one of ``SERVED_TOKENS_PER_REQUEST``."""
+    tokens = getattr(server_args, "speculative_num_draft_tokens", None)
+    steps = getattr(server_args, "speculative_num_steps", None)
+    if tokens in SERVED_TOKENS_PER_REQUEST and steps == tokens - 1:
+        return []
+    return [
+        "requires --speculative-num-draft-tokens / --speculative-num-steps "
+        + " or ".join(f"{t} / {t - 1}" for t in SERVED_TOKENS_PER_REQUEST)
+        + f" (got {tokens!r} / {steps!r})"
+    ]
 
 # GLM-5 DSA checkpoint shapes the path is built for.
 _EXPECTED_SHAPES = {
@@ -68,8 +102,6 @@ _VALUES = {
 }
 _EAGLE_VALUES = {
     "speculative_eagle_topk": (1,),
-    "speculative_num_draft_tokens": (VERIFY_TOKENS_PER_REQUEST,),
-    "speculative_num_steps": (VERIFY_TOKENS_PER_REQUEST - 1,),
 }
 # Server arguments that must be off: features, layouts and communication
 # variants that change the verify step's stock op sequence.
@@ -158,7 +190,8 @@ def construction_reasons(config, server_args, *, device_capability=None) -> List
                 f"config.{key} = {getattr(config, key, None)!r}, expected {want!r}"
             )
     reasons += _mismatches(server_args, _VALUES, _OFF)
-    # Speculative decoding: EAGLE / MTP chain, 3 draft tokens (NEXTN resolves to EAGLE).
+    # Speculative decoding: EAGLE / MTP chain, 3 or 5 draft steps (NEXTN resolves to
+    # EAGLE).
     algo = getattr(server_args, "speculative_algorithm", None)
     if algo is None:
         reasons.append(
@@ -171,6 +204,7 @@ def construction_reasons(config, server_args, *, device_capability=None) -> List
         )
     else:
         reasons += _mismatches(server_args, _EAGLE_VALUES, _EAGLE_OFF)
+        reasons += draft_length_reason(server_args)
     # The attention steps implement the bf16 absorbed query and the fused DSA
     # top-k page table (providers.AttentionDecode).
     if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
@@ -273,7 +307,7 @@ def check_loaded(model) -> None:
     # boundaries use at verify sizes.
     if uses_cutedsl_ar_fusion():
         reasons.append("the CuTe DSL all-reduce fusion backend is not supported")
-    elif not _ar_fusion_ok(flashinfer_ar_fusion_applies, max(SUPPORTED_ROWS)):
+    elif not _ar_fusion_ok(flashinfer_ar_fusion_applies, MAX_ROWS):
         reasons.append(
             "requires the FlashInfer all-reduce + RMSNorm fusion at verify sizes "
             "(--flashinfer-allreduce-fusion-backend not disabled; without NVLink "
@@ -394,7 +428,7 @@ def step_in_graph_runner(
 
     return (
         forward_batch.forward_mode.is_target_verify()
-        and rows in SUPPORTED_ROWS
+        and rows in supported_rows(tokens_per_request())
         and input_embeds is None
         and pp_proxy_tensors is None
         and not getattr(forward_batch, "can_run_tbo", False)

@@ -39,9 +39,12 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 from sgl_nvidia_mega.glm_dsa import HF_CONFIG, MODEL_TYPE, TP_SIZE
-from sgl_nvidia_mega.glm_dsa.eligibility import SUPPORTED_ROWS, VERIFY_TOKENS_PER_REQUEST
+from sgl_nvidia_mega.glm_dsa.eligibility import (
+    MAX_ROWS,
+    SERVED_TOKENS_PER_REQUEST,
+    draft_length_reason,
+)
 from sgl_nvidia_mega.glm_dsa.kernels.cute.hop.constants import CLUSTER, TIMEOUT_NS
-from sgl_nvidia_mega.glm_dsa.plan import MAX_ROWS
 from sgl_nvidia_mega.glm_dsa.runtime import SLOTS, SLOTS_ENV, parity, slot_reasons
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -140,8 +143,10 @@ SERVER_ARGS = {
     "dp_size": frozenset({None, 1}),
     "speculative_algorithm": frozenset({"EAGLE", "NEXTN"}),
     "speculative_eagle_topk": frozenset({1}),
-    "speculative_num_draft_tokens": frozenset({VERIFY_TOKENS_PER_REQUEST}),
-    "speculative_num_steps": frozenset({VERIFY_TOKENS_PER_REQUEST - 1}),
+    # top-1 drafts of 3 or 5 steps: verify steps of 4 or 6 rows a request (the pair
+    # is checked in _config_disable_reasons)
+    "speculative_num_draft_tokens": frozenset(SERVED_TOKENS_PER_REQUEST),
+    "speculative_num_steps": frozenset(t - 1 for t in SERVED_TOKENS_PER_REQUEST),
     "speculative_adaptive": frozenset(_OFF),
     "enable_multi_layer_eagle": frozenset(_OFF),
     **dict.fromkeys(
@@ -347,6 +352,7 @@ def deadline_reasons(cfg) -> list:
 def _config_disable_reasons(cfg, hf_config) -> list:
     reasons = toolchain_reasons() + binding_reasons() + slot_reasons()
     reasons += draft_capture_reasons() + deadline_reasons(cfg)
+    reasons += draft_length_reason(cfg)
     if (
         cfg.cuda_graph_config.decode.backend == "disabled"
         and not parity.eager_steps_allowed()

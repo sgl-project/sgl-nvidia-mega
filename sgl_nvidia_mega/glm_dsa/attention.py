@@ -11,7 +11,7 @@ stock key / head-gate projection right after it, which the prologue consumes);
 ``q_b_proj``, W_UK absorption, RoPE + FP8 query left in ``step.q_fp8``, the MLA
 and index-K cache rows), so ``index_k``, ``q_absorb`` and ``rope_cache`` pass
 through; ``index_q`` on ``indexer_q_proj``; ``sparse_mla`` on ``sparse_mla_decode``
-over the fused top-k page table (16 warps per CTA up to 4 rows, 8 above);
+over the fused top-k page table (16 warps per CTA up to 6 rows, 8 above);
 ``uv_proj`` on ``mla_uv_proj``. The indexer's logits and top-k stay stock.
 With SGLANG_NVIDIA_MEGAKERNEL_GLM_SHARED_QKV_A_SMALL_M (default on) the layers
 without their own top-k also run ``qkv_a`` on the small-M kernel, and with
@@ -92,8 +92,9 @@ def kernel_rows(rows: int) -> Optional[int]:
 
 
 def sparse_warps(rows: int) -> int:
-    """Warps per CTA of the sparse MLA form: one CTA per SM up to 4 rows, two above."""
-    return 16 if rows <= 4 else 8
+    """Warps per CTA of the sparse MLA form: one CTA per SM up to 6 rows (one request
+    of up to 6 verify rows), two above."""
+    return 16 if rows <= 6 else 8
 
 
 def _f32(x: float) -> float:
@@ -521,7 +522,7 @@ class AttentionGlue:
         self.layers: Dict[int, LayerArgs] = {}
         # the compiled kernel forms by ``attn.api.compile_specs`` name:
         # "uv|prologue|index_q.{8,16}" (row capacity), "prologue_end.{8,16}" (target
-        # only), "sparse.{16,8}" (warps per CTA: 16 up to 4 rows, 8 above) and
+        # only), "sparse.{16,8}" (warps per CTA: 16 up to 6 rows, 8 above) and
         # "qkv_a[_shared[_dn]].8"
         self.fn: Dict[str, object] = {}
         rope_f32, index_rope_f32 = set(), set()

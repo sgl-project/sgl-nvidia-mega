@@ -16,7 +16,7 @@ Forms per verify row count (a function of the row count and the layer index
 only, so every rank runs the same hop sequence on its mailboxes):
 
 * MoE family served, rows <= 8: the routing ``o_proj`` hop and the fold hop on
-  MoE layers; dense layers use the plain hops at rows <= 4, stock above.
+  MoE layers; dense layers use the plain hops at rows <= 6, stock above.
 * MoE family served, rows 9..16: the 16-row routing hop and fold on their own
   mailbox; dense layers stock.
 * MoE family stock at this row count (declined at startup), rows <= 8 ("far
@@ -73,7 +73,7 @@ class HopSteps:
 O_PROJ_IN = 2048
 TOP_K = 8  # routed experts per row
 SMALL_ROWS = 8  # mailbox instance A (instance B: 9..16 rows)
-DENSE_MAX_ROWS = 4  # plain hops on the dense layers beside the fold; stock above
+DENSE_MAX_ROWS = 6  # plain hops on the dense layers beside the fold; stock above
 # Error sites: layer * 4 + {0: o_proj, 1: MLP output, 2: final}; sites from
 # EXTERNAL_SITES on are other kernels' (named with ``HopFamily.register_sites``).
 HOPS_PER_LAYER = 4

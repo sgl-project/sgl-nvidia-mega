@@ -15,11 +15,11 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request) |
-| GLM-5 DSA (NVFP4) | GB300 (SM103), Rubin (SM107) | 8 | EAGLE topk-1 target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request), NextN draft and draft-extend steps of 1 to 16 rows |
+| GLM-5 DSA (NVFP4) | GB300 (SM103), Rubin (SM107) | 8 | EAGLE topk-1 target verify steps of whole requests up to 16 rows (batch 1 to 4 at 4 rows a request, 1 to 2 at 6), NextN draft and draft-extend steps of 1 to 16 rows |
 
 Larger verify steps, prefill and extend run SGLang's standard path. The DSpark draft step runs on the plugin's draft spec.
 
-GLM-5 DSA needs `--kv-cache-dtype fp8_e4m3 --page-size 64 --attention-backend dsa --dsa-decode-backend trtllm --moe-runner-backend flashinfer_trtllm --speculative-algorithm EAGLE --speculative-eagle-topk 1 --speculative-num-steps 3 --speculative-num-draft-tokens 4` and `SGLANG_ENABLE_EMBED_REPLICATION=1`. Without NVLink multicast (no all-reduce fusion), set `SGLANG_NVIDIA_MEGAKERNEL_GLM_ALLOW_NO_AR_FUSION=1`.
+GLM-5 DSA needs `--kv-cache-dtype fp8_e4m3 --page-size 64 --attention-backend dsa --dsa-decode-backend trtllm --moe-runner-backend flashinfer_trtllm --speculative-algorithm EAGLE --speculative-eagle-topk 1 --speculative-num-steps 3 --speculative-num-draft-tokens 4` (or `--speculative-num-steps 5 --speculative-num-draft-tokens 6`) and `SGLANG_ENABLE_EMBED_REPLICATION=1`. Without NVLink multicast (no all-reduce fusion), set `SGLANG_NVIDIA_MEGAKERNEL_GLM_ALLOW_NO_AR_FUSION=1`.
 
 ### Speculative step graph (any EAGLE v2 model)
 

@@ -34,9 +34,6 @@ SGLANG_READS = {
     "srt/models/deepseek_v2.py": ("set_embed_and_head", "logits_processor", "lm_head"),
 }
 
-# draft decode: one row per request; draft extend: 4 rows per request
-DRAFT_ROWS = (1, 2, 3, 4, 8, 12, 16)
-
 # The draft top-1 is the stock argmax of the same logits (the distributed argmax
 # keeps its NaN and tie rules); the embedding front is bitwise fused_eh_norm.
 NUMERICS = Numerics(
@@ -49,12 +46,13 @@ class _BuiltDraft:
     """The installed draft forward: armed steps run the fused draft layer."""
 
     draft_sampler = None
-    widths = DRAFT_ROWS
 
     def __init__(self, model):
         from sgl_nvidia_mega.glm_dsa import draft
 
         self.model = model
+        # draft decode: one row per request; draft extend: one per verify token
+        self.widths = draft.served_eh_rows()
         self.fused = draft.create_fused_draft(model)
         model.logits_processor = draft.make_draft_logits_processor(
             model.config, self.fused
@@ -120,7 +118,8 @@ SPEC = MegakernelSpec(
     features=frozenset({Feature.SPECULATIVE_DECODING, Feature.MULTI_NODE_TP}),
     numerics=NUMERICS,
     # 0 keeps SGLang's draft forward (no step covered, nothing installed)
-    max_rows=max(DRAFT_ROWS) if switches.fused_draft() else 0,
+    # the draft extend at the widest covered width (draft.served_eh_rows)
+    max_rows=target.MAX_ROWS if switches.fused_draft() else 0,
     build=_build,
     api_version=target.API_VERSION,
 )

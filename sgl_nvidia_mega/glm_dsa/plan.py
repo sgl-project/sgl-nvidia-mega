@@ -12,9 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
-from sgl_nvidia_mega.glm_dsa.eligibility import SUPPORTED_ROWS, VERIFY_TOKENS_PER_REQUEST
+from sgl_nvidia_mega.glm_dsa.eligibility import MAX_ROWS  # noqa: F401
 
-MAX_ROWS = max(SUPPORTED_ROWS)
 
 # Steps of each group in call order (for logging, rank agreement, tests).
 STEPS = {
