@@ -511,6 +511,7 @@ class TestAdmission(unittest.TestCase):
                         scratch={"mla.query": query},
                         max_seq_len=262144 + (q if q > 1 else 0),
                         mla_core=selected,
+                        dcp_resources=None,
                         tokens_per_request=q,
                         workspaces={},
                         device=torch.device("cuda:0"),

@@ -19,7 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from sglang.srt.distributed.communication_op import (
@@ -43,6 +43,9 @@ from .projection_storage import (
     coalesce_mla_projection_storage,
 )
 from .shape_policy import MAX_ROWS, mla_max_seq_len, prepared_widths
+
+if TYPE_CHECKING:
+    from .dcp_resources import DcpBuildOptions
 
 PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
 _MAX_BATCH = MAX_ROWS
@@ -602,6 +605,7 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    dcp: Any | None = None
     prefetch: Any | None = None
     embedding: Any | None = None
     tokens_per_request: int = 1
@@ -874,7 +878,28 @@ class ResourceSet:
         }
         return binding
 
+    def prepare_dcp_mla_caches(self, caches: dict[int, torch.Tensor]) -> None:
+        """Private MLA-only handoff, not a legacy or full-model pool binding."""
+        if self.dcp is None:
+            raise RuntimeError("DCP resources were not explicitly requested")
+        self.dcp.prepare_mla_caches(self.attention, caches)
+        workspace = self.dcp.workspace
+        self.workspaces["mla.dcp.tokenspeed.workspace"] = workspace
+        row = _tensor_row(
+            "workspace", "resources.workspaces.mla.dcp.tokenspeed.workspace", workspace
+        )
+        if not any(
+            item["data_ptr"] == row["data_ptr"] for item in self.resource_inventory
+        ):
+            self.resource_inventory.append(row)
+            self.resource_inventory.sort(key=lambda item: (item["kind"], item["name"]))
+        self.resource_digest = _pointer_free_digest(self.resource_inventory)
+        # Deliberately leave binding_fingerprint unset: no KDA/step binding exists
+        # in this resource-only checkpoint, and the full executor must refuse it.
+
     def bind(self, hybrid: HybridPoolView) -> None:
+        if self.dcp is not None:
+            raise RuntimeError("private DCP requires a separate native hybrid binding")
         if self.tokens_per_request > 1 and self.aux_capture_layers is None:
             raise RuntimeError(
                 "Kimi K3 DSPARK auxiliary taps must be prepared before binding"
@@ -962,8 +987,13 @@ def build_resources(
     enable_embedding: bool = False,
     widths: tuple[int, ...] | None = None,
     mla_core: str = "trtllm",
+    dcp: DcpBuildOptions | None = None,
 ) -> ResourceSet:
-    """Build TP8 providers; optional prefetch and embedding are opt-in at build."""
+    """Build TP8 providers; private DCP preparation requires explicit options.
+
+    DCP does not enable a spec or full-model binding. Its resources can only be
+    prepared by the separate private MLA cache handoff.
+    """
 
     if type(enable_prefetch) is not bool:
         raise ValueError("enable_prefetch must be a bool")
@@ -973,6 +1003,19 @@ def build_resources(
     batches = prepared_widths(tokens_per_request, widths)
     max_seq_len = mla_max_seq_len(context_length, tokens_per_request)
     memory_before = dict(memory_before)
+    dcp_owner = None
+    if dcp is not None:
+        from .dcp_resources import DcpResources, NativeDcpOwner, PreparedDcpMla
+
+        dcp_owner = NativeDcpOwner.capture(
+            dcp,
+            device=next(model.parameters()).device,
+            tokens_per_request=tokens_per_request,
+            deadline_ns=deadline_ns,
+            widths=batches,
+            max_context=max_seq_len,
+            mla_core=mla_core,
+        )
     origins: dict[str, str] = {}
     projection_module = _module("gemm.projection", origins)
     mla_module = _module("mla.prepared", origins)
@@ -1042,6 +1085,17 @@ def build_resources(
         "small_batch": small_box,
         "moe_tail": tail_box,
     }
+    dcp_resources = None
+    if dcp_owner is not None:
+        dcp_resources = DcpResources(
+            dcp_owner,
+            dcp,
+            _module("mla.dcp", origins),
+            widths=batches,
+            max_context=max_seq_len,
+            deadline_ns=deadline_ns,
+        )
+        boxes["mla.dcp"] = dcp_resources.box
     moe_state = prepared_moe_module.MoEScratch(tp, device, batches)
     # Materialize the state-owned event handles before resource inventory.  The
     # prepared MoE records them again at each execution boundary, so completing
@@ -1142,10 +1196,20 @@ def build_resources(
                 scratch["mla.query"],
                 max_context=max_seq_len,
                 core=mla_core,
-                dcp=None,
+                dcp=None if dcp_resources is None else dcp_resources.box,
                 queries=(tokens_per_request,),
+                **(
+                    {}
+                    if dcp_resources is None
+                    else {
+                        "parity": full_ids.index(layer_id) % 2,
+                        "deadline_ns": deadline_ns,
+                    }
+                ),
             )
-            if mla_core == "tokenspeed":
+            if dcp_resources is not None:
+                core = PreparedDcpMla(core, dcp_resources)
+            elif mla_core == "tokenspeed":
                 core = _PreparedTokenSpeedMla(core, _module("mla.dcp", origins))
             elif not workspaces:
                 workspace, counter = _prepare_mla_workspace(
@@ -1370,6 +1434,7 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        dcp=dcp_resources,
         prefetch=prefetch,
         embedding=embedding,
         tokens_per_request=tokens_per_request,

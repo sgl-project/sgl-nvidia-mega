@@ -187,7 +187,13 @@ class PreparedMla:
         shape, bf16 = (max(pitches, default=0), self.heads, 512), torch.bfloat16
         self.latent = torch.empty(shape, dtype=bf16, device=self.device)
 
-    def prepare_cache(self, kv):
+    def prepare_cache(self, kv, *, prewarm=None):
+        # A fresh DCP mailbox contains non-finite sentinel query bytes. Only an
+        # explicit resource owner may prewarm with independent finite inputs.
+        if self.dcp is not None and kv.is_cuda and prewarm is None:
+            raise ValueError("DCP cache preparation requires a finite prewarm owner")
+        if self.dcp is None and prewarm is not None:
+            raise ValueError("custom MLA prewarm is only supported for private DCP")
         specs = tuple(layout(w) for w in (*self.weights, kv.view(torch.uint8)))
         for batch, q in self.cores:
             device = self.device.index
@@ -202,9 +208,12 @@ class PreparedMla:
             if self.dcp is not None:
                 self.prepare_dcp(batch)
             if kv.is_cuda:  # compile before graph capture
-                table = torch.zeros(batch, 1, dtype=torch.int32, device=kv.device)
-                ones = torch.full((batch,), q, dtype=torch.int32, device=kv.device)
-                self.stock_core(kv, table, ones, batch, q, ones)
+                if prewarm is not None:
+                    prewarm(self, batch, q)
+                else:
+                    table = torch.zeros(batch, 1, dtype=torch.int32, device=kv.device)
+                    ones = torch.full((batch,), q, dtype=torch.int32, device=kv.device)
+                    self.stock_core(kv, table, ones, batch, q, ones)
         return self
 
     def prepare_dcp(self, batch):

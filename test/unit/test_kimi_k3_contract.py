@@ -62,8 +62,10 @@ MEGAKERNEL_API_VERSION = registry.MEGAKERNEL_API_VERSION
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 # Includes KDA/AttnRes, embedding-shard and private DCP wait-deadline adaptations.
+# Private DCP resource checkpoint adds host handle ownership and finite prewarm
+# dispatch only; existing kernel/JIT/compiler/numerical method ASTs are unchanged.
 FROZEN_PAYLOAD_SHA256 = (
-    "797734320821b00d45d1c5b8cff9fa625eedba85e47b26ee01b91ae0ae0bb8e4"
+    "24b161022f6e92d7644501e9a9fe81ea98cbfaca2663d035524c2083cf4fbd0a"
 )
 
 

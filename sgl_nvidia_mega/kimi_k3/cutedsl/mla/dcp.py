@@ -55,6 +55,15 @@ Q_SENT = 0xFFFFFFFF  # four FP8 0xFF bytes: never written (satfinite, canonical 
 PAIR_SENT = 0x80000000  # BF16 pair (+0, -0); sent pairs have no negative zero
 
 
+class _DcpTransportOwner:
+    """Opaque borrowed group plus strong symmetric handles, not tensor inventory."""
+
+    __slots__ = ("group", "handles")
+
+    def __init__(self, group, handles):
+        self.group, self.handles = group, tuple(handles)
+
+
 class DcpBox:
     """Model-owned DCP state over ``group``, Lamport mailboxes (sentinel-filled,
     re-armed by their reader): q [2, CAP, DCP*H, 576] FP8 bytes (multicast stores),
@@ -71,10 +80,15 @@ class DcpBox:
         self.partial = empty((*shape, 512), dtype=torch.bfloat16, device=device)
         self.lse = empty(shape, dtype=torch.float32, device=device)
         tensors = (self.q, self.partial, self.lse)
-        handles = [symm_mem.rendezvous(t, group) for t in tensors]
+        handles = tuple(symm_mem.rendezvous(t, group) for t in tensors)
+        self._transport_owner = _DcpTransportOwner(group, handles)
         self.q_mc = int(handles[0].multicast_ptr or 0)
-        if not self.q_mc:
+        if self.q_mc <= 0:
             raise RuntimeError("Kimi K3 specialized MLA DCP needs multicast memory")
+        for handle in handles:
+            pointers = handle.buffer_ptrs
+            if len(pointers) != size or any(int(pointer) <= 0 for pointer in pointers):
+                raise RuntimeError("Kimi K3 MLA DCP symmetric peer geometry differs")
         i64 = dict(dtype=torch.int64, device=device)
         self.peers = torch.tensor(handles[1].buffer_ptrs, **i64)
         self.lse_peers = torch.tensor(handles[2].buffer_ptrs, **i64)
@@ -86,6 +100,14 @@ class DcpBox:
         self.rows_lse = torch.empty(rows, dtype=torch.float32, device=device)
         torch.accelerator.synchronize(device)
         torch.distributed.barrier(group=group)
+
+    @property
+    def handles(self):
+        return self._transport_owner.handles
+
+    @property
+    def device_group(self):
+        return self._transport_owner.group
 
     def mc(self, parity):
         """The q mailbox multicast address of ``parity``."""

@@ -429,6 +429,7 @@ class TestPrefetchAdmission(unittest.TestCase):
             return value
 
         namespace = {
+            "dcp_resources": None,
             "__builtins__": {**vars(builtins), "__import__": import_module},
             "_module": payload,
             "ResourceSet": resources,
