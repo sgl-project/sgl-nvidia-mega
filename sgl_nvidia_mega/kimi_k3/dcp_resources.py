@@ -202,6 +202,25 @@ class NativeDcpOwner:
     def device_group(self):
         return self._owners[4]
 
+    def agreement_group(self):
+        """Original native CPU route, even if the current parallel view is stale.
+
+        Never select a replacement group. If the retained coordinator's CPU
+        route itself changed, safe agreement is impossible: fail and tear down
+        the worker group (peers retain the native CPU-group timeout).
+        """
+        group = self._owners[0]
+        if (
+            tuple(id(value) for value in self._owners) != self._owner_ids
+            or group.cpu_group is not self._owners[3]
+            or type(group.world_size) is not int
+            or group.world_size != self._snapshot[1][0][5]
+        ):
+            raise RuntimeError(
+                "private DCP retained native TP CPU agreement route changed"
+            )
+        return group
+
     def assert_live(self):
         try:
             current = _group_snapshot(self._lookup())
@@ -249,6 +268,7 @@ class DcpResources:
             )
         owner.check_plan(options, widths, max_context, deadline_ns)
         self.owner, self.options = owner, options
+        self._agreement_owner = owner
         self.widths, self.deadline_ns = tuple(widths), deadline_ns
         self.device = owner.device
         self.attention_heads = options.size * options.heads
@@ -281,6 +301,12 @@ class DcpResources:
         self._seals = {name: _identity(tensor) for name, tensor in self._tensors()}
         self._handle_ids = tuple(id(handle) for handle in self.box.handles)
         self.owner.assert_live()
+
+    def agreement_group(self):
+        """The originally captured native CPU route, not a replaced owner field."""
+        if id(self._agreement_owner) != self._box_geometry[0]:
+            raise RuntimeError("private DCP retained agreement owner changed")
+        return self._agreement_owner.agreement_group()
 
     def _tensors(self):
         for name in ("q", "partial", "lse", "peers", "lse_peers", "rows", "rows_lse"):

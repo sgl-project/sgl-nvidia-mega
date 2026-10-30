@@ -220,7 +220,6 @@ class KimiK3MegakernelExecutor:
         view: HybridStepView,
     ) -> torch.Tensor:
         resources = self.resources
-        prefetch = getattr(resources, "prefetch", None)
         if resources.binding_fingerprint is None:
             raise RuntimeError(
                 "Kimi K3 megakernel pools were not bound before graph warmup"
@@ -265,6 +264,57 @@ class KimiK3MegakernelExecutor:
             if q > 1
             else {}
         )
+        return self._run_layers(
+            input_ids,
+            inputs_embeds,
+            view.kda,
+            batch,
+            q,
+            mla_slots,
+            mla_lengths,
+            view.mla,
+            auxiliary,
+        )
+
+    def run_dcp(self, input_ids, inputs_embeds, *, prepared, bucket):
+        """Explicit private q1 entry; no native metadata updates or replay hooks."""
+        from .dcp_execution import PreparedDcpHybrid, validate_step
+
+        if not isinstance(prepared, PreparedDcpHybrid):
+            raise ValueError("private DCP execution requires prepared hybrid owners")
+        view = prepared.step_view(self.resources, bucket)
+        validate_step(self.resources, input_ids, inputs_embeds, view)
+        return self._run_layers(
+            input_ids,
+            inputs_embeds,
+            view.kda,
+            int(input_ids.shape[0]),
+            1,
+            view.mla.canonical_write_slots,
+            view.mla.local_sequence_lengths,
+            view.mla,
+            {},
+            totals=view.mla.global_sequence_lengths,
+        )
+
+    def _run_layers(
+        self,
+        input_ids,
+        inputs_embeds,
+        kda,
+        batch,
+        q,
+        mla_slots,
+        mla_lengths,
+        mla,
+        auxiliary,
+        *,
+        totals=None,
+    ):
+        """Shared arithmetic/order; only the explicit private entry supplies totals."""
+        resources = self.resources
+        prefetch = getattr(resources, "prefetch", None)
+        kda_slots = kda.state_indices
         if inputs_embeds is not None:
             x = inputs_embeds
         elif resources.embedding is not None:
@@ -308,9 +358,12 @@ class KimiK3MegakernelExecutor:
                     local,
                     cache=attention.cache,
                     slots=mla_slots,
-                    block_table=view.mla.block_table,
+                    block_table=mla.block_table
+                    if totals is None
+                    else mla.local_block_table,
                     lengths=mla_lengths,
                     q=q,
+                    **({} if totals is None else {"totals": totals}),
                 )
                 if prefetch is not None:
                     prefetch.fork("attention_moe", layer_id, batch)
@@ -326,13 +379,13 @@ class KimiK3MegakernelExecutor:
                         caches=attention.caches,
                         slots=kda_slots,
                         intermediates=attention.intermediates,
-                        scratch_indices=view.kda.verify_scratch_indices,
+                        scratch_indices=kda.verify_scratch_indices,
                     )
                 else:
                     attention.core.run(
                         projected, local, caches=attention.caches, slots=kda_slots
                     )
-                    view.kda.track_decode_state(layer_id)
+                    kda.track_decode_state(layer_id)
             attention.output.run(local, prefix, blocks, second)
             if prefetch is not None:
                 prefetch.fork("oproj_down", layer_id, batch)

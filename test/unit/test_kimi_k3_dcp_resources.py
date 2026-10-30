@@ -194,6 +194,40 @@ class TestNativeOwner(unittest.TestCase):
             fixture.agree.call_args.kwargs["group"], fixture.parallel.tp_group
         )
 
+    def test_agreement_route_retains_original_cpu_group_after_current_replacement(self):
+        fixture = NativeFixture()
+        owner = fixture.capture()
+        original = fixture.parallel.tp_group
+        fixture.parallel.tp_group = parallel().tp_group
+        with self.assertRaisesRegex(RuntimeError, "native group changed"):
+            owner.assert_live()
+        self.assertIs(owner.agreement_group(), original)
+        self.assertIsNot(owner.agreement_group(), fixture.parallel.tp_group)
+
+    def test_damaged_retained_agreement_route_refuses_without_replacement(self):
+        for field, value in (
+            ("cpu_group", Token()),
+            ("world_size", 7),
+            ("world_size", True),
+        ):
+            fixture = NativeFixture()
+            owner = fixture.capture()
+            setattr(fixture.parallel.tp_group, field, value)
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(RuntimeError, "CPU agreement route changed"),
+            ):
+                owner.agreement_group()
+
+    def test_resources_keep_original_agreement_owner_when_public_owner_is_stale(self):
+        fixture = ResourceFixture()
+        original = fixture.resources.agreement_group()
+        fixture.resources.owner = Token()
+        self.assertIs(fixture.resources.agreement_group(), original)
+        fixture.resources._agreement_owner = Token()
+        with self.assertRaisesRegex(RuntimeError, "retained agreement owner changed"):
+            fixture.resources.agreement_group()
+
     def test_invalid_configuration_still_agrees_before_raising(self):
         for change in (
             {"tokens_per_request": 6},
