@@ -121,6 +121,12 @@ python -m sglang.launch_server \
 
 The three environment variables are required by the DeepSeek-V4.1 spec; without them the server stops at startup, naming each.
 
+An experimental 148-SM B300 profile adds
+`SGLANG_NVIDIA_MEGAKERNEL_B300_CC1=1` to that environment. It requires
+`--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and
+`--speculative-dspark-block-size 5`; larger batch configurations are refused at
+startup. The default profile retains the 152-SM requirement.
+
 Qwen3.5, on each of the two trays (`--node-rank 0` and `1`):
 
 ```bash
