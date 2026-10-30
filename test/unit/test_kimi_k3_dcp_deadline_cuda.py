@@ -182,7 +182,7 @@ def _value_fixture(device, kind, missing):
         to_cute(lse[0, 0], 4),
         to_cute(peers, 8),
         to_cute(lpeers, 8),
-        to_cute(mailbox),
+        to_cute(mailbox[:capacity]),
         to_cute(uv),
         to_cute(projected[:, 2112:]),
         to_cute(lens, 4),
@@ -227,7 +227,8 @@ def _value_fixture(device, kind, missing):
     return launch, check
 
 
-def worker(kind, missing, report_path):
+def worker(kind, missing, report_path, *, plugin_import_root=None):
+    import_root = Path(plugin_import_root or ROOT).resolve()
     report = {
         "scope": "one_gpu_dcp_wait_mechanism_only",
         "kind": kind,
@@ -236,6 +237,7 @@ def worker(kind, missing, report_path):
         "deadline_ns": DEADLINE_NS,
         "status": "FAIL",
         "distributed_transport": "NOT_RUN",
+        "plugin_import_root": str(import_root),
     }
     _save(report_path, report)
     try:
@@ -251,7 +253,7 @@ def worker(kind, missing, report_path):
             for name in sys.modules
         ):
             raise RuntimeError("Fresh plugin process required")
-        sys.path.insert(0, str(ROOT))
+        sys.path.insert(0, str(import_root))
         torch.cuda.set_device(0)
         device = torch.device("cuda", 0)
         launch, check = (
@@ -262,7 +264,9 @@ def worker(kind, missing, report_path):
         for name, module in tuple(sys.modules.items()):
             if name == "sgl_nvidia_mega" or name.startswith("sgl_nvidia_mega."):
                 origin = getattr(module, "__file__", None)
-                if origin is None or not Path(origin).resolve().is_relative_to(ROOT):
+                if origin is None or not Path(origin).resolve().is_relative_to(
+                    import_root
+                ):
                     raise RuntimeError(f"Plugin import escaped pinned source: {name}")
         torch.cuda.synchronize(device)
         report["stage"] = "launch"
@@ -275,9 +279,9 @@ def worker(kind, missing, report_path):
             report["launch_seconds"] = time.monotonic() - started
             if not missing or not _cuda_fault(error):
                 raise
-            if report["launch_seconds"] >= LAUNCH_BOUND_SECONDS:
+            if not DEADLINE_NS / 1e9 <= report["launch_seconds"] < LAUNCH_BOUND_SECONDS:
                 raise AssertionError(
-                    "Fail-stop exceeded bounded launch time"
+                    "Fault occurred outside the native deadline window"
                 ) from error
             report["cuda_fault"] = str(error)
             # The deliberate fault must poison THIS worker's context. Recovery
@@ -306,6 +310,67 @@ def worker(kind, missing, report_path):
 
 
 class TestDcpDeadlineFixture(unittest.TestCase):
+    def test_immediate_sticky_fault_is_not_a_deadline_success(self):
+        def bad_launch():
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        from contextlib import ExitStack
+
+        with tempfile.TemporaryDirectory(prefix="kimi-dcp-deadline-host-") as temporary:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(sys, "platform", "linux"))
+                stack.enter_context(patch.dict(sys.modules))
+                for name in list(sys.modules):
+                    if name == "sgl_nvidia_mega" or name.startswith("sgl_nvidia_mega."):
+                        del sys.modules[name]
+                stack.enter_context(
+                    patch.object(torch.cuda, "is_available", return_value=True)
+                )
+                stack.enter_context(
+                    patch.object(torch.cuda, "device_count", return_value=1)
+                )
+                stack.enter_context(
+                    patch.object(
+                        torch.cuda, "get_device_capability", return_value=(10, 3)
+                    )
+                )
+                stack.enter_context(patch.object(torch.cuda, "set_device"))
+                stack.enter_context(patch.object(torch.cuda, "synchronize"))
+                stack.enter_context(
+                    patch.object(time, "monotonic", side_effect=(10.0, 10.001))
+                )
+                stack.enter_context(
+                    patch.dict(
+                        worker.__globals__,
+                        _query_fixture=lambda *_: (bad_launch, lambda: None),
+                    )
+                )
+                report = worker("query", True, Path(temporary) / "report.json")
+            self.assertEqual(report["status"], "FAIL")
+            self.assertIn("outside the native deadline window", report["error"])
+            self.assertNotIn("sticky_cuda_fault", report)
+
+    def test_value_mailbox_view_matches_compiled_capacity(self):
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(_value_fixture)))
+        views = [
+            node.args[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "to_cute"
+            and node.args
+        ]
+        self.assertEqual(
+            sum(ast.unparse(view) == "mailbox[:capacity]" for view in views), 1
+        )
+        self.assertFalse(
+            any(isinstance(view, ast.Name) and view.id == "mailbox" for view in views)
+        )
+
     def test_worker_refuses_non_native_execution_before_fixture_import(self):
         with tempfile.TemporaryDirectory(prefix="kimi-dcp-deadline-host-") as temporary:
             with patch.object(sys, "platform", "darwin"):
@@ -379,11 +444,17 @@ if __name__ == "__main__":
     parser.add_argument("--worker", choices=KINDS)
     parser.add_argument("--missing", action="store_true")
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--plugin-import-root", type=Path)
     args, remaining = parser.parse_known_args()
     if args.worker:
         if args.report is None:
             parser.error("--worker requires --report")
-        outcome = worker(args.worker, args.missing, args.report)
+        outcome = worker(
+            args.worker,
+            args.missing,
+            args.report,
+            plugin_import_root=args.plugin_import_root,
+        )
         raise SystemExit(
             0 if outcome["status"] in ("PASS", "FAIL_STOP_OBSERVED") else 1
         )
