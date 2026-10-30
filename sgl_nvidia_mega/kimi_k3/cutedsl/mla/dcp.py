@@ -42,6 +42,8 @@ from ..common.primitives import (
     store_shared_words,
     store_words,
     unpack_bf16,
+    wait_deadline_check,
+    wait_deadline_start,
     warp_sum,
     zeros,
 )
@@ -99,9 +101,13 @@ class DcpValue:
     polled rows in FP32
     (one BF16 rounding, re-arming what it read) into shared memory, and W_UV (BF16
     MMA, FP32 accumulation) and the sigmoid gate follow as in MlaValue: warp w owns
-    outputs 32 (w // 4) + 8 (w % 4) .. + 7. Rows are tokens, ``q`` per request."""
+    outputs 32 (w // 4) + 8 (w % 4) .. + 7. Rows are tokens, ``q`` per request.
+    Both remote waits use the required positive compile-time ``deadline_ns``."""
 
-    def __init__(self, heads, size, batch, sms=148, q=1):
+    def __init__(self, heads, size, batch, sms=148, q=1, *, deadline_ns):
+        if type(deadline_ns) is not int or not 0 < deadline_ns < (1 << 63):
+            raise ValueError("MLA DCP requires a positive int64 wait deadline")
+        self.deadline_ns = deadline_ns
         self.heads, self.size, self.batch = heads, size, batch
         self.q = q
         # Push-only CTAs (z > 0) spread the NVLink stores over more SMs: up to one
@@ -182,7 +188,11 @@ class DcpValue:
             if lane < D:
                 source = at(lbox, lane, t0 + warp, head)
                 word = load_volatile(source)[0]
+                started, polls = Int64(0), Int32(0)
+                if word == Uint32(LSE_SENT):
+                    started = wait_deadline_start(self.deadline_ns)
                 while word == Uint32(LSE_SENT):
+                    polls = wait_deadline_check(started, polls, self.deadline_ns)
                     word = load_volatile(source)[0]
                 store_words(source, (Uint32(LSE_SENT),))
                 lse = bits_float(word)
@@ -212,7 +222,13 @@ class DcpValue:
                     loads = [load_volatile(source, count=4) for source in sources]
                     for i in cutlass.range_constexpr(len(sources)):
                         words = loads[i]
+                        started, polls = Int64(0), Int32(0)
+                        if not published(words):
+                            started = wait_deadline_start(self.deadline_ns)
                         while not published(words):
+                            polls = wait_deadline_check(
+                                started, polls, self.deadline_ns
+                            )
                             words = load_volatile(sources[i], count=4)
                         store_words(sources[i], (Uint32(PAIR_SENT),) * 4)
                         w = scales[r, s0 + i]
@@ -255,7 +271,9 @@ class DcpValue:
 
 
 @cache
-def compile_value(heads, size, batch, cap, uv, pitch, device, sms=148, q=1):
+def compile_value(
+    heads, size, batch, cap, uv, pitch, device, sms=148, q=1, *, deadline_ns
+):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
     KV columns)."""
@@ -272,7 +290,9 @@ def compile_value(heads, size, batch, cap, uv, pitch, device, sms=148, q=1):
     args: tuple = (rows, rows_lse, lens, box, lbox, peers, peers, mailbox, w_uv)
     args += (gate, lens, output, Int32(0), Int32(0), make_fake_stream())
     with torch.accelerator.device_index(device):
-        return cute.compile(DcpValue(heads, size, batch, sms, q), *args)
+        return cute.compile(
+            DcpValue(heads, size, batch, sms, q, deadline_ns=deadline_ns), *args
+        )
 
 
 _WORKSPACE: dict[tuple[torch.device, int], torch.Tensor] = {}

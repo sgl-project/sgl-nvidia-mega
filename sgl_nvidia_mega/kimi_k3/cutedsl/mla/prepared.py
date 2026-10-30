@@ -31,7 +31,9 @@ _FLASHINFER: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] =
 
 
 @cache
-def compile_core(batch, heads, pitch, specs, device, dcp=0, sms=148, q=1):
+def compile_core(
+    batch, heads, pitch, specs, device, dcp=0, sms=148, q=1, *, deadline_ns=0
+):
     """CuTe kernels (query, value) of one batch of rows (``q`` per request); under DCP
     (``dcp``: its size) the query publishes and the value is DcpValue."""
     qnorm, kvnorm, qb, uk, uv, qinv, kinv, kv = (
@@ -47,7 +49,10 @@ def compile_core(batch, heads, pitch, specs, device, dcp=0, sms=148, q=1):
     latent = fake((batch, heads, 512))
     f32, s = cutlass.Float32, make_fake_stream()
     cp_async = heads == 12 and batch == 1
-    mla_query = MlaQuery(heads, batch, q_b_cp_async=cp_async, dcp=dcp)
+    deadline = {"deadline_ns": deadline_ns} if dcp else {}
+    if not dcp and (type(deadline_ns) is not int or deadline_ns != 0):
+        raise ValueError("MLA wait deadline is only supported with DCP")
+    mla_query = MlaQuery(heads, batch, q_b_cp_async=cp_async, dcp=dcp, **deadline)
     q_args: tuple = (projected, qnorm, kvnorm, qb, uk, kv, slots, qinv, kinv)
     q_args += (f32(1e-6), query)
     if dcp:  # this parity's q mailbox, its multicast address, rank
@@ -60,7 +65,9 @@ def compile_core(batch, heads, pitch, specs, device, dcp=0, sms=148, q=1):
         if dcp:
             uv_spec = specs[4]
             kernels.append(
-                compile_value(heads, dcp, batch, 64, uv_spec, pitch, device, sms, q)
+                compile_value(
+                    heads, dcp, batch, 64, uv_spec, pitch, device, sms, q, **deadline
+                )
             )
         else:
             v_args = (latent, uv, gate, lengths, output, s)
@@ -134,7 +141,8 @@ class PreparedMla:
     """``max_context`` (the deployment's longest sequence) bounds the split count;
     ``core`` forces "tokenspeed" or "trtllm". ``dcp``: the model's DcpBox, with this
     layer's mailbox ``parity``. ``queries``: the query lengths q (spec verify: 1 + the
-    draft length) prepared for every batch of rows divisible by q."""
+    draft length) prepared for every batch of rows divisible by q. ``deadline_ns``
+    is required positive with DCP; it is not passed to DCP-off compiler keys."""
 
     def __init__(
         self,
@@ -147,7 +155,14 @@ class PreparedMla:
         dcp=None,
         parity=0,
         queries=(1,),
+        deadline_ns=0,
     ):
+        if dcp is not None:
+            if type(deadline_ns) is not int or not 0 < deadline_ns < (1 << 63):
+                raise ValueError("MLA DCP requires a positive int64 wait deadline")
+        elif type(deadline_ns) is not int or deadline_ns != 0:
+            raise ValueError("MLA wait deadline is only supported with DCP")
+        self.deadline_ns = deadline_ns
         self.heads = attention.W_UK_T.shape[0]
         norms = attention.q_a_layernorm.weight, attention.kv_a_layernorm.weight
         self.weights: tuple = (*norms, attention.q_b_proj.weight, attention.W_UK_T)
@@ -182,7 +197,8 @@ class PreparedMla:
             args = batch, self.heads, pitch, specs, device, dcp, sms, q
             query = to_cute(self.query_scratch[:batch])
             latent = to_cute(self.latent[:batch])
-            self.kernels[batch, q] = (*compile_core(*args), query, latent)
+            deadline = {"deadline_ns": self.deadline_ns} if dcp else {}
+            self.kernels[batch, q] = (*compile_core(*args, **deadline), query, latent)
             if self.dcp is not None:
                 self.prepare_dcp(batch)
             if kv.is_cuda:  # compile before graph capture

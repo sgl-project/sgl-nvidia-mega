@@ -5,7 +5,7 @@ Static weights load before the PDL wait; current-token data is consumed after it
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..common.primitives import (
     alloc,
@@ -35,6 +35,8 @@ from ..common.primitives import (
     unpack_bf16,
     view,
     wait,
+    wait_deadline_check,
+    wait_deadline_start,
     warp_sum,
     zeros,
 )
@@ -56,7 +58,8 @@ class MlaQuery:
     mailbox, its multicast address and the rank): each CTA also multicasts the query
     bytes it wrote into head block ``rank`` of every rank's Lamport q mailbox
     (mla.dcp.DcpBox), then polls its share of the gathered mailbox until no word is
-    the sentinel, so the next kernel reads the gathered query."""
+    the sentinel, so the next kernel reads the gathered query. DCP requires a
+    positive compile-time ``deadline_ns``; DCP-off calls keep the zero default."""
 
     def __init__(
         self,
@@ -65,7 +68,14 @@ class MlaQuery:
         *,
         q_b_cp_async: bool = False,
         dcp: int = 0,
+        deadline_ns: int = 0,
     ):
+        if dcp:
+            if type(deadline_ns) is not int or not 0 < deadline_ns < (1 << 63):
+                raise ValueError("MLA DCP requires a positive int64 wait deadline")
+        elif type(deadline_ns) is not int or deadline_ns != 0:
+            raise ValueError("MLA wait deadline is only supported with DCP")
+        self.deadline_ns = deadline_ns
         tiled = TILED_FROM[heads]
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
         self.dcp = dcp
@@ -137,7 +147,11 @@ class MlaQuery:
             loads = [load_volatile(source, count=4) for source in sources]
             for i in cutlass.range_constexpr(n):  # the loads above are in flight
                 words = loads[i]
+                started, polls = Int64(0), Int32(0)
+                if not published(words, sentinel=Q_SENT):
+                    started = wait_deadline_start(self.deadline_ns)
                 while not published(words, sentinel=Q_SENT):
+                    polls = wait_deadline_check(started, polls, self.deadline_ns)
                     words = load_volatile(sources[i], count=4)
 
     @cute.kernel
