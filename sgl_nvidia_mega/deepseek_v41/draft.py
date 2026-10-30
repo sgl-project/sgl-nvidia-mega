@@ -129,7 +129,6 @@ SPEC = MegakernelSpec(
         tp_sizes=target.SPEC.requires.tp_sizes,
         dtypes=target.SPEC.requires.dtypes,
         decode_graph_backends=target.SPEC.requires.decode_graph_backends,
-        resident_blocks=148 if target.B300_CC1 else 0,
     ),
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     numerics=NUMERICS,

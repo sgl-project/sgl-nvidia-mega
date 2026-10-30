@@ -5,10 +5,6 @@ registers it: the documented setup passes, and every other setup is refused at
 argument resolution with each reason named."""
 
 import contextlib
-import json
-import os
-import subprocess
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -170,80 +166,17 @@ def test_the_draft_spec_follows_the_target_spec():
     assert draft.SPEC.max_rows == (48 if "draft" in runtime.SLOTS else 0)
 
 
-def test_b300_capacity_is_opt_in():
-    code = """
-import json
-from sgl_nvidia_mega.deepseek_v41 import spec, draft
-print(json.dumps([spec.SPEC.requires.resident_blocks, draft.SPEC.requires.resident_blocks]))
-"""
-    for enabled, expected in [(False, [152, 0]), (True, [148, 148])]:
-        env = dict(os.environ)
-        env.pop("SGLANG_NVIDIA_MEGAKERNEL_B300_CC1", None)
-        if enabled:
-            env["SGLANG_NVIDIA_MEGAKERNEL_B300_CC1"] = "1"
-        output = subprocess.check_output(
-            [sys.executable, "-c", code], env=env, text=True
-        )
-        assert json.loads(output.splitlines()[-1]) == expected
+def test_sm148_lowers_the_targets_sm_floor_by_name(monkeypatch):
+    """The target needs GB300's 152 SMs, or a B300's 148 with "sm148" listed, a name
+    the slot check knows; the draft needs none."""
+    from sgl_nvidia_mega.deepseek_v41 import draft, runtime
 
-
-@pytest.mark.parametrize("sms, refused", [(147, True), (148, False), (152, False)])
-def test_b300_keeps_the_capacity_guard(monkeypatch, sms, refused):
-    requires = msgspec.structs.replace(spec.SPEC.requires, resident_blocks=148)
-    checked = msgspec.structs.replace(
-        spec.SPEC, requires=requires, model_disable_reasons=None
-    )
-    monkeypatch.setattr(guards.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        guards.torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(multi_processor_count=sms),
-    )
-    reasons = guards._model_disable_reasons(
-        spec=checked, model=SimpleNamespace(), hf_config=None
-    )
-    assert bool(reasons) == refused
-    if refused:
-        assert "147 SMs" in reasons[0] and "148" in reasons[0]
-
-
-@pytest.mark.parametrize(
-    "changes, reason",
-    [
-        ({}, None),
-        ({"max_running_requests": 2}, "max_running_requests=1"),
-        (
-            {
-                "cuda_graph_config": with_phase(
-                    default_cuda_graph_config(), Phase.DECODE, max_bs=2, bs=[1, 2]
-                )
-            },
-            "max_bs=1",
-        ),
-        ({"speculative_dspark_block_size": 6}, "speculative_dspark_block_size=5"),
-    ],
-)
-def test_b300_profile_is_batch_one(monkeypatch, changes, reason):
-    monkeypatch.setattr(spec, "B300_CC1", True)
-    args = dict(
-        max_running_requests=1,
-        speculative_dspark_block_size=5,
-        cuda_graph_config=with_phase(
-            default_cuda_graph_config(), Phase.DECODE, max_bs=1, bs=[1]
-        ),
-    )
-    args.update(changes)
-    refusal = _refusal(**args)
-    assert refusal == "" if reason is None else reason in refusal
-
-
-def test_b300_accepts_the_legacy_batch_one_cli_setting(monkeypatch):
-    monkeypatch.setattr(spec, "B300_CC1", True)
-    assert (
-        _refusal(
-            max_running_requests=1,
-            speculative_dspark_block_size=5,
-            cuda_graph_max_bs_decode=1,
-        )
-        == ""
-    )
+    monkeypatch.setattr(spec, "SLOTS", frozenset())
+    assert spec.resident_blocks() == 152
+    monkeypatch.setattr(spec, "SLOTS", frozenset({"sm148"}))
+    assert spec.resident_blocks() == 148
+    assert draft.SPEC.requires.resident_blocks == 0
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"sm148"}))
+    assert _refusal() == ""
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"sm184"}))
+    assert "unknown slot 'sm184'" in _refusal()

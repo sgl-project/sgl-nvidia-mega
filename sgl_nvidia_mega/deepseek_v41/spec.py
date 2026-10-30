@@ -49,13 +49,7 @@ SGLANG_READS = {
         "config_disable_reasons",
     ),
     # the decode CUDA graph backend _config_disable_reasons reads
-    "srt/model_executor/cuda_graph_config.py": (
-        "decode",
-        "backend",
-        '"disabled"',
-        "max_bs",
-        "bs",
-    ),
+    "srt/model_executor/cuda_graph_config.py": ("decode", "backend", '"disabled"'),
     "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
     "srt/arg_groups/fields/*.py": (
         "cuda_graph_config",
@@ -65,16 +59,12 @@ SGLANG_READS = {
         "dsv4_attn_backend",
         "enable_encoder_swa_bounded_replay",
         "startup_weight_load_mode",
-        "max_running_requests",
-        "speculative_dspark_block_size",
-        "cuda_graph_max_bs_decode",
     ),
 }
 
 ARCHITECTURE = "DeepseekV4ForCausalLM"
 # the SGLang megakernel contract this spec is written against
 API_VERSION = 2
-B300_CC1 = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_B300_CC1", "") == "1"
 # The FlashInfer low-latency GEMM file the wo_b publish epilogue subclasses, by the
 # sha256 of its source; it is byte-identical in FlashInfer 0.7.0, 0.7.1 and 0.7.2
 FLASHINFER_LL_GEMM = "gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py"
@@ -110,11 +100,17 @@ def decode_graph_backends() -> frozenset:
     return frozenset({"full", "disabled"} if eager_steps_allowed() else {"full"})
 
 
+def resident_blocks() -> int:
+    """GB300's 152 SMs, within which the GEMM pair's persistent schedule and the
+    Lamport consumer stay; with "sm148" listed, a B300's 148: no DeepSeek-V4.1 kernel
+    pins a 152-CTA grid."""
+    return 148 if "sm148" in SLOTS else 152
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     tp_sizes=frozenset({4}),
-    # The opt-in B300 profile is limited to one request and one decode graph batch.
-    resident_blocks=148 if B300_CC1 else 152,
+    resident_blocks=resident_blocks(),
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
     server_args={
@@ -260,17 +256,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
     reasons = toolchain_reasons() + runtime.slot_reasons()
-    if B300_CC1:
-        if cfg.max_running_requests != 1:
-            reasons.append("B300 CC1 needs max_running_requests=1")
-        decode = cfg.cuda_graph_config.decode
-        max_bs = decode.max_bs
-        if max_bs is None:
-            max_bs = cfg.cuda_graph_max_bs_decode
-        if max_bs != 1 or decode.bs not in (None, [1]):
-            reasons.append("B300 CC1 needs decode CUDA graph max_bs=1 and bs=[1]")
-        if cfg.speculative_dspark_block_size != 5:
-            reasons.append("B300 CC1 needs speculative_dspark_block_size=5")
     if cfg.cuda_graph_config.decode.backend == "disabled" and not eager_steps_allowed():
         reasons.append(
             "decode CUDA graphs are disabled: the eager forward is not supported yet; "
