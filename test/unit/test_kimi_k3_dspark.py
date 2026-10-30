@@ -214,7 +214,21 @@ def test_context_respects_native_model_cap_and_rope_policy_without_override():
             mla_max_seq_len(MAX_CONTEXT, q)
 
 
-def test_prepared_mla_uses_scheduling_hint_without_changing_backend_or_lengths():
+def test_prepared_mla_uses_scheduling_hint_and_preserves_default_backend():
+    assert (
+        inspect.signature(providers.build_resources).parameters["mla_core"].default
+        == "trtllm"
+    )
+    public_build = ast.parse(inspect.getsource(spec._build))
+    resource_calls = [
+        node
+        for node in ast.walk(public_build)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_resources"
+    ]
+    assert len(resource_calls) == 1
+    assert "mla_core" not in {item.arg for item in resource_calls[0].keywords}
     tree = ast.parse(inspect.getsource(providers.build_resources))
     hint = next(
         node
@@ -239,7 +253,7 @@ def test_prepared_mla_uses_scheduling_hint_without_changing_backend_or_lengths()
     kwargs = {item.arg: ast.unparse(item.value) for item in calls[0].keywords}
     assert kwargs == {
         "max_context": "max_seq_len",
-        "core": "'trtllm'",
+        "core": "mla_core",
         "dcp": "None",
         "queries": "(tokens_per_request,)",
     }
