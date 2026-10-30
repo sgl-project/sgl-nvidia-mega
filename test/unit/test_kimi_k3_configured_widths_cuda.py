@@ -6,8 +6,7 @@ Run this file on one SM103 GPU with the pinned native dependencies. Imports and
 compilation are real; no native entry point is mocked. Host execution only tests
 the CPU oracle and skips the three CUDA cases. A GPU run must execute all three.
 
-The q1 oracle adapts the existing DSpark probe's ``fp32_reference`` equations
-(``scripts/oci-jhb/megakernel_dspark/kda_state_probe.py``) to persistent q1 state.
+The q1 oracle applies the FP32 KDA reference equations to persistent q1 state.
 The BF16 F_B projection boundary and existing tolerances are retained. Projection
 checks follow the API2 component probe's PreparedProjection eager/graph pattern.
 """
