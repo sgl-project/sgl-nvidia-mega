@@ -61,9 +61,9 @@ NumericsKind = registry.NumericsKind
 MEGAKERNEL_API_VERSION = registry.MEGAKERNEL_API_VERSION
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
-# Includes the reviewed KDA and AttnRes adaptations documented beside each kernel.
+# Includes KDA/AttnRes, source-refresh and native embedding-shard adaptations.
 FROZEN_PAYLOAD_SHA256 = (
-    "8812156728bf7f7137727e70f9aa3480521a3a50a788924a99aaf3cdd65d944c"
+    "0482c8f8512dc0d37e27a2be5d2de3b7133910a398a654a16ec283755e71c8e1"
 )
 
 

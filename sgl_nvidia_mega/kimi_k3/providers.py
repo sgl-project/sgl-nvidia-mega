@@ -606,6 +606,7 @@ class ResourceSet:
     memory_after: dict[str, int]
     deadline_ns: int
     prefetch: Any | None = None
+    embedding: Any | None = None
     tokens_per_request: int = 1
     widths: tuple[int, ...] = ()
     aux_capture_layers: tuple[int, ...] | None = None
@@ -961,13 +962,16 @@ def build_resources(
     deadline_ns: int,
     tokens_per_request: int = 1,
     enable_prefetch: bool = False,
+    enable_embedding: bool = False,
     widths: tuple[int, ...] | None = None,
     mla_core: str = "trtllm",
 ) -> ResourceSet:
-    """Build TP8 providers after all-rank consensus; prefetch is opt-in at build."""
+    """Build TP8 providers; optional prefetch and embedding are opt-in at build."""
 
     if type(enable_prefetch) is not bool:
         raise ValueError("enable_prefetch must be a bool")
+    if type(enable_embedding) is not bool:
+        raise ValueError("enable_embedding must be a bool")
     _validate_mla_core(mla_core)
     batches = prepared_widths(tokens_per_request, widths)
     max_seq_len = mla_max_seq_len(context_length, tokens_per_request)
@@ -1017,6 +1021,18 @@ def build_resources(
             "Kimi layer modules disagree with the configured attention split"
         )
 
+    embedding = None
+    if enable_embedding:
+        from .embedding import prepare_embedding
+
+        embedding = prepare_embedding(
+            backbone.embed_tokens,
+            tp_group=parallel.tp_group,
+            load_prepared=lambda: (
+                _module("common.embedding", origins).PreparedEmbedding
+            ),
+        )
+
     mailbox = oproj_module.OprojMailbox(*owner)
     oproj_twoshot = twoshot_module.TwoShot(*owner)
     front_box = oproj_module.OprojMailbox(*owner, (1, 64, 3584 + 2 * 896))
@@ -1064,6 +1080,10 @@ def build_resources(
         ),
         "moe": moe_state,
     }
+    if embedding is not None:
+        scratch["embedding.out"] = torch.empty(
+            (_MAX_BATCH, 7168), dtype=torch.bfloat16, device=device
+        )
     if tokens_per_request > 1:
         # Native graph padding uses physical KDA slots <= 0, but MLA requires
         # zero lengths and negative write slots. Own the translated metadata
@@ -1100,6 +1120,8 @@ def build_resources(
     feed_forward: dict[int, Any] = {}
     moe_front_weights: dict[int, torch.Tensor] = {}
     compilation: list[dict[str, Any]] = []
+    if embedding is not None:
+        compilation.append({"kind": "embedding", "name": "prepared"})
 
     for layer in layers:
         layer_id = int(layer.layer_idx)
@@ -1352,6 +1374,7 @@ def build_resources(
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
         prefetch=prefetch,
+        embedding=embedding,
         tokens_per_request=tokens_per_request,
         widths=batches,
     )

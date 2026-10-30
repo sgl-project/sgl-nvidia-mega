@@ -452,6 +452,7 @@ class TestPrefetchAdmission(unittest.TestCase):
             "scratch": {},
             "workspaces": {},
             "runtime_handles": {},
+            "embedding": None,
         }
         module = ast.Module(
             body=[

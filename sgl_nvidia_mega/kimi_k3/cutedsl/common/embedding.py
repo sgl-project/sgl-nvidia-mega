@@ -8,15 +8,9 @@ import cutlass as c
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
-from sglang.srt.distributed.parallel_state import get_tp_group
 
 from .host import architecture, fake
 from .primitives import launch
-
-# Names read from SGLang internals. A contract test checks these before GPU use.
-SGLANG_READS = {
-    "srt/distributed/parallel_state.py": ("get_tp_group",),
-}
 
 
 class EmbeddingGather:
@@ -51,8 +45,7 @@ def compile_gather(dtype, shard, arch):
 
 
 class PreparedEmbedding:
-    def __init__(self, embedding, tp, rank):
-        weight = embedding.weight
+    def __init__(self, weight, *, start, end, group):
         # The gather moves 7 x 1024 BF16 columns of contiguous rows.
         if weight.dim() != 2 or weight.shape[1] != 7168 or not weight.is_contiguous():
             raise ValueError(
@@ -61,14 +54,16 @@ class PreparedEmbedding:
             )
         if weight.dtype != torch.bfloat16:
             raise ValueError(f"embedding shard must be BF16, got {weight.dtype}")
-        self.group, self.weight = get_tp_group(), weight.detach()
-        self.start, self.vocab = rank * weight.shape[0], embedding.org_vocab_size
+        if not weight.is_cuda or not 0 <= start <= end <= start + weight.shape[0]:
+            raise ValueError("embedding requires CUDA storage and valid shard bounds")
+        self.all_reduce, self.weight = group.all_reduce, weight.detach()
+        self.start, self.vocab = start, end
         with torch.accelerator.device_index(weight.device.index):
             arch, ids = architecture(weight.device), (torch.int32, torch.int64)
             self.kernels = {t: compile_gather(t, weight.shape[0], arch) for t in ids}
 
     def run(self, ids, out):
-        if ids.dim() != 1 or ids.dtype not in self.kernels:
+        if ids.dim() != 1 or ids.dtype not in self.kernels or not ids.is_contiguous():
             raise ValueError(
                 f"token ids must be 1-D int32/int64, got {ids.dtype} {tuple(ids.shape)}"
             )
@@ -76,8 +71,14 @@ class PreparedEmbedding:
             raise ValueError(
                 f"embedding output must be contiguous [{ids.shape[0]}, 7168]"
             )
+        if out.dtype != self.weight.dtype or not (
+            ids.device == out.device == self.weight.device
+        ):
+            raise ValueError(
+                "embedding ids/output must match the prepared device/dtype"
+            )
         self.kernels[ids.dtype](ids, self.weight, out, self.start, self.vocab)
-        reduced = self.group.all_reduce(out)
+        reduced = self.all_reduce(out)
         if reduced is not out:
             out.copy_(reduced)
         return out

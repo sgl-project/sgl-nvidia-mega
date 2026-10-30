@@ -264,11 +264,14 @@ class KimiK3MegakernelExecutor:
             if q > 1
             else {}
         )
-        x = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else resources.model.model.embed_tokens(input_ids)
-        )
+        if inputs_embeds is not None:
+            x = inputs_embeds
+        elif resources.embedding is not None:
+            x = resources.embedding.run(
+                input_ids, resources.scratch["embedding.out"][:batch]
+            )
+        else:
+            x = resources.model.model.embed_tokens(input_ids)
         if tuple(x.shape) != (batch, 7168):
             raise RuntimeError(f"unexpected Kimi K3 megakernel input shape: {x.shape}")
 
