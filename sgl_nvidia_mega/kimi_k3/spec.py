@@ -7,32 +7,64 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, cast
 
-from sglang.srt.megakernels.spec import (
-    BuildContext,
-    BuiltMegakernel,
-    Feature,
-    MegakernelSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-    Step,
-)
 from sglang.srt.runtime_context import get_model
 
-if TYPE_CHECKING:
-    from sglang.srt.megakernels.binding import PreparationView
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import (
+        BuildContext,
+        BuiltMegakernel,
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        Step,
+    )
+except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
+    if error.name not in (
+        "sglang.kernels",
+        "sglang.kernels.plugin_kernels",
+        "sglang.kernels.plugin_kernels.nvidia",
+        "sglang.kernels.plugin_kernels.nvidia.spec",
+    ):
+        raise
+    from sglang.srt.megakernels.spec import (
+        BuildContext,
+        BuiltMegakernel,
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        Step,
+    )
 
-WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
+from .shape_policy import DECODE_WIDTHS, VERIFY_QUERIES, mla_max_seq_len, token_widths
+
+if TYPE_CHECKING:
+    try:
+        from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
+    except ModuleNotFoundError as error:
+        if error.name not in (
+            "sglang.srt.kernel_plugins",
+            "sglang.srt.kernel_plugins.nvidia",
+            "sglang.srt.kernel_plugins.nvidia.binding",
+        ):
+            raise
+        from sglang.srt.megakernels.binding import PreparationView
+
+WIDTHS = DECODE_WIDTHS
 # Keep this independent of the host constant so find_spec rejects incompatibility.
-REQUIRED_MEGAKERNEL_API_VERSION = 1
+REQUIRED_MEGAKERNEL_API_VERSION = 2
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "BuildContext",
         "BuiltMegakernel",
         "Feature",
         "MULTI_NODE_TP",
+        "SPECULATIVE_DECODING",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -48,8 +80,13 @@ SGLANG_READS = {
         "view",
         "widths",
     ),
-    "srt/megakernels/binding.py": ("PreparationView",),
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
+        "PreparationView",
+        "aux_hidden_states",
+    ),
     "srt/runtime_context.py": ("get_model",),
+    "srt/utils/hf_transformers/common.py": ("get_context_length",),
+    "srt/configs/kimi_k3.py": ("text_config",),
     "srt/arg_groups/fields/*.py": (
         "context_length",
         "cuda_graph_config",
@@ -62,6 +99,9 @@ SGLANG_READS = {
         "moe_runner_backend",
         "page_size",
         "prefill_attention_backend",
+        "speculative_adaptive",
+        "speculative_algorithm",
+        "speculative_num_draft_tokens",
     ),
     "srt/models/kimi_k3.py": (
         "KimiK3ForConditionalGeneration",
@@ -97,12 +137,39 @@ def _deadline_ns(seconds: Any) -> int:
 
 
 def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
+    from sglang.srt.utils.hf_transformers.common import get_context_length
+
     reasons: list[str] = []
     graph_config = cfg.cuda_graph_config
     if graph_config is None or graph_config.decode.backend != "full":
         reasons.append("needs the FULL decode CUDA-graph backend")
-    if int(cfg.context_length or 0) != 8192:
-        reasons.append("initial Kimi K3 coverage requires context length 8192")
+    try:
+        mla_max_seq_len(cfg.context_length, 1)
+    except ValueError as error:
+        reasons.append(str(error))
+    else:
+        # Use the native model limit, including its RoPE policy, without enabling
+        # the framework's opt-in longer-context override or modifying HF config.
+        text_config = getattr(hf_config, "text_config", hf_config)
+        model_limit = get_context_length(text_config)
+        if cfg.context_length > model_limit:
+            reasons.append(
+                f"context length {cfg.context_length} exceeds native model limit "
+                f"{model_limit}"
+            )
+    algorithm = cfg.speculative_algorithm
+    if algorithm is not None:
+        if algorithm != "DSPARK":
+            reasons.append("Kimi K3 speculative coverage requires DSPARK")
+        if (
+            type(cfg.speculative_num_draft_tokens) is not int
+            or cfg.speculative_num_draft_tokens not in VERIFY_QUERIES
+        ):
+            reasons.append(
+                "Kimi K3 DSPARK coverage requires a fixed q4-8 verify window"
+            )
+        if bool(cfg.speculative_adaptive):
+            reasons.append("Kimi K3 DSPARK coverage excludes adaptive speculation")
     return reasons
 
 
@@ -144,7 +211,7 @@ def _call_option(
 
 
 class _Built:
-    """Top-level model-forward replacement for the exact decode shapes served."""
+    """Top-level replacement for the exact decode or target-verify shapes served."""
 
     draft_sampler = None
     draft_loop = None
@@ -158,12 +225,19 @@ class _Built:
         self.model = model
         self.language_model = model.language_model
         self.resources = resources
+        self.tokens_per_request = resources.tokens_per_request
         self.widths = widths
         self.executor = KimiK3MegakernelExecutor(resources)
         # Local validation observers read this without changing the public API.
         model.__dict__["_nvidia_kimi_k3_megakernel"] = self
 
     def summary(self) -> str:
+        if self.tokens_per_request > 1:
+            requests = [rows // self.tokens_per_request for rows in self.widths]
+            return (
+                f"TP8 fixed DSPARK q{self.tokens_per_request} target verify "
+                f"at request batches {requests}"
+            )
         return "TP8 one-token decode at rows 1-8, 16, 32, and 64"
 
     def plan(
@@ -175,11 +249,13 @@ class _Built:
             return None
         mode = forward_batch.forward_mode
         rows = int(input_ids.shape[0])
-        if not mode.is_decode() or rows not in self.widths:
+        verify = self.tokens_per_request > 1
+        covered = mode.is_target_verify() if verify else mode.is_decode()
+        if not covered or rows not in self.widths:
             return None
-        if int(forward_batch.batch_size) != rows:
+        if int(forward_batch.batch_size) * self.tokens_per_request != rows:
             return None
-        return Step(mode="decode", rows=rows)
+        return Step(mode="target_verify" if verify else "decode", rows=rows)
 
     def forward(
         self,
@@ -193,10 +269,13 @@ class _Built:
     ) -> Any:
         if get_embedding or pp_proxy_tensors is not None:
             raise RuntimeError("Kimi K3 megakernel received an unplanned model call")
-        if step.mode != "decode" or step.rows not in self.widths:
+        expected_mode = "target_verify" if self.tokens_per_request > 1 else "decode"
+        if step.mode != expected_mode or step.rows not in self.widths:
             raise RuntimeError(f"unsupported Kimi K3 megakernel step: {step}")
-        if int(forward_batch.batch_size) != step.rows:
+        if int(forward_batch.batch_size) * self.tokens_per_request != step.rows:
             raise RuntimeError("Kimi K3 megakernel plan and forward batch disagree")
+        if int(input_ids.shape[0]) != step.rows:
+            raise RuntimeError("Kimi K3 megakernel plan and input rows disagree")
         if step.view is None or step.view.hybrid is None:
             raise RuntimeError("Kimi K3 megakernel received no typed hybrid step view")
         hidden_states = self.executor.run(input_ids, None, step.view.hybrid)
@@ -205,7 +284,7 @@ class _Built:
             hidden_states,
             self.language_model.lm_head,
             forward_batch,
-            None,
+            step.view.hybrid.aux_hidden_states if self.tokens_per_request > 1 else None,
         )
 
 
@@ -213,13 +292,14 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
     """Bind typed SGLang-owned pools after allocation, before graph warmup."""
     if view.hybrid is None:
         raise ValueError("Kimi K3 megakernel requires a hybrid MLA/KDA pool")
-    cast(_Built, built).resources.bind(view.hybrid)
+    resources = cast(_Built, built).resources
+    resources.prepare_aux_capture()
+    resources.bind(view.hybrid)
 
 
 def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
-    if context.tokens_per_request != 1:
-        raise ValueError("Kimi K3 megakernel serves one-token decode only")
-    widths = tuple(width for width in context.widths if width in WIDTHS)
+    supported = token_widths(context.tokens_per_request)
+    widths = tuple(width for width in context.widths if width in supported)
     if not widths:
         raise ValueError(
             f"Kimi K3 megakernel found no supported width in {list(context.widths)}"
@@ -234,9 +314,10 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
 
     resources = build_resources(
         model.language_model,
-        context_length=int(get_model().context_length),
+        context_length=get_model().context_length,
         memory_before=_cuda_memory(),
         deadline_ns=deadline_ns,
+        tokens_per_request=context.tokens_per_request,
     )
     return _Built(model, resources, widths)
 
@@ -262,7 +343,7 @@ SPEC = MegakernelSpec(
         },
         hf_config={"language_only": True, "encoder_only": False},
     ),
-    features=frozenset({Feature.MULTI_NODE_TP}),
+    features=frozenset({Feature.MULTI_NODE_TP, Feature.SPECULATIVE_DECODING}),
     numerics=Numerics(
         kind=NumericsKind.TOLERANCE,
         tolerances={"forward.selected_logprobs.max_abs": 0.5},

@@ -16,7 +16,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | GB300 (SM103); 148-SM B300 (SM103) with `sm148` | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request); on B300, speed was measured at one request only, serving passed a GSM8K canary at client concurrency 12 and 16 with decode CUDA graphs up to batch 16 (DSpark block 5), and larger batches and other block sizes rely on the kernel tests |
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
-| Kimi K3 (packed MXFP4) | GB300 (SM103) | 8 | One-token decode steps of 1–8, 16, 32 and 64 rows |
+| Kimi K3 (packed MXFP4) | GB300 (SM103) | 8 | One-token decode steps of 1–8, 16, 32 and 64 rows; fixed q4–q8 target verification within 64 token rows |
 
 For DeepSeek-V4.1-Flash and Qwen3.5, larger verify steps, prefill and extend run
 SGLang's standard path. Their draft specs provide the DSpark proposal and the
@@ -24,13 +24,25 @@ Qwen3.5 EAGLE entries, respectively. For Kimi K3, the plugin covers the 93-layer
 language model (24 MLA and 69 KDA layers) at the listed widths; every other call
 runs the standard path.
 
-The Kimi K3 adapter is experimental. On the pinned GB300/TP8 configuration
-below, every listed CUDA-graph width and padding boundary passed dummy-weight
+The Kimi K3 adapter is experimental. Initial ordinary-decode validation used
+context length 8192 on GB300/TP8: every listed CUDA-graph width and padding
+boundary passed dummy-weight
 capture/replay, B1 and B16 passed stock-versus-plugin real-weight canaries, and a
 specialized-route/captured-replay canary passed, and the GSM8K quality protocol
 matched its frozen stock-path reference score. This is bounded functional and
 quality evidence; it does not claim performance, unlisted configurations, production
 readiness, or publication readiness.
+
+Separate matched real-weight functional checks cover ordinary decode and
+five-draft/q6 DSpark at context length 262144, with DCP off and stock draft
+execution. Inputs span 32768, 131072, 240000 and 255872 tokens, plus a
+262000-input/128-output deployment-edge request. Long B1 and mixed-B2 requests,
+short B4 controls, chunked prefill, page boundaries, retirement, request-slot
+reuse and full decode graph replay passed the predefined numerical checks.
+Long-input output tokens matched stock; short controls can differ within the
+numerical bounds. This is not global bitwise equivalence, an AgentX benchmark,
+long-context task-quality validation or a performance claim. Other fixed draft
+lengths have component coverage, not equivalent long-context serving evidence.
 
 ### What a covered DeepSeek-V4.1-Flash step runs
 
@@ -89,9 +101,14 @@ The sampling and acceptance after the verify, and the GatedDeltaNet extend of pr
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.2), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
 - DeepSeek-V4.1-Flash: 4 x GB300, or 4 x 148-SM B300 (SM103) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`
 - Qwen3.5: 8 x GB300, two trays of one NVLink domain
-- Kimi K3: 8 x GB300 (SM103), BF16, context length 8192, TP8 and DP1,
+- Kimi K3: 8 x GB300 (SM103), BF16, context length up to 262144 within the
+  native model limit, TP8, DP1 and DCP off,
   FP8 E4M3 KV cache with page size 64, `trtllm_mla` for prefill and decode,
   `flashinfer_mxfp4` with default precision, and full decode CUDA graphs
+- Kimi K3 DSpark requires the target-verification interfaces in
+  [SGLang #45406](https://github.com/sgl-project/sglang/pull/45406). The tested
+  configuration uses `RadixArk/Kimi-K3-DSpark` with five draft proposals (q6);
+  the draft model and acceptance remain on SGLang's stock path.
 
 ### Installation
 
@@ -160,7 +177,7 @@ sgl-nvidia-mega/
 │   └── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
-    ├── unit/              # CPU: the plugin, the setup checks, the step loop and the SGLang contract
+    ├── unit/              # plugin contracts and setup checks; selected CUDA metadata/graph cases
     ├── kernels/           # GPU: each kernel against SGLang's or FlashInfer's op, fail-stop
     └── e2e/               # GPU: serving accuracy, KL, passkey and fail-stop, switch on and off
 ```
@@ -168,14 +185,15 @@ sgl-nvidia-mega/
 ## Testing
 
 ```bash
-pytest test/unit               # CPU only
+pytest test/unit               # host tests plus CUDA cases when a compatible GPU is available
 pytest test/kernels            # DeepSeek-V4.1-Flash: 4 x GB300
 pytest test/e2e                # DeepSeek-V4.1-Flash: 4 x GB300, with SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH set
 ```
 
 Qwen3.5 runs TP8, which spans two GB300 trays: its e2e tests read a server launched on them through `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` and the files its ranks log to (`SGLANG_NVIDIA_MEGAKERNEL_E2E_LOGS`, comma-separated).
 
-Kimi K3 GPU and end-to-end suites are not yet part of these commands.
+Kimi K3 full-serving qualification is separate from these unit tests; the
+`test/kernels` and `test/e2e` commands above remain DeepSeek-V4.1-Flash suites.
 
 ## Contributing
 

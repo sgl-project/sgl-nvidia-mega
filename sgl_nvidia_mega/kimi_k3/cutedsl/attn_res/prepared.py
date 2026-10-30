@@ -21,7 +21,9 @@ from .kernel import ClusterAttnRes
 
 
 @cache
-def compile_consumer(nb, delta, write, final, slots, cap, arch, deadline_ns, aux=False):
+def compile_consumer(
+    nb, delta, write, final, slots, cap, arch, deadline_ns, aux=False, aux_mixture=False
+):
     row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
     source = fake((slots, cap, 7168), (cap * 7168, 7168, 1)) if slots else row
     kernel = ClusterAttnRes(
@@ -31,9 +33,10 @@ def compile_consumer(nb, delta, write, final, slots, cap, arch, deadline_ns, aux
         write=write,
         final=final,
         deadline_ns=deadline_ns,
+        aux_mixture=aux_mixture,
     )
     args = (source, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
-    args += (row,) * aux  # the updated prefix row, also stored to an aux stream
+    args += (row,) * aux
     return cute.compile(kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}")
 
 
@@ -49,9 +52,11 @@ class PreparedAttnRes:
         self.ring: Any = None
         self.aux: Any = None
 
-    def _compile(self, slots, cap, aux=False):
+    def _compile(self, slots, cap, aux=False, aux_mixture=False):
         arch = architecture(self.device)
-        return compile_consumer(*self.key, slots, cap, arch, self.deadline_ns, aux)
+        return compile_consumer(
+            *self.key, slots, cap, arch, self.deadline_ns, aux, aux_mixture
+        )
 
     @classmethod
     def for_target(cls, target, *, deadline_ns, final=False, has_delta=True):
@@ -72,13 +77,13 @@ class PreparedAttnRes:
         shape = tuple(mailbox.shape[:2])
         self.ring = self._compile(*shape), to_cute(mailbox), shape
 
-    def bind_aux(self):
-        """Variants that also store the updated prefix rows (a stock aux stream)."""
+    def bind_aux(self, *, mixture=False):
+        """Store the updated prefix, or the pre-output-normalization mixture."""
         ring = None
         if self.ring is not None:
             slots, cap = self.ring[2]
-            ring = self._compile(slots, cap, True)
-        self.aux = self._compile(0, 0, True), ring
+            ring = self._compile(slots, cap, True, mixture)
+        self.aux = self._compile(0, 0, True, mixture), ring
 
     def run_ring(self, prefix, blocks, out, aux=None):
         code = self.ring[0] if aux is None else self.aux[1]

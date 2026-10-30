@@ -79,10 +79,12 @@ class ClusterAttnRes:
         write=-1,
         final=False,
         deadline_ns=0,
+        aux_mixture=False,
     ):
         self.nb, self.slots, self.has_delta = nb, slots, has_delta
         self.write, self.final = write, final
         self.deadline_ns = deadline_ns
+        self.aux_mixture = aux_mixture
         self.npre = 2 * nb
         self.npost = (2 if final else 4) if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
@@ -195,8 +197,7 @@ class ClusterAttnRes:
     def post(
         self, state, bufs, delta, rows, output, eps: Float32, out_eps: Float32, ids, aux
     ):
-        """Add the delta, update prefix (and its ``aux`` copy) and saved block, write
-        the normalized output."""
+        """Update prefix/saved block, optionally publish auxiliary rows, normalize."""
         prefix, blocks, norm, query, out_norm = rows
         rank, token, tid = ids
         warp_buf, peer_buf, total, bars = bufs
@@ -248,8 +249,9 @@ class ClusterAttnRes:
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
         row = (words[0], words[1], words[2], words[3])
         store_words(at(prefix, token, col), row)
-        for stream_out in aux:
-            store_words(at(stream_out, token, col), row)
+        if cutlass.const_expr(not self.aux_mixture or self.nb == 0):
+            for stream_out in aux:
+                store_words(at(stream_out, token, col), row)
         if cutlass.const_expr(self.write >= 0):
             store_words(block_ptr(blocks, token, self.write, col), row)
         result = cute.make_rmem_tensor((1, 8), Float32)
@@ -264,6 +266,22 @@ class ClusterAttnRes:
             alpha = cute.math.exp(maximum - top, fastmath=True)
             ep = cute.math.exp(logit - top, fastmath=True)
             denominator = fma(alpha, exp_sum, ep)
+            if cutlass.const_expr(self.aux_mixture):
+                inverse = Float32(1) / denominator
+                for j in cutlass.range_constexpr(4):
+                    lo = fma(
+                        alpha * inverse, mixture[0, 2 * j], ep * inverse * v[NEW, 2 * j]
+                    )
+                    hi = fma(
+                        alpha * inverse,
+                        mixture[0, 2 * j + 1],
+                        ep * inverse * v[NEW, 2 * j + 1],
+                    )
+                    words[j] = bf16x2(lo, hi)
+                for stream_out in aux:
+                    store_words(
+                        at(stream_out, token, col), tuple(words[j] for j in range(4))
+                    )
             if cutlass.const_expr(self.final):
                 inverse = Float32(1) / denominator
                 for j in cutlass.range_constexpr(4):

@@ -10,6 +10,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
+from ...shape_policy import VERIFY_QUERIES, token_widths
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
 from .kernel import KdaSplit
@@ -29,7 +30,7 @@ SPEC_SCHEDULE = {
 
 
 @cache
-def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
+def executable(specs, heads, gate_mode, has_bias, device, tokens=1, split_cache=False):
     args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
     batch = specs[0][0][0]
     table = SCHEDULE if tokens == 1 else SPEC_SCHEDULE
@@ -38,7 +39,9 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
     if schedule[0] >= 2 and specs[9][1][-2:] != (128, 1):  # staging needs whole rows
         schedule = (1, *schedule[1:4])  # no evict hint without staging
     requests = batch // tokens
-    kernel = KdaSplit(heads, requests, gate_mode, has_bias, schedule, tokens)
+    kernel = KdaSplit(
+        heads, requests, gate_mode, has_bias, schedule, tokens, split_cache
+    )
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     with torch.accelerator.device_index(device):
         return cute.compile(
@@ -66,6 +69,7 @@ class PreparedKda:
         scalars = (attention.gate_lower_bound, 128**-0.5, attention.o_norm.eps)
         self.scalars = tuple(map(cutlass.Float32, scalars))
         self.conv_dim_first, self.kernels = conv_dim_first, {}
+        self.verify_kernels, self.verify_layouts = {}, {}
 
     def _operands(self, caches, projected, slots, out, accepted=None):
         """Kernel tensors in launch order: 13 before the scalars, then F_B (and the
@@ -109,4 +113,157 @@ class PreparedKda:
         tensors = self._operands(caches, projected, slots[:rows], out, accepted)
         views = tuple(to_cute(t, 16) for t in tensors)
         self.kernels[key](*views[:13], *self.scalars, *views[13:], stream(self.device))
+        return out
+
+    def _verify_operands(
+        self, caches, projected, slots, out, intermediates, scratch_indices
+    ):
+        conv_windows, checkpoints = intermediates
+        return self._operands(caches, projected, slots, out) + (
+            scratch_indices,
+            conv_windows.transpose(-1, -2),
+            checkpoints,
+        )
+
+    def _check_verify_caches(self, caches, intermediates):
+        conv, state = caches
+        conv_windows, checkpoints = intermediates
+        if self.heads != 12 or self.conv_dim_first:
+            raise ValueError(
+                "split-cache verification requires TP8 and window-first conv"
+            )
+        expected = (
+            (conv, (3, 3 * self.dim), torch.bfloat16, 1),
+            (state, (self.heads, 128, 128), torch.float32, 1),
+            (conv_windows, (3, 3 * self.dim), torch.bfloat16, 2),
+            (checkpoints, (self.heads, 128, 128), torch.float32, 2),
+        )
+        for tensor, tail, dtype, outer in expected:
+            if (
+                tensor.ndim != len(tail) + outer
+                or tuple(tensor.shape[-len(tail) :]) != tail
+                or tensor.dtype != dtype
+                or tensor.device != self.device
+            ):
+                raise ValueError(
+                    "invalid split-cache verification shape, dtype or device"
+                )
+            stride = 1
+            for size, actual in zip(
+                reversed(tensor.shape[1:]), reversed(tensor.stride()[1:])
+            ):
+                if actual != stride:
+                    raise ValueError(
+                        "split-cache verification requires contiguous cache rows"
+                    )
+                stride *= size
+            if (
+                tensor.stride(0) < stride
+                or tensor.stride(0) * tensor.element_size() % 16
+            ):
+                raise ValueError(
+                    "split-cache verification requires aligned, disjoint cache rows"
+                )
+            if tensor.storage_offset() * tensor.element_size() % 16:
+                raise ValueError(
+                    "split-cache verification requires 16-byte aligned caches"
+                )
+        if (
+            conv.shape[0] != state.shape[0]
+            or conv_windows.shape[:2] != checkpoints.shape[:2]
+        ):
+            raise ValueError("split-cache verification cache capacities do not match")
+        if conv_windows.shape[1] < 4:
+            raise ValueError(
+                "split-cache verification requires at least four checkpoints"
+            )
+
+    def prepare_verify_caches(self, caches, intermediates):
+        """Compile TP8/q4-8 policies for separate committed pools and checkpoints.
+
+        ``caches``: BF16 conv [P, 3, 4608], FP32 SSM [P, 12, 128, 128].
+        ``intermediates``: BF16 conv [S, >=q, 3, 4608], FP32 SSM
+        [S, >=q, 12, 128, 128]. Only the leading pool stride may be padded.
+        """
+        self._check_verify_caches(caches, intermediates)
+        policies = {
+            key: policy
+            for key, policy in self.policies.items()
+            if isinstance(key, tuple)
+        }
+        if not policies:
+            raise ValueError("split-cache verification requires (requests, q) policies")
+        for key, (pitch, mode) in policies.items():
+            requests, tokens = key
+            if (
+                tokens not in VERIFY_QUERIES
+                or requests * tokens not in token_widths(tokens)
+                or (pitch, mode) != (6288, 1)
+            ):
+                raise ValueError(
+                    f"unsupported split-cache verification policy: {key}, {(pitch, mode)}"
+                )
+            if intermediates[0].shape[1] < tokens:
+                raise ValueError(
+                    f"split-cache verification requires at least {tokens} checkpoints"
+                )
+            meta = {"device": "meta"}
+            projected = torch.empty(
+                (requests * tokens, pitch), dtype=torch.bfloat16, **meta
+            )
+            out = torch.empty(
+                (requests * tokens, self.dim), dtype=torch.bfloat16, **meta
+            )
+            slots = torch.empty(requests, dtype=torch.int32, **meta)
+            scratch_indices = torch.empty_like(slots)
+            operands = self._verify_operands(
+                caches, projected, slots, out, intermediates, scratch_indices
+            )
+            specs = tuple(map(layout, operands))
+            self.verify_kernels[key] = executable(
+                specs, self.heads, mode, self.has_bias, self.device.index, tokens, True
+            )
+            self.verify_layouts[key] = specs
+        return self
+
+    def run_verify(
+        self, projected, out, *, caches, slots, intermediates, scratch_indices
+    ):
+        """Read persistent state and publish q checkpoints without committing.
+
+        ``slots`` and ``scratch_indices`` are independent contiguous int32 [B].
+        Physical slots <= 0 pad a request; scratch row zero is valid. Live scratch
+        rows must be distinct and in range. Graph replay may change index values,
+        not the prepared layouts. The caller owns the subsequent accept commit.
+        """
+        if (
+            slots.ndim != 1
+            or projected.ndim != 2
+            or slots.shape[0] <= 0
+            or projected.shape[1] != 6288
+            or projected.shape[0] % slots.shape[0]
+        ):
+            raise ValueError(
+                "split-cache verification requires uniform rows per request"
+            )
+        key = (slots.shape[0], projected.shape[0] // slots.shape[0])
+        if key not in self.verify_kernels:
+            raise ValueError(f"unprepared split-cache verification policy: {key}")
+        tensors = self._verify_operands(
+            caches, projected, slots, out, intermediates, scratch_indices
+        )
+        if tuple(map(layout, tensors)) != self.verify_layouts[key]:
+            raise ValueError("split-cache verification layouts differ from preparation")
+        if any(tensor.device != self.device for tensor in tensors):
+            raise ValueError(
+                "split-cache verification operands must share the prepared device"
+            )
+        if any(tensor.data_ptr() % 16 for tensor in tensors):
+            raise ValueError(
+                "split-cache verification requires 16-byte aligned operands"
+            )
+        views = tuple(to_cute(tensor, 16) for tensor in tensors)
+        self.verify_kernels[key](
+            *views[:13], *self.scalars, *views[13:], stream(self.device)
+        )
         return out

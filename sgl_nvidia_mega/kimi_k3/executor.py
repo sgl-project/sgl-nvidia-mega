@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""TP8/B1-B8/B16/B32/B64 captured-decode executor for Kimi K3."""
+"""TP8 q1 decode and fixed DSPARK q4-8 target-verify executor for Kimi K3."""
 
 from __future__ import annotations
 
@@ -8,18 +8,33 @@ from functools import partial
 from typing import Any
 
 import torch
-from sglang.srt.megakernels.binding import HybridStepView
+
+try:
+    from sglang.srt.kernel_plugins.nvidia.binding import HybridStepView
+except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
+    if error.name not in (
+        "sglang.srt.kernel_plugins",
+        "sglang.srt.kernel_plugins.nvidia",
+        "sglang.srt.kernel_plugins.nvidia.binding",
+    ):
+        raise
+    from sglang.srt.megakernels.binding import HybridStepView
+
+from .shape_policy import VERIFY_QUERIES, token_widths
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
-    "srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "HybridStepView",
+        "aux_hidden_states",
         "block_table",
         "kda",
         "mla",
         "sequence_lengths",
         "state_indices",
+        "tokens_per_request",
         "track_decode_state",
+        "verify_scratch_indices",
         "write_slots",
     ),
 }
@@ -63,11 +78,22 @@ def _validate_step_inputs(
     *,
     batch: int,
     device: torch.device,
+    tokens_per_request: int = 1,
+    aux_width: int = 0,
 ) -> None:
     if device.type != "cuda":
         raise RuntimeError(
             f"Kimi K3 megakernel execution requires CUDA resources, found {device}"
         )
+    if tokens_per_request not in (1, *VERIFY_QUERIES) or batch not in token_widths(
+        tokens_per_request
+    ):
+        raise RuntimeError("Kimi K3 megakernel received an unsupported query width")
+    if view.mla.tokens_per_request != tokens_per_request:
+        raise RuntimeError(
+            "Kimi K3 megakernel MLA query width differs from preparation"
+        )
+    requests = batch // tokens_per_request
     _require_tensor(
         "input_ids",
         input_ids,
@@ -97,7 +123,7 @@ def _validate_step_inputs(
         "MLA sequence lengths",
         view.mla.sequence_lengths,
         dtype=torch.int32,
-        shape=(batch,),
+        shape=(requests,),
         device=device,
         strides=(1,),
     )
@@ -105,7 +131,7 @@ def _validate_step_inputs(
         "KDA state indices",
         view.kda.state_indices,
         dtype=torch.int32,
-        shape=(batch,),
+        shape=(requests,),
         device=device,
         strides=(1,),
     )
@@ -117,10 +143,10 @@ def _validate_step_inputs(
             "Kimi K3 megakernel MLA block table must be int32 on "
             f"{device}, found {table.dtype} on {table.device}"
         )
-    if table.dim() != 2 or int(table.shape[0]) != batch or int(table.shape[1]) <= 0:
+    if table.dim() != 2 or int(table.shape[0]) != requests or int(table.shape[1]) <= 0:
         raise RuntimeError(
             "Kimi K3 megakernel MLA block table must be a nonempty "
-            f"[{batch}, pages] tensor, found {tuple(table.shape)}"
+            f"[{requests}, pages] tensor, found {tuple(table.shape)}"
         )
     rows, columns = int(table.stride(0)), int(table.stride(1))
     if columns != 1 or rows < int(table.shape[1]):
@@ -128,6 +154,57 @@ def _validate_step_inputs(
             "Kimi K3 megakernel MLA block table has unsupported stride "
             f"{tuple(table.stride())}"
         )
+    if tokens_per_request > 1:
+        _require_tensor(
+            "KDA verify scratch indices",
+            view.kda.verify_scratch_indices,
+            dtype=torch.int32,
+            shape=(requests,),
+            device=device,
+            strides=(1,),
+        )
+        if aux_width <= 0:
+            raise RuntimeError("Kimi K3 DSPARK auxiliary taps were not prepared")
+        _require_tensor(
+            "DSPARK auxiliary hidden states",
+            view.aux_hidden_states,
+            dtype=torch.bfloat16,
+            shape=(batch, aux_width),
+            device=device,
+            strides=(aux_width, 1),
+        )
+    elif (
+        view.kda.verify_scratch_indices is not None
+        or view.aux_hidden_states is not None
+    ):
+        raise RuntimeError("Kimi K3 decode received verify-only runtime buffers")
+
+
+def _verify_mla_metadata(
+    state_indices: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    write_slots: torch.Tensor,
+    scratch: dict[str, Any],
+    tokens_per_request: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Translate native verify padding into MLA's skip-write/zero-output contract.
+
+    Physical KDA slots <= 0 are inactive, including startup's all-zero slots.
+    Verify scratch index zero is live and is deliberately not consulted. Every
+    operation writes preallocated storage and is replayed inside the CUDA graph.
+    """
+    requests = int(state_indices.shape[0])
+    inactive = scratch["mla.verify_inactive"][:requests]
+    lengths = scratch["mla.verify_lengths"][:requests]
+    slots = scratch["mla.verify_slots"][: requests * tokens_per_request]
+    torch.le(state_indices, 0, out=inactive)
+    lengths.copy_(sequence_lengths)
+    lengths.masked_fill_(inactive, 0)
+    slots.copy_(write_slots)
+    slots.view(requests, tokens_per_request).masked_fill_(
+        inactive.view(requests, 1), -1
+    )
+    return slots, lengths
 
 
 class KimiK3MegakernelExecutor:
@@ -148,9 +225,12 @@ class KimiK3MegakernelExecutor:
                 "Kimi K3 megakernel pools were not bound before graph warmup"
             )
         mla_slots = view.mla.write_slots
+        mla_lengths = view.mla.sequence_lengths
         kda_slots = view.kda.state_indices
         batch = int(input_ids.shape[0])
-        if batch not in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64):
+        q = resources.tokens_per_request
+        widths = token_widths(q)
+        if batch not in widths:
             raise RuntimeError(f"unsupported Kimi K3 megakernel batch: {batch}")
         device = resources.scratch["hidden.0"].device
         _validate_step_inputs(
@@ -159,12 +239,30 @@ class KimiK3MegakernelExecutor:
             view,
             batch=batch,
             device=device,
+            tokens_per_request=q,
+            aux_width=7168 * len(resources.aux_capture_layers or ()),
         )
+        if q > 1:
+            mla_slots, mla_lengths = _verify_mla_metadata(
+                kda_slots, mla_lengths, mla_slots, resources.scratch, q
+            )
         for layer_id, attention in resources.attention.items():
             if attention.kind == "mla" and attention.cache is None:
                 raise RuntimeError(f"MLA cache for layer {layer_id} is not bound")
             if attention.kind == "kda" and attention.caches is None:
                 raise RuntimeError(f"KDA caches for layer {layer_id} are not bound")
+            if attention.kind == "kda" and q > 1 and attention.intermediates is None:
+                raise RuntimeError(
+                    f"KDA verify scratch for layer {layer_id} is not bound"
+                )
+        auxiliary = (
+            {
+                layer_id: view.aux_hidden_states[:, index * 7168 : (index + 1) * 7168]
+                for index, layer_id in enumerate(resources.aux_capture_layers)
+            }
+            if q > 1
+            else {}
+        )
         x = (
             inputs_embeds
             if inputs_embeds is not None
@@ -189,7 +287,12 @@ class KimiK3MegakernelExecutor:
             layer_id = int(layer.layer_idx)
             last_layer_id = layer_id
             if not next_input_ready:
-                resources.before[layer_id].run(hidden, prefix, blocks, first)
+                kwargs = (
+                    {"aux": auxiliary[layer_id - 1]}
+                    if layer_id - 1 in auxiliary
+                    else {}
+                )
+                resources.before[layer_id].run(hidden, prefix, blocks, first, **kwargs)
 
             attention = resources.attention[layer_id]
             projected = mla_projected if attention.kind == "mla" else kda_projected
@@ -201,7 +304,19 @@ class KimiK3MegakernelExecutor:
                     cache=attention.cache,
                     slots=mla_slots,
                     block_table=view.mla.block_table,
-                    lengths=view.mla.sequence_lengths,
+                    lengths=mla_lengths,
+                    q=q,
+                )
+            elif q > 1:
+                # Verification only writes checkpoints. Stock DSpark exclusively
+                # owns acceptance selection and the eventual persistent commit.
+                attention.core.run_verify(
+                    projected,
+                    local,
+                    caches=attention.caches,
+                    slots=kda_slots,
+                    intermediates=attention.intermediates,
+                    scratch_indices=view.kda.verify_scratch_indices,
                 )
             else:
                 attention.core.run(
@@ -215,14 +330,18 @@ class KimiK3MegakernelExecutor:
             feed_forward = resources.feed_forward[layer_id]
             if consumer is not None:
                 target = output if consumer is resources.final else first
-                consume = partial(consumer.run_ring, prefix, blocks)
+                kwargs = {"aux": auxiliary[layer_id]} if layer_id in auxiliary else {}
+                consume = partial(consumer.run_ring, prefix, blocks, **kwargs)
                 hidden = feed_forward.run(second, target, consume=consume)
             else:
                 hidden = feed_forward.run(second, first)
                 first, second = second, first
 
         if not next_input_ready:
-            resources.final.run(hidden, prefix, blocks, output)
+            kwargs = (
+                {"aux": auxiliary[last_layer_id]} if last_layer_id in auxiliary else {}
+            )
+            resources.final.run(hidden, prefix, blocks, output, **kwargs)
         if last_layer_id != 92:
             raise RuntimeError(f"Kimi K3 megakernel stopped at layer {last_layer_id}")
         return output

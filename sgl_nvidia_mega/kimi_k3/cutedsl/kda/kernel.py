@@ -113,13 +113,30 @@ class KdaSplit:
     state comes from slot[b, accepted - 1] and token t's state goes to slot[b, t] if
     > 0; conv slot[b, 0] holds [dim, q + 2] with taps at accepted - 1 ..., rewritten to
     [c_accepted, c_accepted + 1, x_0, ..., x_q-1]. Token t's F_B row is MMA column t;
-    CTA t % C normalizes token t."""
+    CTA t % C normalizes token t.
 
-    def __init__(self, heads, batch, gate_mode, has_bias, schedule=(0, 0, 0), tokens=1):
+    ``split_cache`` reads slots [B] without modifying persistent state. Extra
+    tensors after F_B are scratch indices [B], conv windows [S, q, dim, 3], and
+    recurrent checkpoints [S, q, head, value, key]. Scratch row zero is valid;
+    the caller commits its selected checkpoint after verification."""
+
+    def __init__(
+        self,
+        heads,
+        batch,
+        gate_mode,
+        has_bias,
+        schedule=(0, 0, 0),
+        tokens=1,
+        split_cache=False,
+    ):
         # The gate stage sends decays for tokens 2 * quarter + column (at most 8), while
         # the decay barrier expects 512 bytes per token: more tokens would never arrive.
         if not 1 <= tokens <= 8:
             raise ValueError(f"KdaSplit supports 1-8 tokens per request; got {tokens}")
+        if split_cache and tokens == 1:
+            raise ValueError("split-cache verification requires multiple tokens")
+        self.split_cache = split_cache
         self.heads, self.gate_mode, self.has_bias = heads, gate_mode, has_bias
         early, lanes, self.occupancy, cluster, evict = (*schedule, 0, 0)[:5]
         self.early, self.staged = bool(early), early >= 2
@@ -155,7 +172,12 @@ class KdaSplit:
             cute.arch.griddepcontrol_wait()
         thread, _, _ = cute.arch.thread_idx()
         partition, head, token = cute.arch.block_idx()
-        if cutlass.const_expr(T == 1):
+        if cutlass.const_expr(self.split_cache):
+            request, token = token, token * T
+            slot = slots[request]
+            conv_slot, offset = slot, 0
+            scratch = args[17][request]
+        elif cutlass.const_expr(T == 1):
             slot = slots[token]
             conv_slot, offset, writes = slot, 0, [slot]
         else:
@@ -211,6 +233,8 @@ class KdaSplit:
                 page = lambda s: state[Int64(s), None, None, None]
                 state_page = page(slot)
                 conv_page = conv_state[Int64(conv_slot), None, None]
+                if cutlass.const_expr(self.split_cache):
+                    conv_windows = args[18][Int64(scratch), None, None, None]
                 state_row = lambda r, c, s=state_page: at(s, head, value_base + r, c)
                 history = zeros((self.passes, self.chunks, 4), Float32)
                 if cutlass.const_expr(self.staged):  # noqa: SIM102
@@ -376,8 +400,13 @@ class KdaSplit:
                                 position = self.output_position(value_base + row)
                                 dst = shared_o.iterator + position
                                 store_async_dsmem(dst, float_bits(dots[p]), bar, owner)
-                        rows = partial(state_row, s=page(writes[t]))
-                        when = None if T == 1 else writes[t] > 0
+                        if cutlass.const_expr(self.split_cache):
+                            checkpoint = args[19][Int64(scratch), t, None, None, None]
+                            rows = partial(state_row, s=checkpoint)
+                            when = None
+                        else:
+                            rows = partial(state_row, s=page(writes[t]))
+                            when = None if T == 1 else writes[t] > 0
                         self.store_rows(history, rows, (start, stop), lanes, when)
                 if thread < self.rows:
                     channel = 2 * dim + value_channel
@@ -386,8 +415,13 @@ class KdaSplit:
                         taps[2, 2],
                         *(inputs[3 * t + 2] for t in range(T)),
                     )
-                    for i, value in enumerate(window):
-                        conv_page[channel, i] = value
+                    if cutlass.const_expr(self.split_cache):
+                        for t in cutlass.range_constexpr(T):
+                            for i in cutlass.range_constexpr(3):
+                                conv_windows[t, channel, i] = window[t + i]
+                    else:
+                        for i, value in enumerate(window):
+                            conv_page[channel, i] = value
 
                 for t in cutlass.range_constexpr(T):
                     if partition == t % self.cluster:
@@ -411,8 +445,13 @@ class KdaSplit:
                                 window += tuple(
                                     inputs[3 * u + section] for u in range(T)
                                 )
-                                for i, value in enumerate(window):
-                                    conv_page[channel, i] = value
+                                if cutlass.const_expr(self.split_cache):
+                                    for u in cutlass.range_constexpr(T):
+                                        for i in cutlass.range_constexpr(3):
+                                            conv_windows[u, channel, i] = window[u + i]
+                                else:
+                                    for i, value in enumerate(window):
+                                        conv_page[channel, i] = value
 
     @cute.jit
     def store_rows(self, history, state_row, span, lanes, when=None):
