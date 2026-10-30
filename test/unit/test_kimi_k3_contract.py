@@ -135,40 +135,54 @@ class TestKimiK3Contract(unittest.TestCase):
         )
 
     def test_registration_is_lazy_and_api_mismatch_fails_closed(self):
-        for name in tuple(sys.modules):
-            if name.startswith("sgl_nvidia_mega.kimi_k3"):
-                del sys.modules[name]
-        plugin = importlib.import_module("sgl_nvidia_mega.plugin")
-        plugin.register()
-        self.assertEqual(
-            registry._REGISTRY["KimiK3ForConditionalGeneration"],
-            "sgl_nvidia_mega.kimi_k3.spec:SPEC",
-        )
-        self.assertFalse(
-            any(name.startswith("sgl_nvidia_mega.kimi_k3") for name in sys.modules)
-        )
-        spec, reason = registry.find_spec(
-            architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
-        )
-        self.assertIsNotNone(spec)
-        self.assertEqual(reason, "")
-        self.assertFalse(
-            any(
-                name.startswith("sgl_nvidia_mega.kimi_k3.cutedsl")
-                for name in sys.modules
+        # Preserve modules already held by other collected contract tests.
+        with (
+            patch.dict(sys.modules),
+            patch.dict(vars(importlib.import_module("sgl_nvidia_mega"))),
+        ):
+            for name in tuple(sys.modules):
+                if name.startswith("sgl_nvidia_mega.kimi_k3"):
+                    del sys.modules[name]
+            plugin = importlib.import_module("sgl_nvidia_mega.plugin")
+            plugin.register()
+            self.assertEqual(
+                registry._REGISTRY["KimiK3ForConditionalGeneration"],
+                "sgl_nvidia_mega.kimi_k3.spec:SPEC",
             )
-        )
-        for version in (1, 3):
-            with (
-                self.subTest(version=version),
-                patch.object(registry, "MEGAKERNEL_API_VERSION", version),
-            ):
-                incompatible, reason = registry.find_spec(
-                    architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
+            self.assertFalse(
+                any(name.startswith("sgl_nvidia_mega.kimi_k3") for name in sys.modules)
+            )
+            spec, reason = registry.find_spec(
+                architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
+            )
+            self.assertIsNotNone(spec)
+            self.assertEqual(reason, "")
+            self.assertFalse(
+                any(
+                    name.startswith("sgl_nvidia_mega.kimi_k3.cutedsl")
+                    for name in sys.modules
                 )
-                self.assertIsNone(incompatible)
-                self.assertIn("uses megakernel API version 2", reason)
-                self.assertIn(f"requires version {version}", reason)
+            )
+            for version in (1, 3):
+                with (
+                    self.subTest(version=version),
+                    patch.object(registry, "MEGAKERNEL_API_VERSION", version),
+                ):
+                    incompatible, reason = registry.find_spec(
+                        architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
+                    )
+                    self.assertIsNone(incompatible)
+                    self.assertIn("uses megakernel API version 2", reason)
+                    self.assertIn(f"requires version {version}", reason)
+
+    def test_lazy_registration_preserves_loaded_module_identity(self):
+        parent = importlib.import_module("sgl_nvidia_mega")
+        child = importlib.import_module("sgl_nvidia_mega.kimi_k3")
+        prefetch = importlib.import_module("sgl_nvidia_mega.kimi_k3.weight_prefetch")
+        self.test_registration_is_lazy_and_api_mismatch_fails_closed()
+        self.assertIs(parent.kimi_k3, child)
+        self.assertIs(importlib.import_module(child.__name__), child)
+        self.assertIs(importlib.import_module(prefetch.__name__), prefetch)
 
     def test_api2_optional_entries_keep_stock_draft_and_graph_paths(self):
         from sglang.srt.kernel_plugins.nvidia import binding
