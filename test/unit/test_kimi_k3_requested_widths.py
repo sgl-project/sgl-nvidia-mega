@@ -50,7 +50,12 @@ POLICY = definitions(
 def providers(**values):
     return definitions(
         ROOT / "providers.py",
-        ("_kda_policy", "_projection_policies", "build_resources"),
+        (
+            "_kda_policy",
+            "_projection_policies",
+            "_validate_mla_core",
+            "build_resources",
+        ),
         prepared_widths=POLICY.prepared_widths,
         mla_max_seq_len=POLICY.mla_max_seq_len,
         _MAX_BATCH=64,
@@ -236,6 +241,43 @@ class BuildFixture:
 
 
 class TestWidthSelection(unittest.TestCase):
+    def test_optional_mla_preserves_requested_widths_and_prefetch_admission(self):
+        for q, selected in ((1, (2, 8, 64)), (6, (6, 12, 60))):
+            for enabled in (False, True):
+                with self.subTest(q=q, selected=selected, prefetch=enabled):
+                    fixture = BuildFixture()
+                    dependency, controller = object(), object()
+                    fixture.modules["mla.dcp"] = dependency
+                    wrapper = Mock(
+                        side_effect=lambda core, module: NS(heads=core.heads)
+                    )
+                    fixture.module._PreparedTokenSpeedMla = wrapper
+                    with (
+                        patch("importlib.metadata.version", return_value="2.0.2"),
+                        patch.object(
+                            weight_prefetch,
+                            "PrefetchController",
+                            return_value=controller,
+                        ) as construct,
+                    ):
+                        result = fixture.build(
+                            q, selected, enable_prefetch=enabled, mla_core="tokenspeed"
+                        )
+                    self.assertEqual(result.widths, selected)
+                    self.assertEqual(wrapper.call_count, len(fixture.cores["mla"]))
+                    self.assertGreater(wrapper.call_count, 0)
+                    for call in wrapper.call_args_list:
+                        self.assertIs(call.args[1], dependency)
+                    fixture.module._prepare_mla_workspace.assert_not_called()
+                    for call in fixture.modules[
+                        "mla.prepared"
+                    ].PreparedMla.call_args_list:
+                        self.assertEqual(tuple(call.args[1]), selected)
+                        self.assertEqual(call.kwargs["core"], "tokenspeed")
+                        self.assertEqual(call.kwargs["queries"], (q,))
+                    self.assertIs(result.prefetch, controller if enabled else None)
+                    self.assertEqual(construct.call_count, int(enabled))
+
     def test_prefetch_opt_in_binds_only_existing_small_batch_owners(self):
         for q, selected in (
             (1, (1, 4, 16)),

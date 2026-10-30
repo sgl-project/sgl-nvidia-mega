@@ -63,7 +63,7 @@ MEGAKERNEL_API_VERSION = registry.MEGAKERNEL_API_VERSION
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 # Includes the reviewed KDA and AttnRes adaptations documented beside each kernel.
 FROZEN_PAYLOAD_SHA256 = (
-    "1fcdc2459b13d45401b8570dce4a17ce9efa86f3d1280d335eab29d67a049ad0"
+    "8812156728bf7f7137727e70f9aa3480521a3a50a788924a99aaf3cdd65d944c"
 )
 
 

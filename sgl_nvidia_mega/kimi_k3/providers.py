@@ -447,6 +447,132 @@ def _prepare_mla_workspace(
     return workspace, counter
 
 
+def _validate_mla_core(core: str) -> None:
+    if core not in ("trtllm", "tokenspeed"):
+        raise ValueError(f"unsupported private MLA core: {core!r}")
+    if core == "tokenspeed":
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            installed = version("tokenspeed-mla")
+        except PackageNotFoundError as error:
+            raise RuntimeError(
+                "TokenSpeed MLA requires tokenspeed-mla==2.0.2"
+            ) from error
+        if installed != "2.0.2":
+            raise RuntimeError(
+                f"TokenSpeed MLA requires tokenspeed-mla==2.0.2, found {installed}"
+            )
+
+
+class _PreparedTokenSpeedMla:
+    """Retain the final shared workspace after all native MLA prewarms.
+
+    Calls use the caller's current stream, like the native prepared core. The
+    resource set owns one stream-ordered workspace, not concurrent MLA calls.
+    No module-global registry is changed; replacement by another owner is an
+    error at the next owned entry, while this strong reference keeps old graphs'
+    storage alive.
+    """
+
+    def __init__(self, core: Any, module: Any):
+        if core.dcp is not None or set(core.cores.values()) != {"tokenspeed"}:
+            raise ValueError("TokenSpeed preparation requires a DCP-off forced core")
+        self.core = core
+        # A lookup closure avoids treating arbitrary module globals as owned
+        # resources during the resource inventory's object traversal.
+        self._workspace_pool = lambda: module._WORKSPACE
+        self.workspace: torch.Tensor | None = None
+        self._prepared_geometry: tuple | None = None
+        self._workspace_identity: tuple | None = None
+
+    @property
+    def heads(self) -> int:
+        return self.core.heads
+
+    @property
+    def weights(self) -> tuple[torch.Tensor, ...]:
+        return self.core.weights
+
+    def _geometry(self) -> tuple:
+        core = self.core
+        return (
+            core.device,
+            core.heads,
+            core.max_seq,
+            core.dcp,
+            tuple(sorted(core.cores.items())),
+            tuple(sorted(core.pitches.items())),
+            tuple(sorted(core.kernels)),
+        )
+
+    @staticmethod
+    def _identity(workspace: torch.Tensor) -> tuple:
+        return (
+            workspace.device,
+            workspace.dtype,
+            tuple(workspace.shape),
+            tuple(workspace.stride()),
+            int(workspace.data_ptr()),
+            int(workspace.untyped_storage().data_ptr()),
+            int(workspace.untyped_storage().nbytes()),
+        )
+
+    def prepare_cache(self, cache: torch.Tensor) -> _PreparedTokenSpeedMla:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("TokenSpeed prewarm cannot run during capture")
+        if self.workspace is not None:
+            raise RuntimeError("TokenSpeed workspace is finalized; cannot reprepare")
+        self.core.prepare_cache(cache)
+        self._prepared_geometry = self._geometry()
+        return self
+
+    def finalize_workspace(self) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("TokenSpeed workspace cannot finalize during capture")
+        if self.workspace is not None:
+            self.check_workspace()
+            return self.workspace
+        if (
+            self._prepared_geometry is None
+            or self._geometry() != self._prepared_geometry
+        ):
+            raise RuntimeError(
+                "TokenSpeed shapes must be prewarmed before finalization"
+            )
+        workspace = self._workspace_pool().get((self.core.device, self.heads))
+        if (
+            not isinstance(workspace, torch.Tensor)
+            or workspace.device != self.core.device
+            or workspace.device.type != "cuda"
+            or workspace.dtype != torch.int8
+            or workspace.ndim != 1
+            or not workspace.is_contiguous()
+            or workspace.numel() == 0
+        ):
+            raise RuntimeError("TokenSpeed prewarm did not produce a valid workspace")
+        self.workspace = workspace
+        self._workspace_identity = self._identity(workspace)
+        return workspace
+
+    def check_workspace(self) -> None:
+        if self.workspace is None:
+            raise RuntimeError("TokenSpeed workspace must finalize before execution")
+        if (
+            self._workspace_pool().get((self.core.device, self.heads))
+            is not self.workspace
+            or self._identity(self.workspace) != self._workspace_identity
+            or self._geometry() != self._prepared_geometry
+        ):
+            raise RuntimeError("TokenSpeed prepared workspace or geometry changed")
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        self.check_workspace()
+        result = self.core.run(*args, **kwargs)
+        self.check_workspace()
+        return result
+
+
 @dataclass
 class PreparedAttention:
     layer_id: int
@@ -758,6 +884,9 @@ class ResourceSet:
         candidate = self._binding_candidate(hybrid)
         fingerprint = _digest(candidate)
         if self.binding_fingerprint is not None:
+            for provider in self.attention.values():
+                if isinstance(provider.core, _PreparedTokenSpeedMla):
+                    provider.core.check_workspace()
             if fingerprint != self.binding_fingerprint or candidate != self.binding:
                 raise RuntimeError("Kimi K3 megakernel pool binding changed")
             return
@@ -784,6 +913,37 @@ class ResourceSet:
             self.compilation_inventory.append(
                 {"kind": "attention_core", "layer_id": layer_id, "name": provider.kind}
             )
+        tokenspeed = [
+            provider.core
+            for provider in self.attention.values()
+            if isinstance(provider.core, _PreparedTokenSpeedMla)
+        ]
+        if tokenspeed:
+            # Every layer and prepared shape has now warmed the module-global
+            # workspace. Retain its final maximum-size owner, never an earlier
+            # layer's buffer that a later warmup may have replaced.
+            workspace = tokenspeed[0].finalize_workspace()
+            for core in tokenspeed[1:]:
+                if core.finalize_workspace() is not workspace:
+                    raise RuntimeError(
+                        "TP8 MLA layers must share one TokenSpeed workspace"
+                    )
+            self.workspaces["mla.tokenspeed.workspace"] = workspace
+            # Native KV/KDA pools are borrowed by now. Do not re-walk providers
+            # after binding: register only this explicitly owned new storage.
+            row = _tensor_row(
+                "workspace", "resources.workspaces.mla.tokenspeed.workspace", workspace
+            )
+            if not any(
+                item["kind"] not in ("stream", "event")
+                and item["data_ptr"] == row["data_ptr"]
+                for item in self.resource_inventory
+            ):
+                self.resource_inventory.append(row)
+                self.resource_inventory.sort(
+                    key=lambda item: (item["kind"], item["name"])
+                )
+            self.resource_digest = _pointer_free_digest(self.resource_inventory)
         torch.cuda.synchronize()
         after = self._binding_candidate(hybrid)
         if after != candidate:
@@ -802,11 +962,13 @@ def build_resources(
     tokens_per_request: int = 1,
     enable_prefetch: bool = False,
     widths: tuple[int, ...] | None = None,
+    mla_core: str = "trtllm",
 ) -> ResourceSet:
     """Build TP8 providers after all-rank consensus; prefetch is opt-in at build."""
 
     if type(enable_prefetch) is not bool:
         raise ValueError("enable_prefetch must be a bool")
+    _validate_mla_core(mla_core)
     batches = prepared_widths(tokens_per_request, widths)
     max_seq_len = mla_max_seq_len(context_length, tokens_per_request)
     memory_before = dict(memory_before)
@@ -960,11 +1122,13 @@ def build_resources(
                 {batch: 3648 for batch in batches},
                 scratch["mla.query"],
                 max_context=max_seq_len,
-                core="trtllm",
+                core=mla_core,
                 dcp=None,
                 queries=(tokens_per_request,),
             )
-            if not workspaces:
+            if mla_core == "tokenspeed":
+                core = _PreparedTokenSpeedMla(core, _module("mla.dcp", origins))
+            elif not workspaces:
                 workspace, counter = _prepare_mla_workspace(
                     mla_module, device, int(core.heads)
                 )

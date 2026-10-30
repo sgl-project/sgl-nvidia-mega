@@ -338,6 +338,7 @@ def stock_decode(
         is_var_seq=True,
         is_var_split_kv=False,
         compute_capability=arch,
+        has_local_visible_lens=False,
         skip_correction_threshold=8.0,
         is_workspace_size_zero=size == 0,
         fold_sq_factor=fold,
