@@ -254,9 +254,39 @@ def test_prepared_mla_uses_scheduling_hint_and_preserves_default_backend():
     assert kwargs == {
         "max_context": "max_seq_len",
         "core": "mla_core",
-        "dcp": "None",
+        "dcp": "None if dcp_resources is None else dcp_resources.box",
         "queries": "(tokens_per_request,)",
+        None: "{} if dcp_resources is None else {'parity': full_ids.index(layer_id) % 2, 'deadline_ns': deadline_ns}",
     }
+    # Evaluate the actual keyword expressions: DCP-off q1/q6 must still omit
+    # parity/deadline entirely, not just pass harmless-looking defaults.
+    for q in (1, 6):
+        for dcp_resources in (None, SimpleNamespace(box=object())):
+            context = dict(
+                max_seq_len=8192,
+                mla_core="trtllm",
+                tokens_per_request=q,
+                dcp_resources=dcp_resources,
+                full_ids=(0, 4),
+                layer_id=4,
+                deadline_ns=5_000_000_000,
+            )
+            actual = {}
+            for keyword in calls[0].keywords:
+                value = eval(
+                    compile(
+                        ast.Expression(keyword.value), "prepared-mla-kwargs", "eval"
+                    ),
+                    {},
+                    context,
+                )
+                actual.update(value if keyword.arg is None else {keyword.arg: value})
+            expected = dict(max_context=8192, core="trtllm", queries=(q,), dcp=None)
+            if dcp_resources is not None:
+                expected.update(
+                    dcp=dcp_resources.box, parity=1, deadline_ns=5_000_000_000
+                )
+            assert actual == expected
 
 
 def test_kda_verify_policy_uses_requests_and_preserves_decode_policy():
