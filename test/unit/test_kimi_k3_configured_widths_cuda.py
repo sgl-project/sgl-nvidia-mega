@@ -128,6 +128,9 @@ def _capture(run, device):
     with torch.cuda.stream(stream):
         for _ in range(3):
             run()
+            # KdaSplit's PDL trigger is not a shared-state dependency boundary.
+            # Warmups mutate the same cache; finish each launch before the next.
+            stream.synchronize()
     torch.cuda.current_stream(device).wait_stream(stream)
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
