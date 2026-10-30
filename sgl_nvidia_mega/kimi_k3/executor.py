@@ -297,6 +297,31 @@ class KimiK3MegakernelExecutor:
             totals=view.mla.global_sequence_lengths,
         )
 
+    def run_dcp_verify(self, input_ids, inputs_embeds, *, prepared, bucket):
+        """Private fixed-q6 entry; native acceptance/commit remain outside it."""
+        from .dcp_verify_execution import PreparedDcpVerify, validate_step
+
+        if not isinstance(prepared, PreparedDcpVerify):
+            raise ValueError("private DCP verify requires prepared typed owners")
+        view = prepared.step_view(self.resources, bucket)
+        validate_step(self.resources, input_ids, inputs_embeds, view)
+        auxiliary = {
+            layer: view.aux_hidden_states[:, index * 7168 : (index + 1) * 7168]
+            for index, layer in enumerate(self.resources.aux_capture_layers)
+        }
+        return self._run_layers(
+            input_ids,
+            inputs_embeds,
+            view.kda,
+            int(input_ids.shape[0]),
+            6,
+            view.mla.canonical_write_slots,
+            view.mla.local_sequence_lengths,
+            view.mla,
+            auxiliary,
+            totals=view.mla.global_sequence_lengths,
+        )
+
     def _run_layers(
         self,
         input_ids,

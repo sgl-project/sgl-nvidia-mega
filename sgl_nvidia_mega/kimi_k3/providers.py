@@ -1094,6 +1094,7 @@ def build_resources(
             widths=batches,
             max_context=max_seq_len,
             deadline_ns=deadline_ns,
+            tokens_per_request=tokens_per_request,
         )
         boxes["mla.dcp"] = dcp_resources.box
     moe_state = prepared_moe_module.MoEScratch(tp, device, batches)

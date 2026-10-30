@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Private q1 DCP resource preparation, deliberately without model admission.
+"""Private q1/fixed-q6 DCP resources, deliberately without model admission.
 
 The native groups exist before pool sizing. Cache preparation is a separate,
 explicit operation after allocation; it does not fabricate a framework binding.
@@ -138,6 +138,8 @@ class NativeDcpOwner:
         try:
             if not isinstance(options, DcpBuildOptions):
                 raise ValueError("private DCP requires typed DcpBuildOptions")
+            if type(tokens_per_request) is not int or tokens_per_request not in (1, 6):
+                raise ValueError("private DCP resource preparation requires q1 or q6")
             if (
                 not isinstance(widths, tuple)
                 or not widths
@@ -146,11 +148,13 @@ class NativeDcpOwner:
                 )
                 or tuple(sorted(set(widths))) != widths
                 or type(max_context) is not int
-                or not 0 < max_context <= 262144
+                or not 0 < max_context <= 262144 + (6 if tokens_per_request == 6 else 0)
+                or (
+                    tokens_per_request == 6
+                    and any(width % 6 or width > 60 for width in widths)
+                )
             ):
                 raise ValueError("private DCP requires bounded prepared widths/context")
-            if tokens_per_request != 1 or type(tokens_per_request) is not int:
-                raise ValueError("private DCP resource preparation is q1 only")
             if mla_core != "tokenspeed":
                 raise ValueError("private DCP requires forced TokenSpeed MLA")
             if type(deadline_ns) is not int or not 0 < deadline_ns < (1 << 63):
@@ -172,11 +176,11 @@ class NativeDcpOwner:
         contract = (
             None
             if error is not None
-            else (options, widths, max_context, deadline_ns, ranks)
+            else (options, widths, max_context, deadline_ns, ranks, tokens_per_request)
         )
         agree(
             (error, contract),
-            what="private q1 DCP resource contract",
+            what="private DCP resource contract",
             group=parallel.tp_group,
         )
         if error is not None:
@@ -193,7 +197,7 @@ class NativeDcpOwner:
             dcp.cpu_group,
         )
         owner._owner_ids = tuple(id(value) for value in owner._owners)
-        owner._contract = options, widths, max_context, deadline_ns
+        owner._contract = options, widths, max_context, deadline_ns, tokens_per_request
         owner.device, owner.rank, owner.ranks = device, parallel.dcp_rank, ranks
         owner._placement = device, parallel.dcp_rank, ranks
         return owner
@@ -233,9 +237,21 @@ class NativeDcpOwner:
         ):
             raise RuntimeError("private DCP native group changed")
 
-    def check_plan(self, options, widths, max_context, deadline_ns):
+    def check_plan(
+        self, options, widths, max_context, deadline_ns, tokens_per_request=1
+    ):
         self.assert_live()
-        if (options, widths, max_context, deadline_ns) != self._contract:
+        if (
+            type(tokens_per_request) is not int
+            or (
+                options,
+                widths,
+                max_context,
+                deadline_ns,
+                tokens_per_request,
+            )
+            != self._contract
+        ):
             raise ValueError(
                 "private DCP resources differ from all-rank agreed preparation"
             )
@@ -259,17 +275,28 @@ def _identity(tensor):
 class DcpResources:
     """One model's box, finite prewarm inputs and final 96-head workspace."""
 
-    def __init__(self, owner, options, module, *, widths, max_context, deadline_ns):
+    def __init__(
+        self,
+        owner,
+        options,
+        module,
+        *,
+        widths,
+        max_context,
+        deadline_ns,
+        tokens_per_request=1,
+    ):
         if not isinstance(owner, NativeDcpOwner) or not isinstance(
             options, DcpBuildOptions
         ):
             raise ValueError(
                 "private DCP resources require captured native owners/options"
             )
-        owner.check_plan(options, widths, max_context, deadline_ns)
+        owner.check_plan(options, widths, max_context, deadline_ns, tokens_per_request)
         self.owner, self.options = owner, options
         self._agreement_owner = owner
         self.widths, self.deadline_ns = tuple(widths), deadline_ns
+        self.tokens_per_request = tokens_per_request
         self.device = owner.device
         self.attention_heads = options.size * options.heads
         self.max_seq = module.local_max(max_context, options.size)
@@ -293,6 +320,14 @@ class DcpResources:
         )
         self.warm_table = torch.zeros((options.cap, 1), dtype=torch.int32, **factory)
         self.warm_lengths = torch.ones((options.cap,), dtype=torch.int32, **factory)
+        if tokens_per_request == 6:
+            # Prefix eight plus six verify rows is finite and leaves every rank
+            # nonempty even for the first causal query. Never prewarm from the
+            # mailbox sentinels or from borrowed native KV/length storage.
+            self.warm_totals = torch.full(
+                (options.cap,), 14, dtype=torch.int32, **factory
+            )
+            self.warm_lengths.fill_(2 if owner.rank < 6 else 1)
         self.workspace = None
         self._workspace_identity = None
         self.failed = False
@@ -313,6 +348,8 @@ class DcpResources:
             yield f"box.{name}", getattr(self.box, name)
         for name in ("warm_query", "warm_cache", "warm_table", "warm_lengths"):
             yield name, getattr(self, name)
+        if self.tokens_per_request == 6:
+            yield "warm_totals", self.warm_totals
 
     def _geometry(self):
         box = self.box
@@ -331,6 +368,7 @@ class DcpResources:
             self.max_seq,
             self.attention_heads,
             self.device,
+            self.tokens_per_request,
         )
 
     def assert_live(self):
@@ -358,22 +396,36 @@ class DcpResources:
     def prewarm(self, core, batch, q):
         """Warm the real native core without reading/writing any mailbox or KV pool."""
         self.assert_live()
-        if self._prepared or q != 1 or batch not in self.widths:
+        if self._prepared or q != self.tokens_per_request or batch not in self.widths:
             raise RuntimeError("private DCP invalid or already finalized prewarm")
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("private DCP prewarm cannot run during capture")
         module = self._module()
         try:
+            requests = batch // q
+            query = self.warm_query[:batch].view(torch.float8_e4m3fn)
+            out, lse = self.box.rows[:batch], self.box.rows_lse[:batch]
+            causal = {}
+            if q == 6:
+                query = query.view(requests, q, self.attention_heads, 576)
+                out = out.view(requests, q, self.attention_heads, 512)
+                lse = lse.view(requests, q, self.attention_heads)
+                causal = dict(
+                    cp=(self.box.size, self.box.rank, self.box.interleave),
+                    totals=self.warm_totals[:requests],
+                    pack=True,
+                )
             module.stock_decode(
-                self.warm_query[:batch].view(torch.float8_e4m3fn),
+                query,
                 self.warm_cache,
-                self.warm_table[:batch],
-                self.warm_lengths[:batch],
+                self.warm_table[:requests],
+                self.warm_lengths[:requests],
                 self.max_seq,
                 core.stock_scales,
-                self.box.rows[:batch],
-                self.box.rows_lse[:batch],
+                out,
+                lse,
                 module.fill_splits(batch, self.device),
+                **causal,
             )
             # This is preparation, outside capture: finish each use of shared
             # scratch before another PDL-capable kernel can overwrite it.
@@ -440,11 +492,14 @@ class PreparedDcpMla:
             or core.device != resources.device
             or core.deadline_ns != resources.deadline_ns
             or core.parity not in (0, 1)
-            or set(core.cores) != {(batch, 1) for batch in resources.widths}
+            or set(core.cores)
+            != {(batch, resources.tokens_per_request) for batch in resources.widths}
             or set(core.cores.values()) != {"tokenspeed"}
             or core.max_seq != resources.max_seq
         ):
-            raise ValueError("private DCP requires the prepared q1/12-head native core")
+            raise ValueError(
+                "private DCP requires its prepared q1/q6 12-head native core"
+            )
         self.core, self.resources = core, resources
         self.workspace = None
         self._prepared_geometry = None
@@ -531,9 +586,12 @@ class PreparedDcpMla:
         self.check_workspace()
         if not self.resources._prepared:
             raise RuntimeError("private DCP resource preparation is not finalized")
-        if kwargs.get("q", 1) != 1 or kwargs.get("totals") is None:
+        if (
+            kwargs.get("q", 1) != self.resources.tokens_per_request
+            or kwargs.get("totals") is None
+        ):
             raise ValueError(
-                "private DCP execution requires q1 and explicit global totals"
+                "private DCP execution requires its prepared q and explicit global totals"
             )
         result = self.core.run(*args, **kwargs)
         self.check_workspace()
