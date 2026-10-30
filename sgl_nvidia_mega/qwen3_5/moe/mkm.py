@@ -131,10 +131,50 @@ def unsupported(mlp) -> str:
     return ""
 
 
-def routed(mlp, maps: tuple, identity: torch.Tensor, logits, x_fp4, x_sf):
+def routing_unsupported(mlp) -> str:
+    """Why SGLang's trtllm-gen runner cannot take slot route_topk's materialized routing
+    under expert parallelism ("" when it can): a softmax top-10, renormalized, over 512
+    global experts on the NVFP4 trtllm-gen weights; the runner keeps global ids and
+    reads this rank's window from local_expert_offset."""
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import mkm
+
+    experts, cfg = mlp.experts, mlp.topk.topk_config
+    if experts.w13_weight.dtype != torch.uint8 or experts.w13_weight.shape[0] != (
+        experts.num_local_experts
+    ):
+        return (
+            f"w13_weight {experts.w13_weight.dtype} {tuple(experts.w13_weight.shape)}"
+        )
+    if not (
+        experts.num_experts == mkm.EXPERTS
+        and experts.top_k == cfg.top_k == mkm.TOP_K
+        and cfg.renormalize
+        and cfg.scoring_func == "softmax"
+        and cfg.correction_bias is None
+        and not cfg.use_grouped_topk
+        and shared_topk_slots(cfg) == 0
+        and experts.routing_method_type == RoutingMethodType.RenormalizeNaive
+    ):
+        return "routing other than a softmax top-10, renormalized, over 512 experts"
+    return ""
+
+
+def routed(
+    mlp,
+    maps: tuple,
+    identity: torch.Tensor,
+    logits,
+    x_fp4,
+    x_sf,
+    routing=None,
+    wide_bal: bool = False,
+    m16_max_rows: int = 16,
+):
     """The deferred-finalize output of ``mlp``'s routed experts from the router front's
     logits and quantized input (``maps``: the layer's weight TMA maps; ``identity``:
-    0, 1, ... int32)."""
+    0, 1, ... int32; ``routing``: route_topk's ids and weights, for the 64-token engine)."""
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         FlashInferTrtllmDeferredFinalizeOutput,
     )
@@ -153,6 +193,9 @@ def routed(mlp, maps: tuple, identity: torch.Tensor, logits, x_fp4, x_sf):
         experts.g1_alphas,
         experts.g1_scale_c,
         experts.g2_alphas,
+        routing=routing,
+        wide_bal=wide_bal,
+        m16_max_rows=m16_max_rows,
     )
     deferred = FlashInferTrtllmDeferredFinalizeOutput(
         gemm2_out=gemm2_out,

@@ -10,8 +10,16 @@ SM100-family GPUs (GB300) with NVLink multicast, against torch on the same input
   rounded once to bf16, bit for bit;
 - the memo rows equal the split fc's partials summed in rank order (checked at
   construction), and the split fc's gather and rank-order sum are exact;
+- the one-launch all-sum equals the gather and rank-order sum bit for bit, also from a
+  CUDA graph;
 - a whole draft round (five steps, the extend exchange with extend fc) replays from a CUDA
-  graph with fresh inputs, equal to its eager run.
+  graph with fresh inputs, equal to its eager run;
+- the sharded top-1 of slot draft_multi (``sm103/draft/top1``) picks, for 1-16 rows, the
+  argmax of the all-gathered logits under both NaN rules (ties to the lowest id, -0.0 as
+  +0.0), writes the token column, 1.0 and positions + 1, and replays from a CUDA graph;
+- the embedding exchange of slot draft_embed (``sm103/draft/embed``) gives, for 1-128 rows,
+  the rows of SGLang's vocabulary-parallel embedding (masked lookup + all-reduce) bit for
+  bit, -0.0 entries included, and replays from a CUDA graph.
 
 The bitwise comparison with the kernels of SGLang branch nvidia/qwen35-agentx-gb300 needs that
 branch installed as ``sglang`` and is not part of this test.
@@ -112,7 +120,14 @@ def _want_token(local_logits, group, nan_as):
     return int(torch.argmax(full))  # the first maximum: the lowest id
 
 
-def test_step_exchange_picks_the_global_argmax(ranks, boundary):
+@pytest.mark.parametrize("split_send", [False, True])
+def test_step_exchange_picks_the_global_argmax(
+    ranks, boundary, split_send, monkeypatch
+):
+    """The split-send and serial-send schedules produce the same boundary outputs."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    monkeypatch.setattr(kernels, "SPLIT_MEMO_SEND", split_send)
     rank, world, group, _ = ranks
     mkd, _ = boundary
     n_embed = world // 2
@@ -206,6 +221,64 @@ def test_extend_exchange_nan_rules(ranks, boundary, nan_key):
         assert int(topk_index) == want
 
 
+def test_extend_mkd_head_is_the_scan_path(ranks, boundary):
+    """The one-request MKD head, side-stream partial and maxima exchange equal the
+    shard GEMV, logits scan and serial partial, eager and under graph replay."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, cpu_group = ranks
+    mkd, _ = boundary
+
+    def scan_path(x):
+        logits = torch.empty(1, VOCAB, dtype=torch.bfloat16, device="cuda")
+        part = torch.zeros(mkd.head_part.numel(), dtype=torch.int32, device="cuda")
+        kernels.mkd_draft_head(x, mkd.lm_head_weight, logits, part)
+        mkd.note_draft_input()
+        _, ti = mkd.exchange_extend(logits, x)
+        return [logits, ti.clone(), mkd.fc_buf.clone()]
+
+    def head_path(x):
+        logits = mkd.extend_head(x)
+        assert logits is not None
+        mkd.note_draft_input()
+        _, ti = mkd.exchange_extend(logits, x, mkd_head=True)
+        return [logits, ti.clone(), mkd.fc_buf.clone()]
+
+    def same(got, want):
+        assert torch.equal(got[0].view(torch.int16), want[0].view(torch.int16))
+        assert int(got[1]) == int(want[1]) == _want_token(want[0], group, -1e30)
+        assert torch.equal(got[2].view(torch.int16), want[2].view(torch.int16))
+
+    with torch.inference_mode():
+        rows = [_randn(1, H, g=_gen(7300 + s)) for s in range(4)]
+        for x in rows:
+            want = scan_path(x)
+            got = head_path(x)
+            torch.cuda.synchronize()
+            same(got, want)
+        dist.barrier(group=cpu_group)
+        static = rows[0].clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            head_path(static)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = head_path(static)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for x in rows:
+            want = scan_path(x)
+            static.copy_(x)
+            graph.replay()
+            torch.cuda.synchronize()
+            same(captured, want)
+            dist.barrier(group=cpu_group)
+
+
 @pytest.mark.parametrize("m", [1, 2, 7])
 def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
@@ -233,6 +306,121 @@ def test_split_fc_gathers_and_sums_in_rank_order(ranks, boundary, m):
         )
         ref = (x.float() @ weights["fc"].float().T).bfloat16()
         torch.testing.assert_close(got.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.fixture(scope="module")
+def allsum(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, cpu_group = ranks
+    return kernels.FcAllsum(
+        world=world,
+        rank=rank,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+
+
+def _fp32_partials(m, rank, seed):
+    """Rank ``rank``'s fp32 partials, with signed zeros in the first columns of every rank."""
+    p = torch.randn(m, H, device="cuda", generator=_gen(seed + 31 * rank)) * 4.0
+    p[:, :8] = -0.0
+    return p
+
+
+def _gather_ordered_sum(mkd, partial, world):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    out = torch.empty(partial.shape, dtype=torch.bfloat16, device="cuda")
+    return kernels.ordered_partial_sum(mkd._fc_gather(partial), world, out)
+
+
+@pytest.mark.parametrize("m", [1, 2, 7, 16])
+def test_fc_allsum_is_the_gather_and_ordered_sum(ranks, boundary, allsum, m):
+    """One launch gives FcGather + ordered_partial_sum's rows bit for bit, -0.0
+    sums included, over calls that visit every stage twice."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, group, _ = ranks
+    mkd, _ = boundary
+    with torch.inference_mode():
+        for call in range(2 * kernels.ALLSUM_STAGES):
+            partial = _fp32_partials(m, rank, 1000 * m + call)
+            got = allsum(
+                partial, torch.empty(m, H, dtype=torch.bfloat16, device="cuda")
+            )
+            want = _gather_ordered_sum(mkd, partial, world)
+            torch.cuda.synchronize()
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), call
+
+
+def test_fc_allsum_replays_from_a_cuda_graph(ranks, boundary, allsum):
+    rank, world, group, cpu_group = ranks
+    mkd, _ = boundary
+    m = NUM_STEPS + 1
+    with torch.inference_mode():
+        partial = _fp32_partials(m, rank, 5000)
+        out = torch.empty(m, H, dtype=torch.bfloat16, device="cuda")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            allsum(partial, out)
+        torch.cuda.current_stream().wait_stream(stream)
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            allsum(partial, out)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for call in range(4):
+            partial.copy_(_fp32_partials(m, rank, 5100 + call))
+            graph.replay()
+            want = _gather_ordered_sum(mkd, partial, world)
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int16), want.view(torch.int16)), call
+            dist.barrier(group=cpu_group)
+
+
+@pytest.mark.parametrize("ctas", [8, 24, 0])
+def test_hidden_partial_rows4_is_the_one_row_kernel(ranks, boundary, ctas):
+    """The four-row load schedule equals the one-row kernel at every hidden slice."""
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
+
+    rank, world, _, _ = ranks
+    mkd, weights = boundary
+    width = mkd.width
+    with torch.inference_mode():
+        h = _randn(1, H, g=_gen(7100 + rank + ctas))
+        shard = _randn(H, width, g=_gen(7200 + rank), scale=0.02)
+        got = {}
+        for rows_per_iter in (1, 4):
+            for col in range(0, H, width):
+                out = torch.full(
+                    (1, H), float("nan"), dtype=torch.float32, device="cuda"
+                )
+                epoch_done = torch.tensor([11, 0], dtype=torch.int32, device="cuda")
+                sync = torch.zeros(2, dtype=torch.int32, device="cuda")
+                kernels.mkd_hidden_partial(
+                    h,
+                    shard,
+                    weights["norm_hid"],
+                    EPS,
+                    col,
+                    out,
+                    epoch_done,
+                    sync,
+                    world,
+                    ctas=ctas,
+                    rows_per_iter=rows_per_iter,
+                )
+                torch.cuda.synchronize()
+                assert sync.tolist() == [0, 11], (rows_per_iter, col)
+                got[(rows_per_iter, col)] = out
+        for col in range(0, H, width):
+            assert torch.equal(
+                got[(4, col)].view(torch.int32), got[(1, col)].view(torch.int32)
+            ), col
 
 
 def test_round_replays_from_a_cuda_graph(ranks, boundary):
@@ -297,6 +485,223 @@ def test_round_replays_from_a_cuda_graph(ranks, boundary):
                     want.view(torch.int16) if want.dtype == torch.bfloat16 else want,
                 )
             dist.barrier(group=cpu_group)
+
+
+V_TOP1 = 31040  # TP8's LM head shard rows
+
+
+@pytest.fixture(scope="module")
+def top1x(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import Top1Exchange
+
+    rank, world, group, cpu_group = ranks
+    return Top1Exchange(
+        world=world,
+        rank=rank,
+        vocab_local=V_TOP1,
+        vocab_start=rank * V_TOP1,
+        vocab_size=world * V_TOP1,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+
+
+def _top1_logits(rank, m, case):
+    g = _gen(7000 + 31 * rank + m)
+    logits = _randn(m, V_TOP1, g=g)
+    if case == "ties":  # equal maxima inside a shard and across ranks
+        logits = (torch.round(logits.float() * 2) / 2).to(torch.bfloat16)
+    elif case == "nan":
+        if rank == 1:
+            logits[0, 17] = float("nan")
+            logits[m - 1, 5] = float("nan")
+        if rank == 2:
+            logits[0, 3] = float("nan")
+    elif case == "zero":  # -0.0 ties +0.0: the lower id wins
+        logits = torch.full_like(logits, -1.0)
+        if rank == 2:
+            logits[:, 40] = -0.0
+        if rank == 3:
+            logits[:, 10] = 0.0
+    return logits
+
+
+def _top1_want(logits, group, nan):
+    full = _all_gather(logits, group).permute(1, 0, 2).reshape(logits.shape[0], -1)
+    full = full.float()
+    if nan == "split":
+        full = torch.where(torch.isnan(full), torch.full_like(full, -1e30), full)
+    return torch.argmax(
+        full, dim=1
+    )  # the first maximum (a NaN first under torch's rule)
+
+
+@pytest.mark.parametrize("case", ["random", "ties", "nan", "zero"])
+@pytest.mark.parametrize("nan", ["split", "torch"])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 64, 128])
+def test_sharded_top1_is_the_gathered_argmax(ranks, top1x, m, nan, case):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import top1
+
+    rank, world, group, _ = ranks
+    key = top1.NAN_KEY_SPLIT_ARGMAX if nan == "split" else top1.NAN_KEY_TORCH_ARGMAX
+    with torch.inference_mode():
+        logits = _top1_logits(rank, m, case)
+        tokens = torch.full((m, NUM_STEPS), -1, dtype=torch.int64, device="cuda")
+        topk_p = torch.zeros(m, 1, dtype=torch.float32, device="cuda")
+        positions = torch.arange(m, dtype=torch.int64, device="cuda") * 10
+        mrope = torch.arange(3 * (m + 1), dtype=torch.int64, device="cuda").view(3, -1)
+        mrope0 = mrope.clone()
+        top1x(
+            logits,
+            tokens,
+            3,
+            nan_key=key,
+            topk_p=topk_p,
+            positions=positions,
+            mrope_positions=mrope[:, :m],
+        )
+        torch.cuda.synchronize()
+        want = _top1_want(logits, group, nan)
+        assert torch.equal(tokens[:, 3], want)
+        assert (tokens[:, [0, 1, 2, 4, 5]] == -1).all()
+        assert (topk_p == 1.0).all()
+        assert torch.equal(positions, torch.arange(m, device="cuda") * 10 + 1)
+        assert torch.equal(mrope[:, :m], mrope0[:, :m] + 1)
+        assert torch.equal(mrope[:, m:], mrope0[:, m:])
+
+
+def test_sharded_top1_replays_from_a_cuda_graph(ranks, top1x):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import top1
+
+    rank, world, group, cpu_group = ranks
+    m = 8
+    with torch.inference_mode():
+        logits = _top1_logits(rank, m, "random")
+        tokens = torch.zeros(m, NUM_STEPS, dtype=torch.int64, device="cuda")
+        positions = torch.zeros(m, dtype=torch.int64, device="cuda")
+
+        def run():
+            for col in range(1, NUM_STEPS):
+                top1x(
+                    logits,
+                    tokens,
+                    col,
+                    nan_key=top1.NAN_KEY_SPLIT_ARGMAX,
+                    positions=positions,
+                )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        dist.barrier(group=cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        for case in ("random", "ties", "nan"):
+            logits.copy_(_top1_logits(rank, m, case))
+            positions.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            want = _top1_want(logits, group, "split")
+            for col in range(1, NUM_STEPS):
+                assert torch.equal(tokens[:, col], want)
+            assert (positions == NUM_STEPS - 1).all()
+            dist.barrier(group=cpu_group)
+
+
+V_EMBED = 512  # embedding rows a rank holds here
+
+
+@pytest.fixture(scope="module")
+def embedx(ranks):
+    from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import EmbedExchange
+
+    rank, world, group, cpu_group = ranks
+    full = _randn(world * V_EMBED, H, g=_gen(9100))  # the same table on every rank
+    full[3, :64] = -0.0
+    full[V_EMBED, 1::2] = -0.0  # rank 1's first row
+    table = full[rank * V_EMBED : (rank + 1) * V_EMBED].contiguous()
+    ex = EmbedExchange(
+        world=world,
+        table=table,
+        vocab_start=rank * V_EMBED,
+        vocab_local=V_EMBED,
+        group=group,
+        cpu_group=cpu_group,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    return ex, table
+
+
+def _embed_want(table, ids, rank, group):
+    """SGLang's VocabParallelEmbedding at TP > 1: out-of-shard ids read row 0 and are
+    zeroed, then the all-reduce."""
+    start = rank * V_EMBED
+    mask = (ids < start) | (ids >= start + V_EMBED)
+    rows = torch.nn.functional.embedding((ids - start) * ~mask, table)
+    rows.masked_fill_(mask.unsqueeze(-1), 0)
+    dist.all_reduce(rows, group=group)
+    return rows
+
+
+def _embed_ids(world, m, seed):
+    ids = torch.randint(0, world * V_EMBED, (m,), device="cuda", generator=_gen(seed))
+    edges = [3, V_EMBED, V_EMBED - 1, world * V_EMBED - 1, 0]
+    ids[: min(m, len(edges))] = torch.tensor(edges[:m], device="cuda")
+    return ids
+
+
+@pytest.mark.parametrize("m", [1, 2, 7, 16, 28, 112, 128])
+def test_embedding_exchange_is_the_vocab_parallel_embedding(ranks, embedx, m):
+    rank, world, group, cpu_group = ranks
+    ex, table = embedx
+    ids = _embed_ids(world, m, 9200 + m)
+    tokens = torch.zeros(m, NUM_STEPS, dtype=torch.int64, device="cuda")
+    tokens[:, 2] = ids  # a strided column, as the draft tokens' next column
+    got = ex(tokens[:, 2])
+    want = _embed_want(table, ids, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    dist.barrier(group=cpu_group)
+
+
+def test_embedding_exchange_replays_from_a_cuda_graph(ranks, embedx):
+    rank, world, group, cpu_group = ranks
+    ex, table = embedx
+    m = 16
+    ids = torch.zeros(m, dtype=torch.int64, device="cuda")
+    outs = []
+
+    def run():
+        outs.clear()
+        for _ in range(NUM_STEPS - 1):
+            outs.append(ex(ids))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    dist.barrier(group=cpu_group)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+    dist.barrier(group=cpu_group)
+    for seed in (1, 2, 3):
+        ids.copy_(_embed_ids(world, m, 9300 + seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        want = _embed_want(table, ids, rank, group)
+        assert all(
+            torch.equal(o.view(torch.int16), want.view(torch.int16)) for o in outs
+        )
+        dist.barrier(group=cpu_group)
 
 
 if __name__ == "__main__":

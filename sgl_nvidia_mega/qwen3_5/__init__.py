@@ -29,3 +29,26 @@ TEXT_CONFIG = dict(
     hidden_act="silu",
     rms_norm_eps=1e-6,
 )
+
+CP_LITE_HEAD_DIM = 256
+
+
+def cp_lite_topology(
+    attention_tp_size: int,
+    *,
+    num_key_value_heads: int = TEXT_CONFIG["num_key_value_heads"],
+    num_attention_heads: int = TEXT_CONFIG["num_attention_heads"],
+    head_dim: int = TEXT_CONFIG["head_dim"],
+    kernel_head_dim: int = CP_LITE_HEAD_DIM,
+) -> tuple[int, int] | None:
+    """Return ``(CP size, local Q heads)`` when CP-lite supports the topology."""
+    tp = attention_tp_size
+    if tp <= num_key_value_heads or tp % num_key_value_heads:
+        return None
+    if head_dim != kernel_head_dim:
+        return None
+    cp = tp // num_key_value_heads
+    q_heads = num_attention_heads // tp
+    if cp not in (2, 4, 8) or q_heads * cp > 16:
+        return None
+    return cp, q_heads

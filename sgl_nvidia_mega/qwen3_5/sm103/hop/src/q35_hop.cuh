@@ -56,6 +56,15 @@ struct Site {
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+// Keep the named static loads above a PDL wait. Without the data dependency,
+// ptxas may sink ld.global.nc instructions below the wait.
+__device__ __forceinline__ void pin_before_wait(uint32_t dep, uint64_t never) {
+  asm volatile(
+      "{ .reg .pred a, b; setp.eq.u64 a, %1, 0; setp.eq.u32 b, %0, 1; "
+      "and.pred a, a, b; @a trap; }"
+      :: "r"(dep), "l"(never)
+      : "memory");
+}
 __device__ __forceinline__ unsigned long long gtimer() {
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));

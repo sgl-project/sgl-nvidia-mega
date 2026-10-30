@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 # SGLANG_Q35MF_MKA_Q1_MIN_LENGTH default, which its TP8 serving configuration keeps)
 Q1_STOCK, Q1_LONG = "q1_stock", "q1_long"
 Q1_MIN_LENGTH = 16384
+# slot draft_q1_cp: one request past attention.route.CP_MIN_KV["draft"] runs its steps'
+# decode as CP-lite (SGLang's read-split attention over the KV group)
+Q1_CP = "q1_cp"
 # A draft step's q1 decode and its merge launch as programmatic dependents, the
 # one-row front releasing them at entry (same arithmetic)
 Q1_PDL = True
@@ -43,13 +46,20 @@ GATE_FOLD = 2
 
 class Q1Variants:
     """The draft loop's graph variants (SGLang's AttentionGraphVariants), as 2.2's
-    Q1GraphVariants: SKV2-Q1 from a host-only KV length lower bound."""
+    Q1GraphVariants: SKV2-Q1 from a host-only KV length lower bound, and with
+    ``cp_min_length`` (slot draft_q1_cp) CP-lite from that length."""
 
-    # stock first, as 2.2 captures them (variants share a graph memory pool)
-    capture_labels = (Q1_STOCK, Q1_LONG)
+    # select picks Q1_STOCK past one request (q1 decodes one row), so SGLang captures
+    # one graph at every larger batch size
+    max_batch_size = 1
 
-    def __init__(self, min_length: int = Q1_MIN_LENGTH):
+    def __init__(self, min_length: int = Q1_MIN_LENGTH, cp_min_length=None):
         self.min_length = min_length
+        self.cp_min_length = cp_min_length
+        # stock first, as 2.2 captures them (variants share a graph memory pool)
+        self.capture_labels = (Q1_STOCK, Q1_LONG) + (
+            (Q1_CP,) if cp_min_length is not None else ()
+        )
 
     def select(self, forward_batch) -> str:
         if forward_batch.batch_size != 1:
@@ -63,7 +73,11 @@ class Q1Variants:
                 and lengths.numel() == 1
             ):
                 length = int(lengths[0])
-        return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
+        if length is None:
+            return Q1_STOCK
+        if self.cp_min_length is not None and length >= self.cp_min_length:
+            return Q1_CP
+        return Q1_LONG if length >= self.min_length else Q1_STOCK
 
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -185,6 +199,9 @@ class Attention:
         self.skv2 = (
             DraftExtendSplitKV.build(parts) if "draft_skv2" in parts.slots else None
         )
+        # slots draft_q1_cp / draft_skv2_cp: one request's steps / extend in their
+        # CP graph variant run CP-lite at one request (DraftCP)
+        self.cp_b1 = DraftCP.build(parts)
 
     def __call__(
         self, x, positions, cache_loc, meta, kv, *, rows_per_request: int, o_proj=None
@@ -299,6 +316,10 @@ class Attention:
         attn = self.layer.attn
         bmm1_scale = 1.0 * kv.k_scale[0] * attn.scaling
         bmm2_scale = kv.v_scale[0]
+        if self.cp_b1 is not None and self.cp_b1.takes(rows_per_request, q8.shape[0]):
+            o = self.cp_b1.run(self, q8, meta, kv, rows_per_request)
+            if o is not None:
+                return o
         # q1 decodes one request
         if (
             self.q1 is not None
@@ -307,7 +328,12 @@ class Attention:
             and _q1_label() != Q1_STOCK
         ):
             return self.q1(q8, kv, meta).view(-1, self.heads * self.head_dim)
-        if self.skv2 is not None and rows_per_request > 1 and self.skv2.long():
+        if (
+            self.skv2 is not None
+            and rows_per_request > 1
+            and q8.shape[0] == rows_per_request
+            and self.skv2.long()
+        ):
             return self.skv2.run(attn, q8, kv, meta)
         kwargs = {}
         if rows_per_request != 1:
@@ -387,6 +413,87 @@ class DraftExtendSplitKV:
                 q8.shape[0],
             )
         return self.split_kv.skv2(attn, q8, kv, meta)
+
+
+class DraftCP:
+    """Slots draft_q1_cp / draft_skv2_cp: in the draft loop's ``Q1_CP`` and the draft
+    extend's ``SPLIT_KV_CP`` graph variants (one request past its measured crossover),
+    the decode of the request's rows as the plugin's CP-lite, which then serves one
+    request through ``attention.split_kv.cp_core``. Slot
+    draft_multi also preserves CP-lite on multi-request graphs where SGLang built it;
+    CP-lite's own shape gate decides whether it runs."""
+
+    def __init__(self, split_kv, route, steps: bool, extend: bool, multi: bool = False):
+        self.split_kv, self.route = split_kv, route
+        self.steps, self.extend, self.multi = steps, extend, multi
+        self._logged: set = set()
+
+    @classmethod
+    def build(cls, parts):
+        steps = "draft_q1_cp" in parts.slots
+        extend = "draft_skv2_cp" in parts.slots
+        multi = "draft_multi" in parts.slots
+        if not (steps or extend or multi):
+            return None
+        from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
+
+        why = split_kv.cp_reason()
+        if why:
+            if multi and not (steps or extend):
+                return None
+            raise RuntimeError(
+                f"NVIDIA megakernel: slots draft_q1_cp / draft_skv2_cp cannot run: {why}"
+            )
+        return cls(split_kv, route, steps, extend, multi)
+
+    def takes(self, rows_per_request: int, rows: int) -> bool:
+        """Whether this graph lets CP-lite try the decode."""
+        if self.multi and rows > rows_per_request:
+            return True
+        label = _q1_label()
+        if rows_per_request == 1:
+            return self.steps and label == Q1_CP
+        return self.extend and label == self.route.SPLIT_KV_CP
+
+    def run(self, attention, q8, meta, kv, rows_per_request: int):
+        layer = attention.layer
+        attn = layer.attn
+        multi = q8.shape[0] > rows_per_request
+        o = self.split_kv.cp_core(
+            attn,
+            q8,
+            kv,
+            meta,
+            attention,
+            rows_per_request,
+            min_bs=None if multi else 1,
+            # R11 orders the draft-multi exact partial and merge after their waits.
+            # Keep the shared CP-lite default for target and one-request draft calls.
+            early_merge=False if multi else None,
+        )
+        if o is not None and torch.cuda.is_current_stream_capturing():
+            key = (rows_per_request, q8.shape[0])
+            if key not in self._logged:
+                self._logged.add(key)
+                if multi:
+                    logger.info(
+                        "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_multi keeps "
+                        "CP-lite for %d requests x %d rows",
+                        q8.shape[0] // rows_per_request,
+                        rows_per_request,
+                    )
+                else:
+                    logger.info(
+                        "NVIDIA megakernel: Qwen3.5 MTP draft slot %s runs the %s's "
+                        "%d rows as CP-lite (from %d tokens of KV)",
+                        "draft_q1_cp" if rows_per_request == 1 else "draft_skv2_cp",
+                        "step" if rows_per_request == 1 else "extend",
+                        q8.shape[0],
+                        self.route.cp_min_length(
+                            "draft" if rows_per_request == 1 else "extend"
+                        ),
+                    )
+        return o
 
 
 def _q1_label():

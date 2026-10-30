@@ -111,6 +111,7 @@ class Qwen35Verify:
         binding=None,
         summary: str = "",
         parity=None,
+        speculative_runtime_hooks=None,
     ):
         from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
 
@@ -119,10 +120,13 @@ class Qwen35Verify:
         self.binding = binding  # SGLang's EagleBinding (BuildContext.binding)
         self._summary = summary
         self.parity = parity  # runtime.parity.Parity under the test-only switch
+        # A factory over SGLang's stock strategy, or None.  The binding reads this
+        # optional BuiltMegakernel member once when it wires speculative verify.
+        self.speculative_runtime_hooks = speculative_runtime_hooks
         # the attention graph variants per SGLang runner ("target_verify"), which it
         # captures once it takes a megakernel's (attention/route.py)
         self.graph_variants = (
-            {"target_verify": attention.route.VERIFY}
+            {"target_verify": attention.route.verify_variants()}
             if any(s.skv2 for s in slots.values())
             else {}
         )
@@ -185,6 +189,20 @@ class Qwen35Verify:
                     "NVIDIA megakernel: slot gdn_verify cannot run: "
                     + "; ".join(reasons)
                 )
+        if any(s.gdn_conv for s in self.slots.values()):
+            reasons = gdn.verify.conv_pool_reasons(
+                view.mamba, self.binding.tokens_per_request
+            )
+            if reasons:
+                raise RuntimeError(
+                    "NVIDIA megakernel: slot gdn_conv cannot run: " + "; ".join(reasons)
+                )
+        if any(s.gdn_core for s in self.slots.values()):
+            reasons = gdn.verify.core_pool_reasons(view.mamba)
+            if reasons:
+                raise RuntimeError(
+                    "NVIDIA megakernel: slot gdn_core cannot run: " + "; ".join(reasons)
+                )
         if any(s.gdn_front for s in self.slots.values()):
             from sgl_nvidia_mega.qwen3_5.gdn import front
 
@@ -194,6 +212,11 @@ class Qwen35Verify:
                     "NVIDIA megakernel: slot gdn_front cannot run: "
                     + "; ".join(reasons)
                 )
+            front.prepare(
+                self.lm,
+                view.mamba,
+                trt=any(s.gdn_trt_front for s in self.slots.values()),
+            )
         skv2 = any(s.skv2 for s in self.slots.values())
         mka = any(s.mka for s in self.slots.values())
         if skv2 or mka:

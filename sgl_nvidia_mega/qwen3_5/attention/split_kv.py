@@ -16,7 +16,8 @@ K / V rows and quantizes Q in one ``fused_fp8_qkv_kv_cache``, then runs ``core``
 ``core`` takes an FP8 Q whose K / V rows are written (slot ``mka``'s prologue writes
 them itself) and runs SKV2 where the step takes split-KV attention (``route``),
 SGLang's attention otherwise. It reads the page table, the KV lengths and the pool from
-the forward's view (``Step.view``).
+the forward's view (``Step.view``). With slot ``skv2_cp``, a step of one request past
+the measured crossover runs CP-lite (``cp_core``) instead of SKV2.
 """
 
 from __future__ import annotations
@@ -65,14 +66,31 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc",),
     "srt/environ.py": ("envs", "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR"),
+    "srt/layers/attention/trtllm_mha_backend.py": (
+        "DEFAULT_WORKSPACE_SIZE_MB",
+        '"trtllm_mha_zero_workspace"',
+    ),
+    "srt/runtime_context.py": ("get_buffer",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": "8e36076dafabff66",
+    # Stock and the SGLang follow-up's CP-lite dispatch; the metadata this module
+    # mirrors is unchanged by the dispatch around the fixed-q-length call.
+    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": (
+        "8e36076dafabff66",
+        "d7e7c1fe125739e6",
+        "066a1e0aa5bd6e5c",
+        "10bd9120d713848b",
+        "37c7c1fa55956740",
+        "1445b85387928caf",
+    ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
-    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": "363661c3585e6a0f",
+    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": (
+        "363661c3585e6a0f",
+        "208190898701e7b0",
+    ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._get_bmm_scales": "90a1387e8f561611",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._reshape_paged_kv_cache": "53ae20937769b99a",
 }
@@ -162,17 +180,131 @@ def core(attn, q, st):
     step are written: [rows, heads * head_dim] in bf16."""
     from sgl_nvidia_mega.qwen3_5.attention import route
 
-    split = route.split_kv(route.VERIFY, st.fb)
-    if (split, q.shape[0]) not in _ENGAGED:
-        _ENGAGED.add((split, q.shape[0]))
-        logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot skv2 runs at %d rows (%s)",
-            q.shape[0],
-            "SKV2" if split else "SGLang's attention below the split-KV length",
+    if cp_multi(q.shape[0]):
+        o = cp_core(
+            attn,
+            q,
+            st.view.kv,
+            st.view.attn,
+            st.fb,
+            ROWS,
+            min_bs=None,
         )
-    if not split:
+        if o is not None:
+            key = (route.SPLIT_KV_CP, q.shape[0])
+            if key not in _ENGAGED:
+                _ENGAGED.add(key)
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 slot skv2_cp keeps CP-lite for "
+                    "%d requests x %d target-verify rows",
+                    q.shape[0] // ROWS,
+                    ROWS,
+                )
+            return o
+    label = route.label(route.verify_variants(), st.fb)
+    if (label, q.shape[0]) not in _ENGAGED:
+        _ENGAGED.add((label, q.shape[0]))
+        if label == route.SPLIT_KV_CP:
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot skv2_cp runs at %d rows (CP-lite from "
+                "%d tokens of KV)",
+                q.shape[0],
+                route.cp_min_length("verify"),
+            )
+        else:
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot skv2 runs at %d rows (%s)",
+                q.shape[0],
+                "SKV2"
+                if label == route.SPLIT_KV_LONG
+                else "SGLang's attention below the split-KV length",
+            )
+    if label == route.SPLIT_KV_STOCK:
         return attn(q, None, None, st.fb)
+    if label == route.SPLIT_KV_CP:
+        o = cp_core(attn, q, st.view.kv, st.view.attn, st.fb, ROWS)
+        if o is not None:
+            return o
     return skv2(attn, q, st.view.kv, st.view.attn)
+
+
+def cp_lite():
+    """The CP state built collectively by the Qwen3.5 plugin, else None."""
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+
+    return CpLite._instance
+
+
+def cp_multi(rows: int) -> bool:
+    """Whether a multi-request target verify can try the plugin's CP state."""
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_fused import MAX_BATCH
+
+    return (
+        "skv2_cp" in SLOTS and ROWS < rows <= ROWS * MAX_BATCH and cp_lite() is not None
+    )
+
+
+def cp_reason() -> str:
+    """Why the CP graph variants cannot run ("" when they can)."""
+    return "" if cp_lite() is not None else "the plugin did not build CP-lite"
+
+
+def cp_core(
+    attn,
+    q,
+    kv,
+    meta,
+    forward_batch,
+    q_len: int,
+    min_bs: int | None = 1,
+    early_merge: bool | None = None,
+):
+    """CP-lite on requests of ``q_len`` FP8 query rows over the pool ``kv``:
+    [rows, heads * head_dim] bf16, or None where CP-lite declines. ``min_bs`` overrides
+    CP-lite's configured minimum for a host-selected one-request graph; ``None`` keeps
+    the configured gate for a multi-request graph. ``early_merge=False`` restores the
+    R11 plain merge for both exact and fold paths when no fused gate epilogue was
+    offered; ``None`` preserves CP-lite's default."""
+    from sglang.kernels.ops.attention.utils import canonicalize_stride
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        DEFAULT_WORKSPACE_SIZE_MB,
+    )
+    from sglang.srt.runtime_context import get_buffer
+
+    cp = cp_lite()
+    if cp is None:
+        return None
+    i = kv.layer_ids.index(attn.layer_id)
+    # the pool's NHD rows as HND pages, as TRT-LLM MHA hands them to CP-lite
+    caches = tuple(
+        canonicalize_stride(
+            buf.view(-1, PAGE_SIZE, heads, attn.head_dim).permute(0, 2, 1, 3)
+        )
+        for buf, heads in ((kv.k[i], attn.tp_k_head_num), (kv.v[i], attn.tp_v_head_num))
+    )
+    workspace = get_buffer(
+        "trtllm_mha_zero_workspace",
+        lambda: torch.zeros(
+            DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024, dtype=torch.uint8, device=q.device
+        ),
+    )
+    options = {} if early_merge is None else {"early_merge": early_merge}
+    o = cp.attend(
+        q.reshape(-1, attn.tp_q_head_num, attn.head_dim),
+        caches,
+        meta.page_table,
+        meta.cache_seqlens,
+        q_len,
+        float(1.0 * kv.k_scale[i] * attn.scaling),
+        float(kv.v_scale[i]),
+        workspace,
+        attn,
+        forward_batch,
+        min_bs=min_bs,
+        **options,
+    )
+    return None if o is None else o.view(-1, attn.tp_q_head_num * attn.head_dim)
 
 
 def skv2(attn, q, kv, meta):

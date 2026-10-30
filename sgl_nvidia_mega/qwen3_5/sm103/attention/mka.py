@@ -4,7 +4,9 @@
 # python/sglang/kernels/ops/attention/mka_fused.py and mka_fused.cu (its host side).
 """MKA (``src/mka.cu``): the fused full-attention prologue and epilogue of one request's
 verify rows (at most 8) at hidden 4096 and head_dim 256, the kernels of SGLang branch
-nvidia/qwen35-agentx-gb300 built with NVRTC.
+nvidia/qwen35-agentx-gb300 built with NVRTC; and their wide entries for the rows of
+several requests (9 to ``WIDE_MAX_ROWS``, four query heads a rank), which run the same
+math on 8-row tiles in one launch, bit for bit the narrow kernels on each 8-row chunk.
 
 ``prologue``: the normed hidden rows' static FP8 quantization, the qkv (+ gate) GEMM, the
 q / k Gemma RMSNorm, the partial NeoX M-RoPE, the FP8 query rows, the FP8 K / V rows
@@ -29,15 +31,23 @@ from sgl_nvidia_mega.qwen3_5.sm103.hop import Site
 
 SOURCE = Path(__file__).parent / "src" / "mka.cu"
 THREADS, CLUSTER, HEAD_DIM, HIDDEN, MAX_ROWS = 256, 8, 256, 4096, 8
-ENTRIES = (
-    "q35mka_prologue",
-    "q35mka_prologue_late",
-    "q35mka_gate",
-    "q35mka_epilogue_q4",
-    "q35mka_epilogue_q4_late",
-    "q35mka_epilogue_q8",
-    "q35mka_epilogue_q8_late",
-)
+WIDE_MAX_ROWS = 112  # src/mka.cu kWideTiles 8-row tiles
+_INBOX = WIDE_MAX_ROWS // 8 * CLUSTER * 256 * 4
+# each entry's dynamic shared memory: the wide entries' inbox and operand tiles
+ENTRIES = {
+    "q35mka_prologue": 0,
+    "q35mka_prologue_late": 0,
+    "q35mka_gate": 0,
+    "q35mka_epilogue_q4": 0,
+    "q35mka_rl_router": 0,
+    "q35mka_epilogue_q4_late": 0,
+    "q35mka_epilogue_q8": 0,
+    "q35mka_epilogue_q8_late": 0,
+    "q35mka_prologue_wide": _INBOX + WIDE_MAX_ROWS // 8 * 16 * 32 * 8,
+    "q35mka_prologue_wide_late": _INBOX + WIDE_MAX_ROWS // 8 * 16 * 32 * 8,
+    "q35mka_epilogue_wide_q4": _INBOX + WIDE_MAX_ROWS // 8 * 4 * 32 * 8,
+    "q35mka_epilogue_wide_q4_late": _INBOX + WIDE_MAX_ROWS // 8 * 4 * 32 * 8,
+}
 
 
 class ProParams(ctypes.Structure):
@@ -89,7 +99,7 @@ def _kernels(device_index: int) -> dict[str, jit.Kernel]:
         ("-std=c++17", "-default-device"),
         headers=hop.headers(),
     )
-    return {n: jit.load(cubin, n, (THREADS, 1, 1), 0) for n in ENTRIES}
+    return {n: jit.load(cubin, n, (THREADS, 1, 1), b) for n, b in ENTRIES.items()}
 
 
 def build(device) -> None:
@@ -173,12 +183,17 @@ def prologue(
 ) -> None:
     """The branch's ``prologue`` (its host function's checks and launches)."""
     w_main, w_gate = w_packed
+    wide = x.shape[0] > MAX_ROWS
     if (
-        not (x.dim() == 2 and x.shape[0] <= MAX_ROWS and x.shape[1] == HIDDEN)
+        not (x.dim() == 2 and x.shape[0] <= WIDE_MAX_ROWS and x.shape[1] == HIDDEN)
         or not x.is_contiguous()
     ):
         raise ValueError(
-            f"MKA prologue: x {tuple(x.shape)} is not [<= 8, 4096] contiguous"
+            f"MKA prologue: x {tuple(x.shape)} is not [<= {WIDE_MAX_ROWS}, 4096] contiguous"
+        )
+    if wide and w_gate.numel():
+        raise ValueError(
+            f"MKA prologue: {x.shape[0]} rows need four query heads a rank"
         )
     if positions.dim() != 2 or positions.shape[0] != 3 or positions.stride(1) != 1:
         raise ValueError(
@@ -220,7 +235,11 @@ def prologue(
         wg=w_gate.data_ptr() if split else None,
     )
     if not split:
-        name = "q35mka_prologue" if early_trigger else "q35mka_prologue_late"
+        name = (
+            "q35mka_prologue"
+            + ("_wide" if wide else "")
+            + ("" if early_trigger else "_late")
+        )
         _launch(name, (2 * nq + 2) * CLUSTER, p, x.device)
         return
     # The gate launch must start while the prologue runs, so the prologue triggers right after its wait.
@@ -242,11 +261,12 @@ def epilogue(
     """The branch's ``epilogue``; ``site``: the hop mailbox to push the rows into."""
     if not (attn.is_contiguous() and gate.is_contiguous() and out.is_contiguous()):
         raise ValueError("MKA epilogue: attn, gate and out must be contiguous")
-    if attn.shape[0] > MAX_ROWS or attn.shape[1] != nq * HEAD_DIM:
+    m = int(attn.shape[0])
+    wide = m > MAX_ROWS
+    if m > (WIDE_MAX_ROWS if nq == 4 else MAX_ROWS) or attn.shape[1] != nq * HEAD_DIM:
         raise ValueError(f"MKA epilogue: attn {tuple(attn.shape)} for {nq} heads")
     if nq not in (4, 8):
         raise ValueError("MKA epilogue: nq must be 4 (TP8) or 8 (TP4)")
-    m = int(attn.shape[0])
     if site is not None and m > site.m_cap:
         raise ValueError(f"MKA epilogue: {m} rows past the hop's {site.m_cap}")
     p = EpiParams(
@@ -260,5 +280,39 @@ def epilogue(
         push=int(site is not None),
         site=site if site is not None else Site(),
     )
-    name = f"q35mka_epilogue_q{nq}" + ("" if early_trigger else "_late")
+    name = f"q35mka_epilogue{'_wide' if wide else ''}_q{nq}" + (
+        "" if early_trigger else "_late"
+    )
     _launch(name, 16 * CLUSTER, p, attn.device)
+
+
+def epilogue_rl(attn, gate, w_packed, sx, sw, out, site: Site, rl_args) -> None:
+    """``epilogue`` of a TP8 B1 step (4 q heads a rank, early trigger, pushing into the hop) plus the router partial
+    (slot ``route_lin``): 16 CTAs push this rank's router partial into the hop's router mailbox
+    (``rl_args``: sm103/hop RlArgs, from ``Hop.rl_push_args``)."""
+    m = int(attn.shape[0])
+    if not (attn.is_contiguous() and gate.is_contiguous() and out.is_contiguous()):
+        raise ValueError("MKA epilogue: attn, gate and out must be contiguous")
+    if m > MAX_ROWS or attn.shape[1] != 4 * HEAD_DIM or m > site.m_cap:
+        raise ValueError(f"MKA router-lin epilogue: attn {tuple(attn.shape)}")
+    p = EpiParams(
+        attn=attn.data_ptr(),
+        gate=gate.data_ptr(),
+        w=w_packed.data_ptr(),
+        sx=sx.data_ptr(),
+        sw=sw.data_ptr(),
+        out=out.data_ptr(),
+        m=m,
+        push=1,
+        site=site,
+    )
+    stream = torch.cuda.current_stream(attn.device).cuda_stream
+    kernels = _kernels(attn.device.index)
+    jit.launch(
+        kernels["q35mka_epilogue_q4"],
+        (16 * CLUSTER, 1, 1),
+        [p],
+        stream,
+        (CLUSTER, 1, 1),
+    )
+    jit.launch(kernels["q35mka_rl_router"], (16, 1, 1), [p, rl_args], stream)

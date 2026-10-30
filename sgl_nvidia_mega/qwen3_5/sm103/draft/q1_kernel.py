@@ -304,6 +304,7 @@ class Q1SplitDecode:
         copy_s = tcgen05.make_tmem_copy(copy_atom, s_plane).get_slice(local_tid)
         rlayout = copy_s.partition_D(s_plane).layout
         # trtllm-gen split: one CTA per SM, ceil(steps / CTAs) contiguous 256-token steps each.
+        # lengths / table are read before the dependency wait: they must be written before the graph launch.
         length = lengths[0]
         spc = cute.ceil_div(cute.ceil_div(length, 256), self.nsplit)
         begin_tok = split * spc * 256

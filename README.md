@@ -50,23 +50,34 @@ The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/
 
 With the megakernel on, the default 39 slots run: the ones above, the attention chain, hop B's triggers, and the DSpark draft step's 16 slots. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting; empty runs every step function's stock code. The opt-in slots run only when listed there: `target_lm_head` (the target's LM head on the low-M kernel at 1-8 rows), `lm_head_pinned_tactic` (both low-M LM heads on one fixed tactic per row count, untuned), `hop_b_quad_trigger` (hop B's finalize-publish launches its consumer right after its own wait, batch 1 only), `hop_b_cap16` and `draft_embed`; listing `sm148` there admits the 148 SMs of a B300 instead of the 152 required otherwise.
 
-Qwen3.5 (`qwen3_5/runtime`) runs the same way: per layer the stage boundary (`boundary/`), the GatedDeltaNet or the attention (`gdn/`, `attention/`) and the MoE (`moe/`), each with a stock implementation that reproduces SGLang's verify step bit for bit. It reads the running forward's metadata and pools through SGLang's EAGLE binding (`sglang.srt.kernel_plugins.nvidia.eagle_binding`). Its slots run only when listed in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`, and each is bit for bit SGLang's:
+Qwen3.5 (`qwen3_5/runtime`) runs the same way: per layer the stage boundary (`boundary/`), the GatedDeltaNet or the attention (`gdn/`, `attention/`) and the MoE (`moe/`), each with a stock implementation that reproduces SGLang's verify step bit for bit. It reads the running forward's metadata and pools through SGLang's EAGLE binding (`sglang.srt.kernel_plugins.nvidia.eagle_binding`). With the megakernel enabled, its shape-bounded bitwise paths run by default. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` overrides that policy for testing and bisecting; an empty value runs the stock paths.
 
 | Slot | Rows | Kernel |
 | --- | --- | --- |
-| `route` | 7 | The router GEMM and the NVFP4 quantization of the MoE input in one launch |
-| `mkm` (with `route`) | 7 | On `route`'s outputs, the top-10, FC1, SwiGLU, the NVFP4 requantization and FC2 in one launch |
-| `gdn_verify` | 7 | The GatedDeltaNet verify chain (conv update, split, ReplaySSM verify, gated norm with the FP8 `out_proj` input) with its launch choices changed |
-| `gdn_pdl` (with `gdn_verify`) | 7 | Its ReplaySSM verify launched as a programmatic dependent of the conv |
-| `hop` | 7 | The layer boundary's fused all-reduce + residual add + RMSNorm points on an NVLink multicast hop |
+| `route_topk`, `mkm_m32` … `mkm_m512` | 1–896 | Materialized stock routing and the shape-selected fused wide routed-expert engines |
+| `gdn_verify`, `gdn_pdl`, `gdn_conv` | 7–896 | The opened GatedDeltaNet verify chain, dependent launch, and bitwise conv update |
+| `hop`, `hop_fp8` | 1–15 | The layer boundary's fused all-reduce + residual add + RMSNorm, also writing the next static-FP8 input |
+| `multi_request` | 2–128 requests | The target graphs keep every offered request count instead of padding to a coarser width |
+| `draft_loop`, `draft_extend`, `draft_multi`, `draft_embed` | 1–128 requests | EAGLE draft entries, exact sharded top-1 and embedding exchange; the pre-FC norms write directly into the FC input |
 
-These slots change the arithmetic (numeric: each sums in another order than SGLang's op, within the tolerances `spec.py` declares):
+The remaining kernel families are opt-in through that one slot policy. These change the arithmetic within the tolerances `spec.py` declares; `mkm_wide_bal` also stays opt-in because its serving evidence covers TP8 only:
 
 | Slot | Rows | Kernel |
 | --- | --- | --- |
+| `route`, `route_gemm`, `mkm`, `mkm_wide` | 1–32 | Fused router fronts and the small routed-expert engines |
+| `gdn_core` | 7–224 | ReplaySSM verify, gated norm and FP8 output in one launch |
+| `hop_mid` (with `hop`) | 16–28 | Extends the one-shot boundary mailbox through four requests instead of returning those widths to the stock boundary |
 | `gdn_push` (with `gdn_verify`, `hop`) | 7 | The GatedDeltaNet `out_proj` as the hop's GEMM, whose epilogue pushes the partial into the hop's mailbox |
-| `gdn_front` (with `gdn_verify`, `gdn_pdl`) | 7 (one request) | The GatedDeltaNet `in_proj_qkvz` (static FP8) and `in_proj_ba` (BF16) projections, the conv update and an L2 prefetch of the verify's state in one launch, then the ReplaySSM verify and the gated norm writing `out_proj`'s FP8 input, each launched dependent on the one before |
+| `gdn_front`, `gdn_trt_front` | 7–28 | Fused GatedDeltaNet projections and conv before the dependent verify |
 | `route_shared` (with `route`) | 1–8 | The shared expert's static-FP8 gate/up in the router front's launch, so the shared expert on the alternate stream waits for that launch only |
+| `route_lin`, `skv2`, `mka`, `mka_push` | shape-bounded | Router/attention overlap, split-KV attention and fused attention boundaries |
+| `lowm_in`, `lowm_out`, `lowm_se`, `lowm_push` | shape-bounded | Validated low-row projection and shared-expert launches |
+| `draft_moe`, `draft_q1`, `draft_xchg`, `draft_hop`, `draft_fin`, `draft_front`, `draft_skv2` | shape-bounded | Fused MTP draft kernels and boundaries |
+
+The tuned Qwen3.5 TP8/TEP8 serving policy explicitly includes `hop_mid` whenever it
+includes `hop`.  It remains opt-in rather than part of the bitwise default policy;
+an explicit `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` value replaces, rather than extends,
+that default list.
 
 The sampling and acceptance after the verify, and the GatedDeltaNet extend of prefill, stay SGLang's own code. In an SGLang that has the switches, `SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH=1` runs the sampling and acceptance in CUDA graphs, and `SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND=1` captures the GatedDeltaNet extend inside the breakable prefill CUDA graphs.
 
@@ -124,7 +135,6 @@ The three environment variables are required by the DeepSeek-V4.1 spec; without 
 Qwen3.5, on each of the two trays (`--node-rank 0` and `1`):
 
 ```bash
-SGLANG_NVIDIA_MEGAKERNEL_SLOTS=route,mkm,gdn_verify,gdn_pdl,hop \
 python -m sglang.launch_server \
   --model-path nvidia/Qwen3.5-397B-A17B-NVFP4-V2 \
   --tp 8 --nnodes 2 --node-rank 0 --dist-init-addr <tray-0 host>:<port> \

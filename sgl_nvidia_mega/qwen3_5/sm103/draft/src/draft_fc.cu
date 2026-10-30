@@ -166,6 +166,7 @@ namespace fc_gather {
 inline constexpr int kSlots = 3;
 inline constexpr uint32_t kSpinLimit = 1u << 27;
 inline constexpr int kMaxTokens = 16;  // the fc split's widest batch (2.2 _FC_SPLIT_MAX_TOKENS)
+inline constexpr int kBatch = 8;       // polled words in flight per thread
 
 SGL_DEVICE void mc_store(uint64_t* addr, uint32_t payload, uint32_t tag) {
   const uint64_t w = static_cast<uint64_t>(payload) | (static_cast<uint64_t>(tag) << 32);
@@ -206,16 +207,33 @@ SGL_DEVICE void fc_gather_kernel(const FcGatherParams& p) {
   for (int64_t i = first; i < n; i += stride) {
     fc_gather::mc_store(dst + i, __float_as_uint(p.partial[i]), tag);
   }
-  for (int64_t i = first; i < kWorld * n; i += stride) {
-    const int64_t r = i / n, j = i % n;
-    const uint64_t* src = p.uc + (slot * kWorld + r) * kPacket + j;
-    uint64_t w;
-    uint32_t spins = 0;
-    do {
-      asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(w) : "l"(src) : "memory");
-      if (++spins > fc_gather::kSpinLimit) __trap();
-    } while (static_cast<uint32_t>(w >> 32) != tag);
-    p.out[(j / kH) * kWorld * kH + r * kH + j % kH] = __uint_as_float(static_cast<uint32_t>(w));
+  // kBatch independent loads in flight per thread, then each word re-polled only while its tag is stale:
+  // the words that already landed cost one round trip together, not one each
+  const int64_t total = kWorld * n;
+  for (int64_t base = first; base < total; base += stride * fc_gather::kBatch) {
+    uint64_t w[fc_gather::kBatch];
+#pragma unroll
+    for (int u = 0; u < fc_gather::kBatch; ++u) {
+      const int64_t i = base + u * stride;
+      if (i < total) {
+        const uint64_t* src = p.uc + (slot * kWorld + i / n) * kPacket + i % n;
+        asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(w[u]) : "l"(src) : "memory");
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < fc_gather::kBatch; ++u) {
+      const int64_t i = base + u * stride;
+      if (i < total) {
+        const int64_t r = i / n, j = i % n;
+        const uint64_t* src = p.uc + (slot * kWorld + r) * kPacket + j;
+        uint32_t spins = 0;
+        while (static_cast<uint32_t>(w[u] >> 32) != tag) {
+          if (++spins > fc_gather::kSpinLimit) __trap();
+          asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(w[u]) : "l"(src) : "memory");
+        }
+        p.out[(j / kH) * kWorld * kH + r * kH + j % kH] = __uint_as_float(static_cast<uint32_t>(w[u]));
+      }
+    }
   }
   __syncthreads();
   if (threadIdx.x == 0) {

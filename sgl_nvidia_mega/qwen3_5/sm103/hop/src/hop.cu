@@ -55,21 +55,16 @@ __device__ __forceinline__ size_t row_elem(int token, int frag) {
 // sum_k w_k * routed[perm_k] in k order with separate multiply and add, then the shared output,
 // as the reference finalize does. TOPK > 0 fixes top-k at compile time, so every routed row is
 // loaded into registers before any accumulation (TOPK = 0 reads top_k at run time).
+
+// The routing slots are read after griddepcontrol.wait: the MoE that runs right before (mkm's expert weights, the
+// router's tables) writes them, and PDL makes a predecessor's writes visible only after the wait. A null `permuted`
+// is the identity (row token * top_k + k): then the routed rows are requested at once, with the weights.
 template <int TOPK>
 __device__ __forceinline__ void publish_fin_quad_kernel(const Args& a) {
   constexpr int kSlots = TOPK > 0 ? TOPK : kMaxTopK;
-  __shared__ int32_t rows_s[kSlots];
-  __shared__ float wts_s[kSlots];
   const int top_k = TOPK > 0 ? TOPK : a.top_k;
   const int token = blockIdx.x;
   const int quad = blockIdx.y * kRowThreads + threadIdx.x;
-  if (threadIdx.x < top_k) {
-    const int i = token * top_k + threadIdx.x;
-    const int r = a.permuted[i];
-    rows_s[threadIdx.x] = r;
-    wts_s[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(a.expert_w[i]) << 16);
-  }
-  __syncthreads();
   const size_t col = static_cast<size_t>(quad) * 4;
   pdl_wait();
   const uint32_t stage = stage_peek(a.site);
@@ -79,17 +74,24 @@ __device__ __forceinline__ void publish_fin_quad_kernel(const Args& a) {
   if (a.shared != nullptr) sh = *reinterpret_cast<const uint2*>(a.shared + static_cast<size_t>(token) * kHidden + col);
   int rows[kSlots];
 #pragma unroll
-  for (int k = 0; k < kSlots; ++k) rows[k] = k < top_k ? rows_s[k] : -1;
+  for (int k = 0; k < kSlots; ++k) {
+    const int i = token * top_k + k;
+    rows[k] = k < top_k ? (a.permuted != nullptr ? a.permuted[i] : i) : -1;
+  }
   uint2 src[kSlots];
 #pragma unroll
   for (int k = 0; k < kSlots; ++k)
     src[k] = rows[k] >= 0 ? *reinterpret_cast<const uint2*>(a.routed + static_cast<size_t>(rows[k]) * kHidden + col)
                           : make_uint2(0, 0);
+  float wts[kSlots];
+#pragma unroll
+  for (int k = 0; k < kSlots; ++k)
+    wts[k] = rows[k] >= 0 ? __uint_as_float(static_cast<uint32_t>(a.expert_w[token * top_k + k]) << 16) : 0.f;
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int k = 0; k < kSlots; ++k) {
     if (rows[k] >= 0) {
-      const float w = wts_s[k];
+      const float w = wts[k];
       const float f[4] = {bf_lo(src[k].x), bf_hi(src[k].x), bf_lo(src[k].y), bf_hi(src[k].y)};
 #pragma unroll
       for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], w));
@@ -186,6 +188,10 @@ __device__ __forceinline__ void oproj_push_kernel(const OprojArgs& o) {
       for (int b = 0; b < 2; ++b) a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
   }
   const float alpha = __fmul_rn(*o.sx, *o.sw);
+  uint32_t weight_dep = __float_as_uint(alpha);
+#pragma unroll
+  for (int st = 0; st < S; ++st) weight_dep ^= a[st][0].x ^ a[st][1].x;
+  pin_before_wait(weight_dep, reinterpret_cast<uint64_t>(o.w));
   pdl_wait();
   const int m = o.m;
   const bool tok_ok = g < m;
@@ -245,6 +251,7 @@ extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) q35hop_publish
 extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) q35hop_publish_fin(Args a) {
   q35hop_kernels::publish_fin_quad_kernel<0>(a);
 }
+
 
 extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) q35hop_consume_w2(Args a) {
   q35hop_kernels::consume_kernel<2>(a);

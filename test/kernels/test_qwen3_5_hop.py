@@ -13,7 +13,8 @@ verify server builds it (hidden 4096, top-10, no early shared-expert load), bit 
 And the GatedDeltaNet out_proj push (slot gdn_push, numeric): its partial against an
 fp64 reference on the same FP8 operands, at most 1.05 x the mean relative L2 and 2 x the
 max abs error of FlashInfer's BMM (SGLang's op), and its all-reduce, which only consumes,
-bit for bit the fusion's on the same partial.
+bit for bit the fusion's on the same partial. And the low-M launch's push (slot lowm_push): its partial is
+the launch's without the push, and the all-reduce that only consumes it is the fusion's.
 
 Run with ``python test/kernels/test_qwen3_5_hop.py --num-gpu 4``.
 """
@@ -153,6 +154,68 @@ def test_hop_matches_flashinfer_fusion(rank, pair):
         torch.cuda.synchronize()
 
 
+def test_finalize_reads_routing_after_the_wait_and_identity_rows(rank, pair):
+    """The finalize reads routing after its PDL wait; registered identity maps need
+    no load. Both cases match the fusion with a late rank and freshly written routing."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as H
+
+    fusion, hop = pair
+    world = ps.get_tp_group().world_size
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    identity = torch.arange(MAX_M * TOP_K, dtype=torch.int32, device=device)
+    H.register_identity_rows(identity)
+    scale = torch.tensor([0.05], device=device)
+    with torch.inference_mode():
+        for i, m in enumerate((1, 2, 5, 7, 15)):
+            for ident in (False, True):
+                x = _operands(m, device, rank, seed=400 + i)
+                if ident:
+                    x["permuted"] = identity[: m * TOP_K].view(m, TOP_K)
+                want = _run(fusion, "finalize", x)
+                # the routing rewritten by the launch right before (as the MoE writes it)
+                w = x["expert_weights"].clone()
+                x["expert_weights"].zero_()
+                x["expert_weights"].copy_(w)
+                if i % (world + 1) == rank:
+                    torch.cuda._sleep(1_000_000)
+                got = _run(hop, "finalize", x, fp8_scale=scale)
+                _same(got[:2], want)
+        torch.cuda.synchronize()
+
+
+def test_identity_rows_registry_keeps_its_buffers(rank):
+    """A registered identity row map stays allocated after its caller drops it."""
+    import gc
+
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop as H
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    n = MAX_M * TOP_K
+    perm = torch.arange(n, dtype=torch.int32, device=device).flip(0).contiguous()
+    rows = torch.arange(n, dtype=torch.int32, device=device)
+    H.register_identity_rows(rows)
+    ptr = rows.data_ptr()
+    del rows
+    gc.collect()
+    later = [torch.empty_like(perm) for _ in range(8)]
+    reused = any(t.data_ptr() == ptr for t in later)
+    alive = any(
+        block.get("address") == ptr and block["state"] == "active_allocated"
+        for segment in torch.cuda.memory_snapshot()
+        for block in segment["blocks"]
+    )
+    if not reused and not alive:
+        pytest.skip(f"the allocator did not reuse or retain identity buffer {ptr:#x}")
+    for tensor in later:
+        tensor.copy_(perm)
+        identity = (
+            tensor.is_contiguous()
+            and H._IDENTITY_ROWS.get(tensor.data_ptr(), 0) >= tensor.numel()
+        )
+        assert not identity
+    torch.cuda.synchronize()
+
+
 def test_hop_replays_from_a_cuda_graph(rank, pair):
     fusion, hop = pair
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -239,6 +302,49 @@ def test_out_proj_push_holds_to_fp64_and_its_all_reduce_only_consumes(rank, pair
     # the numeric-slot protocol's T0 rule
     assert push[:, 0].mean() <= 1.05 * stock[:, 0].mean()
     assert push[:, 1].max() <= 2 * stock[:, 1].max()
+
+
+def test_lowm_push_is_its_partial_and_its_all_reduce_only_consumes(rank, pair):
+    """Slot lowm_push: the low-M out_proj / o_proj launch (sm103/lowm) with the hop push stores the
+    same partial as without it, and the all-reduce that only consumes it is the fusion's, bit for bit."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import lowm
+
+    fusion, hop = pair
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    k = 1024
+    with torch.inference_mode():
+        for seed in range(2):
+            gen = torch.Generator(device=device).manual_seed(2000 * seed + rank)
+            w = _fp8(HIDDEN, k, device, gen, scale=0.5)
+            sw = torch.tensor([0.01], device=device)
+            sx = torch.tensor([0.02], device=device)
+            for m in (9, 14):
+                for bf16_in in (False, True):
+                    x8 = _fp8(m, k, device, gen)
+                    act = {"x16": x8.to(torch.bfloat16)} if bf16_in else {"x8": x8}
+                    plain = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device=device)
+                    lowm.gemm(w8=w, w_scale=sw, in_scale=sx, out=plain, **act)
+                    partial = torch.empty_like(plain)
+                    lowm.gemm(
+                        w8=w,
+                        w_scale=sw,
+                        in_scale=sx,
+                        out=partial,
+                        push_site=hop.site,
+                        **act,
+                    )
+                    hop.mark_pushed(partial)
+                    x2 = _operands(m, device, rank, seed=seed)
+                    got = hop.all_reduce_residual_rms_norm(
+                        local_contribution=partial,
+                        residual=x2["residual"],
+                        gamma=x2["gamma"],
+                    )
+                    assert torch.equal(
+                        partial.view(torch.int16), plain.view(torch.int16)
+                    )
+                    _same(got, _run(fusion, "all_reduce", dict(x2, partial=partial)))
+        torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

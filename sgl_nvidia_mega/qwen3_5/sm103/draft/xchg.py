@@ -52,7 +52,11 @@ MAX_TOKENS = 2
 _MAX_SMEM_BYTES = 216 * 1024
 # fc_gather: the split fc's widest batch (2.2 _FC_SPLIT_MAX_TOKENS) and its grid
 GATHER_MAX_TOKENS = 16
-GATHER_CTAS, GATHER_THREADS = 32, 512
+GATHER_THREADS = 512
+# fc_allsum (draft_fc_sum.cu): 128 threads a CTA, 4 fp32 columns a thread, so 8 CTAs a row
+ALLSUM_THREADS = 128
+ALLSUM_CTAS_PER_ROW = HIDDEN // (4 * ALLSUM_THREADS)
+ALLSUM_STAGES = 3
 
 
 def _order_key(value: float) -> int:
@@ -64,6 +68,9 @@ def _order_key(value: float) -> int:
 # -1e30; torch.argmax ranks NaN above every value (2.2 draft_vocab_argmax.py)
 NAN_KEY_SPLIT_ARGMAX = _order_key(-1e30)
 NAN_KEY_TORCH_ARGMAX = 0xFFFFFFFF
+# Hidden ranks send the memo row and their side-stream partial from disjoint thread
+# ranges. Tests may set this internal policy false for a bitwise lockstep.
+SPLIT_MEMO_SEND = True
 
 
 class MkdXchgParams(ctypes.Structure):
@@ -160,6 +167,14 @@ class FcGatherParams(ctypes.Structure):
     ] + [("rank", ctypes.c_int32), ("m", ctypes.c_int32)]
 
 
+class FcAllsumParams(ctypes.Structure):
+    """sglang::FcAllsumParams."""
+
+    _fields_ = [
+        (name, ctypes.c_void_p) for name in ("partial", "out", "mc", "uc", "ctrl")
+    ] + [("rank", ctypes.c_int32), ("m", ctypes.c_int32)]
+
+
 def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
@@ -180,7 +195,7 @@ def _xchg_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
     cubin = _compile(device_index, "mkd_xchg", (f"MKD_WORLD={world}",))
     return {
         name: jit.load(cubin, name, (XCHG_THREADS, 1, 1), 0)
-        for name in ("mkd_xchg_memo", "mkd_xchg_emb")
+        for name in ("mkd_xchg_memo", "mkd_xchg_emb", "mkd_xchg_memo_split")
     }
 
 
@@ -198,6 +213,9 @@ def _fc_kernels(device_index: int, world: int) -> dict[str, jit.Kernel]:
             cubin, "mkd_fc_memo", (256, 1, 1), MEMO_BLOCK_ROWS * HIDDEN * 2
         ),
         "mkd_hidden_partial": jit.load(cubin, "mkd_hidden_partial", (256, 1, 1), 0),
+        "mkd_hidden_partial_r4": jit.load(
+            cubin, "mkd_hidden_partial_r4", (256, 1, 1), 0
+        ),
     }
 
 
@@ -224,6 +242,13 @@ def _draft_fc_kernels(device_index: int, world: int, max_rows: int) -> dict:
     }
     kernels["fc_gather"] = jit.load(cubin, "fc_gather", (GATHER_THREADS, 1, 1), 0)
     return kernels
+
+
+@cache
+def _fc_sum_kernel(device_index: int, world: int) -> jit.Kernel:
+    """The split FC's one-launch gather and rank-order sum."""
+    cubin = _compile(device_index, "draft_fc_sum", (f"MKD_WORLD={world}",))
+    return jit.load(cubin, "fc_allsum", (ALLSUM_THREADS, 1, 1), 0)
 
 
 def build(device_index: int, world: int) -> None:
@@ -423,7 +448,11 @@ def mkd_xchg(
     )
     kernels = _xchg_kernels(device.index, world)
     _launch(
-        kernels["mkd_xchg_memo" if memo else "mkd_xchg_emb"],
+        kernels[
+            ("mkd_xchg_memo_split" if SPLIT_MEMO_SEND else "mkd_xchg_memo")
+            if memo
+            else "mkd_xchg_emb"
+        ],
         CHUNKS,
         p,
         device,
@@ -520,12 +549,13 @@ def mkd_hidden_partial(
     sync: torch.Tensor,
     world: int,
     ctas: int = 0,
+    rows_per_iter: int = 4,
 ) -> None:
     """Hidden-slice fc partial [1, H] fp32 of ``h`` [1, H] (draft_fc_partial arithmetic
     over ``shard`` [H, W] at hidden-half column ``col``); the last CTA then sets
     ``sync[1]`` to the exchange epoch ``epoch_done[0]`` (``sync[0]`` counts CTAs, zero
-    between calls). ``ctas`` > 0 launches that many CTAs instead of one per SM (same
-    values: each row is one warp's)."""
+    between calls). ``ctas`` > 0 launches that many CTAs instead of one per SM. The
+    production four-row load schedule is bitwise equal to ``rows_per_iter=1``."""
     device = out.device
     width = 2 * HIDDEN // world
     _check(h, "h", (1, HIDDEN), torch.bfloat16, aligned=True)
@@ -549,7 +579,10 @@ def mkd_hidden_partial(
     )
     kernels = _fc_kernels(device.index, world)
     grid = ctas if ctas > 0 else _sm_count(device.index)
-    _launch(kernels["mkd_hidden_partial"], grid, p, device, pdl=False)
+    if rows_per_iter not in (1, 4):
+        raise ValueError("mkd_hidden_partial: rows_per_iter must be 1 or 4")
+    name = "mkd_hidden_partial_r4" if rows_per_iter == 4 else "mkd_hidden_partial"
+    _launch(kernels[name], grid, p, device, pdl=False)
 
 
 # ---------------------------------------------------------------- draft lm_head
@@ -714,6 +747,7 @@ class FcGather:
         # [epoch, CTA arrivals]: the epoch tags the call's words, from 1
         self.epoch_done = torch.tensor([1, 0], dtype=torch.int32, device=device)
         sms = _sm_count(device.index)
+        self._ctas = sms
         self._kernels = _draft_fc_kernels(
             device.index, world, draft_fc_partial_rows(HIDDEN, 2 * HIDDEN // world, sms)
         )
@@ -738,5 +772,57 @@ class FcGather:
             rank=self.rank,
             m=m,
         )
-        _launch(self._kernels["fc_gather"], GATHER_CTAS, p, self.device, pdl=False)
+        # one CTA an SM: with the batched polls every thread waits about one round trip
+        _launch(self._kernels["fc_gather"], self._ctas, p, self.device, pdl=False)
+        return out
+
+
+class FcAllsum:
+    """The split fc's gather and rank-order sum in one launch (draft_fc_sum.cu fc_allsum):
+    [m, H] fp32 partials on every rank -> [m, H] bf16, summed in rank order from rank 0 and
+    rounded once, as ``FcGather`` + ``ordered_partial_sum``; m <= GATHER_MAX_TOKENS;
+    graph-capturable. Its own mailbox and control block (not FcGather's epochs). Build on
+    every rank of ``group`` (a collective)."""
+
+    def __init__(
+        self,
+        *,
+        world: int,
+        rank: int,
+        group,
+        cpu_group,
+        device: torch.device,
+    ):
+        import torch.distributed as dist
+
+        if world not in WORLDS:
+            raise ValueError(f"the fc all-sum serves TP {WORLDS}, not {world}")
+        self.world, self.rank, self.device = world, rank, device
+        words = ALLSUM_STAGES * world * GATHER_MAX_TOKENS * HIDDEN // 2
+        self._buf, self._handle, self.mc = symmetric_words(words, group, device)
+        # every fp32 word "not arrived" (all ones)
+        self._buf.fill_(-1)
+        self.uc = self._buf.data_ptr()
+        # [stage, arrive] (fc_allsum::Ctrl)
+        self.ctrl = torch.zeros(2, dtype=torch.int32, device=device)
+        self._kernel = _fc_sum_kernel(device.index, world)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=cpu_group)
+
+    def __call__(self, partial: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        m = int(partial.shape[0])
+        if not 1 <= m <= GATHER_MAX_TOKENS:
+            raise ValueError(f"fc all-sum: {m} rows (1-{GATHER_MAX_TOKENS})")
+        _check(partial, "partial", (m, HIDDEN), torch.float32, aligned=True)
+        _check(out, "out", (m, HIDDEN), torch.bfloat16, aligned=True)
+        p = FcAllsumParams(
+            partial=partial.data_ptr(),
+            out=out.data_ptr(),
+            mc=self.mc,
+            uc=self.uc,
+            ctrl=self.ctrl.data_ptr(),
+            rank=self.rank,
+            m=m,
+        )
+        _launch(self._kernel, m * ALLSUM_CTAS_PER_ROW, p, self.device, pdl=True)
         return out

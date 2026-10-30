@@ -82,6 +82,7 @@ SGLANG_READS = {
         "use_marlin",
         "use_sm120_fp8",
         "use_flashinfer_bmm",
+        "orig_dtype",
         '"input_scale"',
         '"weight_scale"',
     ),
@@ -131,6 +132,7 @@ SGLANG_MIRRORS = {
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
         "ab7b048fafb07d0e",
         "12a835fc4f78af33",
+        "6ed4eb6a818f7e20",
     ),
     # Importing the ReplaySSM kernel from fla/ and, after sgl-project/sglang#45112, from
     # linear/; the first goes once all supported SGLangs have the move
@@ -139,8 +141,17 @@ SGLANG_MIRRORS = {
         "739e7115c370ac01",
     ),
     "srt/layers/linear.py:RowParallelLinear.forward": "b291a3c452e428a5",
-    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": "c66562e1de0008db",
-    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": "91b563cf074bff42",
+    # The follow-up also accepts an already-quantized FP8 input, which is the path
+    # _out_proj mirrors; the BF16 path remains the stock alternative.
+    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": (
+        "c66562e1de0008db",
+        "c94a4f1a622c2fe0",
+        "aaa39b9452d9df32",
+    ),
+    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": (
+        "91b563cf074bff42",
+        "4f99db0f712ad24a",
+    ),
 }
 
 RING_LEN, MAX_DRAFT = 16, 8  # the verify tiles' bounds, as measured
@@ -159,6 +170,13 @@ class Options(msgspec.Struct, frozen=True):
     norm_fp8: bool  # the gated norm writes out_proj's static FP8 input
     pdl: bool = False  # the verify launches dependent on the conv (slot gdn_pdl)
     push: bool = False  # out_proj pushes its partial into the hop (slot gdn_push)
+    core: bool = False  # verify, gated norm and FP8 in one launch (slot gdn_core)
+    conv_rows: bool = (
+        False  # the hoisted conv writing each channel's window row once (slot gdn_conv)
+    )
+    lowm_push: bool = (
+        False  # out_proj's low-M launch pushes into the hop (slot lowm_push)
+    )
 
 
 STOCK = Options(views=False, block_n=256, block_v=64, num_warps=1, norm_fp8=False)
@@ -218,6 +236,42 @@ def pool_reasons(pools, tokens_per_request: int) -> list[str]:
     return reasons
 
 
+def conv_pool_reasons(pools, tokens_per_request: int) -> list[str]:
+    """Why slot gdn_conv cannot run on the pools ([] when it can): width-4 conv states and the
+    deduplicated windows (window[t][w] = row[t + w]) of 4 to 8 rows a request."""
+    reasons = []
+    conv, windows = pools.conv[0], pools.intermediate_conv_window[0]
+    if conv.shape[-1] != 3:
+        reasons.append(f"conv states {tuple(conv.shape)} are not width 4")
+    st = windows.stride()
+    if not (st[2] == 1 and st[4] == 1 and st[3] >= tokens_per_request + 2):
+        reasons.append(f"conv windows {tuple(windows.shape)} {st} are not deduplicated")
+    if not 3 < tokens_per_request <= 8:
+        reasons.append(f"{tokens_per_request} rows a request")
+    return reasons
+
+
+def core_pool_reasons(pools) -> list[str]:
+    """Why slot gdn_core cannot write this step's ring entries ([] when it can): the
+    compact ring (update / key low parts, no exact-replay buffers) of BF16 checkpoints,
+    int32 cursors and int8 flush flags."""
+    reasons = []
+    if (
+        pools.ring_beta is not None
+        or pools.ring_rawk is None
+        or pools.ring_rawv is None
+    ):
+        reasons.append("not the compact (low-part) ReplaySSM ring")
+    if (
+        pools.ring_write_pos.dtype != torch.int32
+        or pools.ring_cache_base.dtype != torch.int32
+    ):
+        reasons.append("ring cursors are not int32")
+    if pools.ring_is_flush.dtype != torch.int8:
+        reasons.append("ring flush flags are not int8")
+    return reasons
+
+
 def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
     """``Qwen3_5GatedDeltaNet.forward`` of a target-verify step with the launch
     choices ``opts``: the TP-partial output [rows, hidden] of the normed input x."""
@@ -234,7 +288,15 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
         logger.info(
             "NVIDIA megakernel: Qwen3.5 slot gdn_verify runs at %d rows", x.shape[0]
         )
-    qkvz, ba = gdn._forward_input_proj(x)
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
+    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    if st.slots.lowm_in:
+        qkvz, ba = lowm.in_proj(gdn, x, x8)
+    elif x8 is not None:
+        qkvz, ba = lowm.in_proj_fp8(gdn, x, x8)
+    else:
+        qkvz, ba = gdn._forward_input_proj(x)
     split = (
         qwen3_5_gdn_prefill_projection_views
         if opts.views
@@ -248,6 +310,8 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
         gdn.head_k_dim,
         gdn.head_v_dim,
     )
+    if opts.core:
+        return _fused(gdn, _conv(gdn.attn, mixed_qkv, st, opts), z, a, b, st, opts)
     core = _core(gdn.attn, mixed_qkv, a, b, st, opts)
     core = core.reshape(-1, core.shape[-1])
     nv = gdn.num_v_heads // gdn.attn_tp_size
@@ -270,7 +334,7 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
                 input_scale=gdn.out_proj.input_scale,
                 weight_scale=gdn.out_proj.weight_scale,
             )
-        return _out_proj(gdn.out_proj, x, core.dtype)
+        return _out_proj(gdn.out_proj, x, core.dtype, st, opts.lowm_push)
     z_shape = z.shape
     core = gdn.norm(core, z if opts.views else z.reshape(-1, z.shape[-1]))
     core = core.reshape(z_shape)
@@ -278,10 +342,30 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
     return gdn.out_proj(core)[0]
 
 
-def _out_proj(out_proj, fp8: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+def _out_proj(
+    out_proj, fp8: torch.Tensor, dtype: torch.dtype, st=None, push: bool = False
+) -> torch.Tensor:
     """``RowParallelLinear.forward`` of the FP8 ``out_proj`` on its pre-quantized input:
     ModelOpt's FlashInfer BMM with the static input scale as the activation scale (what
-    its own quantization returns), the TP-partial output in SGLang's symmetric pool."""
+    its own quantization returns), the TP-partial output in SGLang's symmetric pool; with
+    slot lowm_out (``Slots.lowm_outproj``) the low-M launch instead (numeric), pushing into the hop with
+    ``push`` (slot lowm_push)."""
+    # A prequantized E4M3 tensor does not carry the activation dtype that ModelOpt's
+    # linear must produce.  Match ModelOptFp8LinearMethod.apply's v3 contract rather
+    # than inheriting the GDN recurrence's (potentially different) working dtype.
+    dtype = out_proj.orig_dtype
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "prequantized FP8 FlashInfer BMM requires an explicit "
+            "BF16 or FP16 output dtype"
+        )
+    # The low-M kernel writes BF16 unconditionally.  An FP16 ModelOpt layer must
+    # therefore take the stock FlashInfer BMM below even when lowm_out is enabled.
+    if st is not None and st.slots.lowm_outproj and dtype == torch.bfloat16:
+        from sgl_nvidia_mega.qwen3_5 import lowm
+
+        hop = st.bound["boundary"].hop if push else None
+        return lowm.row_parallel(out_proj, fp8, dtype, "out_proj", hop)
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
@@ -295,6 +379,125 @@ def _out_proj(out_proj, fp8: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return flashinfer_bmm_fp8(
             fp8, out_proj.weight, out_proj.input_scale, out_proj.weight_scale, dtype
         )
+
+
+def _conv(attn, mixed_qkv, st, opts) -> torch.Tensor:
+    """The causal conv update of the step's q / k / v rows: [rows, channels], token-major
+    with ``opts.views``."""
+    from sgl_nvidia_mega.qwen3_5.gdn.conv import conv_update
+
+    meta, pools = st.view.gdn, st.view.mamba
+    li = pools.layer_ids.index(attn.layer_id)
+    seq_len = mixed_qkv.shape[0]
+    draft = st.binding.tokens_per_request
+    bs = seq_len // draft
+    states = meta.state_indices
+    y = conv_update(
+        mixed_qkv.view(bs, draft, -1).transpose(1, 2),
+        pools.conv[0][li],
+        attn.conv_weights,
+        attn.bias,
+        attn.activation,
+        states[:bs],
+        pools.intermediate_conv_window[0][li],
+        meta.intermediate_indices[:bs],
+        block_n=opts.block_n,
+        token_major_out=opts.views,
+        **({"hoist": True, "window_mode": 1} if opts.conv_rows else {}),
+    )
+    return y.transpose(1, 2).view(seq_len, -1)
+
+
+def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
+    """Slot gdn_core: the ReplaySSM verify of the convolved rows ``qkv``, the gated norm
+    and its static FP8 output in one launch (``sm103/gdn/core.py``), then ``out_proj``
+    (FlashInfer's BMM, or the hop's push GEMM with ``opts.push``)."""
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import (
+        RELEASE_MAX_ROWS,
+        RELEASE_MIN_ROWS,
+        core,
+    )
+
+    attn, pools = gdn.attn, st.view.mamba
+    li = pools.layer_ids.index(attn.layer_id)
+    rows = qkv.shape[0]
+    nv = gdn.num_v_heads // gdn.attn_tp_size
+    x = torch.empty(
+        (rows, nv * gdn.head_v_dim), dtype=torch.float8_e4m3fn, device=qkv.device
+    )
+
+    def ring(t):
+        return None if t is None else t[li]
+
+    # cuBLASLt's programmatic-dependent out-projection may start at the core's entry
+    # over the validated row window.
+    release = (
+        RELEASE_MIN_ROWS <= rows <= RELEASE_MAX_ROWS
+        and not opts.push
+        and not st.slots.lowm_outproj
+    )
+    if release and ("release", rows) not in _ENGAGED:
+        _ENGAGED.add(("release", rows))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot gdn_core releases out_proj's BMM at its entry at %d rows",
+            rows,
+        )
+    core(
+        qkv,
+        z,
+        a,
+        b,
+        attn.A_log,
+        attn.dt_bias,
+        pools.temporal[li],
+        pools.ring_d[li],
+        pools.ring_k[li],
+        pools.ring_g[li],
+        ring(pools.ring_rawv),
+        ring(pools.ring_rawk),
+        st.view.gdn.state_indices,
+        st.fb.req_pool_indices,
+        pools.ring_write_pos,
+        pools.ring_cache_base,
+        pools.ring_is_flush,
+        gdn.norm.weight,
+        gdn.out_proj.input_scale,
+        gdn.norm.eps,
+        x,
+        rows_per_request=st.binding.tokens_per_request,
+        num_k_heads=attn.num_k_heads,
+        early_dependents=opts.push or release,
+    )
+    if opts.push:
+        hop = st.bound["boundary"].hop
+        h0 = _route_lin_h0(hop, attn.layer_id, rows, st)
+        if h0 is not None:
+            # Slot route_lin: the router partial rides the out_proj push.
+            return hop.out_proj_push_rl(
+                x_fp8=x,
+                packed_w=st.bound["gdn"].packed[attn.layer_id],
+                input_scale=gdn.out_proj.input_scale,
+                weight_scale=gdn.out_proj.weight_scale,
+                rl_w=st.bound["gdn"].rlin[attn.layer_id],
+                h0=h0,
+            )
+        return hop.out_proj_push(
+            x_fp8=x,
+            packed_w=st.bound["gdn"].packed[attn.layer_id],
+            input_scale=gdn.out_proj.input_scale,
+            weight_scale=gdn.out_proj.weight_scale,
+        )
+    return _out_proj(gdn.out_proj, x, qkv.dtype, st, opts.lowm_push)
+
+
+def _route_lin_h0(hop, layer_id: int, rows: int, st):
+    """The layer input when slot route_lin can ride the out_proj push; else None."""
+    if not st.slots.route_lin or hop.rl is None or layer_id not in st.bound["gdn"].rlin:
+        return None
+    lid, h0 = st.scratch.get("rlin.h0", (None, None))
+    if lid != layer_id or h0 is None or tuple(h0.shape) != (rows, 4096):
+        return None
+    return h0
 
 
 def _core(attn, mixed_qkv, a, b, st, opts):
@@ -319,6 +522,7 @@ def _core(attn, mixed_qkv, a, b, st, opts):
         meta.intermediate_indices[:bs],
         block_n=opts.block_n,
         token_major_out=opts.views,
+        **({"hoist": True, "window_mode": 1} if opts.conv_rows else {}),
     )
     mixed_qkv = y.transpose(1, 2).view(seq_len, -1)
     query, key, value = torch.split(

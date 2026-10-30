@@ -47,7 +47,7 @@ SGLANG_MIRRORS = {
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.self_attention": "db0f4d98e0fb1abf",
 }
 
-ATTENTION_SLOTS = ("skv2", "mka", "mka_push")
+ATTENTION_SLOTS = ("skv2", "skv2_cp", "mka", "mka_push", "route_lin")
 
 
 class Bound(msgspec.Struct, frozen=True):
@@ -55,7 +55,9 @@ class Bound(msgspec.Struct, frozen=True):
 
     skv2: bool = False  # slot skv2 serves every full-attention layer
     mka: bool = False
+    mka_wide: bool = False  # mka's wide entries serve the steps of several requests
     mka_push: bool = False
+    route_lin: bool = False  # router-before-all-reduce packed for every layer
     reason: str = ""  # why a requested slot is not built
 
 
@@ -87,10 +89,23 @@ def build(model, ctx) -> Bound:
             )
         if reason:
             return Bound(reason=f"layer {i}: {reason}")
+    if "skv2_cp" in SLOTS:
+        reason = split_kv.cp_reason()
+        if reason:
+            return Bound(reason=f"slot skv2_cp: {reason}")
     if "mka" in SLOTS:
-        for _, layer in layers:
-            mka.pack(layer)
-    return Bound(skv2="skv2" in SLOTS, mka="mka" in SLOTS, mka_push="mka_push" in SLOTS)
+        for i, layer in layers:
+            reason = mka.pack(layer, route_lin="route_lin" in SLOTS)
+            if reason:
+                return Bound(reason=f"slot route_lin: layer {i}: {reason}")
+    mka_on = "mka" in SLOTS
+    return Bound(
+        skv2="skv2" in SLOTS,
+        mka=mka_on,
+        mka_wide=mka_on and all(layer.num_heads == 4 for _, layer in layers),
+        mka_push="mka_push" in SLOTS,
+        route_lin="route_lin" in SLOTS,
+    )
 
 
 def pool_reasons(view, binding, skv2: bool = True, mka: bool = False) -> list[str]:
@@ -111,16 +126,34 @@ def step(layer, x, st):
         from sgl_nvidia_mega.qwen3_5.attention import mka
 
         return mka.step(layer, x, st)
-    q, k, v, gate = layer._prepare_qkv_gate(
-        positions=st.positions, hidden_states=x, forward_batch=st.fb
-    )
-    if st.slots.skv2:
-        from sgl_nvidia_mega.qwen3_5.attention import split_kv
+    from sgl_nvidia_mega.qwen3_5 import lowm
 
+    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    if st.slots.lowm_in or x8 is not None:
+        q, k, v, gate = lowm.prepare_qkv_gate(
+            layer, st.positions, x, x8, low_m=st.slots.lowm_in
+        )
+    else:
+        q, k, v, gate = layer._prepare_qkv_gate(
+            positions=st.positions, hidden_states=x, forward_batch=st.fb
+        )
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    if st.slots.skv2 or split_kv.cp_multi(q.shape[0]):
         o = split_kv.attend(layer.attn, q, k, v, st)
     else:
         o = layer.attn(q, k, v, st.fb)
     if layer.attn_output_gate:
         o = fused_sigmoid_mul(o, gate, inplace=True)
+    if st.slots.lowm_oproj:
+        from sgl_nvidia_mega.qwen3_5 import lowm
+        from sgl_nvidia_mega.qwen3_5.boundary import hop as hop_step
+
+        hop = None
+        if st.slots.lowm_push and hop_step.takes_moe_input(
+            st.bound["boundary"].hop, layer, st, o.shape[0]
+        ):
+            hop = st.bound["boundary"].hop
+        return lowm.row_parallel(layer.o_proj, o, o.dtype, "o_proj", hop)
     out, _ = layer.o_proj(o)
     return out

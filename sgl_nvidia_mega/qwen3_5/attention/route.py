@@ -15,11 +15,17 @@ extend. A built megakernel offers its variants per SGLang runner (``graph_varian
 ``capture_labels`` in order and replays the one ``select`` picks. A step reads the label
 being captured; where SGLang captures none (no runner takes the variants yet), every
 covered step takes split-KV attention.
+
+Slots ``skv2_cp`` / ``draft_skv2_cp`` (and ``draft_q1_cp`` for the draft loop) add a
+third label, ``SPLIT_KV_CP``: one request past the measured per-site crossover takes
+CP-lite (SGLang's read-split attention over ranks that hold the same KV head) in place
+of SKV2, in a graph of its own, so the shorter steps' graphs stay as they are.
 """
 
 from __future__ import annotations
 
-from typing import ClassVar
+import functools
+from typing import ClassVar, Optional
 
 import msgspec
 
@@ -36,6 +42,11 @@ SGLANG_READS = {
 
 SPLIT_KV_STOCK = "split_kv_stock"
 SPLIT_KV_LONG = "split_kv_long"
+SPLIT_KV_CP = "split_kv_cp"
+CP_SITES = {"verify": "skv2_cp", "draft": "draft_q1_cp", "extend": "draft_skv2_cp"}
+# TP8 static A/B crossovers against SKV2 / SKV2-Q1: verify 136 Ki, draft step
+# 180 Ki, draft extend 240 Ki committed KV tokens.
+CP_MIN_KV = {"verify": 139264, "draft": 184320, "extend": 245760}
 
 
 class SplitKVGraphVariants(msgspec.Struct, frozen=True):
@@ -45,19 +56,12 @@ class SplitKVGraphVariants(msgspec.Struct, frozen=True):
     min_length: int
     # capture order matters where the variants share a graph memory pool
     capture_labels: ClassVar[tuple[str, ...]] = (SPLIT_KV_STOCK, SPLIT_KV_LONG)
+    # select picks the stock label past one request (and the steps read the label only
+    # for one), so SGLang captures one graph at every larger batch size
+    max_batch_size: ClassVar[int] = 1
 
     def select(self, forward_batch) -> str:
-        if forward_batch.batch_size != 1:
-            return SPLIT_KV_STOCK
-        length = forward_batch.attention_kv_len_lower_bound
-        if length is None:
-            lengths = forward_batch.seq_lens_cpu
-            if (
-                lengths is not None
-                and lengths.device.type == "cpu"
-                and lengths.numel() == 1
-            ):
-                length = int(lengths[0])
+        length = one_request_length(forward_batch)
         return (
             SPLIT_KV_LONG
             if length is not None and length >= self.min_length
@@ -65,24 +69,98 @@ class SplitKVGraphVariants(msgspec.Struct, frozen=True):
         )
 
 
+class SplitKVCPGraphVariants(SplitKVGraphVariants, frozen=True):
+    """``SplitKVGraphVariants`` with ``SPLIT_KV_CP`` for one request from
+    ``cp_min_length`` tokens of KV."""
+
+    cp_min_length: int = CP_MIN_KV["verify"]
+    capture_labels: ClassVar[tuple[str, ...]] = (
+        SPLIT_KV_STOCK,
+        SPLIT_KV_LONG,
+        SPLIT_KV_CP,
+    )
+
+    def select(self, forward_batch) -> str:
+        length = one_request_length(forward_batch)
+        if length is not None and length >= self.cp_min_length:
+            return SPLIT_KV_CP
+        return (
+            SPLIT_KV_LONG
+            if length is not None and length >= self.min_length
+            else SPLIT_KV_STOCK
+        )
+
+
+def one_request_length(forward_batch) -> Optional[int]:
+    """A host-side lower bound of the KV length of a one-request step, else None."""
+    if forward_batch.batch_size != 1:
+        return None
+    length = forward_batch.attention_kv_len_lower_bound
+    if length is None:
+        lengths = forward_batch.seq_lens_cpu
+        if (
+            lengths is not None
+            and lengths.device.type == "cpu"
+            and lengths.numel() == 1
+        ):
+            length = int(lengths[0])
+    return length
+
+
 VERIFY = SplitKVGraphVariants(min_length=8192)
 EXTEND = SplitKVGraphVariants(min_length=32768)
 
 
-def split_kv(variants: SplitKVGraphVariants, forward_batch) -> bool:
-    """Whether this step takes split-KV attention: the label being captured, else (an
-    eager step) ``variants.select``; every step where SGLang captures no label of
-    ours or keeps no host lower bound."""
+def cp_min_length(site: str) -> Optional[int]:
+    """The KV length from which one request's ``site`` ("verify" / "draft" / "extend")
+    takes CP-lite, or None when its slot is not requested."""
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+
+    if CP_SITES[site] not in SLOTS:
+        return None
+    return CP_MIN_KV[site]
+
+
+def verify_variants() -> SplitKVGraphVariants:
+    """The target verify's variants: ``VERIFY``, with ``SPLIT_KV_CP`` under slot skv2_cp."""
+    n = cp_min_length("verify")
+    if n is None:
+        return VERIFY
+    return _with_cp(VERIFY.min_length, n)
+
+
+def extend_variants() -> SplitKVGraphVariants:
+    """The draft extend's variants: ``EXTEND``, with ``SPLIT_KV_CP`` under slot draft_skv2_cp."""
+    n = cp_min_length("extend")
+    if n is None:
+        return EXTEND
+    return _with_cp(EXTEND.min_length, n)
+
+
+@functools.cache
+def _with_cp(min_length: int, cp_length: int) -> SplitKVCPGraphVariants:
+    return SplitKVCPGraphVariants(min_length=min_length, cp_min_length=cp_length)
+
+
+def label(variants: SplitKVGraphVariants, forward_batch) -> str:
+    """This step's label of ``variants``: the one being captured, else (an eager step)
+    ``variants.select``; ``SPLIT_KV_LONG`` where SGLang captures no label of ours or
+    keeps no host lower bound."""
     from sglang.srt.model_executor.runner_utils.capture_mode import (
         get_capture_attention_variant,
         get_is_capture_mode,
     )
 
-    label = get_capture_attention_variant()
-    if label in SplitKVGraphVariants.capture_labels:
-        return label == SPLIT_KV_LONG
+    captured = get_capture_attention_variant()
+    if captured in variants.capture_labels:
+        return captured
     if get_is_capture_mode() or not hasattr(
         forward_batch, "attention_kv_len_lower_bound"
     ):
-        return True
-    return variants.select(forward_batch) == SPLIT_KV_LONG
+        return SPLIT_KV_LONG
+    return variants.select(forward_batch)
+
+
+def split_kv(variants: SplitKVGraphVariants, forward_batch) -> bool:
+    """Whether this step takes SKV2: ``label`` is ``SPLIT_KV_LONG``."""
+    return label(variants, forward_batch) == SPLIT_KV_LONG

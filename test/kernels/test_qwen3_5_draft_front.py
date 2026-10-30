@@ -142,3 +142,33 @@ def test_the_front_replays_in_a_graph_with_new_positions_and_slots(heads):
         q_s, gate_s = _stock(fresh, kv_s)
         assert _same(q_s, q_p) and _same(gate_s, gate_p)
         assert _same(kv_s[0], kv_p[0]) and _same(kv_s[1], kv_p[1])
+
+
+@pytest.mark.parametrize("rows", [1, 7, 16, 32, 96, 128, 672])
+def test_the_pre_fc_norms_write_fcs_input_as_the_concatenation(rows):
+    """The in-place pre-fc norms equal the concatenated GemmaRMSNorm outputs."""
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+    from sgl_nvidia_mega.qwen3_5.draft.layer import norms_into_cat
+
+    torch.manual_seed(9100 + rows)
+    hidden_size = 4096
+    # BF16 weights, as the server loads them (the kernel takes the input's dtype).
+    norm_embeds, norm_hidden = (
+        GemmaRMSNorm(hidden_size, 1e-6).cuda().to(torch.bfloat16) for _ in range(2)
+    )
+    with torch.no_grad():
+        norm_embeds.weight.normal_(0.0, 0.2)
+        norm_hidden.weight.normal_(0.0, 0.2)
+    embeds = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16) * 3
+    expected = torch.cat([norm_embeds(embeds), norm_hidden(hidden)], dim=-1)
+    actual = norms_into_cat(embeds, hidden, norm_embeds, norm_hidden)
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = norms_into_cat(embeds, hidden, norm_embeds, norm_hidden)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, expected)

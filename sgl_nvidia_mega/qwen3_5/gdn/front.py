@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/models/qwen3_5.py": (
+        "Qwen3_5LinearDecoderLayer",
         "in_proj_qkvz",
         "in_proj_ba",
         "attn_tp_size",
@@ -189,26 +190,100 @@ def build(model, gdns) -> dict:
     }
 
 
+def prepare(lm, pools, trt: bool = False) -> None:
+    """Compile the requested TensorRT-LLM front on the first mamba-pool layouts,
+    before graph capture. Every GDN layer has the same layouts."""
+    from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    if not trt:
+        return
+    m = lm.model
+    gdn = next(
+        m.layers[i].linear_attn
+        for i in range(m.start_layer, m.end_layer)
+        if isinstance(m.layers[i], Qwen3_5LinearDecoderLayer)
+    )
+    li = pools.layer_ids.index(gdn.attn.layer_id)
+    trt_front.prepare(
+        gdn.in_proj_qkvz.weight.shape[1],
+        gdn.in_proj_ba.weight.shape[0],
+        gdn.attn.conv_weights,
+        pools.conv[0][li],
+        pools.intermediate_conv_window[0][li],
+    )
+
+
 def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
     """``Qwen3_5GatedDeltaNet.forward`` of a target-verify step of 7 rows on the front:
     the TP-partial output [7, hidden] of the normed BF16 rows x; ``opts`` is slot
     gdn_verify's (the verify's tiles, and ``push`` for slot gdn_push)."""
+    from sgl_nvidia_mega.qwen3_5 import lowm
     from sgl_nvidia_mega.qwen3_5.gdn import replayssm
     from sgl_nvidia_mega.qwen3_5.gdn.front_norm import norm
     from sgl_nvidia_mega.qwen3_5.gdn.verify import _out_proj
-    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front, trt_front
 
-    if x.shape[0] not in _ENGAGED:
-        _ENGAGED.add(x.shape[0])
+    rows = x.shape[0]
+    requests = rows // ROWS
+    # TensorRT-LLM's front may read the hop's E4M3 copy of x (slot hop_fp8).
+    trt = st.slots.gdn_trt_front and opts.core
+    x8 = lowm.take_fp8(st, x) if trt and st.slots.hop_fp8 else None
+    # the L2 prefetch of the checkpoint / ring in front of slot gdn_core is left out with the early history (the core
+    # holds those loads ahead of its wait) and for the pinned one-request front (which completes later with it)
+    prefetch = not (opts.core and (core_kernel.EARLY or (front.PIN and requests == 1)))
+    if (rows, x8 is not None) not in _ENGAGED:
+        _ENGAGED.add((rows, x8 is not None))
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot gdn_front runs at %d rows", x.shape[0]
+            "NVIDIA megakernel: Qwen3.5 slot gdn_front runs at %d rows "
+            "(pinned=%d, core_early=%d, core_flat=%d, trt_front=%d, "
+            "fp8_x=%d, prefetch=%d)",
+            rows,
+            front.PIN,
+            core_kernel.EARLY,
+            core_kernel.FLAT,
+            trt,
+            x8 is not None,
+            int(prefetch and not trt),
         )
     attn, bound = gdn.attn, st.bound["gdn"]
     meta, pools = st.view.gdn, st.view.mamba
     li = pools.layer_ids.index(attn.layer_id)
-    projected = x.new_empty((ROWS, 2560))
-    conv = x.new_empty((ROWS, CONV_CHANNELS))
-    ba = x.new_empty((ROWS, 16))
+    if trt:
+        from sgl_nvidia_mega.qwen3_5.gdn.verify import _fused
+
+        out = x.new_empty((rows, gdn.in_proj_qkvz.weight.shape[1]))
+        ba = x.new_empty((rows, gdn.in_proj_ba.weight.shape[0]))
+        trt_front.front(
+            x,
+            x8,
+            # the method keeps the weight as the [K, N] transpose of a row-major [N, K]
+            gdn.in_proj_qkvz.weight.t(),
+            gdn.in_proj_qkvz.input_scale,
+            gdn.in_proj_qkvz.weight_scale,
+            gdn.in_proj_ba.weight,
+            attn.conv_weights,
+            pools.conv[0][li],
+            pools.intermediate_conv_window[0][li],
+            meta.state_indices[:requests],
+            out,
+            ba,
+        )
+        # convolved q | k | v, the raw z, and b / a in the front's b8 / a8 order
+        return _fused(
+            gdn,
+            out[:, :CONV_CHANNELS],
+            out[:, CONV_CHANNELS:].view(rows, attn.num_v_heads, attn.head_v_dim),
+            ba[:, attn.num_v_heads :],
+            ba[:, : attn.num_v_heads],
+            st,
+            opts,
+        )
+    projected = x.new_empty((rows, 2560))
+    conv = x.new_empty((rows, CONV_CHANNELS))
+    ba = x.new_empty((rows, 16))
     front.front(
         x,
         bound.front[attn.layer_id],
@@ -230,7 +305,21 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
         history_g=pools.ring_g[li],
         ring_indices=st.fb.req_pool_indices[:1],
         pad_slot=meta.pad_slot_id,
+        prefetch=prefetch,
     )
+    if opts.core:
+        from sgl_nvidia_mega.qwen3_5.gdn.verify import _fused
+
+        # b / a in the front's b8 / a8 order
+        return _fused(
+            gdn,
+            conv,
+            projected[:, CONV_CHANNELS:].view(rows, attn.num_v_heads, attn.head_v_dim),
+            ba[:, 8:],
+            ba[:, :8],
+            st,
+            opts,
+        )
     query, key, value = torch.split(conv, [attn.q_dim, attn.k_dim, attn.v_dim], dim=-1)
     H, K = attn.num_k_heads, attn.head_k_dim
     HV, V = attn.num_v_heads, attn.head_v_dim
@@ -291,4 +380,4 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
             input_scale=gdn.out_proj.input_scale,
             weight_scale=gdn.out_proj.weight_scale,
         )
-    return _out_proj(gdn.out_proj, x_fp8, x.dtype)
+    return _out_proj(gdn.out_proj, x_fp8, x.dtype, st, opts.lowm_push)
