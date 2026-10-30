@@ -981,6 +981,7 @@ class TestPrefetchHooks(unittest.TestCase):
                 resources = SimpleNamespace(
                     binding_fingerprint="bound",
                     tokens_per_request=q,
+                    widths=(rows,),
                     aux_capture_layers=(),
                     model=SimpleNamespace(),
                     layers=layers,

@@ -86,7 +86,7 @@ def _validate_step_inputs(
             f"Kimi K3 megakernel execution requires CUDA resources, found {device}"
         )
     if tokens_per_request not in (1, *VERIFY_QUERIES) or batch not in token_widths(
-        tokens_per_request
+        tokens_per_request, configured=True
     ):
         raise RuntimeError("Kimi K3 megakernel received an unsupported query width")
     if view.mla.tokens_per_request != tokens_per_request:
@@ -230,8 +230,9 @@ class KimiK3MegakernelExecutor:
         kda_slots = view.kda.state_indices
         batch = int(input_ids.shape[0])
         q = resources.tokens_per_request
-        widths = token_widths(q)
-        if batch not in widths:
+        # Preparation owns admission, including privately configured q1 rows.
+        # The tensor validator below checks geometry, not a second policy list.
+        if batch not in resources.widths:
             raise RuntimeError(f"unsupported Kimi K3 megakernel batch: {batch}")
         device = resources.scratch["hidden.0"].device
         _validate_step_inputs(

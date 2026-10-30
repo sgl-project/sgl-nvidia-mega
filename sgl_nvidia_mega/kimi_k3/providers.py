@@ -56,10 +56,7 @@ def _kda_policy(tokens_per_request: int, widths: tuple[int, ...] | None = None) 
             (rows // tokens_per_request, tokens_per_request): (6288, 1)
             for rows in widths
         }
-    return {
-        rows: (6288, 0 if rows in (16, 32, 64) else 1 if rows == 1 else 2)
-        for rows in widths
-    }
+    return {rows: (6288, 1 if rows == 1 else 2 if rows <= 8 else 0) for rows in widths}
 
 
 def _projection_policies(pitch: int, widths: tuple[int, ...]) -> dict:

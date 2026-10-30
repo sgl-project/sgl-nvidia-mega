@@ -540,6 +540,7 @@ class TestKimiK3TypedStep(unittest.TestCase):
         resources = SimpleNamespace(
             binding_fingerprint="bound",
             tokens_per_request=1,
+            widths=(batch,),
             aux_capture_layers=None,
             model=SimpleNamespace(model=SimpleNamespace(embed_tokens=Mock())),
             layers=layers,

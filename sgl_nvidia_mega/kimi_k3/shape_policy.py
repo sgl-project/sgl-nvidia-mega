@@ -8,23 +8,29 @@ MAX_ROWS = 64
 MAX_CONTEXT = 262144
 
 
-def token_widths(tokens_per_request: int) -> tuple[int, ...]:
-    """q1 retains its decode bins; verification prepares whole requests only."""
+def token_widths(
+    tokens_per_request: int, *, configured: bool = False
+) -> tuple[int, ...]:
+    """Keep legacy defaults; explicit q1 capture sizes may use every row to 64."""
     if type(tokens_per_request) is not int or tokens_per_request not in (
         1,
         *VERIFY_QUERIES,
     ):
         raise ValueError("Kimi K3 requires q1 decode or fixed q4-8 verification")
     if tokens_per_request == 1:
-        return DECODE_WIDTHS
+        return tuple(range(1, MAX_ROWS + 1)) if configured else DECODE_WIDTHS
     return tuple(range(tokens_per_request, MAX_ROWS + 1, tokens_per_request))
 
 
 def prepared_widths(
     tokens_per_request: int, widths: tuple[int, ...] | None = None
 ) -> tuple[int, ...]:
-    """Select supported token rows, retaining the full policy for legacy callers."""
-    supported = token_widths(tokens_per_request)
+    """Explicit q1 rows may use 1..64; omitted rows retain legacy preparation.
+
+    The spec separately controls whether its framework width handoff opts in;
+    a dense BuildContext range is not itself an explicit graph configuration.
+    """
+    supported = token_widths(tokens_per_request, configured=widths is not None)
     if widths is None:
         return supported
     if (

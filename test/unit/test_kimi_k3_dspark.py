@@ -888,6 +888,7 @@ def test_executor_preserves_decode_and_never_commits_verify_state(q):
         aux_capture_layers=taps,
         binding_fingerprint="bound",
         tokens_per_request=q,
+        widths=(rows,),
     )
     track = Mock(
         side_effect=AssertionError("verify must not commit decode state")

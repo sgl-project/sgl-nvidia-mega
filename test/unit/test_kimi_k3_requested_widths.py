@@ -12,8 +12,10 @@ from __future__ import annotations
 import ast
 import sys
 import unittest
+from functools import partial
 from pathlib import Path
-from types import ModuleType, SimpleNamespace as NS
+from types import ModuleType
+from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
@@ -362,6 +364,43 @@ class TestWidthSelection(unittest.TestCase):
         self.assertEqual(POLICY.prepared_widths(1, (64, 2, 16)), (2, 16, 64))
         self.assertEqual(POLICY.prepared_widths(6, (60, 6, 12)), (6, 12, 60))
 
+    def test_explicit_ordinary_widths_cover_every_row_through_capacity(self):
+        rows = tuple(range(1, 65))
+        self.assertEqual(POLICY.prepared_widths(1, tuple(reversed(rows))), rows)
+        self.assertEqual(POLICY.prepared_widths(1), POLICY.DECODE_WIDTHS)
+        for row in rows:
+            with self.subTest(row=row):
+                self.assertEqual(POLICY.prepared_widths(1, (row,)), (row,))
+        # Verification still accepts only complete requests, with no new q modes.
+        for q in (4, 5, 6, 7, 8):
+            self.assertEqual(POLICY.prepared_widths(q), tuple(range(q, 65, q)))
+
+    def test_configured_ordinary_widths_keep_source_gate_policy(self):
+        rows = tuple(range(1, 65))
+        module = providers()
+        policy = module._kda_policy(1, rows)
+        self.assertEqual(
+            policy,
+            {row: (6288, 1 if row == 1 else 2 if row <= 8 else 0) for row in rows},
+        )
+        for pitch in (3648, 6288):
+            all_policies = module._projection_policies(pitch, rows)
+            old_policies = module._projection_policies(pitch, POLICY.DECODE_WIDTHS)
+            self.assertEqual(
+                {row: all_policies[row] for row in POLICY.DECODE_WIDTHS}, old_policies
+            )
+
+    def test_odd_width_build_has_no_unrequested_single_row_helper(self):
+        selected = (9, 15, 17, 31, 33, 63)
+        for prefetch in (False, True):
+            with self.subTest(prefetch=prefetch):
+                fixture = BuildFixture()
+                with patch.object(
+                    weight_prefetch, "PrefetchController", return_value=object()
+                ):
+                    result = fixture.build(1, selected, enable_prefetch=prefetch)
+                self.assertEqual(result.widths, selected)
+
     def test_invalid_subsets_reject_before_native_work(self):
         for q, value in (
             (1, ()),
@@ -369,7 +408,6 @@ class TestWidthSelection(unittest.TestCase):
             (1, (True,)),
             (1, (1.0,)),
             (1, (0,)),
-            (1, (9,)),
             (1, (65,)),
             (1, [1]),
             (1, "1"),
@@ -398,7 +436,12 @@ class TestWidthSelection(unittest.TestCase):
                 )
 
     def test_actual_build_passes_only_selected_rows_to_every_width_provider(self):
-        for q, selected in ((1, (1, 4, 16)), (1, (2, 8, 64)), (6, (6, 12, 60))):
+        for q, selected in (
+            (1, (1, 4, 16)),
+            (1, (2, 8, 64)),
+            (1, (9, 15, 17, 31, 33, 63)),
+            (6, (6, 12, 60)),
+        ):
             fixture = BuildFixture()
             result = fixture.build(q, selected)
             with self.subTest(q=q, selected=selected):
@@ -479,7 +522,7 @@ class TestWidthSelection(unittest.TestCase):
             VERIFY_QUERIES=POLICY.VERIFY_QUERIES,
             token_widths=POLICY.token_widths,
         )
-        for q, rows in ((1, (2, 16)), (6, (6, 18))):
+        for q, rows in ((1, (2, 16)), (1, (9, 15, 17, 31, 33, 63)), (6, (6, 18))):
             core = object.__new__(module.PreparedKda)
             core.policies = providers()._kda_policy(q, rows)
             core.dim, core.heads, core.has_bias = 1536, 12, False
@@ -521,7 +564,11 @@ class TestWidthSelection(unittest.TestCase):
             to_cute=lambda t: t,
             compile_core=Mock(return_value=(object(), object())),
         )
-        for q, rows in ((1, (1, 4, 32)), (6, (6, 12, 30))):
+        for q, rows in (
+            (1, (1, 4, 32)),
+            (1, (9, 15, 17, 31, 33, 63)),
+            (6, (6, 12, 30)),
+        ):
             core = object.__new__(module.PreparedMla)
             core.weights = (torch.empty(1, device="meta"),)
             core.cores = dict.fromkeys(((r, q) for r in rows), "trtllm")
@@ -558,7 +605,7 @@ class TestWidthSelection(unittest.TestCase):
             batch_table=lambda value: {},
             JOIN={8: ""},
         )
-        for rows in ((2, 4, 16), (6, 12, 60)):
+        for rows in ((2, 4, 16), (9, 15, 17, 31, 33, 63), (6, 12, 60)):
             experts = NS(prepare=Mock())
             state = NS(
                 tp=8,
@@ -606,9 +653,13 @@ class TestWidthSelection(unittest.TestCase):
                 "width_fixture.executor": executor,
             },
         ):
-            for q, requested, selected in (
-                (1, (32, 3, 9, 1), (1, 3, 32)),
-                (6, (1, 6, 12, 13), (6, 12)),
+            for q, requested, configured, selected in (
+                (1, (32, 3, 9, 1), False, (1, 3, 32)),
+                (1, (32, 3, 9, 1), True, (1, 3, 9, 32)),
+                (1, tuple(range(1, 65)), False, POLICY.DECODE_WIDTHS),
+                (1, (9, 15, 17, 31, 33, 63), True, (9, 15, 17, 31, 33, 63)),
+                (6, (1, 6, 12, 13), False, (6, 12)),
+                (6, (1, 6, 12, 13), True, (6, 12)),
             ):
                 provider.build_resources = Mock(return_value=NS(tokens_per_request=q))
                 model = NS(language_model=NS())
@@ -621,6 +672,7 @@ class TestWidthSelection(unittest.TestCase):
                         deadline_s=1,
                         binding=object(),
                     ),
+                    configured_widths=configured,
                 )
                 self.assertEqual(built.widths, selected)
                 self.assertEqual(
@@ -634,8 +686,11 @@ class TestWidthSelection(unittest.TestCase):
                     str(list(selected if q == 1 else (r // q for r in selected))),
                     built.summary(),
                 )
-                mode = NS(is_decode=lambda: q == 1, is_target_verify=lambda: q > 1)
-                for rows in POLICY.token_widths(q):
+                mode = NS(
+                    is_decode=lambda q=q: q == 1,
+                    is_target_verify=lambda q=q: q > 1,
+                )
+                for rows in POLICY.token_widths(q, configured=True):
                     batch = NS(forward_mode=mode, batch_size=rows // q)
                     planned = built.plan(NS(shape=(rows,)), batch)
                     self.assertEqual(planned is not None, rows in selected)
@@ -644,6 +699,181 @@ class TestWidthSelection(unittest.TestCase):
                         NS(shape=(selected[0],)), NS(forward_mode=mode, batch_size=100)
                     )
                 )
+
+    def test_extended_spec_admission_requires_explicit_boolean_opt_in(self):
+        module = definitions(
+            ROOT / "spec.py",
+            ("_build",),
+            token_widths=POLICY.token_widths,
+            prepared_widths=POLICY.prepared_widths,
+        )
+        context = NS(widths=(9, 15), tokens_per_request=1)
+        # These checks precede bindings, imports, provider compilation or CUDA.
+        with self.assertRaisesRegex(ValueError, "no supported width"):
+            module._build(None, None, context)
+        for value in (None, 1, "true"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "bool"):
+                module._build(None, None, context, configured_widths=value)
+
+
+class _CudaMetadataTensor(torch.Tensor):
+    """Storage-free meta tensor with a synthetic CUDA device for guard tests.
+
+    Shape, strides, dtype and slicing use actual Torch meta behavior. There is
+    no CUDA allocation, kernel execution or numerical oracle in these tests.
+    """
+
+    @property
+    def device(self):
+        return torch.device("cuda:0")
+
+
+class TestConfiguredWidthExecutionContract(unittest.TestCase):
+    """Actual executor and validators over metadata-only tensors, not GPU math."""
+
+    @staticmethod
+    def executor_module():
+        return definitions(
+            ROOT / "executor.py",
+            ("_require_tensor", "_validate_step_inputs", "KimiK3MegakernelExecutor"),
+            torch=torch,
+            partial=partial,
+            VERIFY_QUERIES=POLICY.VERIFY_QUERIES,
+            token_widths=POLICY.token_widths,
+        )
+
+    @staticmethod
+    def fixture(rows, prepared):
+        # Synthetic CUDA metadata lets the actual tensor validator run unchanged.
+        # Provider calls record plumbing; no kernel or device code is executed.
+        def tensor(shape, dtype=torch.bfloat16):
+            return torch.empty(shape, dtype=dtype, device="meta").as_subclass(
+                _CudaMetadataTensor
+            )
+
+        ids = tensor((rows,), torch.int64)
+        embeds = tensor((rows, 7168))
+        view = NS(
+            mla=NS(
+                write_slots=tensor((rows,), torch.int64),
+                sequence_lengths=tensor((rows,), torch.int32),
+                block_table=tensor((rows, 8), torch.int32),
+                tokens_per_request=1,
+            ),
+            kda=NS(
+                state_indices=tensor((rows,), torch.int32),
+                verify_scratch_indices=None,
+                track_decode_state=Mock(),
+            ),
+            aux_hidden_states=None,
+        )
+        no_op = NS(run=Mock(side_effect=lambda x, out, *args, **kwargs: out))
+        projection, mla, kda = Mock(), Mock(), Mock()
+        attention = {
+            index: NS(
+                kind="mla" if index == 0 else "kda",
+                projection=NS(run=projection),
+                core=mla if index == 0 else kda,
+                output=no_op,
+                cache=object() if index == 0 else None,
+                caches=None if index == 0 else (object(), object()),
+            )
+            for index in range(93)
+        }
+        scratch = {
+            name: tensor((64, 7168))
+            for name in (
+                "hidden.0",
+                "hidden.1",
+                "hidden.out",
+                "prefix",
+                "blocks",
+                "mla.projected",
+                "kda.projected",
+                "attention.local",
+            )
+        }
+        resources = NS(
+            binding_fingerprint="bound",
+            tokens_per_request=1,
+            widths=prepared,
+            prefetch=None,
+            aux_capture_layers=None,
+            attention=attention,
+            scratch=scratch,
+            layers=tuple(NS(layer_idx=index) for index in range(93)),
+            before={index: no_op for index in range(93)},
+            fused_before={},
+            feed_forward={index: no_op for index in range(93)},
+            final=no_op,
+        )
+        return resources, ids, embeds, view, projection, mla, kda
+
+    def test_new_rows_execute_the_real_python_chain_and_tensor_validation(self):
+        module = self.executor_module()
+        for rows in (9, 12, 15, 17, 24, 31, 33, 48, 63):
+            with self.subTest(rows=rows):
+                resources, ids, embeds, view, projection, mla, kda = self.fixture(
+                    rows, (rows,)
+                )
+                output = module.KimiK3MegakernelExecutor(resources).run(
+                    ids, embeds, view
+                )
+                self.assertEqual(tuple(output.shape), (rows, 7168))
+                self.assertEqual(projection.call_count, 93)
+                self.assertEqual(mla.run.call_count, 1)
+                self.assertEqual(kda.run.call_count, 92)
+                self.assertEqual(
+                    [
+                        call.args[0]
+                        for call in view.kda.track_decode_state.call_args_list
+                    ],
+                    list(range(1, 93)),
+                )
+                self.assertIs(mla.run.call_args.kwargs["slots"], view.mla.write_slots)
+                self.assertIs(kda.run.call_args.kwargs["slots"], view.kda.state_indices)
+                self.assertTrue(
+                    all(
+                        call.args[0].shape[0] == rows
+                        for call in projection.call_args_list
+                    )
+                )
+
+    def test_unprepared_rows_fail_before_validation_or_provider_execution(self):
+        module = self.executor_module()
+        for rows, selected in ((9, POLICY.DECODE_WIDTHS), (16, (9, 15)), (1, (9, 15))):
+            with self.subTest(rows=rows, selected=selected):
+                resources, ids, embeds, view, projection, mla, kda = self.fixture(
+                    rows, selected
+                )
+                with patch.object(
+                    module, "_validate_step_inputs", wraps=module._validate_step_inputs
+                ) as validate:
+                    with self.assertRaisesRegex(RuntimeError, "unsupported.*batch"):
+                        module.KimiK3MegakernelExecutor(resources).run(
+                            ids, embeds, view
+                        )
+                validate.assert_not_called()
+                projection.assert_not_called()
+                mla.run.assert_not_called()
+                kda.run.assert_not_called()
+
+    def test_new_rows_do_not_bypass_dtype_shape_or_capacity_guards(self):
+        module = self.executor_module()
+        for rows, corrupt in ((9, "dtype"), (9, "shape"), (65, None)):
+            with self.subTest(rows=rows, corrupt=corrupt):
+                resources, ids, embeds, view, projection, mla, kda = self.fixture(
+                    rows, (rows,)
+                )
+                if corrupt == "dtype":
+                    view.mla.write_slots = view.mla.write_slots.to(torch.int32)
+                elif corrupt == "shape":
+                    view.kda.state_indices = view.kda.state_indices[:-1]
+                with self.assertRaises(RuntimeError):
+                    module.KimiK3MegakernelExecutor(resources).run(ids, embeds, view)
+                projection.assert_not_called()
+                mla.run.assert_not_called()
+                kda.run.assert_not_called()
 
 
 if __name__ == "__main__":

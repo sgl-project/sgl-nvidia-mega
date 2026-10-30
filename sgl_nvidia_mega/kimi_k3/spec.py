@@ -303,8 +303,22 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
     resources.bind(view.hybrid)
 
 
-def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
-    supported = token_widths(context.tokens_per_request)
+def _build(
+    model: Any,
+    hf_config: Any,
+    context: BuildContext,
+    *,
+    configured_widths: bool = False,
+) -> _Built:
+    """Keep the public dense-range handoff frozen; extended q1 rows are opt-in.
+
+    Only a private caller may explicitly enable configured widths. Merely
+    receiving BuildContext.widths does not mean they are configured graph
+    buckets: the normal framework supplies a dense capacity range.
+    """
+    if type(configured_widths) is not bool:
+        raise ValueError("configured_widths must be a bool")
+    supported = token_widths(context.tokens_per_request, configured=configured_widths)
     widths = tuple(width for width in context.widths if width in supported)
     if not widths:
         raise ValueError(
