@@ -32,6 +32,42 @@ matched its frozen stock-path reference score. This is bounded functional and
 quality evidence; it does not claim performance, unlisted configurations, production
 readiness, or publication readiness.
 
+### GLM5 native FP8 operator backends
+
+`glm5/` contains the native E4M3 MLA and MoE backends for GLM5.
+Public parameters are `draft_tokens=4/8` and `tp_size=4/8`.
+The eight-row specialization supports both four rows per request at batch 2
+and eight rows at batch 1. Internal 314/718 labels identify compiled kernels.
+
+Load compiles device-only cubins with NVCC and a typed TVM-FFI host binding;
+C++ launches the cubin through the CUDA driver. Bind validates and retains native weight
+references, cache views and layer state, and creates all TMA descriptors before
+capture. Calls pass only dynamic inputs and outputs. Resource sizes come from
+compiled C++ Config metadata; Python allocates and holds them without a weight pack.
+
+The two kernel tests retain inline references and cover local TP shards,
+real TP4/TP8, independent request cache indices, first-call capture and replay.
+
+```bash
+PYTHONPATH=. python benchmark/bench_glm5.py --list-configs
+PYTHONPATH=. pytest -q test/kernels/test_glm_53_megamla.py test/kernels/test_glm_53_megamoe.py
+```
+
+Builds require SM10x, sufficient SMs for the compiled persistent grid,
+NVCC >= 13.0, a C++ compiler, Apache TVM-FFI >= 0.1.11 and external CUTLASS
+headers (`CUTLASS_INCLUDE_DIR`). Install the optional binding dependency with
+`pip install -e ".[ffi]"`. GLM5 launches with PDL disabled; no CUTLASS source
+is vendored. `SGLANG_CACHE_DIR` selects the shared cache root.
+See `benchmark/README.md` for single-layer, layer-rotation and mixed-operator
+modes, each reporting MLA and MoE durations separately.
+
+GLM5 uses native device waits without an added device timeout or device logging.
+Serving failure detection and termination belong to the upper-layer watchdog.
+
+The serving contract uses TRTLLM with `fp8_e4m3` and raw 576-byte cache rows.
+See `docs/glm5_megakernel_integration_plan.md` for the SGLang integration and
+validation status; the operator benchmark measures synthetic MLA/MoE calls.
+
 ### What a covered DeepSeek-V4.1-Flash step runs
 
 The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/runtime`): the embedding and the Engram hashes, then per layer the mHC boundary (`boundary/`), the attention (`attention/`), the MoE (`moe/`) and Engram (`engram/`), then the head and the logits (`logits/`). Each package has a stock implementation that reproduces SGLang's decode step bit for bit, and puts this package's kernels in where the slot plan (`plan.py`) gives them a width:
@@ -157,7 +193,8 @@ sgl-nvidia-mega/
 │   │   ├── logits/          # the head and the logits
 │   │   └── sm103/           # kernels and the build-time runner; no SGLang imports
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
-│   └── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   ├── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   └── glm_5/               # the glm5 spec, adapter, executor and cutlass kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
     ├── unit/              # CPU: the plugin, the setup checks, the step loop and the SGLang contract

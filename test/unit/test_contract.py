@@ -204,6 +204,7 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "temporal",
         "kv_pool",
         "trtllm_attn",
+        "use_fused_topk",
         "uniform_fp8",
         "request_window",
         "write_slots",
