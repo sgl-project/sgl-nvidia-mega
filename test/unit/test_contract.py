@@ -12,7 +12,10 @@ with the digest of its code, so a changed branch fails here too. A file that mov
 between SGLang versions is named newest first, ``"new.py|old.py"``; the first one
 present is checked. A read name such as "replication|layout" accepts either field.
 The checks are static (AST and tokens): no package module is
-imported. Run them against every supported SGLang and nightly against main.
+imported. Run them against every supported SGLang and nightly against main. The
+GLM-5.3 package reads SGLang's megakernel DSA binding view, and its draft spec
+SGLang's draft capture check marker; against an SGLang without them, those reads and
+pins are skipped, naming each.
 """
 
 import ast
@@ -110,11 +113,21 @@ def test_every_sglang_import_is_declared(path):
 
 @pytest.mark.parametrize("path", READERS, ids=_id)
 def test_sglang_provides_what_the_plugin_reads(path):
-    missing = []
+    missing, unchecked = [], []
     for pattern, names in _declared(path).items():
         files = _files(pattern)
         assert files, f"{_id(path)}: no file matches {pattern}"
         provided = frozenset().union(*map(_provided, files))
+        optional = []
+        if files == _files(BINDING) and not _has_dsa_view():
+            optional = [n for n in names if n.split("(", 1)[0] in DSA_VIEW_NAMES]
+            reason = NO_DSA_VIEW
+        if files == _files(DRAFT_CHECK) and not _has_draft_check():
+            optional = [n for n in names if n in DRAFT_CHECK_NAMES]
+            reason = NO_DRAFT_CHECK
+        if optional:
+            unchecked.append(f"{reason}: {_id(path)} reads {sorted(optional)}")
+            names = [n for n in names if n not in optional]
         missing += [
             f"{pattern}: {n}"
             for n in names
@@ -124,6 +137,8 @@ def test_sglang_provides_what_the_plugin_reads(path):
         f"SGLang no longer provides what {_id(path)} reads; repair it and its "
         "SGLANG_READS:\n  " + "\n  ".join(missing)
     )
+    if unchecked:
+        pytest.skip("; ".join(unchecked))
 
 
 # What SGLang's binding file tolerates the megakernel still calling, writing and
@@ -152,7 +167,65 @@ PINNED_TOLERATED = {
         "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph)",
         "MegakernelBinding.engram_host_table",
     ),
+    "TOLERATED_DSA_CALLABLES": (
+        "KvPoolView.set_mla_kv_buffer",
+        "DsaView.indexer_metadata",
+    ),
+    "TOLERATED_DSA_WRITES": (
+        "KvPoolView.get_key_buffer",
+        "KvPoolView.get_index_k_with_scale_buffer",
+    ),
 }
+# What SGLang's megakernel DSA binding view adds to binding.py (the DSA view and the
+# MLA pool members): an SGLang without it skips these reads and pins
+DSA_VIEW_PINS = ("TOLERATED_DSA_CALLABLES", "TOLERATED_DSA_WRITES")
+DSA_VIEW_NAMES = frozenset(
+    {
+        "dsa",
+        "DsaView",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "kv_cache_dim",
+        "physical_page_size",
+        "decode_impl",
+        "use_mha",
+        "kv_cache_dtype",
+        "use_fused_topk",
+        "topk_backend",
+        "dcp_size",
+        "index_kpool",
+        "hisparse",
+        "workspace_buffer",
+        "multi_ctas_kv_counter_buffer",
+        "indexer_metadata",
+        "get_key_buffer",
+        "get_index_k_with_scale_buffer",
+        "index_page_size",
+        "set_mla_kv_buffer",
+    }
+)
+NO_DSA_VIEW = "this SGLang has no megakernel DSA binding view (ForwardView.dsa)"
+# The EAGLE draft runners' capture check marker in spec.py
+DRAFT_CHECK, DRAFT_CHECK_NAMES = (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py",
+    ("EAGLE_DRAFT_CAPTURE_CHECK",),
+)
+NO_DRAFT_CHECK = "this SGLang's EAGLE draft graph runners run no draft capture check"
+
+
+def _has_draft_check() -> bool:
+    return DRAFT_CHECK_NAMES[0] in _provided(_files(DRAFT_CHECK)[0])
+
+
+def _has_dsa_view() -> bool:
+    return any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == DSA_VIEW_PINS[0] for t in node.targets
+        )
+        for node in _tree(_files(BINDING)[0]).body
+    )
 
 
 def _binding_tuple(name: str) -> tuple:
@@ -166,16 +239,31 @@ def _binding_tuple(name: str) -> tuple:
 
 @pytest.mark.parametrize("name", sorted(PINNED_TOLERATED))
 def test_the_binding_tolerates_exactly_the_pinned_sglang_code(name):
+    if name in DSA_VIEW_PINS and not _has_dsa_view():
+        pytest.skip(NO_DSA_VIEW)
     assert _binding_tuple(name) == PINNED_TOLERATED[name]
 
 
+def _binding_functions() -> frozenset:
+    """The public functions of SGLang's binding file: its megakernel API (in
+    guards.py and runtime.py before sgl-project/sglang#45389), not view members."""
+    return frozenset(
+        node.name
+        for node in _tree(_files(BINDING)[0]).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    )
+
+
 def test_every_binding_callable_the_plugin_reads_is_tolerated():
-    """A ForwardView / KvPoolView callable a module declares must be on SGLang's
-    tolerated list (the data fields and the pool's own getters need not be)."""
+    """A ForwardView / KvPoolView / DsaView callable a module declares must be on
+    SGLang's tolerated lists (the data fields, the pool's own getters and the
+    binding file's public functions need not be)."""
     callables = {
         name.split(".", 1)[1]
-        for name in PINNED_TOLERATED["TOLERATED_CALLABLES"]
-        if name.startswith(("ForwardView.", "KdaStepView.", "KvPoolView."))
+        for key in ("TOLERATED_CALLABLES", "TOLERATED_DSA_CALLABLES")
+        for name in PINNED_TOLERATED[key]
+        if name.startswith(("ForwardView.", "KdaStepView.", "KvPoolView.", "DsaView."))
     }
     data = {
         "ForwardView",
@@ -190,6 +278,7 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "layer_mapping",
         "logical_dtype",
         "KvPoolView",
+        "DsaView",
         "MegakernelBinding",
         "metadata",
         "mla",
@@ -210,10 +299,33 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "forward_view",
         "engram_history",
         "engram_host_table",
+        # the DSA backend's view: its layout and state, and the pool's MLA facts
+        "dsa",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "kv_cache_dim",
+        "physical_page_size",
+        "decode_impl",
+        "use_mha",
+        "kv_cache_dtype",
+        "use_fused_topk",
+        "topk_backend",
+        "dcp_size",
+        "index_kpool",
+        "hisparse",
+        "workspace_buffer",
+        "multi_ctas_kv_counter_buffer",
+        "index_page_size",
     }
     for path in READERS:
-        names = {n.split("(", 1)[0] for n in _declared(path).get(BINDING, ())}
-        untolerated = names - callables - data
+        names = {
+            n.split("(", 1)[0]
+            for pattern, declared in _declared(path).items()
+            if _files(pattern) == _files(BINDING)
+            for n in declared
+        }
+        untolerated = names - callables - data - _binding_functions()
         untolerated = {n for n in untolerated if not n.startswith("get_")}
         assert not untolerated, f"{_id(path)}: {sorted(untolerated)}"
 
