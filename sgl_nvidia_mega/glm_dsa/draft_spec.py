@@ -29,6 +29,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Step,
     )
 
+from sgl_nvidia_mega.glm_dsa import HF_CONFIG, MODEL_TYPE
 from sgl_nvidia_mega.glm_dsa import spec as target
 from sgl_nvidia_mega.glm_dsa import switches
 
@@ -43,6 +44,29 @@ SGLANG_READS = {
         "Step",
     ),
     "srt/models/deepseek_v2.py": ("set_embed_and_head", "logits_processor", "lm_head"),
+}
+
+ARCHITECTURE = "GlmMoeDsaForCausalLMNextN"
+
+# The fused draft layer's shapes: its attention and the embedding / head width (its
+# MoE runs SGLang's, and it has one layer whatever the target's depth)
+DRAFT_HF_CONFIG = {
+    **{
+        key: HF_CONFIG[key]
+        for key in (
+            "hidden_size",
+            "num_attention_heads",
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "qk_nope_head_dim",
+            "v_head_dim",
+            "index_n_heads",
+            "index_head_dim",
+            "index_topk",
+        )
+    },
+    "model_type": MODEL_TYPE,
 }
 
 # The draft top-1 is the stock argmax of the same logits (the distributed argmax
@@ -131,6 +155,7 @@ SPEC = MegakernelSpec(
         tp_sizes=target.REQUIREMENTS.tp_sizes,
         dtypes=target.REQUIREMENTS.dtypes,
         decode_graph_backends=target.REQUIREMENTS.decode_graph_backends,
+        hf_config=DRAFT_HF_CONFIG,
         env=target.REQUIREMENTS.env,
     ),
     features=frozenset({Feature.SPECULATIVE_DECODING, Feature.MULTI_NODE_TP}),
