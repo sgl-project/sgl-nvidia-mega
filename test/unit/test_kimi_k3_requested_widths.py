@@ -10,6 +10,7 @@ replaced. No model weights, optional attention backend or GPU is loaded.
 from __future__ import annotations
 
 import ast
+import os
 import sys
 import unittest
 from functools import partial
@@ -631,7 +632,8 @@ class TestWidthSelection(unittest.TestCase):
     def test_actual_spec_handoff_summary_and_unselected_fallback(self):
         module = definitions(
             ROOT / "spec.py",
-            ("_build", "_Built", "_call_option"),
+            ("_build", "_Built", "_call_option", "_startup_options"),
+            os=os,
             token_widths=POLICY.token_widths,
             prepared_widths=POLICY.prepared_widths,
             _deadline_ns=lambda value: 123,

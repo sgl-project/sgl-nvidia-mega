@@ -262,7 +262,7 @@ def _host_runtime(test):
 
 
 class TestPrefetchAdmission(unittest.TestCase):
-    def test_private_keyword_defaults_off_and_public_build_does_not_enable_it(self):
+    def test_provider_defaults_off_and_imports_only_on_opt_in(self):
         tree = ast.parse((ROOT / "providers.py").read_text())
         build = next(
             node
@@ -303,17 +303,7 @@ class TestPrefetchAdmission(unittest.TestCase):
         ]
         self.assertEqual(len(optional), 2)
         self.assertTrue(all(node in list(ast.walk(gate)) for node in optional))
-        spec = ast.parse((ROOT / "spec.py").read_text())
-        calls = [
-            node
-            for node in ast.walk(spec)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "build_resources"
-        ]
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("enable_prefetch", [kw.arg for kw in calls[0].keywords])
-        self.assertNotIn(None, [kw.arg for kw in calls[0].keywords])
+        # Registered startup defaults/opt-ins are checked by TestStartupOptions.
         # Existing MoE owners start disabled; only the final opt-in block binds them.
         for name in ("PreparedMoE", "SmallBatchChain"):
             call = next(

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 from sglang.srt.runtime_context import get_model
@@ -303,6 +304,19 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
     resources.bind(view.hybrid)
 
 
+def _startup_options() -> dict[str, bool]:
+    """Read optional providers once, before resource preparation and capture."""
+    options = {}
+    for name in ("prefetch", "embedding"):
+        key = f"SGLANG_KIMI_K3_MEGAKERNEL_{name.upper()}"
+        value = os.environ.get(key, "0")
+        if value not in ("0", "1"):
+            raise ValueError(f"{key} must be 0 or 1, got {value!r}")
+        if value == "1":
+            options[f"enable_{name}"] = True
+    return options
+
+
 def _build(
     model: Any,
     hf_config: Any,
@@ -328,6 +342,7 @@ def _build(
     if context.binding is None:
         raise ValueError("Kimi K3 megakernel received no SGLang runtime binding")
     deadline_ns = _deadline_ns(context.deadline_s)
+    options = _startup_options()
     from .compat import validate_runtime_compatibility
 
     validate_runtime_compatibility()
@@ -340,6 +355,7 @@ def _build(
         deadline_ns=deadline_ns,
         tokens_per_request=context.tokens_per_request,
         widths=widths,
+        **options,
     )
     return _Built(model, resources, widths)
 

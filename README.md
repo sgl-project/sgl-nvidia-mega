@@ -156,6 +156,30 @@ python -m sglang.launch_server \
   --enable-nvidia-megakernel
 ```
 
+### Kimi K3 optional startup providers
+
+Native SGLang embedding and no cross-layer weight prefetch remain the defaults.
+For experiments, set either of these plugin-owned switches before launching
+the server with `--enable-nvidia-megakernel`:
+
+| Environment variable | Unset or `0` | `1` |
+| --- | --- | --- |
+| `SGLANG_KIMI_K3_MEGAKERNEL_PREFETCH` | No optional prefetch preparation/resources | Prepare cross-layer weight prefetch using the existing selective TP8 token-row policy |
+| `SGLANG_KIMI_K3_MEGAKERNEL_EMBEDDING` | Native embedding; no optional gather preparation/resources | Prepare the specialized gather for supported native embedding layouts; retain native fallback otherwise |
+
+Use the same settings on every tensor-parallel rank. Only `0` and `1` are
+accepted; other values fail during build, before optional resource preparation.
+The plugin reads these switches at build time, not in the decode/verification
+loop. Restart the server to change them; they are not live graph toggles.
+Supplied `inputs_embeds`, vocabulary sharding and native communication semantics
+remain unchanged. Neither option enables DCP, alternate MLA or wider batch
+admission.
+
+Each option has bounded ordinary-decode and q6 serving correctness evidence.
+Neither has demonstrated a useful speedup in the existing measurements, so both
+remain default-OFF. Those separate proofs do not qualify both options together
+or establish arbitrary workload, long-context ON or performance coverage.
+
 ## Repository Structure
 
 ```text

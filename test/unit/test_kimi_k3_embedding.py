@@ -181,7 +181,7 @@ class TestEmbeddingPolicy(unittest.TestCase):
 
 
 class TestEmbeddingAdmission(unittest.TestCase):
-    def test_default_off_is_lazy_and_public_build_never_enables_it(self):
+    def test_provider_defaults_off_and_imports_only_on_opt_in(self):
         tree = ast.parse((ROOT / "providers.py").read_text())
         build = next(
             node
@@ -206,16 +206,7 @@ class TestEmbeddingAdmission(unittest.TestCase):
         ]
         self.assertEqual(len(imports), 1)
         self.assertIn(imports[0], list(ast.walk(gate)))
-        calls = [
-            node
-            for node in ast.walk(ast.parse((ROOT / "spec.py").read_text()))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "build_resources"
-        ]
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("enable_embedding", [kw.arg for kw in calls[0].keywords])
-        self.assertNotIn(None, [kw.arg for kw in calls[0].keywords])
+        # Registered startup defaults/opt-ins are checked by TestStartupOptions.
 
         original_import = builtins.__import__
 
