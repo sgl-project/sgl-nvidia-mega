@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // The Muse Spark output boundary in one kernel: the last decoder layer's post-feedforward norm (weight applied to the
 // input, then an RMSNorm without weight), its norm-preserving gated residual into the fp32 stream, the cast of the

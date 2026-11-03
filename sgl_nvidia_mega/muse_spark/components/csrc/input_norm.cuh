@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // The Muse Spark input boundary around one PyTorch reduction. SGLang runs, after the embedding all-reduce, the
 // embedding RMSNorm (no weight; PyTorch's row-wise RMSNorm kernel on bf16), the cast of its output to the fp32

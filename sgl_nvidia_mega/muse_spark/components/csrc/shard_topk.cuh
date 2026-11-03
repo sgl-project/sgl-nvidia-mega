@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Row-wise top-16 of a bf16 matrix (the draft head's vocabulary-shard logits), sorted by value in descending order,
 // equal values by ascending column index. Two launches:

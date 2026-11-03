@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Per-step expert-parallel assignment over a fixed replica pool (component ``bal``). One warp, integer arithmetic only.
 //

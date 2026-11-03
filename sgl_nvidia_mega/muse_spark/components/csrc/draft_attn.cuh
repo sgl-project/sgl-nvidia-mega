@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Attention for the DFlash draft block: every request has kQ query tokens at the end of its sequence (positions
 // seqlen - kQ .. seqlen - 1), attends without a causal mask to the keys of a paged bf16 KV cache within an optional

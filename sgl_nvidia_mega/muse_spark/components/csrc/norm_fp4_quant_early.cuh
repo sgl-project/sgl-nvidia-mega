@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 // Copied from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 // Source: python/sglang/kernels/jit/csrc/muse_spark_v12/norm_fp4_quant.cuh at revision a55ab7d.
 // Modified by NVIDIA: the programmatic-launch trigger (PDLTriggerSecondary) is issued at kernel entry instead of

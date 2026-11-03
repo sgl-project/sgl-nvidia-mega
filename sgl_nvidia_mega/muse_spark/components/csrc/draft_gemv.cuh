@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Weight-streaming BF16 GEMV for the DFlash draft layers:  out[M, N] = x[M, K] @ w[N, K]^T  with M <= kTokTile <= 64,
 // with an optional fused epilogue.

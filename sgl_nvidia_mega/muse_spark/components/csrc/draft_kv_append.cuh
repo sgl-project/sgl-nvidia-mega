@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Writes the draft's per-layer context K/V rows of one verify step into the draft KV cache for every layer in one
 // launch: for request b and block position j < commit_lens[b], row (b * block + j) of layer l goes to slot
