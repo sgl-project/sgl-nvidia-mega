@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 // Derived from FlashInfer (https://github.com/flashinfer-ai/flashinfer) csrc/fp4_kv_quantization.cu as shipped in
-// flashinfer-python 0.7.1 (flashinfer/data/csrc/fp4_kv_quantization.cu); see ../third_party/flashinfer/LICENSE.
+// flashinfer-python 0.7.1 (flashinfer/data/csrc/fp4_kv_quantization.cu); see ../include/LICENSE.flashinfer.
 // Modified by NVIDIA: FlashInfer's per-block NVFP4 quantization is kept (the rcp.approx, bf16 abs / max and E2M1
 // packing helpers and the E4M3 block-scale and output-scale arithmetic of quantize_fp16_to_e2m1_with_scaling); the
 // kernel around it quantizes one layer's K and V rows read from strided views and scatters the packed rows and block
