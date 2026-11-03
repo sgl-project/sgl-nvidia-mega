@@ -1,0 +1,55 @@
+name: Unit Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Includes the hybrid preparation/views API from sgl-project/sglang#45406.
+  # Pin source until a published nightly contains this interface; updating the
+  # pin is a normal PR and must pass the static mirror/contract tests.
+  SGLANG_COMMIT: aa3e34aaebf880d72482cea74dbbfef54da728e2
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out the pinned SGLang source
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: ${{ env.SGLANG_COMMIT }}
+          path: .ci/sglang
+          persist-credentials: false
+
+      # CPU unit tests do not use SGLang's optional Rust extensions. Install
+      # torch before building so build isolation does not download it twice.
+      # CUDA Python dependencies still come from SGLang's own package metadata.
+      - name: Install SGLang and the package
+        env:
+          SGLANG_BUILD_RUST_EXTS: none
+        run: |
+          python -m pip install uv
+          uv pip install --system torch==2.14.1 setuptools setuptools-rust setuptools-scm wheel pytest
+          uv pip install --system --no-build-isolation --prerelease allow ./.ci/sglang/python
+          uv pip install --system --no-deps -e .
+
+      - name: Run unit tests
+        run: python -m pytest test/unit -v -rfE --continue-on-collection-errors

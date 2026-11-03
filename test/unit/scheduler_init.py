@@ -260,7 +260,6 @@ class SchedulerInit:
             verify_num_draft_tokens=width,
             device="cpu",
             tp_sync=self.tp_sync,
-            fused_argmax=True,
             commit_ctx=CommitInjectCtx(
                 draft_model=self.draft_model,
                 block_pos_offsets=torch.arange(width),

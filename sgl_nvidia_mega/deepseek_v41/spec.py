@@ -100,12 +100,17 @@ def decode_graph_backends() -> frozenset:
     return frozenset({"full", "disabled"} if eager_steps_allowed() else {"full"})
 
 
+def resident_blocks() -> int:
+    """GB300's 152 SMs, within which the GEMM pair's persistent schedule and the
+    Lamport consumer stay; with "sm148" listed, a B300's 148: no DeepSeek-V4.1 kernel
+    pins a 152-CTA grid."""
+    return 148 if "sm148" in SLOTS else 152
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     tp_sizes=frozenset({4}),
-    # the GEMM pair's persistent schedule and the Lamport consumer stay within
-    # GB300's 152 SMs
-    resident_blocks=152,
+    resident_blocks=resident_blocks(),
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
     server_args={

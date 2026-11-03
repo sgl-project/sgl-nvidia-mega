@@ -164,3 +164,19 @@ def test_the_draft_spec_follows_the_target_spec():
         assert getattr(draft.SPEC.requires, field) == getattr(spec.SPEC.requires, field)
     # the draft forward's widest step with slot "draft", else SGLang's forward
     assert draft.SPEC.max_rows == (48 if "draft" in runtime.SLOTS else 0)
+
+
+def test_sm148_lowers_the_targets_sm_floor_by_name(monkeypatch):
+    """The target needs GB300's 152 SMs, or a B300's 148 with "sm148" listed, a name
+    the slot check knows; the draft needs none."""
+    from sgl_nvidia_mega.deepseek_v41 import draft, runtime
+
+    monkeypatch.setattr(spec, "SLOTS", frozenset())
+    assert spec.resident_blocks() == 152
+    monkeypatch.setattr(spec, "SLOTS", frozenset({"sm148"}))
+    assert spec.resident_blocks() == 148
+    assert draft.SPEC.requires.resident_blocks == 0
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"sm148"}))
+    assert _refusal() == ""
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"sm184"}))
+    assert "unknown slot 'sm184'" in _refusal()

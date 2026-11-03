@@ -69,10 +69,18 @@ SGLANG_READS = {
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
+# SGLang aa3e34aa routes KV access through kv_layers. This slot already reads
+# the same caches through EagleBinding; its FP8 target-verify math is unchanged.
 SGLANG_MIRRORS = {
-    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": "8e36076dafabff66",
+    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": (
+        "8e36076dafabff66",
+        "1445b85387928caf",
+    ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
-    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": "363661c3585e6a0f",
+    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": (
+        "363661c3585e6a0f",
+        "208190898701e7b0",
+    ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._get_bmm_scales": "90a1387e8f561611",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._reshape_paged_kv_cache": "53ae20937769b99a",
 }

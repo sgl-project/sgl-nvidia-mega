@@ -103,6 +103,9 @@ OPT_IN_SLOTS = (
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
 )
+# Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
+# the target spec's resident blocks)
+OPT_IN_COVERAGE = ("sm148",)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 
 
@@ -132,7 +135,7 @@ def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
 
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
-    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
+    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS, *OPT_IN_COVERAGE)
     reasons = [
         f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known)})"
         for name in sorted(SLOTS - set(known))
