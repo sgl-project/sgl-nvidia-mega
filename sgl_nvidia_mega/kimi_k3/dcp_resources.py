@@ -14,6 +14,11 @@ from typing import Any
 
 import torch
 
+SGLANG_READS = {
+    "srt/kernel_plugins/nvidia/binding.py": ("megakernel_agree",),
+    "srt/runtime_context.py": ("get_parallel",),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class DcpBuildOptions:

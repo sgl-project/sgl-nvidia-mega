@@ -13,6 +13,14 @@ import torch
 
 from .dcp_resources import DcpResources, PreparedDcpMla, _identity, _native_context
 
+SGLANG_READS = {
+    "srt/kernel_plugins/nvidia/_dcp_binding.py": (
+        "_DcpHybridBinding",
+        "_DcpHybridBucket",
+        "_DcpHybridStepView",
+    ),
+}
+
 
 def _native_types():
     # Only this explicit private path requires the private framework successor.

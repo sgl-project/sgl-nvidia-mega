@@ -15,6 +15,14 @@ import torch
 from .dcp_execution import _kda_type, _pool_tensor
 from .dcp_resources import DcpResources, PreparedDcpMla, _identity, _native_context
 
+SGLANG_READS = {
+    "srt/kernel_plugins/nvidia/_dcp_verify_binding.py": (
+        "_DcpVerifyBinding",
+        "_DcpVerifyBucket",
+        "_DcpVerifyStepView",
+    ),
+}
+
 
 def _native_types():
     from sglang.srt.kernel_plugins.nvidia._dcp_verify_binding import (
