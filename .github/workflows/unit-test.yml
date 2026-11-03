@@ -52,4 +52,4 @@ jobs:
           uv pip install --system --no-deps -e .
 
       - name: Run unit tests
-        run: python -m pytest test/unit -v -rfE --continue-on-collection-errors
+        run: python -m pytest test/unit -v -rfE
