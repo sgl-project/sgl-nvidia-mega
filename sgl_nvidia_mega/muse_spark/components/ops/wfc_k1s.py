@@ -30,9 +30,10 @@ def _stamp_dir():
 
 @functools.lru_cache(maxsize=None)
 def module(shard: int, pool: int):
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     sd = _stamp_dir()
     extra = {"extra_cuda_cflags": ["-DMUSE_VR_WFC_K1S_STAMPS"]} if sd else {}

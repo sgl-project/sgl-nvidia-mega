@@ -39,9 +39,10 @@ def _use_pdl() -> bool:
 
 @functools.lru_cache(maxsize=None)
 def module(hidden: int, vt: int, rows: int, pdl: bool, trig: int):
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     negctl = os.environ.get(
         "MUSE_VR_UNORM_TEST_NEGCTL", ""
@@ -75,9 +76,10 @@ def module(hidden: int, vt: int, rows: int, pdl: bool, trig: int):
 @functools.lru_cache(maxsize=None)
 def module_cl(hidden: int, vt: int, rows: int, kk: int, pdl: bool, trig: int):
     """Column-split form (csrc/unorm_cl.cuh): a cluster of kk CTAs per group of ``rows`` rows."""
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     negctl = os.environ.get(
         "MUSE_VR_UNORM_TEST_NEGCTL", ""
@@ -116,7 +118,7 @@ def module_cl(hidden: int, vt: int, rows: int, kk: int, pdl: bool, trig: int):
 
 def stock_threads(num_tokens: int, hidden: int = _H) -> Optional[int]:
     """SGLang's thread count for this row count on its one-CTA-per-row path, or None when it launches clusters."""
-    from muse_vr_plugin import sgl_compat
+    from sgl_nvidia_mega.muse_spark.components import sgl_compat
 
     nr = sgl_compat.module("sglang.kernels.ops.muse_spark_v12.norm_residual")
     cluster, threads, _prefetch = nr.norm_residual_launch_config(hidden, num_tokens)

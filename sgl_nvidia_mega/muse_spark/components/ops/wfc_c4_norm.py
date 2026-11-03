@@ -23,9 +23,10 @@ _CUH = _CSRC / "wfc_c4_norm.cuh"
 def module():
     import os
 
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     plant = (
         os.environ.get("MUSE_VR_WFC_C4N_TEST_PLANT_CL", "") == "1"

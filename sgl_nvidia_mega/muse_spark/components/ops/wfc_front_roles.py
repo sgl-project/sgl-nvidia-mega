@@ -24,9 +24,10 @@ _CUH = _CSRC / "wfc_front_roles.cuh"
 
 @functools.lru_cache(maxsize=None)
 def module(q_threads: int = 256, groups: int = 1, route_warps: int = 4):
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     name = f"WfcFrontRoles<{q_threads}, {groups}, {route_warps}>"
     return load_jit(

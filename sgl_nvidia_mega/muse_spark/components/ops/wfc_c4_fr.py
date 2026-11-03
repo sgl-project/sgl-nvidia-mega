@@ -68,9 +68,10 @@ def _route_flags():
 def module():
     import os
 
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     plant = (
         os.environ.get("MUSE_VR_WFC_C4FR_TEST_PLANT", "") == "1"
@@ -168,9 +169,10 @@ def _stamps_dir() -> str:
 
 @functools.lru_cache(maxsize=None)
 def module_bal():
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     sd = _stamps_dir()
     rf, rn = _route_flags()
@@ -192,7 +194,7 @@ class StateBal:
     [own0, own0 + R)); the balance CTA publishes 33 assignment words into `board`."""
 
     def __init__(self, R: int, M: int, own0: int, world: int, placement, device):
-        from muse_vr_plugin import bal
+        from sgl_nvidia_mega.muse_spark.components import bal
 
         d = device
         self.R, self.M, self.own0, self.world = R, M, own0, world
@@ -309,9 +311,10 @@ def site_specs(
 
 @functools.lru_cache(maxsize=None)
 def module_c3(world: int):
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     if not hop_available():
         raise RuntimeError(
@@ -407,9 +410,10 @@ def run_c3(
 
 @functools.lru_cache(maxsize=None)
 def module_c3_bal(world: int):
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     if not hop_available():
         raise RuntimeError(

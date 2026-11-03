@@ -33,9 +33,10 @@ def _stamp_dir():
 
 @functools.lru_cache(maxsize=None)
 def module():
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+
+    from sgl_nvidia_mega.muse_spark.components.sgl_compat import csrc_include_paths
 
     sd = _stamp_dir()
     plant = (
