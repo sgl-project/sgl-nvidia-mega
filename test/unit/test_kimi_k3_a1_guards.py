@@ -13,6 +13,29 @@ from unittest.mock import Mock, call, patch
 import torch
 from msgspec.structs import replace
 
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import BuildContext
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        HybridPoolView,
+        HybridStepView,
+        KdaPoolView,
+        KdaStateView,
+        KdaStepView,
+        MlaPoolView,
+        MlaStepView,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.binding import (
+        HybridPoolView,
+        HybridStepView,
+        KdaPoolView,
+        KdaStateView,
+        KdaStepView,
+        MlaPoolView,
+        MlaStepView,
+    )
+    from sglang.srt.megakernels.spec import BuildContext
+
 
 class _ContractTensor(torch.Tensor):
     """A metadata-only tensor used to test CUDA contracts without a GPU."""
@@ -254,8 +277,6 @@ class TestKimiK3RuntimeCompatibility(unittest.TestCase):
         self.assertEqual(version.call_count, 4)
 
     def test_build_checks_compatibility_before_resource_construction(self):
-        from sglang.srt.megakernels.spec import BuildContext
-
         from sgl_nvidia_mega.kimi_k3 import spec
 
         context = BuildContext(
@@ -312,8 +333,6 @@ class TestKimiK3RuntimeCompatibility(unittest.TestCase):
         build_mock.assert_not_called()
 
     def test_invalid_deadlines_stop_before_compatibility_validation(self):
-        from sglang.srt.megakernels.spec import BuildContext
-
         from sgl_nvidia_mega.kimi_k3 import spec
 
         model = SimpleNamespace(language_model=object())
@@ -335,13 +354,6 @@ class TestKimiK3RuntimeCompatibility(unittest.TestCase):
 
 class TestKimiK3PoolGuards(unittest.TestCase):
     def _resources_and_pool(self):
-        from sglang.srt.megakernels.binding import (
-            HybridPoolView,
-            KdaPoolView,
-            KdaStateView,
-            MlaPoolView,
-        )
-
         from sgl_nvidia_mega.kimi_k3.providers import PreparedAttention, ResourceSet
 
         mla = torch.zeros(3, 64, 4)
@@ -520,12 +532,6 @@ class TestKimiK3PoolGuards(unittest.TestCase):
 
 class TestKimiK3StepGuards(unittest.TestCase):
     def _view(self, *, batch: int = 2, pages: int = 8):
-        from sglang.srt.megakernels.binding import (
-            HybridStepView,
-            KdaStepView,
-            MlaStepView,
-        )
-
         return HybridStepView(
             mla=MlaStepView(
                 block_table=_ContractTensor(
