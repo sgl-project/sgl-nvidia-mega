@@ -4,16 +4,24 @@
 calling, pinned on CPU against the installed SGLang.
 
 The megakernel lives outside SGLang, so it reads SGLang by name (its specs plug into
-``sglang.srt.megakernels``). Every module that imports from
-``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one fails here, naming the file to
-repair, instead of failing at a GPU server's startup. The checks are static
-(AST): no module of this package is imported. Run it against each SGLang this
-package supports, and nightly against SGLang main.
+``sglang.kernels.plugin_kernels.nvidia``). Every module that imports from
+``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one
+fails here, naming the file to repair, instead of failing at a GPU server's startup.
+A module whose stock step mirrors an SGLang function lists it in ``SGLANG_MIRRORS``
+with the digest of its code, so a changed branch fails here too. A file that moved
+between SGLang versions is named newest first, ``"new.py|old.py"``; the first one
+present is checked. A read name such as "replication|layout" accepts either field.
+The checks are static (AST and tokens): no package module is
+imported. Run them against every supported SGLang and nightly against main.
 """
 
 import ast
+import hashlib
+import io
+import tokenize
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import sglang
@@ -109,7 +117,11 @@ def test_sglang_provides_what_the_plugin_reads(path):
         files = _files(pattern)
         assert files, f"{_id(path)}: no file matches any alternative in {pattern!r}"
         provided = frozenset().union(*map(_provided, files))
-        missing += [f"{pattern}: {n}" for n in names if n not in provided]
+        missing += [
+            f"{pattern}: {n}"
+            for n in names
+            if not any(alternative in provided for alternative in n.split("|"))
+        ]
     assert not missing, (
         f"SGLang no longer provides what {_id(path)} reads; repair it and its "
         "SGLANG_READS:\n  " + "\n  ".join(missing)
@@ -118,7 +130,7 @@ def test_sglang_provides_what_the_plugin_reads(path):
 
 # What SGLang's binding file tolerates the megakernel still calling, writing and
 # reading; any change there must be reviewed here
-BINDING = "srt/megakernels/binding.py"
+BINDING = "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py"
 PINNED_TOLERATED = {
     "TOLERATED_CALLABLES": (
         "ForwardView.attention",
@@ -126,6 +138,7 @@ PINNED_TOLERATED = {
         "ForwardView.swa_out_cache_loc",
         "ForwardView.low_ratio_sources",
         "ForwardView.core_compressor",
+        "KdaStepView.track_decode_state",
         "KvPoolView.set_swa_key_buffer_radix_fused_norm_rope",
         "KvPoolView.pool",
         "sglang.kernels.ops",
@@ -145,7 +158,7 @@ PINNED_TOLERATED = {
 
 
 def _binding_tuple(name: str) -> tuple:
-    for node in _tree(ROOT / BINDING).body:
+    for node in _tree(_files(BINDING)[0]).body:
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == name for t in node.targets
         ):
@@ -164,17 +177,38 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
     callables = {
         name.split(".", 1)[1]
         for name in PINNED_TOLERATED["TOLERATED_CALLABLES"]
-        if name.startswith(("ForwardView.", "KvPoolView."))
+        if name.startswith(("ForwardView.", "KdaStepView.", "KvPoolView."))
     }
     data = {
         "ForwardView",
+        "HybridPoolView",
+        "HybridStepView",
+        "PreparationView",
+        "block_table",
+        "cache",
+        "capacity",
+        "conv",
+        "kda",
+        "layer_mapping",
+        "logical_dtype",
         "KvPoolView",
         "MegakernelBinding",
         "metadata",
+        "mla",
+        "page_size",
+        "post_capture_active",
+        "reserved_capacity",
+        "sequence_lengths",
+        "serving_capacity",
+        "state",
+        "state_indices",
+        "storage_dtype",
+        "temporal",
         "kv_pool",
         "trtllm_attn",
         "uniform_fp8",
         "request_window",
+        "write_slots",
         "forward_view",
         "engram_history",
         "engram_host_table",
@@ -184,3 +218,80 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         untolerated = names - callables - data
         untolerated = {n for n in untolerated if not n.startswith("get_")}
         assert not untolerated, f"{_id(path)}: {sorted(untolerated)}"
+
+
+def _mirrors(path: Path) -> dict:
+    """The module's ``SGLANG_MIRRORS``, or {} without one."""
+    for node in _tree(path).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "SGLANG_MIRRORS" for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    return {}
+
+
+def mirror_digest(path: Path, qualname: str) -> Optional[str]:
+    """The digest of a function's code in ``path`` (``Class.method`` or ``function``):
+    its decorators, signature and body as tokens, without comments, blank lines or
+    docstring; None when the file does not define it."""
+    scope = _tree(path).body
+    *owners, name = qualname.split(".")
+    for owner in owners:
+        cls = next(
+            (n for n in scope if isinstance(n, ast.ClassDef) and n.name == owner), None
+        )
+        if cls is None:
+            return None
+        scope = cls.body
+    node = next(
+        (
+            n
+            for n in scope
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+    lines = path.read_text().splitlines(keepends=True)[first - 1 : node.end_lineno]
+    doc = node.body[0]
+    has_doc = (
+        isinstance(doc, ast.Expr)
+        and isinstance(doc.value, ast.Constant)
+        and isinstance(doc.value.value, str)
+    )
+    skip = (doc.lineno - first + 1, doc.end_lineno - first + 1) if has_doc else None
+    digest = hashlib.sha256()
+    for tok in tokenize.generate_tokens(io.StringIO("".join(lines)).readline):
+        if tok.type in (tokenize.COMMENT, tokenize.NL):
+            continue
+        if skip and skip[0] <= tok.start[0] and tok.end[0] <= skip[1]:
+            continue
+        # indentation depth is structure, not text
+        text = "" if tok.type in (tokenize.INDENT, tokenize.NEWLINE) else tok.string
+        digest.update(f"{tok.type}:{text}\n".encode())
+    return digest.hexdigest()[:16]
+
+
+MIRRORS = [
+    (path, key, digest)
+    for path in sorted(PACKAGE.rglob("*.py"))
+    for key, digest in _mirrors(path).items()
+]
+
+
+@pytest.mark.parametrize(
+    "path, key, digest", MIRRORS, ids=[f"{_id(p)}::{k}" for p, k, _ in MIRRORS]
+)
+def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
+    pattern, qualname = key.split(":")
+    files = sorted(ROOT.glob(pattern))
+    assert len(files) == 1, f"{_id(path)}: {pattern} matches {len(files)} files"
+    got = mirror_digest(files[0], qualname)
+    assert got is not None, f"{_id(path)}: SGLang no longer defines {key}"
+    assert got in ((digest,) if isinstance(digest, str) else digest), (
+        f"SGLang changed {key}, whose body {_id(path)} mirrors: re-read it, update "
+        f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
+        "supported SGLangs differ)"
+    )

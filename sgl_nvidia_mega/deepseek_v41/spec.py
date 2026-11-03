@@ -3,7 +3,7 @@
 """The DeepSeek-V4.1 megakernel's spec: the setups it serves and its build.
 
 SGLang checks the requirements at argument resolution and the model at load
-(``sglang.srt.megakernels``); an unsupported setup stops the server on every rank,
+(``sglang.kernels.plugin_kernels.nvidia``); an unsupported setup stops the server on every rank,
 listing every reason. This module stays light: SGLang imports it in the launcher.
 """
 
@@ -14,13 +14,22 @@ import importlib.util
 import os
 from pathlib import Path
 
-from sglang.srt.megakernels.spec import (
-    Feature,
-    MegakernelSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG
 from sgl_nvidia_mega.deepseek_v41.plan import max_rows
@@ -28,7 +37,7 @@ from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "SPECULATIVE_DECODING",
         "MegakernelSpec",
@@ -54,8 +63,8 @@ SGLANG_READS = {
 }
 
 ARCHITECTURE = "DeepseekV4ForCausalLM"
-# the sglang.srt.megakernels contract this spec is written against
-API_VERSION = 1
+# the SGLang megakernel contract this spec is written against
+API_VERSION = 2
 # The FlashInfer low-latency GEMM file the wo_b publish epilogue subclasses, by the
 # sha256 of its source; it is byte-identical in FlashInfer 0.7.0, 0.7.1 and 0.7.2
 FLASHINFER_LL_GEMM = "gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py"
@@ -91,12 +100,17 @@ def decode_graph_backends() -> frozenset:
     return frozenset({"full", "disabled"} if eager_steps_allowed() else {"full"})
 
 
+def resident_blocks() -> int:
+    """GB300's 152 SMs, within which the GEMM pair's persistent schedule and the
+    Lamport consumer stay; with "sm148" listed, a B300's 148: no DeepSeek-V4.1 kernel
+    pins a 152-CTA grid."""
+    return 148 if "sm148" in SLOTS else 152
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     tp_sizes=frozenset({4}),
-    # the GEMM pair's persistent schedule and the Lamport consumer stay within
-    # GB300's 152 SMs
-    resident_blocks=152,
+    resident_blocks=resident_blocks(),
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
     server_args={
@@ -200,6 +214,9 @@ NUMERICS = Numerics(
         # as TF32, against an exact projection through the same reduce + Sinkhorn; 3.81e-4
         # measured at 6-48 rows on synthetic inputs (SGLang's split-K: 4.8e-7)
         "hc_prenorm.coeff.max_abs": 3.9e-4,
+        # slot target_lm_head: the target's logits shard on the low-M kernel against
+        # SGLang's matmul, checked at build on every rank (the K summation order differs)
+        "target_lm_head.logits.rel": 2**-7,
     },
 )
 

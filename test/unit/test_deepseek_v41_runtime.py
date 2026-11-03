@@ -4,6 +4,7 @@
 binding reaches every reader, the slots' reads follow SGLang's real init order
 (scheduler_init.py), and the Engram prefetch takes its host table from the binding."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -16,7 +17,11 @@ from scheduler_init import (  # noqa: E402
     Scenario,
     SchedulerInit,
 )
-from sglang.srt.megakernels.spec import Step  # noqa: E402
+
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import Step
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.spec import Step
 
 from sgl_nvidia_mega.deepseek_v41 import runtime, spec  # noqa: E402
 from sgl_nvidia_mega.deepseek_v41.engram import prefetch  # noqa: E402
@@ -162,7 +167,10 @@ def test_runtime_build_hands_every_package_the_binding(monkeypatch):
         "sglang.srt.runtime_context.get_parallel",
         lambda: SimpleNamespace(tp_group=None),
     )
-    from sglang.srt.megakernels.binding import MegakernelBinding
+    try:
+        from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.megakernels.binding import MegakernelBinding
 
     model = SimpleNamespace()
     binding = MegakernelBinding(model=model)  # SGLang's own, as install builds it
@@ -323,7 +331,10 @@ def _ctx(binding=None):
 def test_the_host_table_comes_from_the_binding(monkeypatch):
     """SGLang's own MegakernelBinding hands the layer's host table (a shared one here,
     which the prefetch refuses)."""
-    from sglang.srt.megakernels.binding import MegakernelBinding
+    try:
+        from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.megakernels.binding import MegakernelBinding
 
     model = _model()
     engram = model.model.layers[1].engram
@@ -340,3 +351,37 @@ def test_the_host_table_comes_from_the_binding(monkeypatch):
     built, why = prefetch.build(model, ctx, SimpleNamespace(world_size=4))
     assert asked == [model.model.layers[1].engram]
     assert built is None and "per-rank host Engram table" in why
+
+
+def test_the_engram_image_select_runs_only_on_a_multimodal_batch(monkeypatch):
+    """A text-only batch (every decode / verify capture) keeps the gate's output as
+    is, with no select in the step; a multimodal batch keeps the residual on its
+    image-placeholder rows."""
+    from sgl_nvidia_mega.deepseek_v41 import boundary, engram
+
+    x = torch.arange(3 * 2 * 4, dtype=torch.float32).view(3, 2, 4)
+    gated = -x
+    st = SimpleNamespace(
+        state=SimpleNamespace(residual=x),
+        layer_id=1,
+        input_ids=torch.tensor([5, 7, 9]),
+        slots=SimpleNamespace(engram_prefetch=True),
+        bound={
+            "engram": SimpleNamespace(prefetch=SimpleNamespace(gate=lambda i, h: gated))
+        },
+        model=SimpleNamespace(
+            config=SimpleNamespace(
+                model_type="deepseek_v41", vision_n_layers=1, image_token_id=7
+            )
+        ),
+    )
+    written = []
+    monkeypatch.setattr(boundary, "set_residual", lambda s, out: written.append(out))
+    layer = SimpleNamespace(engram=SimpleNamespace())
+    for mm in (False, True):
+        st.fb = SimpleNamespace(contains_mm_inputs=lambda mm=mm: mm)
+        engram.apply(layer, st)
+    text, multimodal = written
+    assert text is gated
+    assert torch.equal(multimodal[1], x[1])
+    assert torch.equal(multimodal[[0, 2]], gated[[0, 2]])

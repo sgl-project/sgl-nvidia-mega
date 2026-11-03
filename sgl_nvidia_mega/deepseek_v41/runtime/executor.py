@@ -31,7 +31,11 @@ import logging
 import os
 
 import torch
-from sglang.srt.megakernels.spec import Step
+
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import Step
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.spec import Step
 
 from sgl_nvidia_mega.deepseek_v41 import attention, boundary, engram, logits, moe
 from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS, embedding
@@ -42,7 +46,7 @@ logger = logging.getLogger(__name__)
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     # Step, and the BuiltMegakernel members SGLang reads
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Step",
         "mode",
         "rows",
@@ -95,6 +99,7 @@ PACKAGES = {
     "attention": attention,
     "moe": moe,
     "engram": engram,
+    "logits": logits,
 }
 
 
@@ -102,8 +107,12 @@ class MegakernelDecode:
     """One rank's covered steps: the model, each width's slots and each package's
     build result."""
 
-    # the target offers no draft sampler (BuiltMegakernel)
+    # the target offers no speculative entries or graph variants (BuiltMegakernel)
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(
         self,

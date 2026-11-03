@@ -37,12 +37,11 @@ SGLANG_READS = {
     ),
     "srt/models/deepseek_v4.py": ("maybe_use_decode_attn_tp", "self_attn", "layer_id"),
     "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "hidden_states"),
-    "kernels/ops/layernorm/mhc.py": ("hc_combine",),
     "srt/eplb/expert_distribution.py": (
         "get_global_expert_distribution_recorder",
         "disable_this_region",
     ),
-    "srt/megakernels/spec.py": ("Step",),
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": ("Step",),
     "srt/runtime_context.py": ("get_spec", "get_parallel", '"tp_group"'),
     "srt/arg_groups/fields/*.py": ("speculative_num_draft_tokens",),
     "srt/speculative/dspark_components/dspark_config.py": (
@@ -171,7 +170,10 @@ class DraftDecode(DraftProposal):
         )
 
     def plan(self, input_ids, forward_batch, *args, **kwargs):
-        from sglang.srt.megakernels.spec import Step
+        try:
+            from sglang.kernels.plugin_kernels.nvidia.spec import Step
+        except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+            from sglang.srt.megakernels.spec import Step
 
         from sgl_nvidia_mega.deepseek_v41.spec import serves_this_step
 
@@ -215,11 +217,12 @@ class DraftDecode(DraftProposal):
 
     def _forward(self, step, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV4ForCausalLMDSpark.forward`` for a covered draft block."""
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
         lm = self.lm
         # the draft forward's KV pool and attention metadata, for the ported attention
@@ -252,7 +255,7 @@ class DraftDecode(DraftProposal):
         streams = residual.flatten(1)
         if not self._tail_bf16:
             streams = streams.float()
-        x = hc_combine(streams, pre, lm.hc_mult, residual.dtype)
+        x = sglang_ops.hc_combine(streams, pre, lm.hc_mult, residual.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 

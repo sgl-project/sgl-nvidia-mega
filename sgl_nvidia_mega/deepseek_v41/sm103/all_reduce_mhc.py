@@ -78,6 +78,7 @@ from sgl_nvidia_mega.common.sync import (
     to_cute,
     to_cute_dynamic,
 )
+from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 
 LAMPORT_GENERATIONS = 3
 
@@ -108,6 +109,20 @@ FRAGMENTS_PER_MXFP8_BLOCK = MXFP8_BLOCK // VEC_BF16
 # The swizzled scale layout tiles 128 rows by 4 scale columns.
 SCALE_TILE_ROWS = 128
 SCALE_TILE_COLS = 4
+# The row-tile layout (mxfp8_ll, past 8 rows): every 8-row tile owns a 128-row atom
+ROW_TILE_ROWS = 8
+
+
+@cute.jit
+def _sf_index_row_tiles(
+    row: Int32, col: Int32, scale_cols: cutlass.Constexpr[int]
+) -> Int32:
+    """Byte offset of row ``row``'s scale column ``col`` in the row-tile layout: rows at
+    the top of their tile's atom, as FlashInfer's 128x4 swizzle places rows 0-7."""
+    atom = (row // ROW_TILE_ROWS) * (
+        scale_cols // SCALE_TILE_COLS
+    ) + col // SCALE_TILE_COLS
+    return atom * 512 + (row % ROW_TILE_ROWS) * 16 + col % SCALE_TILE_COLS
 
 
 @cute.jit
@@ -326,6 +341,7 @@ class _QuadFinalizePublishDeviceKernel:
         prefetch_group: int,
         fp32_weights: bool = False,
         round_routed: bool = False,
+        trigger_after_wait: bool = False,
     ) -> None:
         if hidden <= 0 or hidden % QUAD_BF16:
             raise ValueError("hidden must be a positive multiple of 4")
@@ -345,6 +361,9 @@ class _QuadFinalizePublishDeviceKernel:
         self.prefetch_groups = (top_k + prefetch_group - 1) // prefetch_group
         self.fp32_weights = fp32_weights
         self.round_routed = round_routed
+        # the consumer's prologue overlaps this kernel; its griddepcontrol.wait
+        # still waits for this whole grid, so what it reads is unchanged
+        self.trigger_after_wait = trigger_after_wait
 
     def smem_size_in_bytes(self) -> int:
         return self.top_k * 8
@@ -398,6 +417,8 @@ class _QuadFinalizePublishDeviceKernel:
         if cutlass.const_expr(self.enable_pdl):
             # the routing metadata comes from the kernels this one depends on
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.trigger_after_wait):
+                cute.arch.griddepcontrol_launch_dependents()
         metadata_index = Int32(tidx)
         while metadata_index < Int32(self.top_k):
             element = Int64(token) * self.top_k + Int64(metadata_index)
@@ -562,7 +583,7 @@ class _QuadFinalizePublishDeviceKernel:
                 stage,
             )
         cute.arch.barrier()
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.enable_pdl and not self.trigger_after_wait):
             cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -595,6 +616,7 @@ class _LamportMHCDeviceKernel:
         residual_only: bool = False,
         deadline_ns: int = 0,
         early_trigger: bool | str = False,
+        row_tile_scales: bool = False,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -610,6 +632,8 @@ class _LamportMHCDeviceKernel:
         if quantize and residual_only:
             raise ValueError("a residual-only consumer has no layer input to quantize")
         self.quantize = quantize
+        # the MXFP8 output's scales per 8-row tile (the wide low-latency GEMM's input)
+        self.row_tile_scales = quantize and row_tile_scales
         self.write_layer_input = not residual_only
         self.scale_cols = hidden // MXFP8_BLOCK
         self.hidden = hidden
@@ -982,31 +1006,40 @@ class _LamportMHCDeviceKernel:
                             ),
                         )
                         if fragment % FRAGMENTS_PER_MXFP8_BLOCK == 0:
-                            quant_scales[
-                                compute_sf_index_swizzled_128x4_gpu(
-                                    token,
-                                    fragment // FRAGMENTS_PER_MXFP8_BLOCK,
-                                    Int32(self.scale_cols),
+                            col = fragment // FRAGMENTS_PER_MXFP8_BLOCK
+                            if cutlass.const_expr(self.row_tile_scales):
+                                offset = _sf_index_row_tiles(
+                                    token, col, self.scale_cols
                                 )
-                            ] = scale.to(Uint8)
+                            else:
+                                offset = compute_sf_index_swizzled_128x4_gpu(
+                                    token, col, Int32(self.scale_cols)
+                                )
+                            quant_scales[offset] = scale.to(Uint8)
 
             if cutlass.const_expr(self.quantize):
                 # Zero the scales of the padding rows, as FlashInfer's quantize
-                # does, one 4-column word per store, spread over the whole grid.
+                # does, one 4-column word per store, spread over the whole grid
+                # (row tiles: only the last tile's rows past m are read).
                 m, _, _ = cute.arch.grid_dim()
                 words_per_row = self.scale_cols // SCALE_TILE_COLS
-                padded_m = (
-                    (m + SCALE_TILE_ROWS - 1) // SCALE_TILE_ROWS * SCALE_TILE_ROWS
+                pad_to = (
+                    ROW_TILE_ROWS
+                    if cutlass.const_expr(self.row_tile_scales)
+                    else SCALE_TILE_ROWS
                 )
+                padded_m = (m + pad_to - 1) // pad_to * pad_to
                 pad_words = (padded_m - m) * words_per_row
                 word = (token * self.cluster_size + cluster_rank) * self.threads + tidx
                 while word < pad_words:
                     row = m + word // words_per_row
-                    offset = compute_sf_index_swizzled_128x4_gpu(
-                        row,
-                        word % words_per_row * SCALE_TILE_COLS,
-                        Int32(self.scale_cols),
-                    )
+                    col = word % words_per_row * SCALE_TILE_COLS
+                    if cutlass.const_expr(self.row_tile_scales):
+                        offset = _sf_index_row_tiles(row, col, self.scale_cols)
+                    else:
+                        offset = compute_sf_index_swizzled_128x4_gpu(
+                            row, col, Int32(self.scale_cols)
+                        )
                     store_global_u32(quant_scales.iterator + offset, Uint32(0))
                     word = word + m * self.cluster_size * self.threads
 
@@ -1041,6 +1074,8 @@ class AllReduceMHC:
         residual_only: bool = False,
         early_trigger: bool = False,
         hop_b_start_trigger: bool = False,
+        row_tile_layer_input: bool = False,
+        publish_trigger_max_rows: int = 0,
     ) -> None:
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
@@ -1079,41 +1114,52 @@ class AllReduceMHC:
                 Int32(capacity),
                 current_cu_stream(),
             )
-            self._finalize_publish = cute.compile(
-                _QuadFinalizePublishDeviceKernel(
-                    hidden=hidden,
-                    top_k=top_k,
-                    tp=tp,
-                    rank=rank,
-                    capacity_m=capacity,
-                    threads=128,
-                    # DSV4.1's router folds the scale into the weights.
-                    routed_scaling_factor=1.0,
-                    include_shared_expert=True,
-                    load_shared_expert_before_pdl=False,
-                    enable_pdl=True,
-                    prefetch_group=top_k,
-                    fp32_weights=True,
-                    # SGLang's order: the routed sum rounds to BF16 before the
-                    # shared-expert add, as its unfused finalize returns it.
-                    round_routed=True,
-                ),
-                make_fake_dynamic_compact_tensor(
-                    BFloat16, alignment=16, divisibility=hidden
-                ),
-                make_fake_dynamic_compact_tensor(
-                    Float32, alignment=4, divisibility=top_k
-                ),
-                make_fake_dynamic_compact_tensor(
-                    Int32, alignment=4, divisibility=top_k
-                ),
-                make_fake_dynamic_compact_tensor(
-                    BFloat16, alignment=16, divisibility=hidden
-                ),
-                make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-                Int64(0),
-                Int32(capacity),
-                current_cu_stream(),
+
+            def compile_finalize_publish(trigger_after_wait: bool):
+                return cute.compile(
+                    _QuadFinalizePublishDeviceKernel(
+                        hidden=hidden,
+                        top_k=top_k,
+                        tp=tp,
+                        rank=rank,
+                        capacity_m=capacity,
+                        threads=128,
+                        # DSV4.1's router folds the scale into the weights.
+                        routed_scaling_factor=1.0,
+                        include_shared_expert=True,
+                        load_shared_expert_before_pdl=False,
+                        enable_pdl=True,
+                        prefetch_group=top_k,
+                        fp32_weights=True,
+                        # SGLang's order: the routed sum rounds to BF16 before the
+                        # shared-expert add, as its unfused finalize returns it.
+                        round_routed=True,
+                        trigger_after_wait=trigger_after_wait,
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        BFloat16, alignment=16, divisibility=hidden
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        Float32, alignment=4, divisibility=top_k
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        Int32, alignment=4, divisibility=top_k
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        BFloat16, alignment=16, divisibility=hidden
+                    ),
+                    make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+                    Int64(0),
+                    Int32(capacity),
+                    current_cu_stream(),
+                )
+
+            self._finalize_publish = compile_finalize_publish(False)
+            # slot hop_b_quad_trigger: the trigger-after-wait variant at up to
+            # publish_trigger_max_rows rows only; wider rows keep the end trigger
+            self._publish_trigger_max_rows = publish_trigger_max_rows
+            self._finalize_publish_early = (
+                compile_finalize_publish(True) if publish_trigger_max_rows > 0 else None
             )
             # Stand-ins for the MXFP8 outputs of the unquantized variant,
             # which never touches them.
@@ -1121,7 +1167,9 @@ class AllReduceMHC:
             no_quant_cute = to_cute(self._no_quant_output, 16)
             self._no_quant_args = (no_quant_cute, no_quant_cute)
 
-            def compile_collective(quantize: bool, residual_only: bool = False):
+            def compile_collective(
+                quantize: bool, residual_only: bool = False, row_tiles: bool = False
+            ):
                 if quantize:
                     quant_fakes = (
                         make_fake_dynamic_compact_tensor(
@@ -1153,6 +1201,7 @@ class AllReduceMHC:
                             if hop_b_start_trigger and (quantize or residual_only)
                             else early_trigger
                         ),
+                        row_tile_scales=row_tiles,
                     ),
                     make_fake_compact_tensor(
                         BFloat16,
@@ -1188,6 +1237,12 @@ class AllReduceMHC:
             self._collective = compile_collective(quantize=False)
             self._collective_quant = (
                 compile_collective(quantize=True) if quantize_layer_input else None
+            )
+            # the layer input's scales per 8-row tile, for the wide low-latency GEMM
+            self._collective_quant_rt = (
+                compile_collective(quantize=True, row_tiles=True)
+                if quantize_layer_input and row_tile_layer_input
+                else None
             )
             self._collective_residual = (
                 compile_collective(quantize=False, residual_only=True)
@@ -1312,7 +1367,12 @@ class AllReduceMHC:
             or expanded_idx_to_permuted_idx.numel() != m * top_k
         ):
             raise ValueError("expanded_idx_to_permuted_idx must be int32 [M, top_k]")
-        self._finalize_publish(
+        finalize_publish = (
+            self._finalize_publish_early
+            if m <= self._publish_trigger_max_rows
+            else self._finalize_publish
+        )
+        finalize_publish(
             to_cute_dynamic(gemm2_permuted.flatten(), 16, divisibility=hidden),
             to_cute_dynamic(expert_weights.flatten(), 4, divisibility=top_k),
             to_cute_dynamic(
@@ -1395,14 +1455,24 @@ class AllReduceMHC:
             if mxfp8_out is None:
                 collective, quant_args = self._collective, self._no_quant_args
             else:
-                if self._collective_quant is None:
-                    raise ValueError("built without quantize_layer_input")
+                # a RowTileMxfp8 asks for the row-tile scale layout
+                row_tiles = isinstance(mxfp8_out, mxfp8_ll.RowTileMxfp8)
+                collective = (
+                    self._collective_quant_rt if row_tiles else self._collective_quant
+                )
+                if collective is None:
+                    raise ValueError(
+                        "built without quantize_layer_input"
+                        + (" / row_tile_layer_input" if row_tiles else "")
+                    )
                 values, scales = mxfp8_out
-                if values.shape != (m, hidden) or scales.numel() != (
-                    mxfp8_scale_bytes(m, hidden)
-                ):
+                scale_bytes = (
+                    mxfp8_ll.scale_bytes(m, hidden)
+                    if row_tiles
+                    else mxfp8_scale_bytes(m, hidden)
+                )
+                if values.shape != (m, hidden) or scales.numel() != scale_bytes:
                     raise ValueError("mxfp8_out does not match the layer input")
-                collective = self._collective_quant
                 quant_args = (
                     to_cute_dynamic(
                         values.view(torch.uint8).flatten(), 16, divisibility=hidden

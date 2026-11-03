@@ -37,6 +37,7 @@ class Runner:
     def __init__(self, *, device: torch.device, rank: int):
         self.device, self.rank = device, rank
         self.hop: Optional[all_reduce_mhc.AllReduceMHC] = None
+        self.hop_wide: Optional[all_reduce_mhc.AllReduceMHC] = None
         self.publisher: Optional[PublishingMxfp8Linear] = None
         self.moe: dict[int, RoutedExpertGemm] = {}
         self._inject_after = _fault_inject(rank, "hop_a")
@@ -51,9 +52,13 @@ class Runner:
         top_k: int,
         hop_a_rows: int,
         deadline_s: float,
+        hop_b_wide_rows: int = 0,
         hop_b: bool = False,
         early_trigger: bool = False,
         hop_b_start_trigger: bool = False,
+        row_tile_layer_input: bool = False,
+        wide_row_tile_layer_input: bool = False,
+        publish_trigger_max_rows: int = 0,
     ) -> None:
         """The Lamport mailbox (collective over ``group``) and the publishing GEMM;
         with ``hop_b`` also the MoE finalize's quantized and streams-only consumers."""
@@ -70,13 +75,43 @@ class Runner:
             residual_only=hop_b,
             early_trigger=early_trigger,
             hop_b_start_trigger=hop_b_start_trigger,
+            row_tile_layer_input=row_tile_layer_input,
+            publish_trigger_max_rows=publish_trigger_max_rows,
         )
         self.publisher = PublishingMxfp8Linear(self.hop)
+        # slot hop_b_wide: hop B past hop A's widths on a mailbox of its own, so hop A's
+        # widths keep addressing the small one
+        self.hop_wide = (
+            all_reduce_mhc.AllReduceMHC(
+                hidden_size=hidden,
+                hc_mult=hc_mult,
+                max_num_tokens=hop_b_wide_rows,
+                top_k=top_k,
+                device=self.device,
+                group=group,
+                quantize_layer_input=True,
+                residual_only=True,
+                early_trigger=early_trigger,
+                hop_b_start_trigger=hop_b_start_trigger,
+                row_tile_layer_input=wide_row_tile_layer_input,
+                publish_trigger_max_rows=publish_trigger_max_rows,
+            )
+            if hop_b and hop_b_wide_rows > hop_a_rows
+            else None
+        )
+
+    def hop_for(self, rows: int):
+        """The mailbox hop B of ``rows`` rows runs on."""
+        if self.hop_wide is not None and rows > self.hop.capacity:
+            return self.hop_wide
+        return self.hop
 
     def mailbox_bytes(self) -> int:
-        if self.hop is None:
-            return 0
-        return self.hop._mailbox.numel() * self.hop._mailbox.element_size()
+        return sum(
+            h._mailbox.numel() * h._mailbox.element_size()
+            for h in (self.hop, self.hop_wide)
+            if h is not None
+        )
 
     def precompile_publish(self, wo_b, rows: list[int]) -> list[int]:
         """Compile the publishing GEMM for each row count it takes; returns them."""

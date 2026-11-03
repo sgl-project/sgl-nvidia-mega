@@ -70,14 +70,9 @@ SGLANG_READS = {
         "fused_norm_rope_inplace",
         "fused_q_norm_rope",
         "fused_rope_inplace",
-        "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     ),
     "kernels/ops/attention/dsv4/wo_a.py": ("fused_rope_wo_a_bf16",),
-    "kernels/ops/layernorm/mxfp8_epilogue.py": ("rmsnorm_mxfp8",),
     "kernels/ops/quantization/fp8_kernel.py": ("sglang_per_token_group_quant_fp8",),
-    "kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py": (
-        "is_unified_kv_triton",
-    ),
     "srt/layers/quantization/fp8_utils.py": (
         "Mxfp8DenseGemmBackend",
         "FLASHINFER_CUTEDSL",
@@ -96,7 +91,7 @@ SGLANG_READS = {
         "forward_low_ratio_sources(run_indexer)",
         "forward_low_ratio_sources(run_compressor)",
     ),
-    "srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "ForwardView",
         "metadata",
         "kv_pool",
@@ -124,14 +119,13 @@ SGLANG_READS = {
 
 def disable_reason(attn) -> str:
     """Why the stock step cannot stand in for ``attn``'s forward, or ""."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-        is_unified_kv_triton,
-    )
     from sglang.srt.models.deepseek_v4 import (
         MQALayer,
         _wo_a_fp8_mxscale,
         _wo_a_fp8_mxscale_fused_invrope,
     )
+
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
 
     if not isinstance(attn, MQALayer):
         return f"layer {attn.layer_id}: {type(attn).__name__}, not MQALayer"
@@ -143,7 +137,7 @@ def disable_reason(attn) -> str:
         return "the ROCm wo_a kernels are loaded"
     if attn.use_npu_arch35_mxfp8_wo_a:
         return f"layer {attn.layer_id}: the NPU wo_a"
-    if is_unified_kv_triton():
+    if sglang_ops.unified_kv_triton():
         return "the unified KV cache"
     if not hasattr(attn.wo_a, "weight"):
         return f"layer {attn.layer_id}: wo_a has no dense weight"
@@ -244,6 +238,15 @@ class AttentionStep:
         tp_slice = slice(0, attn.n_local_heads)
         return heads, q_padded, q_padded[:, tp_slice, :], tp_slice
 
+    def takes_swapab(self, rows: int, fb, view) -> bool:
+        """Whether this step's attention runs the chain's swap-AB at ``rows`` rows."""
+        return (
+            self.chain is not None
+            and rows <= chain.NORM_QUANT_MAX_ROWS
+            and self.swapab
+            and chain.swapab_takes(rows, fb, view)
+        )
+
     def run(self, x, positions, fb, x_quant=None, publish=None, *, view) -> Any:
         """The layer's TP-partial attention output (``mhc.AttnOutput``) for input
         ``x`` (``x_quant``: the same input as MXFP8); ``publish``: see ``ops.wo_b``."""
@@ -251,7 +254,7 @@ class AttentionStep:
         assert not view.kv_pool.uniform_fp8, "the uniform-FP8 pool"
         rows = x.shape[0]
         use_chain = self.chain is not None and rows <= chain.NORM_QUANT_MAX_ROWS
-        swapab = use_chain and self.swapab and chain.swapab_takes(rows, fb, view)
+        swapab = self.takes_swapab(rows, fb, view)
         with attn.maybe_use_decode_attn_tp(fb):
             path = self._prepare_path(rows, fb)
             if swapab:

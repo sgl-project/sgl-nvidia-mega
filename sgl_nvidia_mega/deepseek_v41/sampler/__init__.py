@@ -131,11 +131,13 @@ class DraftLmHead:
     """This rank's LM-head shard for the draft's rows: FlashInfer's low-M BF16 kernel
     at 1-LM_HEAD_MAX_ROWS rows, SGLang's projection otherwise."""
 
-    def __init__(self, lm_head, *, low_m: bool):
+    def __init__(self, lm_head, *, low_m: bool, pinned: bool = False):
         self.lm_head = lm_head
         # the CuTe DSL kernels take operands over DLPack, which refuses grad tensors
         self.weight_t = lm_head.weight.detach().t()
         self.low_m = low_m and lm_head.weight.dtype == torch.bfloat16
+        # slot lm_head_pinned_tactic: one fixed tactic per row count, no tuning
+        self.pinned = pinned
 
     def takes(self, rows: int) -> bool:
         return self.low_m and rows <= LM_HEAD_MAX_ROWS
@@ -143,6 +145,8 @@ class DraftLmHead:
     def tune(self, rows: tuple[int, ...]) -> None:
         """Tune the low-M kernel at the row counts the draft runs; the same calls on
         every rank, before any graph is captured."""
+        if self.pinned:
+            return
         from flashinfer.autotuner import autotune
 
         weight = self.lm_head.weight
@@ -160,6 +164,10 @@ class DraftLmHead:
             from sglang.srt.models.dspark import project_through_lm_head
 
             return project_through_lm_head(x, self.lm_head)
+        if self.pinned:
+            from sgl_nvidia_mega.deepseek_v41.sampler.pinned import pinned_mm
+
+            return pinned_mm(x.contiguous(), self.weight_t)
         from flashinfer import mm_bf16
 
         return mm_bf16(x.contiguous(), self.weight_t, pdl=True, backend=LM_HEAD_BACKEND)
@@ -220,7 +228,13 @@ def build_steps(
         deadline_s=deadline_s,
         keeps_logits=not greedy_draft,
     )
-    lm_head = DraftLmHead(lm.lm_head, low_m=low_m and low_m_lm_head_supported())
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
+    lm_head = DraftLmHead(
+        lm.lm_head,
+        low_m=low_m and low_m_lm_head_supported(),
+        pinned="lm_head_pinned_tactic" in SLOTS,
+    )
     mismatch = mismatch_message(_gather(cpu_group, (chain.max_rows, lm_head.low_m)))
     if mismatch:
         raise RuntimeError(mismatch)

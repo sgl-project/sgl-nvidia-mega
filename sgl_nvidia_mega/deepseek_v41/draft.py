@@ -11,20 +11,29 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from sglang.srt.megakernels.spec import (
-    Feature,
-    MegakernelSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_nvidia_mega.deepseek_v41 import spec as target
 
 # The SGLang names this module reads, by file under the sglang package;
 # test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "MegakernelSpec",
         "Numerics",
@@ -50,6 +59,10 @@ class DraftProposal:
     """The draft spec's built object: SGLang's forward on every step, and the proposal."""
 
     widths: tuple[int, ...] = ()
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(self, lm, *, deadline_s: float, slots: frozenset[str]):
         self.lm, self.deadline_s = lm, deadline_s

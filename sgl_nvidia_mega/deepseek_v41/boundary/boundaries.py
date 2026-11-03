@@ -33,6 +33,8 @@ from typing import Optional
 import msgspec
 import torch
 
+from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads, by file under the sglang package;
@@ -156,6 +158,10 @@ class Boundaries:
         self._attn_mxfp8 = {}
         self._ffn_next = {}  # the attention post's next: the FFN norm
         self._attn_next = {}  # the next layer's attention boundary (None: closed)
+        self._next_layer = {}  # layer id -> the next layer's id
+        # layers whose attention reads row-tile MXFP8 rows past 8 rows (wqkv_a on the
+        # wide low-latency GEMM): set by the runtime from the built attention steps
+        self.row_tile_layers: frozenset = frozenset()
         ids = [layer.layer_id for layer in layers]
         for layer in layers:
             self._attn_mxfp8[layer.layer_id] = (
@@ -172,6 +178,7 @@ class Boundaries:
             )
         for prev, layer in zip(ids, layers[1:]):
             self._attn_next[prev] = self._attention_boundary(layer)
+            self._next_layer[prev] = layer.layer_id
         self._attn_next[ids[-1]] = None
 
     def _fuses(self, layer) -> bool:
@@ -353,7 +360,8 @@ class Boundaries:
         )
         return (
             f"hop A {hop_a} ({self.hop_a_reason or 'built'}); "
-            f"hop B {'on' if self.hop_b else 'off'}; "
+            f"hop B {f'at {list(self.hop_a.hop_b_rows)} rows' if self.hop_b else 'off'}"
+            f"{' (row-tile scales past 8 rows)' if self.row_tile_layers else ''}; "
             f"two-shot {two_shot} ({self.two_shot_reason or 'built'}); "
             f"mHC prenorm {self._prenorm_summary()}"
         )
@@ -448,7 +456,7 @@ class Boundaries:
         # the Lamport finalize adds a TP-partial shared expert before the sum
         return (
             self.hop_b
-            and rows in self.hop_a.rows
+            and rows in self.hop_a.hop_b_rows
             and out.shared is not None
             and not out.shared_is_replicated
         )
@@ -467,16 +475,32 @@ class Boundaries:
         args = (r.gemm2_out, r.expert_weights, r.expanded_idx_to_permuted_idx)
         args += (out.shared, opened.streams, post_mix, comb)
         if not (nxt is not None and _quantizes(nxt, rows)):
-            updated, _ = self.hop_a.finalize(*args, None, None, 0.0)
+            updated, _ = self.hop_a.finalize(*args, None, None, 0.0, rows=rows)
             return mhc.HcState(updated, pre)
         hidden = opened.streams.shape[-1]
+        row_tiles = self._row_tiles(layer.layer_id, rows)
+        scale_bytes = mxfp8_ll.scale_bytes if row_tiles else mxfp8_scale_bytes
         q, sf = _mxfp8_buffers(
-            r.expert_weights, opened.streams, lambda m: mxfp8_scale_bytes(m, hidden)
+            r.expert_weights, opened.streams, lambda m: scale_bytes(m, hidden)
         )
+        out = mxfp8_ll.RowTileMxfp8(q, sf) if row_tiles else (q, sf)
         updated, normed = self.hop_a.finalize(
-            *args, pre, nxt.norm.weight, nxt.norm.variance_epsilon, mxfp8_out=(q, sf)
+            *args,
+            pre,
+            nxt.norm.weight,
+            nxt.norm.variance_epsilon,
+            rows=rows,
+            mxfp8_out=out,
         )
-        return mhc.HcState(updated, pre, _quantized(normed, q, sf))
+        return mhc.HcState(updated, pre, _quantized(normed, q, sf, row_tiles))
+
+    def _row_tiles(self, layer_id: int, rows: int) -> bool:
+        """Whether hop B writes the next input's scales per 8-row tile: past 8 rows, when
+        the next layer's chain reads them (wqkv_a on the wide low-latency GEMM)."""
+        return (
+            rows > mxfp8_ll.MAX_ROWS
+            and self._next_layer.get(layer_id) in self.row_tile_layers
+        )
 
     @staticmethod
     def residual(st: BoundaryState) -> torch.Tensor:
@@ -511,11 +535,12 @@ def _mxfp8_buffers(weights, streams, scale_bytes):
     return q, sf
 
 
-def _quantized(normed, q, sf):
+def _quantized(normed, q, sf, row_tiles: bool = False):
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
-    return mhc.HcQuantized(normed, Mxfp8SwizzledInput(q, sf))
+    rows = mxfp8_ll.RowTileMxfp8(q, sf) if row_tiles else Mxfp8SwizzledInput(q, sf)
+    return mhc.HcQuantized(normed, rows)
 
 
 def _attention(kind: str) -> bool:

@@ -62,6 +62,9 @@ def build(model, ctx, group) -> Boundaries:
             early_trigger="early_trigger" in runtime.SLOTS,
             hop_b_start_trigger="hop_b_start_trigger" in runtime.SLOTS,
             batch2="hop_a_batch2" in runtime.SLOTS,
+            hop_b_wide="hop_b_wide" in runtime.SLOTS,
+            hop_b_cap16="hop_b_cap16" in runtime.SLOTS,
+            hop_b_quad_trigger="hop_b_quad_trigger" in runtime.SLOTS,
         )
     two_shot, two_shot_reason = None, "stock (slot off)"
     if "two_shot" in runtime.SLOTS:
