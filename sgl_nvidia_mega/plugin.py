@@ -62,6 +62,15 @@ def register() -> None:
             return
     for architecture, path in SPECS:
         megakernels.register(architecture=architecture, path=path)
+    # Muse Spark's kernels hook SGLang's own forward rather than replacing a
+    # whole step; each is opt-in and default off, so this is a no-op unless a
+    # MUSE_VR_* switch is set.
+    try:
+        from sgl_nvidia_mega.muse_spark.components import register_all
+    except ImportError:
+        pass
+    else:
+        register_all()
     if os.environ.get(PARITY_SORT_ENV) == "1":
         import pkgutil
 
