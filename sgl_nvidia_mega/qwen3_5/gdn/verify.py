@@ -89,6 +89,7 @@ SGLANG_READS = {
         "reduce_results",
         "use_dp_attention_reduce",
         "use_decode_attn_tp",
+        "tp_group",
         "input_is_parallel",
         "bias",
     ),
@@ -125,12 +126,16 @@ SGLANG_READS = {
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
+# SGLang aa3e34aa moves GDN pool access behind state_pool/state_layer_cache;
+# this slot receives those same pools through EagleBinding. The replicated
+# RowParallelLinear allocation guard is mirrored in _out_proj below.
 SGLANG_MIRRORS = {
     # Without and with the early return of the GDN extend in breakable prefill graphs,
     # which target verify never takes; the first goes once all supported SGLangs have it
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
         "ab7b048fafb07d0e",
         "12a835fc4f78af33",
+        "6ed4eb6a818f7e20",
     ),
     # Importing the ReplaySSM kernel from fla/ and, after sgl-project/sglang#45112, from
     # linear/; the first goes once all supported SGLangs have the move
@@ -138,7 +143,10 @@ SGLANG_MIRRORS = {
         "28b89fa4b48b47ad",
         "739e7115c370ac01",
     ),
-    "srt/layers/linear.py:RowParallelLinear.forward": "b291a3c452e428a5",
+    "srt/layers/linear.py:RowParallelLinear.forward": (
+        "b291a3c452e428a5",
+        "1d5fb1eabbb87ec4",
+    ),
     "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": "c66562e1de0008db",
     "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": "91b563cf074bff42",
 }
@@ -290,7 +298,8 @@ def _out_proj(out_proj, fp8: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     from sglang.srt.runtime_context import get_parallel
 
     with use_symmetric_memory(
-        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        get_parallel().tp_group,
+        disabled=out_proj.tp_group is None or not is_allocation_symmetric(),
     ):
         return flashinfer_bmm_fp8(
             fp8, out_proj.weight, out_proj.input_scale, out_proj.weight_scale, dtype

@@ -52,8 +52,10 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
+# Frozen payload shipped in a0a97a0 (#17); host integration changes must not
+# alter these 43 kernel files.
 FROZEN_PAYLOAD_SHA256 = (
-    "c3fde49433b5a43efd9cd75f68db1ce09d41581506492938a29664255d6327c2"
+    "317036ce5d069f1eb68ac110032d7a7f310ad78e2565fd605ed04e968c2aa82a"
 )
 
 
@@ -77,15 +79,15 @@ class TestKimiK3Contract(unittest.TestCase):
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
 
-    def test_spec_is_exact_api1_tp8_sm103_surface(self):
+    def test_spec_is_exact_api2_tp8_sm103_surface(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
             REQUIRED_MEGAKERNEL_API_VERSION,
             SPEC,
         )
 
-        self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 1)
-        self.assertEqual(SPEC.api_version, 1)
-        self.assertEqual(MEGAKERNEL_API_VERSION, 1)
+        self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 2)
+        self.assertEqual(SPEC.api_version, 2)
+        self.assertEqual(MEGAKERNEL_API_VERSION, 2)
         self.assertEqual(SPEC.requires.isas, frozenset({"sm_103"}))
         self.assertEqual(SPEC.requires.tp_sizes, frozenset({8}))
         self.assertEqual(SPEC.requires.resident_blocks, 152)
@@ -142,13 +144,13 @@ class TestKimiK3Contract(unittest.TestCase):
                 for name in sys.modules
             )
         )
-        with patch.object(registry, "MEGAKERNEL_API_VERSION", 2):
+        with patch.object(registry, "MEGAKERNEL_API_VERSION", 3):
             incompatible, reason = registry.find_spec(
                 architectures=["KimiK3ForConditionalGeneration"], isa="sm_103"
             )
         self.assertIsNone(incompatible)
-        self.assertIn("uses megakernel API version 1", reason)
-        self.assertIn("requires version 2", reason)
+        self.assertIn("uses megakernel API version 2", reason)
+        self.assertIn("requires version 3", reason)
 
     def test_build_filters_the_dense_capture_range_to_frozen_widths(self):
         from sgl_nvidia_mega.kimi_k3 import compat, providers

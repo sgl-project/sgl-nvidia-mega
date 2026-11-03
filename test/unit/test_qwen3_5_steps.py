@@ -720,7 +720,10 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
     norm = SimpleNamespace(weight=torch.ones(V), eps=1e-6, activation="silu")
     k.update(out_w=torch.zeros(HV * V, 8), out_s=torch.ones(1))
     out_proj = SimpleNamespace(
-        weight=k["out_w"], weight_scale=k["out_s"], input_scale=k["scale"]
+        weight=k["out_w"],
+        weight_scale=k["out_s"],
+        input_scale=k["scale"],
+        tp_group="tp",
     )
     gdn = SimpleNamespace(
         attn=attn,
@@ -763,7 +766,10 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
 
 
 @pytest.mark.parametrize("push", [False, True])
-def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(push):
+@pytest.mark.parametrize("tp_group", [None, "tp"])
+def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(
+    push, tp_group
+):
     """With ``push`` (slot gdn_push) the norm releases its dependents early and
     out_proj runs as the hop's push GEMM on the layer's packed weights."""
     import msgspec
@@ -772,6 +778,7 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(pu
 
     log = _log()
     verify, gdn, st = _gdn_verify_setup(log)
+    gdn.out_proj.tp_group = tp_group
     k = log.known
     k["packed2"] = torch.zeros(16, dtype=torch.uint8)
     hop = SimpleNamespace(out_proj_push=log.op("out_proj_push", torch.zeros(7, 8)))
@@ -841,6 +848,8 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(pu
 
     @contextlib.contextmanager
     def symmetric(group, disabled=False):
+        assert group == "tp"
+        assert disabled is (tp_group is None)
         log.append(("symmetric",))
         yield
 

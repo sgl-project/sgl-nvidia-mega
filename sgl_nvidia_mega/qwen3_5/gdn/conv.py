@@ -28,8 +28,13 @@ SGLANG_READS = {
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
+# SGLang aa3e34aa adds an optional deduplicated-window launch. The kernel
+# defaults retain the per-token stores used here, with identical window values.
 SGLANG_MIRRORS = {
-    "kernels/ops/mamba/causal_conv1d_triton.py:causal_conv1d_update": "3394efa20c88d580",
+    "kernels/ops/mamba/causal_conv1d_triton.py:causal_conv1d_update": (
+        "3394efa20c88d580",
+        "e014f07a9fb4f68c",
+    ),
 }
 
 
