@@ -180,6 +180,33 @@ Neither has demonstrated a useful speedup in the existing measurements, so both
 remain default-OFF. Those separate proofs do not qualify both options together
 or establish arbitrary workload, long-context ON or performance coverage.
 
+### Kimi K3 optional capture-width build API
+
+`sgl_nvidia_mega.kimi_k3.spec.build_with_capture_widths` is an explicit
+adapter-facing alternative to `SPEC.build`. The registered build remains
+unchanged; no CLI or environment setting automatically enables this policy.
+
+Call the alternative on every TP rank, passing the usual model, HF config and
+`BuildContext`, plus keyword `capture_token_rows`. `None` preserves the existing
+width policy. A tuple selects baseline token rows `1–8,16,32,64` plus the supplied
+capture rows. Sizes must be positive integers; duplicates are deduplicated,
+and sizes above capacity are excluded. An empty tuple selects the baseline.
+Use actual configured capture rows, not a dense capacity range inferred from
+`BuildContext.widths`. For q6, request batches 1/2/4 correspond to token rows
+6/12/24. Verification rounds up to whole requests, excludes rounded rows above
+64 and excludes ordinary-only baseline rows incompatible with its query width.
+This does not add ordinary decode to a verification-only provider.
+
+The API checks cross-rank agreement before preparation and snapshots the selected
+widths into a new build context. All ranks must call the same build API; this is
+not a live toggle. It does not enable prefetch, embedding, alternate MLA or DCP.
+Normal SGLang startup continues to use `SPEC.build`; an adapter must explicitly
+choose the alternative when activating it later.
+
+CPU selection/forwarding tests do not establish GPU correctness or performance.
+Wider full-model numerical checks retain unresolved failures; this API is
+experimental and default-OFF, not qualification or a fix for those failures.
+
 ## Repository Structure
 
 ```text

@@ -98,3 +98,110 @@ class TestStartupOptions(unittest.TestCase):
         # Changing the environment is consumed by a subsequent build only.
         self.assertEqual(first.tokens_per_request, 1)
         self.assertEqual(second.tokens_per_request, 6)
+
+    def test_capture_width_api_preserves_default_and_selects_explicit_rows(self):
+        from sglang.srt.kernel_plugins.nvidia import binding
+
+        for q, captures, expected in (
+            (1, None, (2, 4)),
+            (6, None, (12, 24)),
+            (1, (), spec.WIDTHS),
+            (1, (9, 17), (*range(1, 10), 16, 17, 32, 64)),
+            (6, (1, 7, 13, 61), (6, 12, 18)),
+        ):
+            with self.subTest(q=q, captures=captures):
+                context = spec.BuildContext(
+                    (2, 4) if q == 1 else (12, 24), q, 30.0, object()
+                )
+                self.build.return_value = SimpleNamespace(tokens_per_request=q)
+                order = []
+
+                def prepare(*args, trace=order, query=q, **kwargs):
+                    trace.append("prepare")
+                    return SimpleNamespace(tokens_per_request=query)
+
+                self.build.side_effect = prepare
+
+                def gather(value, group=None, trace=order):
+                    trace.append("agree")
+                    return [value] * 8
+
+                with patch.object(
+                    binding, "_gather_tp", side_effect=gather
+                ) as gathered:
+                    built = spec.build_with_capture_widths(
+                        SimpleNamespace(language_model=object()),
+                        None,
+                        context,
+                        capture_token_rows=captures,
+                    )
+                self.assertEqual(order, ["agree", "prepare"])
+                self.assertEqual(
+                    gathered.call_args.args[0],
+                    (
+                        captures is not None,
+                        q,
+                        captures,
+                        expected if captures is not None else context.widths,
+                    ),
+                )
+                self.assertEqual(built.widths, expected)
+                self.assertEqual(self.build.call_args.kwargs["widths"], expected)
+                self.assertEqual(self.build.call_args.kwargs["tokens_per_request"], q)
+                for optional in (
+                    "enable_prefetch",
+                    "enable_embedding",
+                    "mla_core",
+                    "dcp",
+                ):
+                    self.assertNotIn(optional, self.build.call_args.kwargs)
+                self.assertEqual(context.widths, (2, 4) if q == 1 else (12, 24))
+
+    def test_capture_rank_disagreement_stops_before_provider_preparation(self):
+        from sglang.srt.kernel_plugins.nvidia import binding
+
+        for captures in (None, (17,)):
+            with (
+                self.subTest(captures=captures),
+                patch.object(
+                    binding,
+                    "_gather_tp",
+                    side_effect=lambda value, group=None: (
+                        [value] * 7 + [("different",)]
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "ranks.*differ"),
+            ):
+                spec.build_with_capture_widths(
+                    SimpleNamespace(language_model=object()),
+                    None,
+                    spec.BuildContext((2, 4), 1, 30.0, object()),
+                    capture_token_rows=captures,
+                )
+        self.validate.assert_not_called()
+        self.memory.assert_not_called()
+        self.build.assert_not_called()
+
+    def test_capture_api_invalid_rows_stop_before_preparation(self):
+        for rows in ([1], (0,), (True,), (1.5,)):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                spec.build_with_capture_widths(
+                    SimpleNamespace(language_model=object()),
+                    None,
+                    spec.BuildContext((2, 4), 1, 30.0, object()),
+                    capture_token_rows=rows,
+                )
+        self.validate.assert_not_called()
+        self.build.assert_not_called()
+
+    def test_registered_build_remains_default_without_extra_collectives(self):
+        from sglang.srt.kernel_plugins.nvidia import binding
+
+        self.assertIs(spec.SPEC.build, spec._build)
+        with patch.object(
+            binding,
+            "_gather_tp",
+            side_effect=AssertionError("new collective on default path"),
+        ):
+            self.assertEqual(self.build_registered(1).widths, spec.WIDTHS)
+            self.assertEqual(self.build_registered(6).widths, tuple(range(6, 65, 6)))

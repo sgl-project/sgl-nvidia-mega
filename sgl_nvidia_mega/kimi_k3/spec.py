@@ -43,6 +43,7 @@ except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
 from .shape_policy import (
     DECODE_WIDTHS,
     VERIFY_QUERIES,
+    baseline_capture_widths,
     mla_max_seq_len,
     prepared_widths,
     token_widths,
@@ -90,6 +91,7 @@ SGLANG_READS = {
     "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "PreparationView",
         "aux_hidden_states",
+        "megakernel_agree",
     ),
     "srt/runtime_context.py": ("get_model",),
     "srt/utils/hf_transformers/common.py": ("get_context_length",),
@@ -358,6 +360,51 @@ def _build(
         **options,
     )
     return _Built(model, resources, widths)
+
+
+def build_with_capture_widths(
+    model: Any,
+    hf_config: Any,
+    context: BuildContext,
+    *,
+    capture_token_rows: tuple[int, ...] | None = None,
+) -> _Built:
+    """Opt-in adapter API; registered builds retain their existing width policy.
+
+    Call this API on every TP rank with identical settings before preparation.
+    None keeps the default policy. Explicit rows must come from actual capture
+    configuration, never an inferred dense capacity range.
+    """
+    try:
+        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+    except ModuleNotFoundError as error:
+        if error.name not in (
+            "sglang.srt.kernel_plugins",
+            "sglang.srt.kernel_plugins.nvidia",
+            "sglang.srt.kernel_plugins.nvidia.binding",
+        ):
+            raise
+        from sglang.srt.megakernels.binding import megakernel_agree
+
+    enabled = capture_token_rows is not None
+    widths = (
+        baseline_capture_widths(context.tokens_per_request, capture_token_rows)
+        if enabled
+        else context.widths
+    )
+    megakernel_agree(
+        (enabled, context.tokens_per_request, capture_token_rows, widths),
+        what="Kimi capture-width preparation",
+    )
+    if not enabled:
+        return _build(model, hf_config, context)
+    selected = BuildContext(
+        widths=widths,
+        tokens_per_request=context.tokens_per_request,
+        deadline_s=context.deadline_s,
+        binding=context.binding,
+    )
+    return _build(model, hf_config, selected, configured_widths=True)
 
 
 SPEC = MegakernelSpec(

@@ -43,6 +43,30 @@ def prepared_widths(
     return tuple(sorted(widths))
 
 
+def baseline_capture_widths(
+    tokens_per_request: int, capture_token_rows: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Baseline plus explicit capture rows, restricted to the active query mode.
+
+    Capture sizes are token rows, not request counts. Verification rounds up to
+    complete requests; rows above capacity and ordinary-only rows are excluded.
+    """
+    token_widths(tokens_per_request)
+    if not isinstance(capture_token_rows, tuple) or any(
+        type(rows) is not int or rows <= 0 for rows in capture_token_rows
+    ):
+        raise ValueError("capture_token_rows must be a tuple of positive integers")
+    q = tokens_per_request
+    rounded = {((rows + q - 1) // q) * q for rows in capture_token_rows}
+    return tuple(
+        sorted(
+            rows
+            for rows in {*DECODE_WIDTHS, *rounded}
+            if rows <= MAX_ROWS and rows % q == 0
+        )
+    )
+
+
 def mla_max_seq_len(context_length: int, tokens_per_request: int) -> int:
     """Bound MLA scheduling, without changing native tail-inclusive KV lengths."""
     token_widths(tokens_per_request)
