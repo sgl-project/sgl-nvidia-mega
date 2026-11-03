@@ -18,6 +18,28 @@ from typing import List
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/environ.py": ("envs",),
+    "srt/runtime_context.py": ("get_server_args",),
+    "srt/layers/flashinfer_comm_fusion.py": ("uses_cutedsl_ar_fusion",),
+    "srt/layers/layer_boundary/residual/add_norm.py": ("flashinfer_ar_fusion_applies",),
+    "srt/layers/moe/utils.py": ("post_experts_output_is_complete",),
+    "srt/models/deepseek_v2.py": (
+        "DeepseekV2MLP",
+        "DeepseekV2MoE",
+    ),
+    "srt/models/deepseek_common/attention_forward_methods/forward_methods.py": (
+        "AttnForwardMethod",
+    ),
+    "srt/layers/attention/dsa_backend.py": ("DeepseekSparseAttnBackend",),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/model_executor/runner_backend_utils/breakable_cuda_graph/context.py": (
+        "is_in_breakable_cuda_graph",
+    ),
+    "srt/model_executor/runner_utils/capture_mode.py": ("get_is_capture_mode",),
+}
+
 # Verify rows a request: MTP / EAGLE with top-1 drafts verifies speculative_num_steps
 # draft tokens + 1 (speculative_num_draft_tokens). The values served: 3 and 5 steps.
 SERVED_TOKENS_PER_REQUEST = (4, 6)

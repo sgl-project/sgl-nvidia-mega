@@ -39,6 +39,12 @@ from sgl_nvidia_mega.glm_dsa.eligibility import HIDDEN, TP_SIZE
 from sgl_nvidia_mega.glm_dsa.attention.step import StepContext
 from sgl_nvidia_mega.glm_dsa.runtime.compile import compile_cached, cu_stream
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/layers/moe/utils.py": ("sum_post_experts_output",),
+    "srt/distributed/parallel_state.py": ("get_tp_group",),
+}
+
 logger = logging.getLogger(__name__)
 
 

@@ -41,6 +41,11 @@ from sgl_nvidia_mega.glm_dsa.providers import (
     compile_cached,
 )
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/distributed/parallel_state.py": ("get_tp_group",),
+}
+
 logger = logging.getLogger(__name__)
 
 O_PROJ_IN = 2048

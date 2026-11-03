@@ -37,6 +37,23 @@ from sgl_nvidia_mega.glm_dsa import (
 from sgl_nvidia_mega.glm_dsa.eligibility import HIDDEN, TP_SIZE
 from sgl_nvidia_mega.glm_dsa.runtime.compile import compile_cached, cu_stream
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/distributed/communication_op.py": ("tensor_model_parallel_all_gather",),
+    "srt/distributed/parallel_state.py": ("get_tp_group",),
+    "srt/model_executor/forward_batch_info.py": ("ForwardBatch",),
+    "srt/layers/logits_processor.py": ("LogitsProcessor",),
+    "srt/environ.py": ("envs",),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        "get_spec",
+    ),
+    "kernels/ops/layernorm/fused_eh_norm.py": ("fused_eh_norm",),
+    "srt/eplb/expert_distribution.py": ("get_global_expert_distribution_recorder",),
+    "srt/layers/attention/index_topk_share.py": ("IndexTopKShareState",),
+    "srt/utils/common.py": ("BumpAllocator",),
+}
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -369,7 +386,7 @@ class FusedDraft:
             get_global_expert_distribution_recorder,
         )
         from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+        import sglang.srt.layers.layer_boundary.residual.batch as residual_batch
         from sglang.srt.utils import BumpAllocator
 
         # the zero fill stays the plain launch right before the front kernel (its ids / rows are read after its

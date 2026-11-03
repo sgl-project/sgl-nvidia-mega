@@ -68,6 +68,55 @@ from sglang.srt.utils import is_cuda
 from sgl_nvidia_mega.spec_step import switches
 from sgl_nvidia_mega.spec_step.child_graph_capture import ChildGraphCapture
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/constrained/base_grammar_backend.py": (
+        "GrammarMask",
+        "InvalidGrammarObject",
+    ),
+    "srt/distributed/parallel_state.py": (
+        "get_tp_group",
+        "graph_capture",
+    ),
+    "srt/environ.py": ("envs",),
+    "srt/layers/attention/base_attn_backend.py": ("SharedReadEnds",),
+    "srt/model_executor/forward_batch_info.py": ("ForwardMode",),
+    "srt/model_executor/runner_backend/full_cuda_graph_backend.py": (
+        "FullCudaGraphBackend",
+    ),
+    "srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py": (
+        "BreakableCUDAGraph",
+        "BreakableCUDAGraphCapture",
+        "eager_on_graph",
+    ),
+    "srt/model_executor/runner_utils/pool.py": ("graph_pool_replay_scope",),
+    "srt/runtime_context.py": (
+        "get_stream",
+        "attn_dp_enabled_of",
+    ),
+    "srt/utils/common.py": ("is_cuda",),
+    "srt/managers/schedule_batch.py": ("ScheduleBatch",),
+    "srt/managers/utils.py": ("GenerationBatchResult",),
+    "srt/server_args.py": ("ServerArgs",),
+    "srt/speculative/eagle_worker_v2.py": ("EAGLEWorkerV2",),
+    "srt/layers/attention/dsa_backend.py": (
+        "DeepseekSparseAttnBackend",
+        "DeepseekSparseAttnMultiStepBackend",
+    ),
+    "srt/arg_groups/overrides.py": (
+        "resolved_view",
+        "resolving_view",
+    ),
+    "srt/model_executor/runner_backend_utils/breakable_cuda_graph/cuda_utils.py": (
+        "checkCudaErrors",
+    ),
+    "srt/speculative/spec_utils.py": (
+        "generate_token_bitmask",
+        "sample_simulated_acc_len",
+    ),
+    "kernels/ops/memory/small_copy.py": ("try_small_copy",),
+}
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.utils import GenerationBatchResult
@@ -993,7 +1042,7 @@ class EagleStepCudaGraphRunner:
 
     @staticmethod
     def _simulated_accept_override(sim_accept_len, draw_args):
-        from sglang.srt.speculative import spec_utils
+        import sglang.srt.speculative.spec_utils as spec_utils
 
         def generate_simulated_accept_index(
             original,

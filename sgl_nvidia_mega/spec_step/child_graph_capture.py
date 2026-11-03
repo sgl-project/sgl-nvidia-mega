@@ -36,6 +36,14 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
 )
 from sglang.srt.model_executor.runner_utils.pool import graph_pool_replay_scope
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/model_executor/runner_backend_utils/breakable_cuda_graph/cuda_utils.py": (
+        "checkCudaErrors",
+    ),
+    "srt/model_executor/runner_utils/pool.py": ("graph_pool_replay_scope",),
+}
+
 __all__ = [
     "ChildGraphCapture",
     "capture_override",

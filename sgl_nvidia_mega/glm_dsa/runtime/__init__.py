@@ -30,12 +30,6 @@ SLOT_NEEDS = (
 
 # SGLang symbols this package reads (validated by test/unit/test_contract.py)
 SGLANG_READS = {
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
-        "MegakernelSpec",
-        "MegakernelBinding",
-        "ForwardView",
-        "KvPoolView",
-    ),
     "srt/runtime_context.py": (
         "get_parallel",
         "get_forward",

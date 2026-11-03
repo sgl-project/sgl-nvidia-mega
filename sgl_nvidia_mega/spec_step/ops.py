@@ -29,7 +29,7 @@ SGLANG_READS = {
         "_argmax_pair",
         "_medium_argmax_partial_kernel",
     ),
-    "kernels/jit/utils/compile/loader.py": ("load_jit", "extra_include_paths"),
+    "kernels/jit/utils/compile/loader.py": ("load_jit", "load_jit(extra_include_paths)"),
 }
 
 CSRC = Path(__file__).resolve().parent / "csrc"

@@ -10,20 +10,31 @@ draft's build). ``SGLANG_NVIDIA_MEGAKERNEL_GLM_FUSED_DRAFT=0`` keeps SGLang's dr
 
 from __future__ import annotations
 
-from sglang.srt.megakernels.spec import (
-    Feature,
-    MegakernelSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+try:
+    from sglang.kernels.plugin_kernels.nvidia.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        Step,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels.spec import (
+        Feature,
+        MegakernelSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        Step,
+    )
 
 from sgl_nvidia_mega.glm_dsa import spec as target
 from sgl_nvidia_mega.glm_dsa import switches
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "MegakernelSpec",
         "Numerics",
@@ -45,7 +56,12 @@ NUMERICS = Numerics(
 class _BuiltDraft:
     """The installed draft forward: armed steps run the fused draft layer."""
 
+    # SGLang's own proposal, draft loop and draft extend; one graph per batch size
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(self, model):
         from sgl_nvidia_mega.glm_dsa import draft
@@ -70,8 +86,6 @@ class _BuiltDraft:
         return "GLM-5 NextN draft: fused embedding front, eh_proj shard, distributed top-1"
 
     def plan(self, input_ids, forward_batch, *args, **kwargs):
-        from sglang.srt.megakernels.spec import Step
-
         pp_proxy = kwargs.get("pp_proxy_tensors", args[0] if args else None)
         if pp_proxy is not None or not self.fused.engaged():
             return None
@@ -89,6 +103,10 @@ class _StockDraft:
     """SGLANG_NVIDIA_MEGAKERNEL_GLM_FUSED_DRAFT=0: no step, SGLang's draft forward."""
 
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
     widths = ()
 
     def summary(self) -> str:

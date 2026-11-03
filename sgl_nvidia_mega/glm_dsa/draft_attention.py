@@ -37,6 +37,17 @@ from sgl_nvidia_mega.glm_dsa.attention import (
 from sgl_nvidia_mega.glm_dsa.attention.step import AttentionDecode, StepContext
 from sgl_nvidia_mega.glm_dsa.runtime.executor import DerivedWeights
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/model_executor/runner_utils/capture_mode.py": (
+        "get_capture_attention_variant",
+    ),
+    "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE",),
+    "srt/layers/moe/moe_runner/base.py": ("moe_output_buffer_ctx",),
+}
+
 
 @dataclass
 class DraftStepContext(StepContext):
@@ -156,7 +167,7 @@ def decoder_layer_forward(
     ``o_proj`` (``forward_absorb_core`` ends with ``self.o_proj``). Returns
     ``(hidden_states, topk_indices)`` as the stock layer does."""
     from sglang.srt.layers.layer_boundary import get_attn_tp_context
-    from sglang.srt.layers.layer_boundary.residual import access as residual_access
+    import sglang.srt.layers.layer_boundary.residual.access as residual_access
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
     hidden_states_orig = residual_access.buffer(hidden_states)

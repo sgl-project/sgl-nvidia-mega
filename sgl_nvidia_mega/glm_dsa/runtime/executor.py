@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt import runtime_context
+import sglang.srt.runtime_context as runtime_context
 from sgl_nvidia_mega.glm_dsa import eligibility
 from sgl_nvidia_mega.glm_dsa.attention.step import StepContext
 from sgl_nvidia_mega.glm_dsa.providers import Providers
@@ -21,19 +21,16 @@ from sgl_nvidia_mega.glm_dsa.runtime.compile import compile_stats
 
 # SGLang symbols this module reads (validated by test/unit/test_contract.py)
 SGLANG_READS = {
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
-        "MegakernelBinding",
-        "ForwardView",
-        "KvPoolView",
-        "DsaView",
+    "srt/runtime_context.py": (
+        "get_parallel",
+        "get_forward",
     ),
-    "srt/runtime_context.py": ("get_parallel", "get_forward"),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("AttentionInputs",),
     "srt/eplb/expert_distribution.py": ("get_global_expert_distribution_recorder",),
     "srt/layers/attention/dsa/utils.py": ("maybe_prefetch_next_full_attention_kv",),
     "srt/layers/attention/index_topk_share.py": ("IndexTopKShareState",),
-    "srt/utils.py": ("BumpAllocator",),
+    "srt/utils/common.py": ("BumpAllocator",),
     "srt/layers/moe/moe_runner/base.py": ("moe_output_buffer_ctx",),
 }
 

@@ -12,6 +12,13 @@ import torch
 
 from sgl_nvidia_mega.glm_dsa.attention.step import StepContext
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/layers/moe/moe_runner/base.py": ("moe_output_buffer_ctx",),
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE",),
+    "srt/runtime_context.py": ("get_forward",),
+}
+
 # The engine's row groups: at most 4 groups of at most 4 rows (one group: g1, two: g2,
 # three or four: the four-group engine)
 GROUP_ROWS = 4
@@ -70,7 +77,7 @@ class MoeRecords:
 def _process_like_server(gate, up, gate_sf, up_sf, w2, w2_sf):
     """The server's NVFP4 TRT-LLM weight processing on a synthetic layer: the loader's
     w13 order for this backend (up rows first) and the same processing call."""
-    from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as trtllm
+    import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm as trtllm
 
     e = gate.shape[0]
     f8 = torch.float8_e4m3fn

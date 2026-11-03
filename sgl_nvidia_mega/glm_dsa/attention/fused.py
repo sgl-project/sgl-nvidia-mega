@@ -38,6 +38,14 @@ from sgl_nvidia_mega.glm_dsa.attention.step import (
 )
 from sgl_nvidia_mega.glm_dsa.runtime.compile import compile_cached, cu_stream
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/layers/layernorm.py": ("LayerNorm",),
+    "kernels/ops/kvcache/dsa_fused_store_index_cache.py": ("can_use_dsa_fused_store",),
+    "kernels/ops/quantization/fp8_kernel.py": ("is_fp8_fnuz",),
+}
+
 # One tensor-parallel rank (TP 8).
 HEADS, Q_LORA, KV_LORA, ROPE, NOPE, VALUE_DIM = 8, 2048, 512, 64, 192, 256
 INDEX_HEADS, INDEX_DIM, TOPK, INDEX_PAGE = 32, 128, 2048, 64

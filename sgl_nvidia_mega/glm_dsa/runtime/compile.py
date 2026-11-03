@@ -10,6 +10,11 @@ from typing import Any, Callable, Dict, Hashable, Optional, Tuple
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "kernels/jit/cute_aot_cache.py": ("get_jit_cache",),
+}
+
 logger = logging.getLogger(__name__)
 
 _jit_cache: Any = None  # created on first use

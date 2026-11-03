@@ -26,6 +26,29 @@ from typing import Any, Callable, Dict, Hashable, Optional, Tuple
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "kernels/ops/quantization/act_quant_triton.py": ("act_quant",),
+    "kernels/ops/attention/dsa/indexer_q.py": ("fused_q_indexer_rope_first_quant",),
+    "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
+    "srt/layers/layer_boundary/adapters/attention.py": ("AttentionInputs",),
+    "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
+    "srt/layers/attention/dsa/dsa_indexer.py": ("_broadcast_indexer_topk_from_rank0",),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/state_capturer/indexer_topk.py": ("maybe_capture_indexer_topk",),
+    "kernels/ops/attention/utils.py": ("mla_quantize_and_rope_for_fp8",),
+    "srt/environ.py": ("envs",),
+    "srt/layers/moe/utils.py": ("sum_post_experts_output",),
+    "srt/layers/moe/moe_runner/base.py": ("moe_output_buffer_ctx",),
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE",),
+    "srt/runtime_context.py": ("get_forward",),
+    "kernels/jit/cute_aot_cache.py": ("get_jit_cache",),
+    "srt/layers/attention/dsa_backend.py": (
+        "_restore_trtllm_decode_dp_padding",
+        "_trim_trtllm_decode_dp_padding",
+    ),
+}
+
 logger = logging.getLogger(__name__)
 
 

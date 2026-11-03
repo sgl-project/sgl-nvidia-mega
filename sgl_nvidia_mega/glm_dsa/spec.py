@@ -15,6 +15,11 @@ Stated limits of this spec:
 * The first capture of each width checks, on every rank, that SGLang's attention
   takes the branches the stock step copies; a reason on any rank stops every rank
   (``runtime/executor.py``).
+* The covered step reads the DSA backend and its KV pool through SGLang's running
+  attention backend (``get_attn_backend()``), not through a binding view, so it runs on
+  SGLang's megakernel API version 2 as released.
+* TP8 may span two 4-GPU trays of one NVL72 rack (multi-node TP); without NVLink
+  multicast between them, see ``switches.py`` (``ALLOW_NO_AR_FUSION``).
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ try:
         Numerics,
         NumericsKind,
         Requirements,
+        Step,
     )
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import (
@@ -36,6 +42,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Numerics,
         NumericsKind,
         Requirements,
+        Step,
     )
 
 from sgl_nvidia_mega.glm_dsa import HF_CONFIG, MODEL_TYPE, TP_SIZE
@@ -52,26 +59,25 @@ SGLANG_READS = {
     "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "SPECULATIVE_DECODING",
+        "MULTI_NODE_TP",
         "KV_OFFLOAD",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
         "TOLERANCE",
         "Requirements",
+        "Step",
         "decode_graph_backends",
         "config_disable_reasons",
         "model_disable_reasons",
-        "EAGLE_DRAFT_CAPTURE_CHECK",
+        "draft_loop",
+        "draft_extend",
+        "begin_draft_round",
+        "graph_variants",
     ),
     "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/guards.py": (
         "deadline_s",
         "deadline_s(watchdog_timeout)",
-    ),
-    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
-        "ForwardView",
-        "KvPoolView",
-        "DsaView",
-        "MegakernelBinding",
     ),
     "srt/model_executor/cuda_graph_config.py": ("decode", "backend", '"disabled"'),
     "srt/environ.py": (
@@ -120,7 +126,8 @@ SGLANG_READS = {
 }
 
 ARCHITECTURE = "GlmMoeDsaForCausalLM"
-API_VERSION = 1
+# the SGLang megakernel contract this spec is written against
+API_VERSION = 2
 
 # The co-resident cooperative grid the served kernels need at one CTA per SM
 RESIDENT_BLOCKS = MAX_ROWS * CLUSTER + 1
@@ -247,37 +254,6 @@ NUMERICS = Numerics(
     },
 )
 
-# The SGLang megakernel binding members the covered steps read
-BINDING_MEMBERS = {
-    "MegakernelBinding": ("forward_view",),
-    "ForwardView": ("dsa",),
-    "KvPoolView": (
-        "get_key_buffer",
-        "get_index_k_with_scale_buffer",
-        "index_page_size",
-        "set_mla_kv_buffer",
-    ),
-    "DsaView": (
-        "kv_lora_rank",
-        "qk_nope_head_dim",
-        "qk_rope_head_dim",
-        "kv_cache_dim",
-        "physical_page_size",
-        "decode_impl",
-        "use_mha",
-        "kv_cache_dtype",
-        "use_fused_topk",
-        "topk_backend",
-        "dcp_size",
-        "index_kpool",
-        "hisparse",
-        "workspace_buffer",
-        "multi_ctas_kv_counter_buffer",
-        "indexer_metadata",
-    ),
-}
-
-
 def toolchain_reasons() -> list:
     reasons = []
     for module, what in (
@@ -294,43 +270,6 @@ def toolchain_reasons() -> list:
         if not ok:
             reasons.append(why)
     return reasons
-
-
-def binding_reasons() -> list:
-    try:
-        import sglang.srt.kernel_plugins.nvidia.binding as binding
-    except ModuleNotFoundError:
-        import sglang.srt.megakernels.binding as binding
-
-    missing = [
-        f"{owner}.{member}"
-        for owner, members in BINDING_MEMBERS.items()
-        for member in members
-        if not hasattr(getattr(binding, owner, None), member)
-    ]
-    if missing:
-        return [
-            "this SGLang's megakernel binding lacks the DSA view members "
-            f"{', '.join(missing)}; update SGLang"
-        ]
-    return []
-
-
-def draft_capture_reasons() -> list:
-    if "draft" not in SLOTS:
-        return []
-    try:
-        import sglang.kernels.plugin_kernels.nvidia.spec as layer
-    except ModuleNotFoundError:
-        import sglang.srt.megakernels.spec as layer
-
-    if getattr(layer, "EAGLE_DRAFT_CAPTURE_CHECK", False):
-        return []
-    return [
-        "slot draft: this SGLang's EAGLE draft graph runners do not run a draft "
-        "spec's capture check (spec.EAGLE_DRAFT_CAPTURE_CHECK); update SGLang, or "
-        f"leave slot draft out of {SLOTS_ENV}"
-    ]
 
 
 def deadline_reasons(cfg) -> list:
@@ -350,8 +289,7 @@ def deadline_reasons(cfg) -> list:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list:
-    reasons = toolchain_reasons() + binding_reasons() + slot_reasons()
-    reasons += draft_capture_reasons() + deadline_reasons(cfg)
+    reasons = toolchain_reasons() + slot_reasons() + deadline_reasons(cfg)
     reasons += draft_length_reason(cfg)
     if (
         cfg.cuda_graph_config.decode.backend == "disabled"
@@ -370,18 +308,67 @@ def _model_disable_reasons(model, hf_config) -> list:
     return eligibility.model_construction_reasons(model, hf_config)
 
 
+class _Built:
+    """The installed target forward: covered verify steps run the fused stack."""
+
+    # SGLang's own proposal, draft loop and draft extend; one graph per batch size
+    draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
+
+    def __init__(self, model, fused):
+        self.model, self.fused = model, fused
+        self.widths = tuple(sorted(fused.providers))
+
+    def summary(self) -> str:
+        fused = {
+            rows: sorted(
+                k
+                for k, v in p.describe().items()
+                if not v.startswith(("AttentionDecode", "HopSteps", "MlpSteps"))
+            )
+            for rows, p in self.fused.providers.items()
+        }
+        return "GLM-5 DSA fused verify; fused steps by rows: " + "; ".join(
+            f"{rows}: {', '.join(names) or 'stock'}" for rows, names in fused.items()
+        )
+
+    def plan(self, input_ids, forward_batch, *args, **kwargs):
+        input_embeds = kwargs.get("input_embeds", args[0] if args else None)
+        pp_proxy = kwargs.get("pp_proxy_tensors", args[1] if len(args) > 1 else None)
+        rows = int(input_ids.shape[0])
+        if not self.fused.engages(rows, forward_batch, input_embeds, pp_proxy):
+            return None
+        return Step(mode="target_verify", rows=rows)
+
+    def forward(self, step, original, input_ids, positions, forward_batch, *a, **kw):
+        hidden_states = self.fused.run(input_ids, positions, forward_batch)
+        return self.model.logits_processor(
+            input_ids, hidden_states, self.model.lm_head, forward_batch, None
+        )
+
+
 def _build(model, hf_config, ctx):
     from sgl_nvidia_mega.glm_dsa.runtime.executor import GlmDsaFusedDecode
 
     fused = GlmDsaFusedDecode(model)
     fused.prepare()
-    return fused
+    return _Built(model, fused)
 
 
 SPEC = MegakernelSpec(
     name="GLM-5.2 / GLM-5 DSA",
     requires=REQUIREMENTS,
-    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.KV_OFFLOAD}),
+    features=frozenset(
+        {
+            Feature.SPECULATIVE_DECODING,
+            # TP8 spans the two 4-GPU trays of one NVL72 rack (Rubin, GB300 NVL72)
+            Feature.MULTI_NODE_TP,
+            Feature.KV_OFFLOAD,
+        }
+    ),
     numerics=NUMERICS,
     max_rows=MAX_ROWS,
     build=_build,

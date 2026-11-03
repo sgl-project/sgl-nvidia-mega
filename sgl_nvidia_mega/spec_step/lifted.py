@@ -19,6 +19,24 @@ import logging
 from sgl_nvidia_mega.spec_step import switches as _spec_switches
 from sgl_nvidia_mega.spec_step.ops import draft_extend_tail
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/layers/dp_attention.py": ("is_dp_attention_enabled",),
+    "srt/runtime_context.py": ("get_parallel",),
+    "srt/sampling/penaltylib/repetition_penalty.py": ("apply_scaling_penalties",),
+    "srt/speculative/spec_utils.py": (
+        "SIMULATE_ACC_LEN",
+        "SIMULATE_ACC_TOKEN_MODE",
+        "generate_simulated_accept_index",
+    ),
+    "srt/utils/async_probe.py": (
+        "maybe_detect_nan",
+        "sanitize_nan_logits",
+    ),
+    "srt/speculative/uno_utils.py": ("sample_uno_tree_target_tokens",),
+    "kernels/ops/speculative/eagle.py": ("prepare_draft_extend_inputs",),
+}
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- eagle_utils

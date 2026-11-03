@@ -19,4 +19,4 @@ def build(model, derived):
 
     if "attention" not in SLOTS:
         return None
-    return AttentionGlue.build(model, derived)
+    return AttentionGlue(model, derived)

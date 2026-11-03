@@ -37,6 +37,11 @@ from sgl_nvidia_mega.glm_dsa.providers import (
     cu_stream,
 )
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE",),
+}
+
 logger = logging.getLogger(__name__)
 
 EXPERTS = 256
@@ -62,7 +67,7 @@ class MoeRecords:
 def _process_like_server(gate, up, gate_sf, up_sf, w2, w2_sf):
     """The server's NVFP4 TRT-LLM weight processing on a synthetic layer: the loader's
     w13 order for this backend (up rows first) and the same processing call."""
-    from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as trtllm
+    import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm as trtllm
 
     e = gate.shape[0]
     f8 = torch.float8_e4m3fn

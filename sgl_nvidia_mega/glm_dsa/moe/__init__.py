@@ -45,6 +45,11 @@ INTER = 256  # routed and shared intermediate size per rank (TP 8)
 
 from sgl_nvidia_mega.glm_dsa.moe.step import MoeRecords, MoeSteps, MlpSteps  # noqa: F401
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE",),
+}
+
 
 class MoeGlue:
     """Derived MoE weights, compiled engines and per-row-count steps."""

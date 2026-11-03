@@ -29,7 +29,6 @@ SGLANG_READS = {
         "cleanup",
         "_graphs",
         "_outputs",
-        "torch.cuda.CUDAGraph()",
     ),
     "srt/model_executor/runner_backend/utils.py": ("resolve_decode_backend",),
     "srt/speculative/eagle_worker_v2.py": (
@@ -45,7 +44,8 @@ SGLANG_READS = {
     "srt/speculative/eagle_utils.py": ("eagle_sample",),
     "srt/speculative/spec_utils.py": (
         "generate_simulated_accept_index",
-        "GrammarTree.from_device",
+        "GrammarTree",
+        "from_device",
         "build_grammar_vocab_mask",
     ),
     "kernels/ops/speculative/sampling.py": ("tree_speculative_sampling_target_only",),
@@ -58,7 +58,12 @@ SGLANG_READS = {
         "_DEBUG_ASSERT",
     ),
     "srt/managers/scheduler_components/internal_state.py": (
-        "SchedulerInternalStateController._add_speculative",
+        "SchedulerInternalStateController",
+        "_add_speculative",
+    ),
+    "srt/plugins/hook_registry.py": (
+        "HookRegistry",
+        "HookType",
     ),
 }
 
@@ -186,7 +191,7 @@ def _resolve_single_request_views(self, batch, indices) -> bool:
     req_pool_indices resolves its draft inputs as row views of the relay
     buffers instead of gathering copies. The rows are written back only by this
     request's next stash, which follows its forward on the same stream."""
-    from sglang.srt.managers import overlap_utils
+    import sglang.srt.managers.overlap_utils as overlap_utils
 
     if (
         not indices.is_cuda
@@ -283,7 +288,7 @@ def _rebind(module, names):
 
 
 def _eagle_sample():
-    from sglang.srt.speculative import eagle_utils
+    import sglang.srt.speculative.eagle_utils as eagle_utils
 
     return _rebind(
         eagle_utils,
@@ -298,7 +303,7 @@ def _eagle_sample():
 
 
 def _draft_extend_for_decode():
-    from sglang.srt.speculative import eagle_worker_v2
+    import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_v2
 
     from sgl_nvidia_mega.spec_step.ops import draft_extend_tail
 

@@ -31,7 +31,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt import runtime_context
+import sglang.srt.runtime_context as runtime_context
 from sgl_nvidia_mega.glm_dsa import eligibility
 from sgl_nvidia_mega.glm_dsa.providers import (
     Providers,
@@ -39,6 +39,15 @@ from sgl_nvidia_mega.glm_dsa.providers import (
     build_providers,
     compile_stats,
 )
+
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
+    "srt/eplb/expert_distribution.py": ("get_global_expert_distribution_recorder",),
+    "srt/layers/attention/dsa/utils.py": ("maybe_prefetch_next_full_attention_kv",),
+    "srt/layers/attention/index_topk_share.py": ("IndexTopKShareState",),
+    "srt/utils/common.py": ("BumpAllocator",),
+}
 
 logger = logging.getLogger(__name__)
 
