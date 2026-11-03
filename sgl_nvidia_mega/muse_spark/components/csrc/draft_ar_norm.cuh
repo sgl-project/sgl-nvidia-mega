@@ -1,4 +1,6 @@
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Source: SGLang python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh (one-shot push all-reduce and its
 // phase protocol) at revision a55ab7d.
 // Modified by NVIDIA: one kernel performs, for a DFlash draft layer boundary, the one-shot push all-reduce of the

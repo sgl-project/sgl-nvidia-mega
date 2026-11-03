@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``xattn_b``: SGLang adapter of the own extend-attention op (``extend_attn_b``).
 
 The only code that touches SGLang or FlashInfer for the op. An AROUND hook on the TRT-LLM MHA backend's
@@ -43,9 +45,23 @@ logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "xattn_b"
 CONFLICTS = ("extend_attn", "small_extend_attn", "prefill_attn")
-_state: dict = {"engaged": None, "prev_ctx": None, "mode": "kernel", "dump_dir": None, "dump_max": 16, "dump_every": 1,
-          "dump_device": 0, "dump_seen": 0, "dump_n": 0, "route": False, "compose": False, "composed": False}
-_call: contextvars.ContextVar = contextvars.ContextVar("muse_vr_xattn_b_call", default=None)
+_state: dict = {
+    "engaged": None,
+    "prev_ctx": None,
+    "mode": "kernel",
+    "dump_dir": None,
+    "dump_max": 16,
+    "dump_every": 1,
+    "dump_device": 0,
+    "dump_seen": 0,
+    "dump_n": 0,
+    "route": False,
+    "compose": False,
+    "composed": False,
+}
+_call: contextvars.ContextVar = contextvars.ContextVar(
+    "muse_vr_xattn_b_call", default=None
+)
 # dump-mode bins: new tokens (largest request), cached prefix (smallest request), requests per call
 DUMP_BINS = {"new": (64, 1025, 8193), "prefix": (111616, 166000), "requests": (2, 5)}
 
@@ -53,7 +69,12 @@ DUMP_BINS = {"new": (64, 1025, 8193), "prefix": (111616, 166000), "requests": (2
 def _context_attn(*args, **kwargs):
     """Stand-in for ``flashinfer.prefill.trtllm_batch_context_with_kv_cache``: the op, else the previous function."""
     call = _call.get()
-    if call is None or args or kwargs.get("lse") is not None or kwargs.get("return_lse", False):
+    if (
+        call is None
+        or args
+        or kwargs.get("lse") is not None
+        or kwargs.get("return_lse", False)
+    ):
         return _state["prev_ctx"](*args, **kwargs)
     if _state["mode"] == "dump":
         out = _state["prev_ctx"](*args, **kwargs)
@@ -61,7 +82,9 @@ def _context_attn(*args, **kwargs):
             _dump(call, kwargs, out)
         except Exception as e:  # noqa: BLE001 - diagnostics never change the served result
             bed.count(NAME, "dump:error")
-            logger.warning("muse_vr_plugin: %s dump error (%s: %s)", NAME, type(e).__name__, e)
+            logger.warning(
+                "muse_vr_plugin: %s dump error (%s: %s)", NAME, type(e).__name__, e
+            )
         return out
     from . import extend_attn_b as xb
 
@@ -70,7 +93,12 @@ def _context_attn(*args, **kwargs):
         why = xb.last_decline() if out is None else None
     except Exception as e:  # noqa: BLE001 - the adapter keeps a catch-to-stock; the op itself fails loud
         bed.count(NAME, "error")
-        logger.warning("muse_vr_plugin: %s op error (%s: %s); stock call", NAME, type(e).__name__, e)
+        logger.warning(
+            "muse_vr_plugin: %s op error (%s: %s); stock call",
+            NAME,
+            type(e).__name__,
+            e,
+        )
         out, why = None, None
     if out is None:
         if why:
@@ -103,12 +131,26 @@ def _serve_mask(call, kwargs) -> tuple:
     q = kwargs.get("query")
     if q is None or q.dim() != 3:
         return tuple(False for _ in call.new_lens)
-    key = (q.device.index, int(q.shape[1]), call.mode, call.capturing, call.new_lens, call.prefix_lens)
+    key = (
+        q.device.index,
+        int(q.shape[1]),
+        call.mode,
+        call.capturing,
+        call.new_lens,
+        call.prefix_lens,
+    )
     m = _MASKS.get(key)
     if m is None:
         sms = xb._num_sms(q.device.index)
-        m = tuple(plan.decline_reason(ExtendCall((t,), (c,), call.layer_id, call.mode, call.capturing), int(q.shape[1]),
-                                      sms) is None for t, c in zip(call.new_lens, call.prefix_lens))
+        m = tuple(
+            plan.decline_reason(
+                ExtendCall((t,), (c,), call.layer_id, call.mode, call.capturing),
+                int(q.shape[1]),
+                sms,
+            )
+            is None
+            for t, c in zip(call.new_lens, call.prefix_lens)
+        )
         if len(_MASKS) >= 64:
             _MASKS.clear()
         _MASKS[key] = m
@@ -146,9 +188,16 @@ def _route(call, kwargs, serve):
         cq, ck = kwargs["cum_seq_lens_q"], kwargs["cum_seq_lens_kv"]
         sub = dict(kwargs)
         # rebased cumulative lengths computed on the device in stream order (no host copy, no host wait)
-        sub.update(query=q[ra:rb], block_tables=kwargs["block_tables"][a:b], seq_lens=kwargs["seq_lens"][a:b],
-                   cum_seq_lens_q=cq[a:b + 1] - cq[a], cum_seq_lens_kv=ck[a:b + 1] - ck[a],
-                   batch_size=b - a, max_q_len=max(call.new_lens[a:b]), out=out[ra:rb])
+        sub.update(
+            query=q[ra:rb],
+            block_tables=kwargs["block_tables"][a:b],
+            seq_lens=kwargs["seq_lens"][a:b],
+            cum_seq_lens_q=cq[a : b + 1] - cq[a],
+            cum_seq_lens_kv=ck[a : b + 1] - ck[a],
+            batch_size=b - a,
+            max_q_len=max(call.new_lens[a:b]),
+            out=out[ra:rb],
+        )
         _state["prev_ctx"](**sub)
         a = b
     return out
@@ -163,7 +212,9 @@ def _dump(call, kwargs, out) -> None:
     from . import extend_attn_b as xb
     from .extend_attn_b import plan
 
-    if call.capturing or torch.cuda.is_current_stream_capturing():  # never copy to host inside a graph capture
+    if (
+        call.capturing or torch.cuda.is_current_stream_capturing()
+    ):  # never copy to host inside a graph capture
         return
     q = kwargs["query"]
     k_cache, v_cache = kwargs["kv_cache"]
@@ -178,9 +229,14 @@ def _dump(call, kwargs, out) -> None:
         return
     cap = _state.get("dump_bincap", 0)
     if cap > 0:
-        b = tuple(sum(v >= e for e in DUMP_BINS[k]) for k, v in (("new", max(call.new_lens)),
-                                                                   ("prefix", min(call.prefix_lens)),
-                                                                   ("requests", len(call.new_lens))))
+        b = tuple(
+            sum(v >= e for e in DUMP_BINS[k])
+            for k, v in (
+                ("new", max(call.new_lens)),
+                ("prefix", min(call.prefix_lens)),
+                ("requests", len(call.new_lens)),
+            )
+        )
         seen = _state.setdefault("dump_bin_seen", {})
         saved = _state.setdefault("dump_bin_saved", {})
         seen[b] = seen.get(b, 0) + 1
@@ -200,26 +256,60 @@ def _dump(call, kwargs, out) -> None:
         table.append(list(range(len(rows), len(rows) + npg)))
         rows.extend(int(v) for v in kwargs["block_tables"][r, :npg].tolist())
     width = max(len(x) for x in table)
-    table += [[0]] * max(0, int(kwargs["block_tables"].shape[0]) - len(table))  # padded request slots (never read)
-    bt = torch.tensor([x + [x[-1]] * (width - len(x)) for x in table], dtype=torch.int32)
+    table += [[0]] * max(
+        0, int(kwargs["block_tables"].shape[0]) - len(table)
+    )  # padded request slots (never read)
+    bt = torch.tensor(
+        [x + [x[-1]] * (width - len(x)) for x in table], dtype=torch.int32
+    )
     idx = torch.tensor(rows, dtype=torch.long, device=k_cache.device)
     rec = {
-        "call": {"new_lens": list(call.new_lens), "prefix_lens": list(call.prefix_lens), "layer_id": call.layer_id},
-        "n": n, "pid": os.getpid(), "page": page, "bin": bin_tag[2:] or None,
-        "scalars": {k: v for k, v in kwargs.items() if isinstance(v, (int, float, bool, str)) or v is None},
-        "dtypes": {"q": str(q.dtype), "k": str(k_cache.dtype), "v": str(v_cache.dtype), "out": str(out.dtype)},
-        "shapes": {"q": list(q.shape), "k_pages": [len(rows), *k_cache.shape[1:]], "out": list(out.shape)},
-        "served_strides": {"k": list(k_cache.stride()), "v": list(v_cache.stride())},  # the pages below are contiguous
+        "call": {
+            "new_lens": list(call.new_lens),
+            "prefix_lens": list(call.prefix_lens),
+            "layer_id": call.layer_id,
+        },
+        "n": n,
+        "pid": os.getpid(),
+        "page": page,
+        "bin": bin_tag[2:] or None,
+        "scalars": {
+            k: v
+            for k, v in kwargs.items()
+            if isinstance(v, (int, float, bool, str)) or v is None
+        },
+        "dtypes": {
+            "q": str(q.dtype),
+            "k": str(k_cache.dtype),
+            "v": str(v_cache.dtype),
+            "out": str(out.dtype),
+        },
+        "shapes": {
+            "q": list(q.shape),
+            "k_pages": [len(rows), *k_cache.shape[1:]],
+            "out": list(out.shape),
+        },
+        "served_strides": {
+            "k": list(k_cache.stride()),
+            "v": list(v_cache.stride()),
+        },  # the pages below are contiguous
         "q": q.contiguous().view(torch.uint8).cpu(),
         "k_pages": k_cache[idx].contiguous().view(torch.uint8).cpu(),
         "v_pages": v_cache[idx].contiguous().view(torch.uint8).cpu(),
         "block_tables": bt,
         "seq_lens": kwargs["seq_lens"].cpu(),
         "cum_seq_lens_q": kwargs["cum_seq_lens_q"].cpu(),
-        "cum_seq_lens_kv": kwargs["cum_seq_lens_kv"].cpu() if torch.is_tensor(kwargs.get("cum_seq_lens_kv")) else None,
+        "cum_seq_lens_kv": kwargs["cum_seq_lens_kv"].cpu()
+        if torch.is_tensor(kwargs.get("cum_seq_lens_kv"))
+        else None,
         "out": out.cpu(),
     }
-    torch.save(rec, os.path.join(_state["dump_dir"], f"xb{n:04d}_p{os.getpid()}_l{call.layer_id}{bin_tag}.pt"))
+    torch.save(
+        rec,
+        os.path.join(
+            _state["dump_dir"], f"xb{n:04d}_p{os.getpid()}_l{call.layer_id}{bin_tag}.pt"
+        ),
+    )
     _state["dump_n"] = n + 1
     bed.count(NAME, "dump:saved")
 
@@ -227,19 +317,22 @@ def _dump(call, kwargs, out) -> None:
 def _extend_call(backend, layer, forward_batch):
     """The op's ExtendCall for an eligible layer call, else None."""
     import torch
-
     from sglang.srt.layers.radix_attention import AttentionType
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
     from .extend_attn_b import ExtendCall
 
-    if forward_batch.forward_mode != ForwardMode.EXTEND or layer.attn_type != AttentionType.DECODER:
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        or layer.attn_type != AttentionType.DECODER
+    ):
         return None
     w = getattr(layer, "sliding_window_size", None)
     if (w is not None and w >= 0) or getattr(backend, "use_fmha_v2", False):
         return None
     if getattr(backend, "data_type", None) != torch.float8_e4m3fn and not (
-            _state["composed"] and getattr(backend, "_muse_vr_prefill_dq", None) is not None):
+        _state["composed"] and getattr(backend, "_muse_vr_prefill_dq", None) is not None
+    ):
         return None  # NVFP4 pool: only behind prefill_dq's FP8 workspace (the op declines the NVFP4 calls themselves)
     try:
         from sglang.srt.layers.cp.utils import is_cp_active
@@ -252,13 +345,20 @@ def _extend_call(backend, layer, forward_batch):
     ext = getattr(forward_batch, "extend_seq_lens_cpu", None)
     if pre is None or ext is None or len(pre) != len(ext) or not len(ext):
         return None
-    return ExtendCall(tuple(int(x) for x in ext), tuple(int(x) for x in pre), int(getattr(layer, "layer_id", -1)),
-                      "extend", bool(torch.cuda.is_current_stream_capturing()))
+    return ExtendCall(
+        tuple(int(x) for x in ext),
+        tuple(int(x) for x in pre),
+        int(getattr(layer, "layer_id", -1)),
+        "extend",
+        bool(torch.cuda.is_current_stream_capturing()),
+    )
 
 
 def _wrap_forward_extend(fn):
     @functools.wraps(fn)
-    def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+    def forward_extend(
+        self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
+    ):
         call = _extend_call(self, layer, forward_batch)
         if call is None:
             return fn(self, q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
@@ -287,13 +387,23 @@ def _wrap_load_model(fn):
             hq = mc.num_attention_heads // tp
             hkv = max(1, mc.get_num_kv_heads(tp))
             if hq == 8 * hkv:
-                xb.prepare(torch.cuda.current_device(), max_new_tokens=plan.T_HI, num_kv_heads=hkv, num_q_heads=hq)
+                xb.prepare(
+                    torch.cuda.current_device(),
+                    max_new_tokens=plan.T_HI,
+                    num_kv_heads=hkv,
+                    num_q_heads=hq,
+                )
                 bed.count(NAME, "prepared")
             else:
                 bed.count(NAME, "prepare_skipped:head_layout")
         except Exception as e:  # noqa: BLE001 - without prepare the op declines every call ("not_prepared")
             bed.count(NAME, "prepare_failed")
-            logger.warning("muse_vr_plugin: %s prepare failed (%s: %s); the op stays off", NAME, type(e).__name__, e)
+            logger.warning(
+                "muse_vr_plugin: %s prepare failed (%s: %s); the op stays off",
+                NAME,
+                type(e).__name__,
+                e,
+            )
         return out
 
     load_model.__wrapped_by_xattn_b__ = True
@@ -302,7 +412,6 @@ def _wrap_load_model(fn):
 
 def install() -> None:
     import flashinfer.prefill
-
     from sglang.srt.layers.attention import trtllm_mha_backend as tb
     from sglang.srt.model_executor import model_runner as mr
 
@@ -332,15 +441,21 @@ def engage() -> bool:
         _state["engaged"] = False
         return False
     if bed.enabled("nvfp4_kv") and not _state["compose"]:
-        bed.report(NAME, False, reason="refused: NVFP4 KV pool without the prefill_dq composition (the op reads E4M3 "
-                                       "pages only; nvfp4_kv composes it with MUSE_VR_NVFP4_PREFILL_DQ=1)")
+        bed.report(
+            NAME,
+            False,
+            reason="refused: NVFP4 KV pool without the prefill_dq composition (the op reads E4M3 "
+            "pages only; nvfp4_kv composes it with MUSE_VR_NVFP4_PREFILL_DQ=1)",
+        )
         _state["engaged"] = False
         return False
     import os
 
     mode = os.environ.get("MUSE_VR_XATTN_B_MODE", "kernel")
     if mode not in ("kernel", "dump"):
-        bed.report(NAME, False, reason=f"MUSE_VR_XATTN_B_MODE {mode!r} not kernel / dump")
+        bed.report(
+            NAME, False, reason=f"MUSE_VR_XATTN_B_MODE {mode!r} not kernel / dump"
+        )
         _state["engaged"] = False
         return False
     if mode == "dump":
@@ -353,10 +468,16 @@ def engage() -> bool:
         except ValueError:
             mx = ev = dv = bc = -1
         if not d or not os.path.isdir(d) or mx < 1 or ev < 1 or dv < 0 or bc < 0:
-            bed.report(NAME, False, reason="dump mode needs an existing DUMP_DIR, DUMP_MAX >= 1, DUMP_EVERY >= 1")
+            bed.report(
+                NAME,
+                False,
+                reason="dump mode needs an existing DUMP_DIR, DUMP_MAX >= 1, DUMP_EVERY >= 1",
+            )
             _state["engaged"] = False
             return False
-        _state.update(dump_dir=d, dump_max=mx, dump_every=ev, dump_device=dv, dump_bincap=bc)
+        _state.update(
+            dump_dir=d, dump_max=mx, dump_every=ev, dump_device=dv, dump_bincap=bc
+        )
     _state["mode"] = mode
     _state["route"] = os.environ.get("MUSE_VR_XATTN_B_ROUTE", "0") == "1"
     from .small_extend_attn import _pins_ok
@@ -411,7 +532,11 @@ def compose_context(fn, *, bf16_out: bool):
         return fn
     if _state["prev_ctx"] is not fn:
         # the previous function was captured before this call (never in a server: nvfp4_kv registers first)
-        bed.report(NAME, False, reason="refused: the stand-in's previous function is not the function to wrap")
+        bed.report(
+            NAME,
+            False,
+            reason="refused: the stand-in's previous function is not the function to wrap",
+        )
         _state["engaged"] = False
         return fn
     _state["composed"] = True

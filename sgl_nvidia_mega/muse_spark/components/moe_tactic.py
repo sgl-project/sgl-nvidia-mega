@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``moe_tactic``: pin the FlashInfer trtllm-gen NVFP4 routed-MoE tactic per token count.
 
 SGLang's Muse Spark NVFP4 expert path calls ``flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe`` with
@@ -39,18 +41,18 @@ _OP = "flashinfer::trtllm_fp4_block_scale_moe"
 
 # sha256 of files relative to the directory that holds the ``sglang`` package.
 SGLANG_PINS = {
-    "sglang/srt/layers/muse_spark_fp4_moe.py": ("1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352", "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738"),
+    "sglang/srt/layers/muse_spark_fp4_moe.py": (
+        "1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352",
+        "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738",
+    ),
 }
 # sha256 of files relative to the directory that holds the ``flashinfer`` package.
 FLASHINFER_PINS = {
     "flashinfer/fused_moe/core.py": "d6a8333a2749e45e17f4ad6443c3ca84fcc8b15bca4d32adecc6cd0373528b17",
-    "flashinfer/fused_moe/backends/trtllm/sm100_runner.py":
-        "9ae2ae0f475697b137710028c71517db08bb6ee7c2bdd5a7e40a2849c91df3e8",
+    "flashinfer/fused_moe/backends/trtllm/sm100_runner.py": "9ae2ae0f475697b137710028c71517db08bb6ee7c2bdd5a7e40a2849c91df3e8",
     "flashinfer/autotuner/autotuner.py": "e222f35f8b5a59a99a45fad627a79db8fc45fadc52b667e63b70c0968509109d",
-    "flashinfer/data/csrc/trtllm_fused_moe_kernel_launcher.cu":
-        "82c24909c7c56a4001061afa4e582f0a372b9267c22fcd439517e7fe330b76d1",
-    "flashinfer/data/csrc/trtllm_fused_moe_runner.cu":
-        "f155765b0062a5d8a2395d4c654d10b2a56075abdf0aefd26a6f4274c56867c4",
+    "flashinfer/data/csrc/trtllm_fused_moe_kernel_launcher.cu": "82c24909c7c56a4001061afa4e582f0a372b9267c22fcd439517e7fe330b76d1",
+    "flashinfer/data/csrc/trtllm_fused_moe_runner.cu": "f155765b0062a5d8a2395d4c654d10b2a56075abdf0aefd26a6f4274c56867c4",
     # kernel-list version (config indices refer to it) and the module build spec
     "flashinfer/artifacts.py": "2e6b8d6c9abe220dca8efd964f7bd9cb133bab157995fe0e9cfa501f09e859db",
     "flashinfer/jit/fused_moe.py": "6cb45654b8a838ebe2c7689927d1bde2c6df89d48829cd835afdf5f55580a538",
@@ -73,7 +75,9 @@ def device_key(index: int) -> str:
     import torch
 
     major, minor = torch.cuda.get_device_capability(index)
-    return hashlib.sha256(f"{torch.cuda.get_device_name(index)}|{major}.{minor}".encode()).hexdigest()[:16]
+    return hashlib.sha256(
+        f"{torch.cuda.get_device_name(index)}|{major}.{minor}".encode()
+    ).hexdigest()[:16]
 
 
 def device_table(index: int) -> dict[int, dict[int, tuple[int, int]]] | None:
@@ -82,13 +86,22 @@ def device_table(index: int) -> dict[int, dict[int, tuple[int, int]]] | None:
         data = json.loads((DATA_DIR / f"{device_key(index)}.json").read_text())
     except (OSError, ValueError):
         return None
-    return {int(le): {int(m): (int(t), int(c)) for m, (t, c) in rows.items()} for le, rows in data["table"].items()}
+    return {
+        int(le): {int(m): (int(t), int(c)) for m, (t, c) in rows.items()}
+        for le, rows in data["table"].items()
+    }
 
 
 _lock = threading.Lock()
 # require_candidate: only apply a table entry that is in FlashInfer's own candidate set for the shape (the bench
 # turns it off to sweep every tile the launcher accepts).
-_state: dict = {"engaged": None, "table": {}, "orig": None, "require_candidate": True, "per_device": False}
+_state: dict = {
+    "engaged": None,
+    "table": {},
+    "orig": None,
+    "require_candidate": True,
+    "per_device": False,
+}
 _candidate_cache: dict = {}
 
 
@@ -112,8 +125,12 @@ def _pins_ok() -> tuple[bool, str]:
         except OSError:
             got = None
         if got != sha:
-            logger.warning("muse_vr_plugin: %s sha256 %s does not match the pin %s", rel, (got or "<missing>")[:16],
-                           sha[:16])
+            logger.warning(
+                "muse_vr_plugin: %s sha256 %s does not match the pin %s",
+                rel,
+                (got or "<missing>")[:16],
+                sha[:16],
+            )
             return False, rel
     return True, ""
 
@@ -133,7 +150,11 @@ def parse_table(text: str) -> dict[int, dict[int, tuple[int, int]]]:
 
 
 def format_table(table: dict[int, dict[int, tuple[int, int]]]) -> str:
-    return ",".join(f"{le}@{m}:{t}/{c}" for le in sorted(table) for m, (t, c) in sorted(table[le].items()))
+    return ",".join(
+        f"{le}@{m}:{t}/{c}"
+        for le in sorted(table)
+        for m, (t, c) in sorted(table[le].items())
+    )
 
 
 def _is_target(runner) -> bool:
@@ -158,9 +179,21 @@ def candidate_tactics(runner, num_tokens: int) -> set[tuple[int, int]]:
     hit = _candidate_cache.get(key)
     if hit is None:
         rows = runner.moe_op.trtllm_get_valid_moe_configs(
-            runner.dtype_act, runner.dtype_weights, runner.fp8_quantization_type, runner.top_k, runner.hidden_size,
-            runner.hidden_size_output, runner.intermediate_size, runner.num_local_experts, runner.activation_type,
-            runner.use_shuffled_weight, runner.weight_layout, runner.use_per_token_scaling, int(num_tokens), False)
+            runner.dtype_act,
+            runner.dtype_weights,
+            runner.fp8_quantization_type,
+            runner.top_k,
+            runner.hidden_size,
+            runner.hidden_size_output,
+            runner.intermediate_size,
+            runner.num_local_experts,
+            runner.activation_type,
+            runner.use_shuffled_weight,
+            runner.weight_layout,
+            runner.use_per_token_scaling,
+            int(num_tokens),
+            False,
+        )
         hit = {(int(r[0]), int(r[1])) for r in rows}
         _candidate_cache[key] = hit
     return hit
@@ -172,7 +205,9 @@ def lookup(local_experts: int, num_tokens: int) -> tuple[int, int] | None:
         return None
     if num_tokens in rows:
         return rows[num_tokens]
-    if num_tokens > max(rows):  # beyond the swept range (e.g. prefill chunks): keep the stock choice
+    if num_tokens > max(
+        rows
+    ):  # beyond the swept range (e.g. prefill chunks): keep the stock choice
         return None
     lower = [m for m in rows if m < num_tokens]
     return rows[max(lower)] if lower else None
@@ -189,19 +224,32 @@ def _resolve_device_table(inputs) -> None:
         table = device_table(index) if index is not None else None
         _state["table"] = table or {}
         _candidate_cache.clear()
-    bed.report(NAME + ":table", bool(table), key=device_key(index) if index is not None else None,
-               entries=format_table(table) if table else "")
+    bed.report(
+        NAME + ":table",
+        bool(table),
+        key=device_key(index) if index is not None else None,
+        entries=format_table(table) if table else "",
+    )
 
 
 def _choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
     orig = _state["orig"]
     if custom_op == _OP and _state["per_device"]:
         _resolve_device_table(inputs)
-    if custom_op != _OP or self.is_tuning_mode or not runners or not _is_target(runners[0]):
+    if (
+        custom_op != _OP
+        or self.is_tuning_mode
+        or not runners
+        or not _is_target(runners[0])
+    ):
         return orig(self, custom_op, runners, tuning_config, inputs, **kwargs)
     runner = runners[0]
-    hidden_states = inputs[4]  # MoeRunnerInputs field order: output, logits, ids, weights, hidden_states, ...
-    if hidden_states is None or str(hidden_states.dtype) != "torch.uint8":  # packed NVFP4 activations only
+    hidden_states = inputs[
+        4
+    ]  # MoeRunnerInputs field order: output, logits, ids, weights, hidden_states, ...
+    if (
+        hidden_states is None or str(hidden_states.dtype) != "torch.uint8"
+    ):  # packed NVFP4 activations only
         return orig(self, custom_op, runners, tuning_config, inputs, **kwargs)
     m = int(hidden_states.shape[0])
     tac = lookup(runner.num_local_experts, m)
@@ -213,7 +261,11 @@ def _choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
         try:
             ok = tac in candidate_tactics(runner, m)
         except Exception as e:  # noqa: BLE001 - any query failure keeps the stock choice
-            logger.warning("muse_vr_plugin: moe_tactic candidate query failed at M=%d (%s); stock tactic kept", m, e)
+            logger.warning(
+                "muse_vr_plugin: moe_tactic candidate query failed at M=%d (%s); stock tactic kept",
+                m,
+                e,
+            )
             ok = False
     if not ok:
         bed.count(NAME, f"stock_not_candidate_m{m}")
@@ -222,14 +274,18 @@ def _choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
     return runner, [int(tac[0]), int(tac[1])]
 
 
-def install(table: dict[int, dict[int, tuple[int, int]]] | None, require_candidate: bool = True) -> bool:
+def install(
+    table: dict[int, dict[int, tuple[int, int]]] | None, require_candidate: bool = True
+) -> bool:
     """Install the autotuner hook with ``table`` (also used by the bench and the tests); ``None`` = the device's
     packaged table, resolved at the first routed-MoE call."""
     from flashinfer.autotuner import AutoTuner
 
     with _lock:
         _state["per_device"] = table is None
-        _state["table"] = {} if table is None else {int(le): dict(rows) for le, rows in table.items()}
+        _state["table"] = (
+            {} if table is None else {int(le): dict(rows) for le, rows in table.items()}
+        )
         _state["require_candidate"] = bool(require_candidate)
         _candidate_cache.clear()
         if _state["orig"] is None:
@@ -277,6 +333,10 @@ def engage() -> bool:
         bed.report(NAME, False, reason=f"install failed: {e}")
         _state["engaged"] = False
         return False
-    bed.report(NAME, True, table=format_table(table) if table is not None else "per-device file")
+    bed.report(
+        NAME,
+        True,
+        table=format_table(table) if table is not None else "per-device file",
+    )
     _state["engaged"] = True
     return True

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """SGLang's fused pre-expert RMS norm + per-token NVFP4 quant (``norm_fp4_quant``), built from a copy whose
 programmatic-launch trigger is issued at kernel entry (csrc/norm_fp4_quant_early.cuh; the arithmetic is SGLang's).
 
@@ -24,7 +26,9 @@ def _num_threads(hidden_size: int) -> int:
     """SGLang's thread-count rule for this kernel (the launch shape, and so the reduction order, is SGLang's)."""
     blocks = hidden_size // _BLOCK
     if hidden_size % _BLOCK or blocks % 32:
-        raise RuntimeError(f"norm_fp4_quant_early: hidden_size={hidden_size} must be a multiple of 512")
+        raise RuntimeError(
+            f"norm_fp4_quant_early: hidden_size={hidden_size} must be a multiple of 512"
+        )
     for threads in (256, 512, _MAX_THREADS, 128, 64, 32):
         if blocks % threads == 0:
             return threads
@@ -40,7 +44,9 @@ def _module(hidden_size: int, num_threads: int):
         "muse_vr_norm_fp4_quant_early",
         *args,
         cuda_files=[str(_CUH)],
-        cuda_wrappers=[("run_quant", f"MuseVrNormFp4QuantEarly<{args}, true, false>::run")],
+        cuda_wrappers=[
+            ("run_quant", f"MuseVrNormFp4QuantEarly<{args}, true, false>::run")
+        ],
         extra_include_paths=[str(_CSRC)],
     )
 
@@ -49,7 +55,9 @@ def preload(hidden_size: int) -> None:
     _module(hidden_size, _num_threads(hidden_size))
 
 
-def fused_norm_fp4_quant_early(x: torch.Tensor, weight, eps: float, global_scale_inv: float):
+def fused_norm_fp4_quant_early(
+    x: torch.Tensor, weight, eps: float, global_scale_inv: float
+):
     assert x.dtype == torch.bfloat16 and x.dim() == 2 and x.is_contiguous()
     m, hidden_size = x.shape
     if weight is not None:
@@ -60,6 +68,7 @@ def fused_norm_fp4_quant_early(x: torch.Tensor, weight, eps: float, global_scale
     pts = torch.empty(m, dtype=torch.float32, device=x.device)
     if m == 0:
         return fp4, sf, pts, None
-    _module(hidden_size, _num_threads(hidden_size)).run_quant(x, weight, None, fp4, sf, pts, float(eps),
-                                                            float(global_scale_inv))
+    _module(hidden_size, _num_threads(hidden_size)).run_quant(
+        x, weight, None, fp4, sf, pts, float(eps), float(global_scale_inv)
+    )
     return fp4, sf, pts, None

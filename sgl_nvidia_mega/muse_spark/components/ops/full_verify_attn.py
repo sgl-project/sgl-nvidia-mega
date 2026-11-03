@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paged FP8 verify attention on tensor-core MMA (tcgen05) with a length-proportional key split, JIT CUDA.
 
 See ``csrc/full_verify_attn.cuh`` for the arithmetic, the work split and the synchronization. The op covers the
@@ -28,7 +30,13 @@ _BLOCKS_PER_SM = 1.0
 
 
 @functools.lru_cache(maxsize=None)
-def _module(use_pdl: bool, cluster: bool = False, norm_gate: bool = False, qk: int = 0, unfused: bool = False):
+def _module(
+    use_pdl: bool,
+    cluster: bool = False,
+    norm_gate: bool = False,
+    qk: int = 0,
+    unfused: bool = False,
+):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
     args = make_cpp_args(use_pdl, cluster, norm_gate, qk, unfused)
@@ -36,7 +44,9 @@ def _module(use_pdl: bool, cluster: bool = False, norm_gate: bool = False, qk: i
         "muse_vr_full_verify_attn",
         *args,
         cuda_files=[str(_CSRC)],
-        cuda_wrappers=[("full_verify_attn", f"muse_vr::FullVerifyAttnKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("full_verify_attn", f"muse_vr::FullVerifyAttnKernel<{args}>::run")
+        ],
     )
 
 
@@ -70,9 +80,15 @@ def workspace_floats(num_requests: int, num_kv_heads: int, splits: int) -> int:
     return num_requests * num_kv_heads * splits * ROWS * REC_FLOATS
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int) -> bool:
-    return (head_dim == HEAD_DIM and num_kv_heads * Q_PER_KV == num_q_heads and num_kv_heads % 2 == 0
-            and page_size == PAGE)
+def supported(
+    num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int
+) -> bool:
+    return (
+        head_dim == HEAD_DIM
+        and num_kv_heads * Q_PER_KV == num_q_heads
+        and num_kv_heads % 2 == 0
+        and page_size == PAGE
+    )
 
 
 def full_verify_attn(
@@ -142,30 +158,90 @@ def full_verify_attn(
     flat = out.view(out.shape[0], -1)
     from .swa_verify_attn import qk_unfused
 
-    _module(bool(use_pdl), bool(cluster), gate is not None, qk, qk_unfused(qk)).full_verify_attn(
-        q if q is not None else out, k_pool, v_pool, page_table, seq_lens, out, ws, int(window_left), int(page_size),
-        int(s), float(bmm1_scale), float(bmm2_scale), gate if gate is not None else flat, float(norm_eps),
-        qkv if qkv is not None else flat, cache_loc if cache_loc is not None else seq_lens, float(qk_eps))
+    _module(
+        bool(use_pdl), bool(cluster), gate is not None, qk, qk_unfused(qk)
+    ).full_verify_attn(
+        q if q is not None else out,
+        k_pool,
+        v_pool,
+        page_table,
+        seq_lens,
+        out,
+        ws,
+        int(window_left),
+        int(page_size),
+        int(s),
+        float(bmm1_scale),
+        float(bmm2_scale),
+        gate if gate is not None else flat,
+        float(norm_eps),
+        qkv if qkv is not None else flat,
+        cache_loc if cache_loc is not None else seq_lens,
+        float(qk_eps),
+    )
     return out
 
 
-def preload(max_requests: int, num_q_heads: int, num_kv_heads: int, device, norm_gate: bool = False,
-            use_pdl: bool = False, qk_max_requests: int = 0) -> None:
+def preload(
+    max_requests: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    device,
+    norm_gate: bool = False,
+    use_pdl: bool = False,
+    qk_max_requests: int = 0,
+) -> None:
     """Build and load the kernels and size the workspace for up to ``max_requests`` requests (and the query/key
     prologue variants for up to ``qk_max_requests``), so that no build, module load, function attribute call or
     allocation happens inside a CUDA-graph capture."""
-    key = (device.type, device.index, max_requests, num_q_heads, num_kv_heads, norm_gate, use_pdl, qk_max_requests)
+    key = (
+        device.type,
+        device.index,
+        max_requests,
+        num_q_heads,
+        num_kv_heads,
+        norm_gate,
+        use_pdl,
+        qk_max_requests,
+    )
     if key in _preloaded:
         return
-    workspace(device, max(workspace_floats(n, num_kv_heads, num_splits(n, num_kv_heads, device))
-                          for n in range(1, max_requests + 1)))
-    q = torch.zeros(TOKENS_PER_REQUEST, num_q_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
-    pool = torch.zeros(2 * PAGE, num_kv_heads * HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
+    workspace(
+        device,
+        max(
+            workspace_floats(n, num_kv_heads, num_splits(n, num_kv_heads, device))
+            for n in range(1, max_requests + 1)
+        ),
+    )
+    q = torch.zeros(
+        TOKENS_PER_REQUEST,
+        num_q_heads,
+        HEAD_DIM,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    pool = torch.zeros(
+        2 * PAGE, num_kv_heads * HEAD_DIM, dtype=torch.float8_e4m3fn, device=device
+    )
     table = torch.zeros(1, 2, dtype=torch.int32, device=device)
     lens = torch.full((1,), TOKENS_PER_REQUEST, dtype=torch.int32, device=device)
-    gate = torch.zeros(TOKENS_PER_REQUEST, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device)
-    full_verify_attn(q, pool, pool, table, lens, -1, PAGE, 1.0, 1.0, use_pdl=use_pdl,
-                     gate=gate if norm_gate else None, norm_eps=1e-6)
+    gate = torch.zeros(
+        TOKENS_PER_REQUEST, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    full_verify_attn(
+        q,
+        pool,
+        pool,
+        table,
+        lens,
+        -1,
+        PAGE,
+        1.0,
+        1.0,
+        use_pdl=use_pdl,
+        gate=gate if norm_gate else None,
+        norm_eps=1e-6,
+    )
     from .swa_verify_attn import qk_class
 
     width = (2 * num_q_heads + 2 * num_kv_heads) * HEAD_DIM
@@ -176,12 +252,27 @@ def preload(max_requests: int, num_q_heads: int, num_kv_heads: int, device, norm
         if qk is None:
             continue
         rows = n * TOKENS_PER_REQUEST
-        g = torch.zeros(rows, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device)
-        full_verify_attn(None, pool, pool, table.expand(n, -1).contiguous(), lens.expand(n).contiguous(), -1, PAGE,
-                         1.0, 1.0, use_pdl=use_pdl, gate=g if norm_gate else None, norm_eps=1e-6,
-                         qkv=torch.zeros(rows, width, dtype=torch.bfloat16, device=device),
-                         cache_loc=torch.zeros(rows, dtype=torch.int64, device=device), qk_eps=1e-6,
-                         num_q_heads=num_q_heads)
+        g = torch.zeros(
+            rows, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        full_verify_attn(
+            None,
+            pool,
+            pool,
+            table.expand(n, -1).contiguous(),
+            lens.expand(n).contiguous(),
+            -1,
+            PAGE,
+            1.0,
+            1.0,
+            use_pdl=use_pdl,
+            gate=g if norm_gate else None,
+            norm_eps=1e-6,
+            qkv=torch.zeros(rows, width, dtype=torch.bfloat16, device=device),
+            cache_loc=torch.zeros(rows, dtype=torch.int64, device=device),
+            qk_eps=1e-6,
+            num_q_heads=num_q_heads,
+        )
     torch.cuda.current_stream(device).synchronize()
     _preloaded.add(key)
 

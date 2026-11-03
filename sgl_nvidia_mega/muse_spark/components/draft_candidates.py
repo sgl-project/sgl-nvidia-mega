@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``draft_candidates`` (env ``MUSE_VR_DRAFT_CANDIDATES=1``, default off).
 
 The DFlash2 draft proposes its block through a candidate selector that needs, for every drafted position, the global
@@ -53,8 +55,14 @@ _CUH = Path(__file__).resolve().parent / "csrc" / "draft_candidates.cuh"
 # draft model (candidate_topk, its projection and shard top-k, the unary transform), the push plane and its
 # communicator header, and the gather kernel whose protocol the exchange follows.
 PINS = {
-    "sglang/srt/models/dflash.py": ("59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff", "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b"),
-    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": ("277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001", "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5"),
+    "sglang/srt/models/dflash.py": (
+        "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
+        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+    ),
+    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
+        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+    ),
     "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
 }
 # PyTorch builds whose torch.topk tie order on the gathered entries the bitwise test matched (torch.version.git_version),
@@ -73,10 +81,16 @@ _state: dict = {"loaded": set(), "check": {}, "sms": {}}
 
 
 def _sm_count(device) -> int:
-    idx = device.index if device is not None and device.index is not None else torch.cuda.current_device()
+    idx = (
+        device.index
+        if device is not None and device.index is not None
+        else torch.cuda.current_device()
+    )
     n = _state["sms"].get(idx)
     if n is None:
-        n = _state["sms"][idx] = int(torch.cuda.get_device_properties(idx).multi_processor_count)
+        n = _state["sms"][idx] = int(
+            torch.cuda.get_device_properties(idx).multi_processor_count
+        )
     return n
 
 
@@ -96,7 +110,10 @@ def pins_match() -> tuple[bool, str]:
         if not bed.pinned(rel, want):
             return False, f"{rel} differs from the pinned revision"
     if torch.version.git_version not in VALIDATED_TORCH:
-        return False, f"PyTorch build {torch.version.git_version[:12]} not in the validated set"
+        return (
+            False,
+            f"PyTorch build {torch.version.git_version[:12]} not in the validated set",
+        )
     return True, "ok"
 
 
@@ -140,8 +157,15 @@ def transform_params(model) -> tuple[float, float, bool, bool]:
     return mult, float(cap) if cap is not None else 1.0, mult != 1.0, cap is not None
 
 
-def merge_gathered(gathered_words: torch.Tensor, world: int, mult: float, cap: float, has_mult: bool, has_cap: bool,
-                   stable: bool | None = None):
+def merge_gathered(
+    gathered_words: torch.Tensor,
+    world: int,
+    mult: float,
+    cap: float,
+    has_mult: bool,
+    has_cap: bool,
+    stable: bool | None = None,
+):
     """Test entry: merge ``[N, world * k, 2]`` int32 records (as pushed) on one GPU. Returns (ids int64, vals fp32).
     ``stable``: the order mode; None takes the one this build's rule predicts for ``N`` rows."""
     n = gathered_words.shape[0]
@@ -152,8 +176,18 @@ def merge_gathered(gathered_words: torch.Tensor, world: int, mult: float, cap: f
     out_vals = torch.empty((n, TOP_K), dtype=torch.float32, device=dev)
     vals_like = torch.empty((n, TOP_K), dtype=torch.bfloat16, device=dev)
     ids_like = torch.empty((n, TOP_K), dtype=torch.int64, device=dev)
-    module(world, False).merge_only(gathered_words, out_ids, out_vals, vals_like, ids_like, mult, cap, has_mult, has_cap,
-                                    bool(stable))
+    module(world, False).merge_only(
+        gathered_words,
+        out_ids,
+        out_vals,
+        vals_like,
+        ids_like,
+        mult,
+        cap,
+        has_mult,
+        has_cap,
+        bool(stable),
+    )
     return out_ids, out_vals
 
 
@@ -163,14 +197,20 @@ def _tie_rows(world: int, rows: int, device):
     levels = torch.tensor([3.0, 2.5, 2.5, 2.0, 1.0, -0.0, 0.0, 7.0], device=device)
     r = torch.arange(rows, device=device).unsqueeze(1)
     c = torch.arange(e, device=device).unsqueeze(0)
-    vals = levels[(r * 5 + c * 3 + (r * c) % 7) % levels.numel()].to(torch.bfloat16).contiguous()
+    vals = (
+        levels[(r * 5 + c * 3 + (r * c) % 7) % levels.numel()]
+        .to(torch.bfloat16)
+        .contiguous()
+    )
     gids = (c * 977 + 13).expand(rows, e).contiguous()
     return vals, gids
 
 
 def _words(vals_bf16: torch.Tensor, gids: torch.Tensor) -> torch.Tensor:
     bits = vals_bf16.view(torch.int16).to(torch.int32) & 0xFFFF
-    return torch.stack([(bits << 16) | 1, (gids + 1).to(torch.int32)], dim=-1).contiguous()
+    return torch.stack(
+        [(bits << 16) | 1, (gids + 1).to(torch.int32)], dim=-1
+    ).contiguous()
 
 
 def self_check(world: int, device) -> str | None:
@@ -180,17 +220,28 @@ def self_check(world: int, device) -> str | None:
     and the shapes deterministic, so every rank reaches the same answer."""
     t = _sm_count(device)
     for rows in sorted({1, max(1, t - 1), t, 2 * t}):
-        lab = "T" if rows == t else ("2T" if rows == 2 * t else ("T-1" if rows == t - 1 else str(rows)))
+        lab = (
+            "T"
+            if rows == t
+            else ("2T" if rows == 2 * t else ("T-1" if rows == t - 1 else str(rows)))
+        )
         vals, gids = _tie_rows(world, rows, device)
         ref_vals, sel = torch.topk(vals.float(), TOP_K, dim=-1)
         if rows >= t:
             again_vals, again_sel = torch.topk(vals.float(), TOP_K, dim=-1)
-            if not (torch.equal(sel, again_sel)
-                    and torch.equal(again_vals.view(torch.int32), ref_vals.view(torch.int32))):
+            if not (
+                torch.equal(sel, again_sel)
+                and torch.equal(
+                    again_vals.view(torch.int32), ref_vals.view(torch.int32)
+                )
+            ):
                 return f"world {world} rows {lab}: two torch.topk calls differ"
         ref_ids = torch.gather(gids, -1, sel).long()
         ids, out = merge_gathered(_words(vals, gids), world, 1.0, 1.0, False, False)
-        if not (torch.equal(ids, ref_ids) and torch.equal(out.view(torch.int32), ref_vals.view(torch.int32))):
+        if not (
+            torch.equal(ids, ref_ids)
+            and torch.equal(out.view(torch.int32), ref_vals.view(torch.int32))
+        ):
             return f"world {world} rows {lab}"
     return None
 
@@ -205,7 +256,9 @@ def _preload(world: int, device) -> None:
     bad = self_check(world, device)
     _state["check"][key] = bad
     if bad is not None:
-        logger.warning("%s: tie order self-check failed (%s); the stock path is kept", NAME, bad)
+        logger.warning(
+            "%s: tie order self-check failed (%s); the stock path is kept", NAME, bad
+        )
     _module(world, _use_pdl())  # same build for the plane path
     if bed.flag(NAME + "_topk"):
         from .ops import shard_topk
@@ -218,7 +271,9 @@ def _preload(world: int, device) -> None:
 def _eligible(model, hidden: torch.Tensor):
     """(reason, context): reason is None when the fused path applies; context carries what it needs."""
     from sglang.srt.distributed import communication_op as co
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
     from sglang.srt.models import dflash as d
 
     lm_head = getattr(model, "lm_head", None)
@@ -230,7 +285,9 @@ def _eligible(model, hidden: torch.Tensor):
     if not (hidden.is_cuda and hidden.dim() == 2):
         return "hidden layout", None
     weight = getattr(lm_head, "weight", None)
-    if d.should_apply_lm_head_quant_method(lm_head, getattr(lm_head, "quant_method", None)):
+    if d.should_apply_lm_head_quant_method(
+        lm_head, getattr(lm_head, "quant_method", None)
+    ):
         return "quantized head", None
     if not d.is_dense_head_weight(weight):
         return "head weight", None
@@ -240,7 +297,11 @@ def _eligible(model, hidden: torch.Tensor):
     if tp not in (2, 4, 8) or group.world_size != tp:
         return "tensor-parallel size", None
     comm = getattr(group, "ca_comm", None)
-    if not isinstance(comm, CustomAllReduceV2) or comm.disabled or getattr(comm, "obj", None) is None:
+    if (
+        not isinstance(comm, CustomAllReduceV2)
+        or comm.disabled
+        or getattr(comm, "obj", None) is None
+    ):
         return "no custom all-reduce", None
     n = hidden.shape[0]
     if n == 0:
@@ -266,7 +327,9 @@ def _stock_tail(model, lm_head, vals, ids):
     gathered_vals = d.tensor_model_parallel_all_gather(vals.float(), dim=-1)
     gathered_ids = d.tensor_model_parallel_all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, TOP_K, dim=-1)
-    return torch.gather(gathered_ids, -1, sel).long(), model._transform_unary_logits(top_vals)
+    return torch.gather(gathered_ids, -1, sel).long(), model._transform_unary_logits(
+        top_vals
+    )
 
 
 def n_rows_ok(logits) -> bool:
@@ -284,7 +347,9 @@ def compute_candidates(original, model, hidden: torch.Tensor):
 
     lm_head, comm, tp = ctx
     shard = lm_head.shard_indices
-    logits = d._project_candidate_logits(hidden, lm_head, num_org=int(shard.num_org_elements), use_quant_head=False)
+    logits = d._project_candidate_logits(
+        hidden, lm_head, num_org=int(shard.num_org_elements), use_quant_head=False
+    )
     vals = ids = None
     if bed.flag(NAME + "_topk") and n_rows_ok(logits):
         from .ops import shard_topk
@@ -293,7 +358,11 @@ def compute_candidates(original, model, hidden: torch.Tensor):
             vals, ids = shard_topk.topk16(logits)
     if vals is None:
         vals, ids = d._radix_topk(logits, TOP_K)
-    if vals.dtype != torch.bfloat16 or ids.dtype != torch.int64 or not (vals.is_contiguous() and ids.is_contiguous()):
+    if (
+        vals.dtype != torch.bfloat16
+        or ids.dtype != torch.int64
+        or not (vals.is_contiguous() and ids.is_contiguous())
+    ):
         # nothing collective has happened yet on any rank: every rank sees the same dtypes and takes this branch; the
         # rest of candidate_topk and the transform run as SGLang runs them, on the shard top-k already computed
         bed.count(NAME, "stock:shard top-k dtype")
@@ -303,8 +372,19 @@ def compute_candidates(original, model, hidden: torch.Tensor):
     out_vals = torch.empty((n, TOP_K), dtype=torch.float32, device=hidden.device)
     mult, cap, has_mult, has_cap = transform_params(model)
     stable = stable_ties(tp, n, hidden.device)
-    _module(tp, _use_pdl()).run(comm.obj, vals, ids, out_ids, out_vals, int(shard.org_vocab_start_index), mult, cap,
-                                has_mult, has_cap, stable)
+    _module(tp, _use_pdl()).run(
+        comm.obj,
+        vals,
+        ids,
+        out_ids,
+        out_vals,
+        int(shard.org_vocab_start_index),
+        mult,
+        cap,
+        has_mult,
+        has_cap,
+        stable,
+    )
     bed.count(NAME, f"fused:rows={n}:tp={tp}:{'stable' if stable else 'network'}")
     return out_ids, out_vals
 

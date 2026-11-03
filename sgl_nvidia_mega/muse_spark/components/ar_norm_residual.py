@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """One-shot push all-reduce fused with the Muse Spark post-norm + gated residual + pre-norm boundary.
 
 Replaces the pair ``CustomAllReduceV2.custom_all_reduce`` (algorithm ``1shot_push``) followed by
@@ -31,7 +33,9 @@ def _jit_module(hidden: int, world: int, threads: int, prefetch: bool, cluster: 
     from sglang.kernels.jit.utils import is_arch_support_pdl, load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 
-    args = make_cpp_args(hidden, world, threads, prefetch, cluster, is_arch_support_pdl())
+    args = make_cpp_args(
+        hidden, world, threads, prefetch, cluster, is_arch_support_pdl()
+    )
     return load_jit(
         "muse_vr_ar_norm_residual",
         *args,
@@ -51,7 +55,9 @@ def _supports_clusters(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index)[0] >= 10
 
 
-def launch_config(hidden_size: int, num_tokens: int, device_index: int, pre_norm_bf16: bool = False):
+def launch_config(
+    hidden_size: int, num_tokens: int, device_index: int, pre_norm_bf16: bool = False
+):
     """(cluster size, threads, prefetch) exactly as SGLang's ``fused_norm_residual`` picks them."""
     from sglang.kernels.ops.muse_spark_v12.norm_residual import (
         _cluster_launch_config,
@@ -67,9 +73,13 @@ def launch_config(hidden_size: int, num_tokens: int, device_index: int, pre_norm
     return cluster, threads, prefetch
 
 
-def supported(comm, num_tokens: int, hidden_size: int, pre_norm_bf16: bool = False) -> bool:
+def supported(
+    comm, num_tokens: int, hidden_size: int, pre_norm_bf16: bool = False
+) -> bool:
     """Shape/communicator gate. The caller separately checks that stock would take ``1shot_push``."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
     if (
         not isinstance(comm, CustomAllReduceV2)
@@ -80,7 +90,9 @@ def supported(comm, num_tokens: int, hidden_size: int, pre_norm_bf16: bool = Fal
     ):
         return False
     try:
-        cluster, _, _ = launch_config(hidden_size, num_tokens, comm.device.index or 0, pre_norm_bf16)
+        cluster, _, _ = launch_config(
+            hidden_size, num_tokens, comm.device.index or 0, pre_norm_bf16
+        )
     except (RuntimeError, ValueError):
         return False
     return cluster == 1 or num_tokens * cluster <= comm.config.num_push_blocks
@@ -111,9 +123,15 @@ def ar_norm_residual(
     router = torch.empty_like(stream) if want_router else None
     if m == 0:
         return output, new_stream, router
-    cluster, threads, prefetch = launch_config(hidden, m, partial.device.index or 0, pre_norm_bf16)
+    cluster, threads, prefetch = launch_config(
+        hidden, m, partial.device.index or 0, pre_norm_bf16
+    )
     module = _jit_module(hidden, comm.world_size, threads, prefetch, cluster)
-    fn = getattr(module, ("run_scale" if post_norm_is_input_scale else "run_std") + ("_router" if want_router else ""))
+    fn = getattr(
+        module,
+        ("run_scale" if post_norm_is_input_scale else "run_std")
+        + ("_router" if want_router else ""),
+    )
     fn(
         comm.obj,
         partial,

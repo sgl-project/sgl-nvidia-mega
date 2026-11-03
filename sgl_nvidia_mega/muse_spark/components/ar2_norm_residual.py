@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Two-shot push all-reduce fused with the Muse Spark post-norm + gated residual + pre-norm boundary.
 
 Replaces the pair "custom all-reduce (``2shot_push``, or the ``2shot_pull`` that SGLang picks above the one-shot
@@ -42,11 +44,15 @@ def _negctl() -> int:
 
 
 @_cache
-def _jit_module(hidden: int, world: int, threads: int, prefetch: bool, cluster: int, negctl: int = 0):
+def _jit_module(
+    hidden: int, world: int, threads: int, prefetch: bool, cluster: int, negctl: int = 0
+):
     from sglang.kernels.jit.utils import is_arch_support_pdl, load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 
-    args = make_cpp_args(hidden, world, threads, prefetch, cluster, is_arch_support_pdl())
+    args = make_cpp_args(
+        hidden, world, threads, prefetch, cluster, is_arch_support_pdl()
+    )
     flags = [f"-DMUSE_VR_AR2_NEGCTL={negctl}"] if negctl else []
     return load_jit(
         "muse_vr_ar2_norm_residual" + (f"_negctl{negctl}" if negctl else ""),
@@ -68,9 +74,13 @@ def slot_bytes_needed(world: int, num_tokens: int, hidden_size: int) -> int:
     return 2 * (num_tokens // world) * hidden_size * 2
 
 
-def supported(comm, num_tokens: int, hidden_size: int, pre_norm_bf16: bool = False) -> bool:
+def supported(
+    comm, num_tokens: int, hidden_size: int, pre_norm_bf16: bool = False
+) -> bool:
     """Shape / communicator gate (the caller separately checks which all-reduce stock would run)."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
     if (
         not isinstance(comm, CustomAllReduceV2)
@@ -78,11 +88,14 @@ def supported(comm, num_tokens: int, hidden_size: int, pre_norm_bf16: bool = Fal
         or not 2 <= comm.world_size <= _MAX_WORLD
         or num_tokens <= 0
         or num_tokens % comm.world_size
-        or slot_bytes_needed(comm.world_size, num_tokens, hidden_size) > comm.max_push_size
+        or slot_bytes_needed(comm.world_size, num_tokens, hidden_size)
+        > comm.max_push_size
     ):
         return False
     try:
-        cluster, _, _ = launch_config(hidden_size, num_tokens, comm.device.index or 0, pre_norm_bf16)
+        cluster, _, _ = launch_config(
+            hidden_size, num_tokens, comm.device.index or 0, pre_norm_bf16
+        )
     except (RuntimeError, ValueError):
         return False
     return cluster == 1 or num_tokens * cluster <= comm.config.num_push_blocks
@@ -113,10 +126,16 @@ def ar2_norm_residual(
     router = torch.empty_like(stream) if want_router else None
     if m == 0:
         return output, new_stream, router
-    cluster, threads, prefetch = launch_config(hidden, m, partial.device.index or 0, pre_norm_bf16)
+    cluster, threads, prefetch = launch_config(
+        hidden, m, partial.device.index or 0, pre_norm_bf16
+    )
     negctl = _negctl()
     module = _jit_module(hidden, comm.world_size, threads, prefetch, cluster, negctl)
-    fn = getattr(module, ("run_scale" if post_norm_is_input_scale else "run_std") + ("_router" if want_router else ""))
+    fn = getattr(
+        module,
+        ("run_scale" if post_norm_is_input_scale else "run_std")
+        + ("_router" if want_router else ""),
+    )
     fn(
         comm.obj,
         partial,

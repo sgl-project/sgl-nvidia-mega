@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Dequantize the native NVFP4 KV pages of one prefill batch into an FP8 (E4M3) workspace, so the stock FP8-KV
  * context kernel can serve prefill over an NVFP4 KV cache.

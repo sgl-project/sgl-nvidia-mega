@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``small_extend_attn``: run the attention of small prefill extends with the split-KV decode kernel.
 
 SGLang's TRT-LLM MHA backend computes the attention of every EXTEND forward with FlashInfer's trtllm-gen context
@@ -36,8 +38,10 @@ NAME = "small_extend_attn"
 DEFAULT_MAX_Q = 768
 
 SGLANG_PINS = {
-    "sglang/srt/layers/attention/trtllm_mha_backend.py":
-        ("566d1031d644f71a8adb84d1e2a1581d3a6d1c3cac1e507451ac4cf034c39da4", "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646"),
+    "sglang/srt/layers/attention/trtllm_mha_backend.py": (
+        "566d1031d644f71a8adb84d1e2a1581d3a6d1c3cac1e507451ac4cf034c39da4",
+        "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+    ),
 }
 FLASHINFER_PINS = {
     "flashinfer/prefill.py": (
@@ -50,16 +54,39 @@ FLASHINFER_PINS = {
     ),
 }
 
-_state: dict = {"engaged": None, "max_q": DEFAULT_MAX_Q, "orig_ctx": None, "orig_fwd": None}
+_state: dict = {
+    "engaged": None,
+    "max_q": DEFAULT_MAX_Q,
+    "orig_ctx": None,
+    "orig_fwd": None,
+}
 # set by the forward_extend wrapper for an eligible call: {"mcb": the backend's multi-CTA counter buffer}
-_route: contextvars.ContextVar = contextvars.ContextVar("muse_vr_small_extend_route", default=None)
+_route: contextvars.ContextVar = contextvars.ContextVar(
+    "muse_vr_small_extend_route", default=None
+)
 
 # Context-kernel keywords the redirect understands; any other keyword (LSE output, FP4 output scales, sage/sparse
 # variants, ...) keeps the stock context kernel.
 _HANDLED = {
-    "query", "kv_cache", "workspace_buffer", "block_tables", "seq_lens", "max_q_len", "max_kv_len", "bmm1_scale",
-    "bmm2_scale", "batch_size", "cum_seq_lens_q", "cum_seq_lens_kv", "window_left", "out", "out_dtype", "sinks",
-    "skip_softmax_threshold_scale_factor", "kv_cache_sf", "causal",
+    "query",
+    "kv_cache",
+    "workspace_buffer",
+    "block_tables",
+    "seq_lens",
+    "max_q_len",
+    "max_kv_len",
+    "bmm1_scale",
+    "bmm2_scale",
+    "batch_size",
+    "cum_seq_lens_q",
+    "cum_seq_lens_kv",
+    "window_left",
+    "out",
+    "out_dtype",
+    "sinks",
+    "skip_softmax_threshold_scale_factor",
+    "kv_cache_sf",
+    "causal",
 }
 
 
@@ -77,8 +104,12 @@ def _pins_ok() -> tuple[bool, str]:
         except OSError:
             got = None
         if not bed.sha_ok(got, sha):
-            logger.warning("muse_vr_plugin: %s sha256 %s does not match the pin %s", rel, (got or "<missing>")[:16],
-                           bed.sha_label(sha))
+            logger.warning(
+                "muse_vr_plugin: %s sha256 %s does not match the pin %s",
+                rel,
+                (got or "<missing>")[:16],
+                bed.sha_label(sha),
+            )
             return False, rel
     return True, ""
 
@@ -86,8 +117,14 @@ def _pins_ok() -> tuple[bool, str]:
 def _context_attn(*args, **kwargs):
     """Stand-in for ``flashinfer.prefill.trtllm_batch_context_with_kv_cache``: diverts eligible calls only."""
     route = _route.get()
-    if (route is None or args or not set(kwargs) <= _HANDLED or not kwargs.get("causal", True)
-            or kwargs.get("kv_cache_sf") is not None or kwargs.get("skip_softmax_threshold_scale_factor") is not None):
+    if (
+        route is None
+        or args
+        or not set(kwargs) <= _HANDLED
+        or not kwargs.get("causal", True)
+        or kwargs.get("kv_cache_sf") is not None
+        or kwargs.get("skip_softmax_threshold_scale_factor") is not None
+    ):
         return _state["orig_ctx"](*args, **kwargs)
     import flashinfer
 
@@ -135,7 +172,9 @@ def eligible(backend, layer, forward_batch) -> bool:
 
 def _wrap_forward_extend(fn):
     @functools.wraps(fn)
-    def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+    def forward_extend(
+        self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
+    ):
         if not eligible(self, layer, forward_batch):
             return fn(self, q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
         token = _route.set({"mcb": self._multi_ctas_kv_counter_buffer})
@@ -150,7 +189,6 @@ def _wrap_forward_extend(fn):
 
 def install(max_q: int) -> None:
     import flashinfer.prefill
-
     from sglang.srt.layers.attention import trtllm_mha_backend as tb
 
     _state["max_q"] = int(max_q)
@@ -174,7 +212,9 @@ def engage() -> bool:
         _state["engaged"] = False
         return False
     try:
-        max_q = int(os.environ.get("MUSE_VR_SMALL_EXTEND_ATTN_MAX_Q", str(DEFAULT_MAX_Q)))
+        max_q = int(
+            os.environ.get("MUSE_VR_SMALL_EXTEND_ATTN_MAX_Q", str(DEFAULT_MAX_Q))
+        )
         if max_q <= 0:
             raise ValueError("must be positive")
     except ValueError as e:

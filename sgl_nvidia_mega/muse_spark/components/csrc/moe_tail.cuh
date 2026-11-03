@@ -1,4 +1,6 @@
 // Derived in part from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Source: SGLang python/sglang/kernels/jit/csrc/muse_spark_v12/all_gather_norm_residual.cuh at revision a55ab7d
 // (the cluster boundary kernel: thread map, moment accumulation and output arithmetic).
 // Modified by NVIDIA: the gathered rows that feed the boundary are produced by a separate projection kernel that stores

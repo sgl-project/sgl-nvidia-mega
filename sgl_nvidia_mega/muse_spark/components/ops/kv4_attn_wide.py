@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paged full-attention verify for many requests per step over a native NVFP4 KV cache, JIT CUDA
 (``csrc/kv4_attn_wide.cuh``).
 
@@ -26,7 +28,9 @@ HEAD_DIM = 64
 Q_PER_KV = 8
 PAGE = 128
 REC_FLOATS = 68
-TRACE_FLOATS = 3 * 24 * 256 * 2  # development timeline (DQ_MODE bit 16) after the partial records
+TRACE_FLOATS = (
+    3 * 24 * 256 * 2
+)  # development timeline (DQ_MODE bit 16) after the partial records
 ROWS = 64
 MAX_REQUESTS = 256
 # FP8 stage ring and raw (packed) stage ring depths; tunable, sweep with bench/bench_kv4_attn.py
@@ -56,13 +60,17 @@ def _skel_for(hkv: int) -> int:
     """The skeleton options a build at ``hkv`` KV heads takes: option 32 only with option 4 at 4 KV heads, one softmax
     thread per row, probabilities in tensor memory and 4 dequantization warps (other builds drop it)."""
     s = SKEL
-    if not (hkv == 4 and TPR == 1 and (s & 4) and DQ_WARPS == 4 and not (DQ_MODE >> 17) & 1):
+    if not (
+        hkv == 4 and TPR == 1 and (s & 4) and DQ_WARPS == 4 and not (DQ_MODE >> 17) & 1
+    ):
         s &= ~32
     return s
 
 
 @functools.lru_cache(maxsize=None)
-def _module(pairs: int, f8: int, raw: int, use_pdl: bool, tpr: int, dq: int = 0, skel: int = 0):
+def _module(
+    pairs: int, f8: int, raw: int, use_pdl: bool, tpr: int, dq: int = 0, skel: int = 0
+):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
     args = make_cpp_args(pairs, f8, raw, use_pdl, tpr, dq, skel)
@@ -70,7 +78,9 @@ def _module(pairs: int, f8: int, raw: int, use_pdl: bool, tpr: int, dq: int = 0,
     if DQ_WARPS != 4:
         extra.append(f"-DK4W_DQ_WARPS={DQ_WARPS}")
     return load_jit(
-        "muse_vr_kv4_attn_wide" + (f"_san{SAN_POLLS}" if SAN_POLLS > 0 else "") + (f"_dqw{DQ_WARPS}" if DQ_WARPS != 4 else ""),
+        "muse_vr_kv4_attn_wide"
+        + (f"_san{SAN_POLLS}" if SAN_POLLS > 0 else "")
+        + (f"_dqw{DQ_WARPS}" if DQ_WARPS != 4 else ""),
         *args,
         cuda_files=[str(_CSRC)],
         cuda_wrappers=[("kv4_attn_wide", f"muse_vr::Kv4AttnWideKernel<{args}>::run")],
@@ -116,19 +126,32 @@ _workspace: dict = {}
 def workspace(device, num_kv_heads: int, blocks: int):
     """Per-device fp32 partial records and the per-request counters (zero; the kernel leaves them zero). Grows, never
     shrinks; allocate before graph capture."""
-    key = (device.type, device.index if device.index is not None else torch.cuda.current_device())
+    key = (
+        device.type,
+        device.index if device.index is not None else torch.cuda.current_device(),
+    )
     need = blocks * 2 * num_kv_heads * ROWS * REC_FLOATS + TRACE_FLOATS
     ws = _workspace.get(key)
     if ws is None or ws[0].numel() < need:
-        counters = ws[1] if ws is not None else torch.zeros(MAX_REQUESTS, dtype=torch.int32, device=device)
+        counters = (
+            ws[1]
+            if ws is not None
+            else torch.zeros(MAX_REQUESTS, dtype=torch.int32, device=device)
+        )
         ws = (torch.empty(need, dtype=torch.float32, device=device), counters)
         _workspace[key] = ws
     return ws
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int) -> bool:
-    return (head_dim == HEAD_DIM and num_kv_heads * Q_PER_KV == num_q_heads and num_kv_heads in (2, 4)
-            and page_size == PAGE)
+def supported(
+    num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int
+) -> bool:
+    return (
+        head_dim == HEAD_DIM
+        and num_kv_heads * Q_PER_KV == num_q_heads
+        and num_kv_heads in (2, 4)
+        and page_size == PAGE
+    )
 
 
 def kv4_attn_wide(
@@ -166,23 +189,57 @@ def kv4_attn_wide(
         out = torch.empty(m, hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
     g = blocks or num_blocks(q.device)
     ws, counters = workspace(q.device, hkv, g)
-    _module(hkv // 2, f8_stages or F8_STAGES, raw_stages or RAW_STAGES, bool(use_pdl),
-            TPR if hkv == 4 else 2, DQ_MODE, _skel_for(hkv)).kv4_attn_wide(
-        q, kp, vp, k_scales.view(torch.uint8), v_scales.view(torch.uint8), page_table, seq_lens, out, ws, counters,
-        int(g), float(bmm1_scale), float(bmm2_scale))
+    _module(
+        hkv // 2,
+        f8_stages or F8_STAGES,
+        raw_stages or RAW_STAGES,
+        bool(use_pdl),
+        TPR if hkv == 4 else 2,
+        DQ_MODE,
+        _skel_for(hkv),
+    ).kv4_attn_wide(
+        q,
+        kp,
+        vp,
+        k_scales.view(torch.uint8),
+        v_scales.view(torch.uint8),
+        page_table,
+        seq_lens,
+        out,
+        ws,
+        counters,
+        int(g),
+        float(bmm1_scale),
+        float(bmm2_scale),
+    )
     return out
 
 
 def preload(num_q_heads: int, num_kv_heads: int, device, use_pdl: bool = False) -> None:
     """Build and load the kernel and size the workspace, so that no build, module load, function attribute call or
     allocation happens inside a CUDA-graph capture."""
-    key = (device.type, device.index if device.index is not None else torch.cuda.current_device(), num_q_heads,
-           num_kv_heads, use_pdl)
+    key = (
+        device.type,
+        device.index if device.index is not None else torch.cuda.current_device(),
+        num_q_heads,
+        num_kv_heads,
+        use_pdl,
+    )
     if key in _preloaded:
         return
-    q = torch.zeros(TOKENS_PER_REQUEST, num_q_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
-    pool = torch.zeros(2 * PAGE, num_kv_heads, HEAD_DIM // 2, dtype=torch.uint8, device=device)
-    scales = torch.zeros(2, num_kv_heads, PAGE, HEAD_DIM // 16, dtype=torch.uint8, device=device)
+    q = torch.zeros(
+        TOKENS_PER_REQUEST,
+        num_q_heads,
+        HEAD_DIM,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    pool = torch.zeros(
+        2 * PAGE, num_kv_heads, HEAD_DIM // 2, dtype=torch.uint8, device=device
+    )
+    scales = torch.zeros(
+        2, num_kv_heads, PAGE, HEAD_DIM // 16, dtype=torch.uint8, device=device
+    )
     table = torch.zeros(1, 2, dtype=torch.int32, device=device)
     lens = torch.full((1,), TOKENS_PER_REQUEST, dtype=torch.int32, device=device)
     kv4_attn_wide(q, pool, pool, scales, scales, table, lens, 1.0, 1.0, use_pdl=use_pdl)

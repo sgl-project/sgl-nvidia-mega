@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Bounded mbarrier waits for the ``moe_x_kernels`` kernels.
 
 CuTe DSL pipelines block in ``cute.arch.mbarrier_wait``. While one of this package's kernels is traced, that function

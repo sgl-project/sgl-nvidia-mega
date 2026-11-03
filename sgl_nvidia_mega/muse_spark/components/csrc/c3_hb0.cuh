@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Expert-output hop, route all-gather form (header only, device API). Default off: only kernels that include this header
 // use it, and they are selected by a default-off knob.
 //

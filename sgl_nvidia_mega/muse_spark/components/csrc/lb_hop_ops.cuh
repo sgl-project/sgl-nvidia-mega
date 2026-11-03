@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Launch wrappers for the hop device API v2 (lb_hop.cuh): the per-forward sequence bump, the ring counter advance,
 // standalone row transfers, and the self-test kernels used by tests/dist_lb_hop.py.
 #pragma once

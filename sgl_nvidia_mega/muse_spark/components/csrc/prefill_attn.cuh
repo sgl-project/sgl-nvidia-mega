@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Paged FP8 (e4m3) causal attention for prefill (context) forwards with tensor-core MMA (tcgen05): 8 query
  * heads per KV head, head_dim 64, page size 128, bf16 output; any number of requests, each with q_len new tokens at

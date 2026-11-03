@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Paged FP8 (e4m3) full-attention verify for many requests per step: a persistent kernel whose thread blocks
  * split the summed key range of all requests evenly (one block per SM, one wave), read whole token rows of the K/V

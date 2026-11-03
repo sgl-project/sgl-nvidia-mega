@@ -1,4 +1,6 @@
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Source: SGLang python/sglang/kernels/jit/csrc/muse_spark_v12/all_gather.cuh (push-plane gather protocol) at
 // revision a55ab7d.
 // Modified by NVIDIA: gathers the per-rank top-k candidate records of the draft head instead of a bf16 column slice,

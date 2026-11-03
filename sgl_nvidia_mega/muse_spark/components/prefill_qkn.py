@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``prefill_qkn`` (opt-in, default off): the prefill QK norm of ``MuseSpark1xAttention.gated_attention`` on
 the plugin's kernel.
 
@@ -33,10 +35,19 @@ logger = logging.getLogger("muse_vr_plugin")
 NAME = "prefill_qkn"
 TARGET = "sglang.srt.models.muse_spark.MuseSpark1xAttention.gated_attention"
 PINS = {
-    "sglang/srt/models/muse_spark.py": ("7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355", "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
-                                          "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f"),
-    "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": ("99ed08f1f35bbd4174c4a40becfc7978b7a5ba0a055818e79470254e5c8a2b67", "af4a5bb8de205a99761e6959447748e2e00af0831e58e37fa0f862ce9e964a25"),
-    "sglang/srt/layers/radix_attention.py": ("df6e94b67b61feb4f8e3a7b1fdb0c0444cc56e4bf9d90a622e028bddff31619e", "56a6acb0aaeb78c7c9bb8d1d78e5a23ac51fa35436b993aeb5a630cc9f285ff0"),
+    "sglang/srt/models/muse_spark.py": (
+        "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
+        "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+        "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": (
+        "99ed08f1f35bbd4174c4a40becfc7978b7a5ba0a055818e79470254e5c8a2b67",
+        "af4a5bb8de205a99761e6959447748e2e00af0831e58e37fa0f862ce9e964a25",
+    ),
+    "sglang/srt/layers/radix_attention.py": (
+        "df6e94b67b61feb4f8e3a7b1fdb0c0444cc56e4bf9d90a622e028bddff31619e",
+        "56a6acb0aaeb78c7c9bb8d1d78e5a23ac51fa35436b993aeb5a630cc9f285ff0",
+    ),
 }
 # The arithmetic reproduces the fused QK-norm Triton kernel as each validated Triton release compiles it
 # (ops/swa_verify_attn.py, QK_ARITH / qk_arith); other releases keep the stock call.
@@ -48,14 +59,26 @@ PINS = {
 # call to the real tokens and forwards keywords to the backend, where ``_extend_hook`` consumes the spec. Every call
 # the backend's fused FP8 path would not take falls back to the norm-only kernel followed by the stock call, so the
 # backend never receives an un-normalized q.
-TARGET_EXTEND = "sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend.forward_extend"
+TARGET_EXTEND = (
+    "sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend.forward_extend"
+)
 STORE_KW = "muse_vr_pqk_store"
 STORE_PINS = {
-    "sglang/srt/layers/attention/trtllm_mha_backend.py": ("07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",),
-    "sglang/kernels/ops/kvcache/fused_fp8_qkv_kv_cache.py": ("88755d730cec527a7135aabff1c57779d11752ea7b286343c47c285a0be39fa3",),
-    "sglang/kernels/jit/csrc/attention/fused_fp8_qkv_kv_cache.cuh": ("1e28bbf79d380275353a7275f2d4ab7b77d15c102d8eb8677537637bafcea130",),
-    "sglang/srt/layers/attention/graph_utils.py": ("01b178e4c1248d19ce782aa7d8f8c4f292b87fbb7a5a20e250427a3eb1edf764",),
-    "sglang/srt/layers/attention/base_attn_backend.py": ("3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0",),
+    "sglang/srt/layers/attention/trtllm_mha_backend.py": (
+        "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+    ),
+    "sglang/kernels/ops/kvcache/fused_fp8_qkv_kv_cache.py": (
+        "88755d730cec527a7135aabff1c57779d11752ea7b286343c47c285a0be39fa3",
+    ),
+    "sglang/kernels/jit/csrc/attention/fused_fp8_qkv_kv_cache.cuh": (
+        "1e28bbf79d380275353a7275f2d4ab7b77d15c102d8eb8677537637bafcea130",
+    ),
+    "sglang/srt/layers/attention/graph_utils.py": (
+        "01b178e4c1248d19ce782aa7d8f8c4f292b87fbb7a5a20e250427a3eb1edf764",
+    ),
+    "sglang/srt/layers/attention/base_attn_backend.py": (
+        "3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0",
+    ),
 }
 _store_state = {"engaged": False}
 
@@ -63,11 +86,21 @@ _logged: set = set()
 
 
 def enabled() -> bool:
-    return os.environ.get("MUSE_VR_PREFILL_QKN", "0").strip() in ("1", "true", "yes", "on")
+    return os.environ.get("MUSE_VR_PREFILL_QKN", "0").strip() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def store_enabled() -> bool:
-    return os.environ.get("MUSE_VR_PREFILL_QKN_STORE", "0").strip() in ("1", "true", "yes", "on")
+    return os.environ.get("MUSE_VR_PREFILL_QKN_STORE", "0").strip() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class _StoreSpec:
@@ -75,7 +108,9 @@ class _StoreSpec:
 
     __slots__ = ("cos_sin", "num_q_heads", "num_kv_heads", "eps", "rows")
 
-    def __init__(self, cos_sin, num_q_heads: int, num_kv_heads: int, eps: float, rows=None):
+    def __init__(
+        self, cos_sin, num_q_heads: int, num_kv_heads: int, eps: float, rows=None
+    ):
         self.cos_sin = cos_sin
         self.num_q_heads = int(num_q_heads)
         self.num_kv_heads = int(num_kv_heads)
@@ -89,7 +124,10 @@ class _StoreSpec:
 def _store_reason(backend, layer, forward_batch, save_kv_cache) -> str | None:
     """Reason the backend call must keep its own FP8 store, or None (the backend's fused FP8 q + KV path would run
     with unit KV scales: the case the fused kernel reproduces)."""
-    from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend, is_cp_active
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnBackend,
+        is_cp_active,
+    )
 
     if type(backend) is not TRTLLMHAAttnBackend:
         return "backend"
@@ -155,9 +193,17 @@ def _reason(attn, positions, qkv, forward_batch):
     if torch.compiler.is_compiling():
         return "torch.compile trace", None
     qkn = attn._fused_qk_norm
-    if qkn is None or not attn.use_o_gate or qkn.is_torch_compile or qkn._head_dim != op.HEAD_DIM:
+    if (
+        qkn is None
+        or not attn.use_o_gate
+        or qkn.is_torch_compile
+        or qkn._head_dim != op.HEAD_DIM
+    ):
         return "model configuration", None
-    if fused_op.get_fused_op_backend() is not None or fused_op._oot_dispatch_key() is not None:
+    if (
+        fused_op.get_fused_op_backend() is not None
+        or fused_op._oot_dispatch_key() is not None
+    ):
         return "fused-op override", None
     if attn._fused_kv_store(forward_batch) is not None:
         return "fused kv store", None
@@ -166,13 +212,29 @@ def _reason(attn, positions, qkv, forward_batch):
     cands = qkn._auto_backend_candidates()
     if not cands or cands[0] is not KernelBackend.TRITON:
         return "qk norm backend", None
-    if not qkn.backend_eligible(KernelBackend.TRITON, qkv, positions if rope is not None else None, cos_sin, None):
+    if not qkn.backend_eligible(
+        KernelBackend.TRITON,
+        qkv,
+        positions if rope is not None else None,
+        cos_sin,
+        None,
+    ):
         return "qk norm backend", None
-    if not (qkv.dtype == torch.bfloat16 and qkv.stride(1) == 1 and qkv.stride(0) % 8 == 0 and qkv.data_ptr() % 16 == 0):
+    if not (
+        qkv.dtype == torch.bfloat16
+        and qkv.stride(1) == 1
+        and qkv.stride(0) % 8 == 0
+        and qkv.data_ptr() % 16 == 0
+    ):
         return "qkv layout", None
-    if rope is not None and not (positions.dtype == torch.int64 and positions.is_contiguous()
-                                 and cos_sin.dtype == torch.float32 and cos_sin.is_contiguous()
-                                 and cos_sin.shape[-1] == op.HEAD_DIM and cos_sin.data_ptr() % 16 == 0):
+    if rope is not None and not (
+        positions.dtype == torch.int64
+        and positions.is_contiguous()
+        and cos_sin.dtype == torch.float32
+        and cos_sin.is_contiguous()
+        and cos_sin.shape[-1] == op.HEAD_DIM
+        and cos_sin.data_ptr() % 16 == 0
+    ):
         return "rope layout", None
     return None, cos_sin
 
@@ -185,16 +247,28 @@ def _prefill_path(attn, positions, qkv, forward_batch, cos_sin):
     q_raw, k_raw, v, o_gate = qkv.split(split_sizes + [attn.q_size], dim=-1)
     layer = attn.attn
     eps = float(attn._fused_qk_norm._eps)
-    mode = (":capture" if torch.cuda.is_current_stream_capturing() else ":eager")
+    mode = ":capture" if torch.cuda.is_current_stream_capturing() else ":eager"
     if _store_state["engaged"] and qkv.stride(1) == 1:
         backend = _backend()
         rows_ref = _rows_ref(qkv)
-        if backend is not None and rows_ref is not None and _store_reason(backend, layer, forward_batch, True) is None:
-            spec = _StoreSpec(cos_sin, layer.tp_q_head_num, layer.tp_k_head_num, eps, rows_ref)
-            _tally(("own:store:rope" if cos_sin is not None else "own:store:norope") + mode)
-            output = attn.attn(q_raw, k_raw, v, forward_batch, save_kv_cache=True, **{STORE_KW: spec})
+        if (
+            backend is not None
+            and rows_ref is not None
+            and _store_reason(backend, layer, forward_batch, True) is None
+        ):
+            spec = _StoreSpec(
+                cos_sin, layer.tp_q_head_num, layer.tp_k_head_num, eps, rows_ref
+            )
+            _tally(
+                ("own:store:rope" if cos_sin is not None else "own:store:norope") + mode
+            )
+            output = attn.attn(
+                q_raw, k_raw, v, forward_batch, save_kv_cache=True, **{STORE_KW: spec}
+            )
             return attn._fused_o_norm_gate(output, o_gate)
-    q, k = op.qk_norm(qkv, positions, cos_sin, layer.tp_q_head_num, layer.tp_k_head_num, eps)
+    q, k = op.qk_norm(
+        qkv, positions, cos_sin, layer.tp_q_head_num, layer.tp_k_head_num, eps
+    )
     _tally(("own:rope" if cos_sin is not None else "own:norope") + mode)
     output = attn.attn(q, k, v, forward_batch, save_kv_cache=True)
     return attn._fused_o_norm_gate(output, o_gate)
@@ -234,11 +308,24 @@ def _extend_hook(original, *args, **kwargs):
     n = q.shape[0]
     width = (spec.num_q_heads + 2 * spec.num_kv_heads) * op.HEAD_DIM
     src = spec.rows
-    if (src is not None and src.dim() == 2 and src.shape[0] >= n and src.data_ptr() == q.data_ptr()
-            and src.stride(0) == q.stride(0) and src.stride(1) == 1 and src.shape[1] >= width):
+    if (
+        src is not None
+        and src.dim() == 2
+        and src.shape[0] >= n
+        and src.data_ptr() == q.data_ptr()
+        and src.stride(0) == q.stride(0)
+        and src.stride(1) == 1
+        and src.shape[1] >= width
+    ):
         rows = src[:n]
-    elif (q.dim() == 2 and q.stride(1) == 1 and q.stride(0) >= width and q.shape[1] == spec.num_q_heads * op.HEAD_DIM
-          and q.untyped_storage().nbytes() >= (q.storage_offset() + (n - 1) * q.stride(0) + width) * q.element_size()):
+    elif (
+        q.dim() == 2
+        and q.stride(1) == 1
+        and q.stride(0) >= width
+        and q.shape[1] == spec.num_q_heads * op.HEAD_DIM
+        and q.untyped_storage().nbytes()
+        >= (q.storage_offset() + (n - 1) * q.stride(0) + width) * q.element_size()
+    ):
         rows = _qkv_rows(q, n)
     else:  # no row span to read in place: rebuild the rows the kernels read (q, k, v heads first)
         _tally("store:rebuilt_rows")
@@ -249,19 +336,49 @@ def _extend_hook(original, *args, **kwargs):
         cache_loc = backend._get_layer_cache_loc(layer, forward_batch)
         k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         kv_dim = spec.num_kv_heads * op.HEAD_DIM
-        q8 = torch.empty((n, spec.num_q_heads * op.HEAD_DIM), dtype=torch.float8_e4m3fn, device=q.device)
-        op.prefill_qkn(rows, positions, spec.cos_sin, k_cache.view(-1, kv_dim), v_cache.view(-1, kv_dim), cache_loc, q8,
-                       spec.num_q_heads, spec.num_kv_heads, spec.eps)
+        q8 = torch.empty(
+            (n, spec.num_q_heads * op.HEAD_DIM),
+            dtype=torch.float8_e4m3fn,
+            device=q.device,
+        )
+        op.prefill_qkn(
+            rows,
+            positions,
+            spec.cos_sin,
+            k_cache.view(-1, kv_dim),
+            v_cache.view(-1, kv_dim),
+            cache_loc,
+            q8,
+            spec.num_q_heads,
+            spec.num_kv_heads,
+            spec.eps,
+        )
         _tally("store:fused")
-        return original(backend, q8, None, None, layer, forward_batch, save_kv_cache=False, **kwargs)
+        return original(
+            backend, q8, None, None, layer, forward_batch, save_kv_cache=False, **kwargs
+        )
     # The served norm-only form, then the stock call (the backend keeps its own store / q conversion).
     if reason not in _logged:
         _logged.add(reason)
-        logger.warning("muse_vr_plugin: %s store steps aside (%s); norm-only + stock store", NAME, reason)
+        logger.warning(
+            "muse_vr_plugin: %s store steps aside (%s); norm-only + stock store",
+            NAME,
+            reason,
+        )
     _tally(f"store:stock:{reason}")
-    qn, kn = op.qk_norm(rows, positions, spec.cos_sin, spec.num_q_heads, spec.num_kv_heads, spec.eps)
-    return original(backend, qn, kn.view(n, spec.num_kv_heads, op.HEAD_DIM), v, layer, forward_batch,
-                    save_kv_cache=save_kv_cache, **kwargs)
+    qn, kn = op.qk_norm(
+        rows, positions, spec.cos_sin, spec.num_q_heads, spec.num_kv_heads, spec.eps
+    )
+    return original(
+        backend,
+        qn,
+        kn.view(n, spec.num_kv_heads, op.HEAD_DIM),
+        v,
+        layer,
+        forward_batch,
+        save_kv_cache=save_kv_cache,
+        **kwargs,
+    )
 
 
 def hook(original, *args, **kwargs):
@@ -285,7 +402,9 @@ def register() -> bool:
 
     triton_ok = qk_arith() is not None
     if not (pins_ok and triton_ok):
-        bed.report(NAME, False, pins=pins_ok, triton=_triton_version(), arith=qk_arith())
+        bed.report(
+            NAME, False, pins=pins_ok, triton=_triton_version(), arith=qk_arith()
+        )
         return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -300,7 +419,16 @@ def register() -> bool:
             mode = "qk_norm+store"
         else:
             store = "store pins mismatch: norm-only"
-            logger.warning("muse_vr_plugin: %s store mode not engaged (pin mismatch); norm-only", NAME)
-    bed.report(NAME, True, triton=_triton_version(), arith=qk_arith(), mode=mode,
-               **({"store": store} if store else {}))
+            logger.warning(
+                "muse_vr_plugin: %s store mode not engaged (pin mismatch); norm-only",
+                NAME,
+            )
+    bed.report(
+        NAME,
+        True,
+        triton=_triton_version(),
+        arith=qk_arith(),
+        mode=mode,
+        **({"store": store} if store else {}),
+    )
     return True

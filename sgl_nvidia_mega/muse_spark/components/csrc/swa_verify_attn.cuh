@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Sliding-window paged attention for speculative verify: 8 query tokens per request, FP8 (e4m3) Q/K/V.
  *

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Exact work-slot claim for persistent grids that map their work to slots, one slot per CTA, with the SM's locality
 // domain as a placement hint.
 //

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``ar_attn_boundary`` (env ``MUSE_VR_AR_ATTN_BOUNDARY=1``, default off).
 
 Stock decode runs, after each layer's attention, the row-parallel ``o_proj`` GEMM, a custom all-reduce kernel
@@ -61,15 +63,33 @@ TARGET = "sglang.srt.models.muse_spark.MuseSpark1xDecoderLayer.forward"
 # sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) whose behaviour the fused
 # path reproduces.
 PINS = {
-    "sglang/srt/models/muse_spark.py": ("7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355", "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
-                                          "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f"),
-    "sglang/kernels/ops/muse_spark_v12/fused_norm_residual.py": ("61be2075b233c687f7b111bae06d4f9494c3032a8b0c2289c9ae10fc8c757493", "454f084d20e5f2353a70d260ea4a70c7dfdff3bf45a58619ef72e1eec2646fe3"),
-    "sglang/kernels/ops/muse_spark_v12/norm_residual.py": ("7b63c2e855371e50d291b684e09135ac466f5a1444f75ce87f591b68dd47223a", "76bd0c26ed4d3cf87126619c72a56de908dea0ea1b2c69f6e5ada47318035cbe"),
+    "sglang/srt/models/muse_spark.py": (
+        "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
+        "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+        "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/fused_norm_residual.py": (
+        "61be2075b233c687f7b111bae06d4f9494c3032a8b0c2289c9ae10fc8c757493",
+        "454f084d20e5f2353a70d260ea4a70c7dfdff3bf45a58619ef72e1eec2646fe3",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/norm_residual.py": (
+        "7b63c2e855371e50d291b684e09135ac466f5a1444f75ce87f591b68dd47223a",
+        "76bd0c26ed4d3cf87126619c72a56de908dea0ea1b2c69f6e5ada47318035cbe",
+    ),
     "sglang/kernels/jit/csrc/muse_spark_v12/norm_residual.cuh": "c227348c4d705183d377ac623a62b1ed6957eb8832fb0508f4ac99f1aa3cb0c8",
-    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": ("ec14bbf6b02c481daad053dce6246d684a957cc66aa58a464a15ef117a094258", "693fc6e5b73478bab41a6ea93c1636b180c0e2ddb733794d80f370efa9427c9a"),
+    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": (
+        "ec14bbf6b02c481daad053dce6246d684a957cc66aa58a464a15ef117a094258",
+        "693fc6e5b73478bab41a6ea93c1636b180c0e2ddb733794d80f370efa9427c9a",
+    ),
     "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
-    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": ("277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001", "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5"),
-    "sglang/srt/distributed/parallel_state.py": ("49f4ecb8627b469d1e6972ba6eba0c54412ea5eec756da587b3ad375f607a5c7", "b6c0cd98a81e884c7c4677bd783b3b0cb4eb1438c93540a520296595e8a2ff2d"),
+    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
+        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+    ),
+    "sglang/srt/distributed/parallel_state.py": (
+        "49f4ecb8627b469d1e6972ba6eba0c54412ea5eec756da587b3ad375f607a5c7",
+        "b6c0cd98a81e884c7c4677bd783b3b0cb4eb1438c93540a520296595e8a2ff2d",
+    ),
     "sglang/srt/layers/linear.py": "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
 }
 
@@ -134,9 +154,16 @@ def pins_match() -> tuple[bool, str]:
 
 def _stock_ar_is_one_shot_push(group, tensor: torch.Tensor) -> bool:
     """True when ``group.all_reduce(tensor)`` resolves to ``ca_comm.custom_all_reduce`` with ``1shot_push``."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
-    if group is None or group.world_size == 1 or tensor.is_cpu or torch.compiler.is_compiling():
+    if (
+        group is None
+        or group.world_size == 1
+        or tensor.is_cpu
+        or torch.compiler.is_compiling()
+    ):
         return False
     for name in ("hpu_communicator", "xpu_communicator", "npu_communicator"):
         c = getattr(group, name, None)
@@ -145,21 +172,36 @@ def _stock_ar_is_one_shot_push(group, tensor: torch.Tensor) -> bool:
     ca = group.ca_comm
     if not isinstance(ca, CustomAllReduceV2) or ca.disabled:
         return False
-    pym = group.pymscclpp_comm is not None and group.pymscclpp_comm.should_mscclpp_allreduce(tensor)
+    pym = (
+        group.pymscclpp_comm is not None
+        and group.pymscclpp_comm.should_mscclpp_allreduce(tensor)
+    )
     if pym or not ca.should_custom_ar(tensor):
         return False
     if group._can_use_flashinfer_allreduce(tensor):
         return False
-    if group._resolve_outplace_all_reduce_method(input_=tensor, should_use_pymscclpp_allreduce=False) != "ca":
+    if (
+        group._resolve_outplace_all_reduce_method(
+            input_=tensor, should_use_pymscclpp_allreduce=False
+        )
+        != "ca"
+    ):
         return False
     return ca.uses_one_shot_push(tensor.numel() * tensor.element_size())
 
 
 def _stock_ar_is_custom(group, tensor: torch.Tensor) -> bool:
     """True when ``group.all_reduce(tensor)`` resolves to ``ca_comm.custom_all_reduce`` (any of its algorithms)."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
-    if group is None or group.world_size == 1 or tensor.is_cpu or torch.compiler.is_compiling():
+    if (
+        group is None
+        or group.world_size == 1
+        or tensor.is_cpu
+        or torch.compiler.is_compiling()
+    ):
         return False
     for name in ("hpu_communicator", "xpu_communicator", "npu_communicator"):
         c = getattr(group, name, None)
@@ -168,12 +210,20 @@ def _stock_ar_is_custom(group, tensor: torch.Tensor) -> bool:
     ca = group.ca_comm
     if not isinstance(ca, CustomAllReduceV2) or ca.disabled:
         return False
-    pym = group.pymscclpp_comm is not None and group.pymscclpp_comm.should_mscclpp_allreduce(tensor)
+    pym = (
+        group.pymscclpp_comm is not None
+        and group.pymscclpp_comm.should_mscclpp_allreduce(tensor)
+    )
     if pym or not ca.should_custom_ar(tensor):
         return False
     if group._can_use_flashinfer_allreduce(tensor):
         return False
-    return group._resolve_outplace_all_reduce_method(input_=tensor, should_use_pymscclpp_allreduce=False) == "ca"
+    return (
+        group._resolve_outplace_all_reduce_method(
+            input_=tensor, should_use_pymscclpp_allreduce=False
+        )
+        == "ca"
+    )
 
 
 def _layer_eligible(layer, attn_input: torch.Tensor, forward_batch) -> str | None:
@@ -187,23 +237,41 @@ def _layer_eligible(layer, attn_input: torch.Tensor, forward_batch) -> str | Non
     if not (mode.is_decode() or mode.is_target_verify()):
         return "not decode/verify"
     m = attn_input.shape[0]
-    if m == 0 or not (_one_shot_row(m) or (_ar2_enabled() and _ar2_min_m() <= m <= _ar2_max_m()
-                                            and (_rows() is not None or m > _max_m()))):
+    if m == 0 or not (
+        _one_shot_row(m)
+        or (
+            _ar2_enabled()
+            and _ar2_min_m() <= m <= _ar2_max_m()
+            and (_rows() is not None or m > _max_m())
+        )
+    ):
         return "row count outside range"
     o_proj = layer.self_attn.o_proj
-    if not (o_proj.reduce_results and o_proj.use_dp_attention_reduce) or o_proj.use_decode_attn_tp:
+    if (
+        not (o_proj.reduce_results and o_proj.use_dp_attention_reduce)
+        or o_proj.use_decode_attn_tp
+    ):
         return "o_proj reduce configuration"
     if get_forward().sp_active or should_skip_mlp_all_reduce():
         return "sequence-parallel / reduce override"
-    if layer._fused_attn_boundary is None or not layer._fused_attn_boundary.jit_selected():
+    if (
+        layer._fused_attn_boundary is None
+        or not layer._fused_attn_boundary.jit_selected()
+    ):
         return "stock boundary not on its JIT kernel"
     return None
 
 
-def _shadow_compare(group, boundary, layer, partial, stream, router_dtype, fused) -> None:
+def _shadow_compare(
+    group, boundary, layer, partial, stream, router_dtype, fused
+) -> None:
     """Debug: the stock pair on the same inputs, compared bit for bit with the fused outputs."""
-    ref_out = boundary(stream.clone(), group.all_reduce(partial), branch_dtype=layer.operator_dtype,
-                       router_dtype=router_dtype)
+    ref_out = boundary(
+        stream.clone(),
+        group.all_reduce(partial),
+        branch_dtype=layer.operator_dtype,
+        router_dtype=router_dtype,
+    )
     ok = True
     for a, b in zip(fused, ref_out):
         if (a is None) != (b is None):
@@ -211,7 +279,12 @@ def _shadow_compare(group, boundary, layer, partial, stream, router_dtype, fused
         elif a is not None:
             ia = a.view(torch.int16) if a.element_size() == 2 else a.view(torch.int32)
             ib = b.view(torch.int16) if b.element_size() == 2 else b.view(torch.int32)
-            ok = ok and a.shape == b.shape and a.dtype == b.dtype and bool(torch.equal(ia, ib))
+            ok = (
+                ok
+                and a.shape == b.shape
+                and a.dtype == b.dtype
+                and bool(torch.equal(ia, ib))
+            )
     bed.shadow_result(NAME, ok)
 
 
@@ -230,7 +303,9 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
     attn = layer.self_attn
     # MuseSpark1xAttention.forward with the o_proj all-reduce deferred
     qkv, _ = attn.qkv_proj(attn_input)
-    partial, _ = attn.o_proj(attn.gated_attention(positions, qkv, forward_batch), skip_all_reduce=True)
+    partial, _ = attn.o_proj(
+        attn.gated_attention(positions, qkv, forward_batch), skip_all_reduce=True
+    )
 
     router_dtype = layer._router_dtype
     if router_dtype is not None and _use_split_bf16_router(partial.shape[0]):
@@ -246,7 +321,9 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
         two_shot = (
             _stock_ar_is_custom(group, partial)
             and supported2(comm, m_rows, partial.shape[1])
-            and boundary._triton_supported(stream, partial, layer.operator_dtype, router_dtype, None)
+            and boundary._triton_supported(
+                stream, partial, layer.operator_dtype, router_dtype, None
+            )
             and partial.is_contiguous()
         )
     else:
@@ -260,22 +337,35 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
             boundary._post_norm.eps,
             boundary._pre_norm.eps,
             post_norm_is_input_scale=boundary._post_norm_is_input_scale,
-            post_weight=boundary._cc_post_weight if boundary._post_norm.has_weight else None,
-            pre_weight=boundary._cc_pre_weight if boundary._pre_norm.has_weight else None,
+            post_weight=boundary._cc_post_weight
+            if boundary._post_norm.has_weight
+            else None,
+            pre_weight=boundary._cc_pre_weight
+            if boundary._pre_norm.has_weight
+            else None,
             alpha=boundary._cc_alpha if boundary._use_residual_gate else None,
             beta=boundary._cc_beta if boundary._use_residual_gate else None,
             want_router=router_dtype is not None,
         )
         bed.count(NAME, f"fused2:M={m_rows}:tp={comm.world_size}")
         if _state["shadow"] and not torch.cuda.is_current_stream_capturing():
-            _shadow_compare(group, boundary, layer, partial, stream, router_dtype,
-                            (ffn_input, stream_out, router_input))
+            _shadow_compare(
+                group,
+                boundary,
+                layer,
+                partial,
+                stream,
+                router_dtype,
+                (ffn_input, stream_out, router_input),
+            )
         stream = stream_out
     elif (
         _one_shot_row(m_rows)
         and _stock_ar_is_one_shot_push(group, partial)
         and supported(comm, partial.shape[0], partial.shape[1])
-        and boundary._triton_supported(stream, partial, layer.operator_dtype, router_dtype, None)
+        and boundary._triton_supported(
+            stream, partial, layer.operator_dtype, router_dtype, None
+        )
         and partial.is_contiguous()
     ):
         boundary._ensure_cached_weights(layer.operator_dtype)
@@ -286,22 +376,37 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
             boundary._post_norm.eps,
             boundary._pre_norm.eps,
             post_norm_is_input_scale=boundary._post_norm_is_input_scale,
-            post_weight=boundary._cc_post_weight if boundary._post_norm.has_weight else None,
-            pre_weight=boundary._cc_pre_weight if boundary._pre_norm.has_weight else None,
+            post_weight=boundary._cc_post_weight
+            if boundary._post_norm.has_weight
+            else None,
+            pre_weight=boundary._cc_pre_weight
+            if boundary._pre_norm.has_weight
+            else None,
             alpha=boundary._cc_alpha if boundary._use_residual_gate else None,
             beta=boundary._cc_beta if boundary._use_residual_gate else None,
             want_router=router_dtype is not None,
         )
         bed.count(NAME, f"fused:M={partial.shape[0]}:tp={comm.world_size}")
         if _state["shadow"] and not torch.cuda.is_current_stream_capturing():
-            _shadow_compare(group, boundary, layer, partial, stream, router_dtype, (ffn_input, stream_out, router_input))
+            _shadow_compare(
+                group,
+                boundary,
+                layer,
+                partial,
+                stream,
+                router_dtype,
+                (ffn_input, stream_out, router_input),
+            )
         stream = stream_out
     else:
         # the stock pair, as RowParallelLinear.forward and the decoder layer issue them
         bed.count(NAME, "stock:all-reduce dispatch")
         attn_output = group.all_reduce(partial)
         ffn_input, stream, router_input = boundary(
-            stream, attn_output, branch_dtype=layer.operator_dtype, router_dtype=router_dtype
+            stream,
+            attn_output,
+            branch_dtype=layer.operator_dtype,
+            router_dtype=router_dtype,
         )
 
     # remainder of MuseSpark1xDecoderLayer.forward (pinned revision), unchanged
@@ -310,11 +415,17 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
     else:
         ffn_output = layer.mlp(ffn_input)
     if ffn_output.shape[-1] != stream.shape[-1]:
-        next_attn_input, stream = layer._fused_ffn_boundary.forward_with_ag(stream, ffn_output, get_tp_group().ca_comm)
+        next_attn_input, stream = layer._fused_ffn_boundary.forward_with_ag(
+            stream, ffn_output, get_tp_group().ca_comm
+        )
         return stream, next_attn_input
     if layer._fused_ffn_boundary is None:
-        return layer.post_feedforward_residual_gate(stream, layer.post_feedforward_layernorm(ffn_output)), None
-    next_attn_input, stream, _ = layer._fused_ffn_boundary(stream, ffn_output, branch_dtype=layer.operator_dtype)
+        return layer.post_feedforward_residual_gate(
+            stream, layer.post_feedforward_layernorm(ffn_output)
+        ), None
+    next_attn_input, stream, _ = layer._fused_ffn_boundary(
+        stream, ffn_output, branch_dtype=layer.operator_dtype
+    )
     return stream, next_attn_input
 
 
@@ -335,5 +446,14 @@ def register() -> bool:
 
     _state["shadow"] = bed.enabled(NAME + "_shadow")
     HookRegistry.register(TARGET, hook, HookType.AROUND)
-    bed.report(NAME, True, max_m=_max_m(), rows=sorted(_rows()) if _rows() is not None else None, shadow=_state["shadow"], ar2=_ar2_enabled(), ar2_min_m=_ar2_min_m(), ar2_max_m=_ar2_max_m())
+    bed.report(
+        NAME,
+        True,
+        max_m=_max_m(),
+        rows=sorted(_rows()) if _rows() is not None else None,
+        shadow=_state["shadow"],
+        ar2=_ar2_enabled(),
+        ar2_min_m=_ar2_min_m(),
+        ar2_max_m=_ar2_max_m(),
+    )
     return True

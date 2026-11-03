@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Paged full-attention verify for many requests per step over a native NVFP4 KV cache (packed E2M1 values with
  * one E4M3 scale per 16 values): the persistent kernel of full_attn_wide.cuh with its K/V tiles produced in the kernel

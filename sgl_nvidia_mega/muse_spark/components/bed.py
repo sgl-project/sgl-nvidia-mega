@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Shared helpers for plugin components: env gating, SGLang source pins and engagement records.
 
 ``enabled(name)``
@@ -40,7 +42,11 @@ _counts: dict[str, dict[str, int]] = {}
 
 
 def disabled(name: str) -> bool:
-    return name in {x.strip() for x in os.environ.get("MUSE_VR_PLUGIN_DISABLE", "").split(",") if x.strip()}
+    return name in {
+        x.strip()
+        for x in os.environ.get("MUSE_VR_PLUGIN_DISABLE", "").split(",")
+        if x.strip()
+    }
 
 
 def enabled(name: str) -> bool:
@@ -80,7 +86,9 @@ def file_sha256(relpath: str) -> str | None:
     if root is None:
         return None
     try:
-        return hashlib.sha256((root / sgl_compat.relpath(relpath)).read_bytes()).hexdigest()
+        return hashlib.sha256(
+            (root / sgl_compat.relpath(relpath)).read_bytes()
+        ).hexdigest()
     except OSError:
         return None
 
@@ -103,7 +111,9 @@ def pinned(relpath: str, sha256_hex) -> bool:
     got = file_sha256(relpath)
     if not sha_ok(got, sha256_hex):
         logger.warning(
-            "muse_vr_plugin: %s sha256 %s does not match the pin %s", relpath, (got or "<missing>")[:16],
+            "muse_vr_plugin: %s sha256 %s does not match the pin %s",
+            relpath,
+            (got or "<missing>")[:16],
             sha_label(sha256_hex),
         )
         return False
@@ -119,10 +129,21 @@ def _dump() -> None:
         path = os.path.join(d, f"install_{os.getpid()}.json")
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"pid": os.getpid(), "t": time.time(), "installs": _installs, "counts": _counts}, f, indent=1)
+            json.dump(
+                {
+                    "pid": os.getpid(),
+                    "t": time.time(),
+                    "installs": _installs,
+                    "counts": _counts,
+                },
+                f,
+                indent=1,
+            )
         os.replace(tmp, path)
     except OSError as e:
-        logger.warning("muse_vr_plugin: cannot write engagement record to %s (%s)", d, e)
+        logger.warning(
+            "muse_vr_plugin: cannot write engagement record to %s (%s)", d, e
+        )
 
 
 def report(name: str, engaged: bool, **info) -> None:
@@ -133,7 +154,13 @@ def report(name: str, engaged: bool, **info) -> None:
         _dump()
     if first:
         extra = " ".join(f"{k}={v}" for k, v in info.items())
-        logger.warning("muse_vr_plugin: %s engaged=%s pid=%d %s", name, bool(engaged), os.getpid(), extra)
+        logger.warning(
+            "muse_vr_plugin: %s engaged=%s pid=%d %s",
+            name,
+            bool(engaged),
+            os.getpid(),
+            extra,
+        )
 
 
 def count(name: str, key: str = "calls", n: int = 1) -> None:

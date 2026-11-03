@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Host side of the ``moe_x_kernels`` routed-expert path: compile caches, launches and the full expert pipeline.
 
 Pipeline for one routed-expert call (all on the current stream, no host synchronization, CUDA-graph capturable once
@@ -125,14 +127,18 @@ def _gemm2_ptrs(addrs=None):
         _ptr(cutlass.Uint8, a[9], 16),  # fused conversion: payload
         _ptr(cutlass.Uint8, a[10], 16),  # fused conversion: swizzled block scales
         _ptr(cutlass.Float32, a[11]),  # fused conversion: per-row scales
-        _ptr(cutlass.Int32, a[12]),  # fused conversion: ctl words (counters, done flags)
+        _ptr(
+            cutlass.Int32, a[12]
+        ),  # fused conversion: ctl words (counters, done flags)
         _ptr(cutlass.Int32, a[13]),  # tile -> expert
         _ptr(cutlass.Int32, a[14]),  # tile -> mn limit
         _ptr(cutlass.Int32, a[15]),  # number of tiles
     ]
 
 
-def compile_gemm1(tactic: Tactic, *, use_pdl: bool = False, vectorized_f32: bool = True):
+def compile_gemm1(
+    tactic: Tactic, *, use_pdl: bool = False, vectorized_f32: bool = True
+):
     """Compiled first GEMM for a tactic (cached per process; CuTe DSL's file cache applies across processes)."""
     import cutlass.cute as cute
 
@@ -175,7 +181,12 @@ def compile_gemm1(tactic: Tactic, *, use_pdl: bool = False, vectorized_f32: bool
         return fn
 
 
-def compile_gemm2(tactic: Tactic, swiglu: bool = False, row_amax: bool = False, fuse_quant: bool = False):
+def compile_gemm2(
+    tactic: Tactic,
+    swiglu: bool = False,
+    row_amax: bool = False,
+    fuse_quant: bool = False,
+):
     """Compiled rows kernel: the second GEMM, or (``swiglu``) the first GEMM over sorted-row activations (with
     ``row_amax``: also reducing each row's largest |output| for the row-block quantizer)."""
     import cutlass.cute as cute
@@ -184,8 +195,16 @@ def compile_gemm2(tactic: Tactic, swiglu: bool = False, row_amax: bool = False, 
     from .bounded_wait import bounded_waits
     from .grouped_gemm_rows import GroupedGemmRowsKernel
 
-    key = ((("gemm1_rows_fq" if fuse_quant else "gemm1_rows_amax") if row_amax else "gemm1_rows") if swiglu
-           else "gemm2", tactic)
+    key = (
+        (
+            ("gemm1_rows_fq" if fuse_quant else "gemm1_rows_amax")
+            if row_amax
+            else "gemm1_rows"
+        )
+        if swiglu
+        else "gemm2",
+        tactic,
+    )
     # output stores: per-row bulk copies (default; measured faster) or tensor-memory-access tile stores
     tma_store = os.environ.get("MUSE_VR_MOE_X_TMA_STORE", "0") == "1"
     if tma_store:
@@ -251,17 +270,32 @@ def row_block_quant(t1: Tactic = None) -> bool:
 def compiled(t1: Tactic, t2: Tactic) -> bool:
     """Kernels for these tactics (and the row-kernel module, if used) are built in this process."""
     form = quant_form(t1)
-    g1 = (({"fused": "gemm1_rows_fq", "blocks": "gemm1_rows_amax"}.get(form, "gemm1_rows"), t1) if gemm1_rows_mode()
-          else ("gemm1", t1, False, True))
+    g1 = (
+        (
+            {"fused": "gemm1_rows_fq", "blocks": "gemm1_rows_amax"}.get(
+                form, "gemm1_rows"
+            ),
+            t1,
+        )
+        if gemm1_rows_mode()
+        else ("gemm1", t1, False, True)
+    )
     ok = g1 in _cache and ("gemm2", t2) in _cache
-    return ok and (not (own_quantizer_applies() or gemm1_rows_mode()) or "quant_module" in _cache)
+    return ok and (
+        not (own_quantizer_applies() or gemm1_rows_mode()) or "quant_module" in _cache
+    )
 
 
 def build(t1: Tactic, t2: Tactic) -> None:
     """Compile / load everything one call needs (outside CUDA graph capture)."""
     if gemm1_rows_mode():
         form = quant_form(t1)
-        compile_gemm2(t1, swiglu=True, row_amax=form in ("fused", "blocks"), fuse_quant=form == "fused")
+        compile_gemm2(
+            t1,
+            swiglu=True,
+            row_amax=form in ("fused", "blocks"),
+            fuse_quant=form == "fused",
+        )
     else:
         compile_gemm1(t1)
     compile_gemm2(t2)
@@ -269,43 +303,133 @@ def build(t1: Tactic, t2: Tactic) -> None:
         _quant_module()
 
 
-def run_gemm1(a_fp4, a_sf, w13, w13_sf, alpha_gate, alpha_up, token_scale, tile_expert, tile_limit, row_to_expanded,
-              num_tiles, out, tactic: Tactic):
+def run_gemm1(
+    a_fp4,
+    a_sf,
+    w13,
+    w13_sf,
+    alpha_gate,
+    alpha_up,
+    token_scale,
+    tile_expert,
+    tile_limit,
+    row_to_expanded,
+    num_tiles,
+    out,
+    tactic: Tactic,
+):
     """out[:R, :I] = SwiGLU of the first GEMM for the sorted rows (R = out rows, I = w13 rows / 2)."""
     fn = compile_gemm1(tactic)
     num_experts, n, k_half = w13.shape
-    addrs = [a_fp4.data_ptr(), w13.data_ptr(), a_sf.data_ptr(), w13_sf.data_ptr(), out.data_ptr(),
-             alpha_gate.data_ptr(), alpha_up.data_ptr(), token_scale.data_ptr(), tile_expert.data_ptr(),
-             tile_limit.data_ptr(), row_to_expanded.data_ptr(), num_tiles.data_ptr()]
-    fn(*_gemm1_ptrs(addrs), a_fp4.shape[0], out.shape[0], n, k_half * 2, num_experts, stream=_stream())
+    addrs = [
+        a_fp4.data_ptr(),
+        w13.data_ptr(),
+        a_sf.data_ptr(),
+        w13_sf.data_ptr(),
+        out.data_ptr(),
+        alpha_gate.data_ptr(),
+        alpha_up.data_ptr(),
+        token_scale.data_ptr(),
+        tile_expert.data_ptr(),
+        tile_limit.data_ptr(),
+        row_to_expanded.data_ptr(),
+        num_tiles.data_ptr(),
+    ]
+    fn(
+        *_gemm1_ptrs(addrs),
+        a_fp4.shape[0],
+        out.shape[0],
+        n,
+        k_half * 2,
+        num_experts,
+        stream=_stream(),
+    )
 
 
-def run_gemm2(a_fp4, a_sf, w2, w2_sf, alpha, row_scale, tile_expert, tile_limit, num_tiles, out, tactic: Tactic,
-              alpha_up=None, row_amax=None, fused=None):
+def run_gemm2(
+    a_fp4,
+    a_sf,
+    w2,
+    w2_sf,
+    alpha,
+    row_scale,
+    tile_expert,
+    tile_limit,
+    num_tiles,
+    out,
+    tactic: Tactic,
+    alpha_up=None,
+    row_amax=None,
+    fused=None,
+):
     """out[r, :] = alpha[e] * row_scale[r] * (A[r] @ W2[e]^T) for every valid sorted row r; with ``alpha_up`` the first
     GEMM's SwiGLU form (out has half the weight's rows as columns), with ``row_amax`` (SwiGLU form, zeroed int32 [rows])
     also each row's largest |output| as FP32 bits; with ``fused`` = (payload, swizzled scales, per-row scales, ctl)
     also the per-token NVFP4 form of the output where the epilogue can (see the kernel)."""
     swiglu = alpha_up is not None
-    fn = compile_gemm2(tactic, swiglu=swiglu, row_amax=row_amax is not None, fuse_quant=fused is not None)
+    fn = compile_gemm2(
+        tactic,
+        swiglu=swiglu,
+        row_amax=row_amax is not None,
+        fuse_quant=fused is not None,
+    )
     num_experts, n, k_half = w2.shape
-    fq = [t.data_ptr() for t in fused] if fused is not None else [row_scale.data_ptr()] * 4
-    addrs = [a_fp4.data_ptr(), w2.data_ptr(), a_sf.data_ptr(), w2_sf.data_ptr(), out.data_ptr(), alpha.data_ptr(),
-             row_scale.data_ptr(), (alpha_up if swiglu else alpha).data_ptr(),
-             (row_amax if row_amax is not None else row_scale).data_ptr(), *fq, tile_expert.data_ptr(),
-             tile_limit.data_ptr(), num_tiles.data_ptr()]
+    fq = (
+        [t.data_ptr() for t in fused]
+        if fused is not None
+        else [row_scale.data_ptr()] * 4
+    )
+    addrs = [
+        a_fp4.data_ptr(),
+        w2.data_ptr(),
+        a_sf.data_ptr(),
+        w2_sf.data_ptr(),
+        out.data_ptr(),
+        alpha.data_ptr(),
+        row_scale.data_ptr(),
+        (alpha_up if swiglu else alpha).data_ptr(),
+        (row_amax if row_amax is not None else row_scale).data_ptr(),
+        *fq,
+        tile_expert.data_ptr(),
+        tile_limit.data_ptr(),
+        num_tiles.data_ptr(),
+    ]
     fn(*_gemm2_ptrs(addrs), out.shape[0], n, k_half * 2, num_experts, stream=_stream())
 
 
-def permute_rows(hs_fp4, hs_sf, token_scale, row_to_expanded, num_tiles, tile_limit, tile_m, out, out_sf, out_scale,
-                 row_amax=None, ctl=None):
+def permute_rows(
+    hs_fp4,
+    hs_sf,
+    token_scale,
+    row_to_expanded,
+    num_tiles,
+    tile_limit,
+    tile_m,
+    out,
+    out_sf,
+    out_scale,
+    row_amax=None,
+    ctl=None,
+):
     """Sorted-row copy of the call's NVFP4 activations (payload, 128x4 swizzled block scales, per-token scale); zeroes
     row_amax (int32 [rows]) for the valid rows and the ctl words, if given."""
     empty = torch.empty((0,), dtype=torch.int32, device=out.device)
-    _quant_module().permute_rows(hs_fp4, hs_sf.view(torch.uint8), token_scale, row_to_expanded, TOP_K, num_tiles,
-                                 tile_limit, tile_m, out, out_sf, out_scale,
-                                 row_amax if row_amax is not None else empty, ctl if ctl is not None else empty,
-                                 _row_blocks(out, "permute"))
+    _quant_module().permute_rows(
+        hs_fp4,
+        hs_sf.view(torch.uint8),
+        token_scale,
+        row_to_expanded,
+        TOP_K,
+        num_tiles,
+        tile_limit,
+        tile_m,
+        out,
+        out_sf,
+        out_scale,
+        row_amax if row_amax is not None else empty,
+        ctl if ctl is not None else empty,
+        _row_blocks(out, "permute"),
+    )
 
 
 def quantize_rows(inter, row_map, out_fp4, out_sf, out_scale):
@@ -321,10 +445,21 @@ def quantize_rows(inter, row_map, out_fp4, out_sf, out_scale):
     mod = get_fp4_quantization_module(device_arch()[3:])
     m = row_map.numel()
     mod.nvfp4_quant_and_per_token_scale_out_sm100(
-        inter[:m], PER_TOKEN_SCALE_INV, out_fp4, out_sf, out_scale, row_map, SfLayout.layout_128x4.value)
+        inter[:m],
+        PER_TOKEN_SCALE_INV,
+        out_fp4,
+        out_sf,
+        out_scale,
+        row_map,
+        SfLayout.layout_128x4.value,
+    )
 
 
-_QUANT_ENV_OFF = ("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "FLASHINFER_NVFP4_4OVER6")
+_QUANT_ENV_OFF = (
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6",
+)
 
 
 def own_quantizer_applies() -> bool:
@@ -351,14 +486,23 @@ def _quant_module():
 
     digits = device_arch()[3:]
     ref = getattr(fp4jit, f"gen_fp4_quantization_sm{digits}_module")()
-    flags = [f for f in ref.extra_cuda_cflags if f.startswith("-gencode") or f.startswith("-D")]
+    flags = [
+        f
+        for f in ref.extra_cuda_cflags
+        if f.startswith("-gencode") or f.startswith("-D")
+    ]
     csrc = jit_env.FLASHINFER_CSRC_DIR
     common = csrc / "nv_internal" / "cpp" / "common"
     src = Path(__file__).resolve().parent.parent / "csrc" / "moe_x_quant.cu"
     spec = gen_jit_spec(
         f"muse_vr_moe_x_quant_{digits}",
-        [src, common / "envUtils.cpp", common / "logger.cpp", common / "stringUtils.cpp",
-         common / "tllmException.cpp"],
+        [
+            src,
+            common / "envUtils.cpp",
+            common / "logger.cpp",
+            common / "stringUtils.cpp",
+            common / "tllmException.cpp",
+        ],
         extra_cuda_cflags=flags,
         extra_cflags=["-DENABLE_BF16", "-DENABLE_FP8", "-DENABLE_FP4"],
         extra_include_paths=[csrc / "nv_internal", csrc / "nv_internal" / "include"],
@@ -375,37 +519,89 @@ def _row_blocks(t, kind: str = "quant") -> int:
     blocks = int(_cache.get(key) or 0)
     if not blocks:
         props = torch.cuda.get_device_properties(t.device)
-        var, default = {"permute": ("MUSE_VR_MOE_X_PERMUTE_BLOCKS_PER_SM", "8"),
-                        "blocks": ("MUSE_VR_MOE_X_BLOCKQ_BLOCKS_PER_SM", "5"),
-                        "regions": ("MUSE_VR_MOE_X_REGION_BLOCKS_PER_SM", "4")}.get(
-                            kind, ("MUSE_VR_MOE_X_ROW_BLOCKS_PER_SM", "2"))
+        var, default = {
+            "permute": ("MUSE_VR_MOE_X_PERMUTE_BLOCKS_PER_SM", "8"),
+            "blocks": ("MUSE_VR_MOE_X_BLOCKQ_BLOCKS_PER_SM", "5"),
+            "regions": ("MUSE_VR_MOE_X_REGION_BLOCKS_PER_SM", "4"),
+        }.get(kind, ("MUSE_VR_MOE_X_ROW_BLOCKS_PER_SM", "2"))
         blocks = props.multi_processor_count * int(os.environ.get(var, default))
         _cache[key] = blocks
     return blocks
 
 
-def quantize_sorted_rows(inter, num_tiles, tile_limit, tile_m, out_fp4, out_sf, out_scale):
+def quantize_sorted_rows(
+    inter, num_tiles, tile_limit, tile_m, out_fp4, out_sf, out_scale
+):
     """Per-token NVFP4 quantization of the valid sorted rows (one warp per row), default recipe only."""
-    _quant_module().quant_sorted_rows(inter, num_tiles, tile_limit, tile_m, PER_TOKEN_SCALE_INV, out_fp4, out_sf,
-                                      out_scale, _row_blocks(inter))
+    _quant_module().quant_sorted_rows(
+        inter,
+        num_tiles,
+        tile_limit,
+        tile_m,
+        PER_TOKEN_SCALE_INV,
+        out_fp4,
+        out_sf,
+        out_scale,
+        _row_blocks(inter),
+    )
 
 
-def quantize_row_blocks(inter, row_amax, num_tiles, tile_limit, tile_m, out_fp4, out_sf, out_scale):
+def quantize_row_blocks(
+    inter, row_amax, num_tiles, tile_limit, tile_m, out_fp4, out_sf, out_scale
+):
     """Per-token NVFP4 quantization of the valid sorted rows from given row maxima (independent blocks), default recipe
     only."""
-    _quant_module().quant_row_blocks(inter, row_amax, num_tiles, tile_limit, tile_m, PER_TOKEN_SCALE_INV, out_fp4,
-                                     out_sf, out_scale, _row_blocks(inter, "blocks"))
+    _quant_module().quant_row_blocks(
+        inter,
+        row_amax,
+        num_tiles,
+        tile_limit,
+        tile_m,
+        PER_TOKEN_SCALE_INV,
+        out_fp4,
+        out_sf,
+        out_scale,
+        _row_blocks(inter, "blocks"),
+    )
 
 
-def quantize_regions(inter, row_amax, ctl, num_tiles, tile_limit, tile_m, out_fp4, out_sf, out_scale):
+def quantize_regions(
+    inter, row_amax, ctl, num_tiles, tile_limit, tile_m, out_fp4, out_sf, out_scale
+):
     """Per-token NVFP4 conversion of the regions the fused first-GEMM epilogue left (done flag 0)."""
-    _quant_module().quant_regions(inter, row_amax, ctl, num_tiles, tile_limit, tile_m, PER_TOKEN_SCALE_INV, out_fp4,
-                                  out_sf, out_scale, _row_blocks(inter, "regions"))
+    _quant_module().quant_regions(
+        inter,
+        row_amax,
+        ctl,
+        num_tiles,
+        tile_limit,
+        tile_m,
+        PER_TOKEN_SCALE_INV,
+        out_fp4,
+        out_sf,
+        out_scale,
+        _row_blocks(inter, "regions"),
+    )
 
 
-def routed_experts(hs_fp4, hs_sf, per_token_scale, topk_ids, w13, w13_sf, w2, w2_sf, g1_gate, g1_up, g2,
-                   *, num_experts: int, local_expert_offset: int, t1: Tactic = DEFAULT_GEMM1,
-                   t2: Tactic = DEFAULT_GEMM2):
+def routed_experts(
+    hs_fp4,
+    hs_sf,
+    per_token_scale,
+    topk_ids,
+    w13,
+    w13_sf,
+    w2,
+    w2_sf,
+    g1_gate,
+    g1_up,
+    g2,
+    *,
+    num_experts: int,
+    local_expert_offset: int,
+    t1: Tactic = DEFAULT_GEMM1,
+    t2: Tactic = DEFAULT_GEMM2,
+):
     """Deferred-finalize outputs (gemm2_out, expanded_idx_to_permuted_idx [T * 8]) of one routed-expert call.
 
     hs_fp4 [T, H/2] uint8, hs_sf [T, H/16] e4m3 (linear), per_token_scale [T] fp32, topk_ids [T, 8] int32 (global ids),
@@ -434,43 +630,120 @@ def routed_experts(hs_fp4, hs_sf, per_token_scale, topk_ids, w13, w13_sf, w2, w2
     rows = p2e.shape[0]
     expanded = tokens * TOP_K
     own_quant = own_quantizer_applies()
-    inter = torch.empty((rows if own_quant else max(rows, expanded), inter_size), dtype=torch.bfloat16, device=dev)
+    inter = torch.empty(
+        (rows if own_quant else max(rows, expanded), inter_size),
+        dtype=torch.bfloat16,
+        device=dev,
+    )
     form = quant_form(t1)
     blocks_quant = form in ("fused", "blocks")
-    row_amax = torch.empty((rows,), dtype=torch.int32, device=dev) if blocks_quant else None
+    row_amax = (
+        torch.empty((rows,), dtype=torch.int32, device=dev) if blocks_quant else None
+    )
     a2 = torch.empty((rows, inter_size // 2), dtype=torch.uint8, device=dev)
     a2_sf = torch.empty((rows, inter_size // SF_VEC), dtype=torch.uint8, device=dev)
     a2_scale = torch.empty((rows,), dtype=torch.float32, device=dev)
     ctl = None
     if form == "fused":
         # [row-block counters | done flags | error word]
-        ctl = torch.empty((rows // 128 * (1 + inter_size // 128) + 1,), dtype=torch.int32, device=dev)
+        ctl = torch.empty(
+            (rows // 128 * (1 + inter_size // 128) + 1,), dtype=torch.int32, device=dev
+        )
     if gemm1_rows_mode():
         a1 = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=dev)
         a1_sf = torch.empty((rows, hidden // SF_VEC), dtype=torch.uint8, device=dev)
         a1_scale = torch.empty((rows,), dtype=torch.float32, device=dev)
-        permute_rows(hs_fp4, hs_sf, per_token_scale, p2e, num_tiles, tile_limit, t1.tile_m, a1, a1_sf, a1_scale,
-                     row_amax, ctl)
-        a1_sf_mma = convert_sf_to_mma_layout(a1_sf, m=rows, k=hidden, num_groups=1, sf_vec_size=SF_VEC)
-        run_gemm2(a1, a1_sf_mma, w13, w13_sf.view(torch.uint8).reshape(num_local, -1), g1_gate, a1_scale, tile_expert,
-                  tile_limit, num_tiles, inter[:rows], t1, alpha_up=g1_up, row_amax=row_amax,
-                  fused=(a2, a2_sf, a2_scale, ctl) if ctl is not None else None)
+        permute_rows(
+            hs_fp4,
+            hs_sf,
+            per_token_scale,
+            p2e,
+            num_tiles,
+            tile_limit,
+            t1.tile_m,
+            a1,
+            a1_sf,
+            a1_scale,
+            row_amax,
+            ctl,
+        )
+        a1_sf_mma = convert_sf_to_mma_layout(
+            a1_sf, m=rows, k=hidden, num_groups=1, sf_vec_size=SF_VEC
+        )
+        run_gemm2(
+            a1,
+            a1_sf_mma,
+            w13,
+            w13_sf.view(torch.uint8).reshape(num_local, -1),
+            g1_gate,
+            a1_scale,
+            tile_expert,
+            tile_limit,
+            num_tiles,
+            inter[:rows],
+            t1,
+            alpha_up=g1_up,
+            row_amax=row_amax,
+            fused=(a2, a2_sf, a2_scale, ctl) if ctl is not None else None,
+        )
     else:
-        run_gemm1(hs_fp4, hs_sf, w13, w13_sf.view(torch.uint8).reshape(num_local, -1), g1_gate, g1_up,
-                  per_token_scale, tile_expert, tile_limit, p2e, num_tiles, inter[:rows], t1)
+        run_gemm1(
+            hs_fp4,
+            hs_sf,
+            w13,
+            w13_sf.view(torch.uint8).reshape(num_local, -1),
+            g1_gate,
+            g1_up,
+            per_token_scale,
+            tile_expert,
+            tile_limit,
+            p2e,
+            num_tiles,
+            inter[:rows],
+            t1,
+        )
     e2p_flat = e2p.view(-1)
     if form == "fused":
-        if os.environ.get("MUSE_VR_MOE_X_KEEP_CTL") == "1":  # inspection of the conversion coverage (tests)
+        if (
+            os.environ.get("MUSE_VR_MOE_X_KEEP_CTL") == "1"
+        ):  # inspection of the conversion coverage (tests)
             _cache["last_ctl"] = ctl
-        quantize_regions(inter[:rows], row_amax, ctl, num_tiles, tile_limit, t1.tile_m, a2, a2_sf, a2_scale)
+        quantize_regions(
+            inter[:rows],
+            row_amax,
+            ctl,
+            num_tiles,
+            tile_limit,
+            t1.tile_m,
+            a2,
+            a2_sf,
+            a2_scale,
+        )
     elif blocks_quant:
-        quantize_row_blocks(inter, row_amax, num_tiles, tile_limit, t1.tile_m, a2, a2_sf, a2_scale)
+        quantize_row_blocks(
+            inter, row_amax, num_tiles, tile_limit, t1.tile_m, a2, a2_sf, a2_scale
+        )
     elif own_quant:
-        quantize_sorted_rows(inter, num_tiles, tile_limit, t1.tile_m, a2, a2_sf, a2_scale)
+        quantize_sorted_rows(
+            inter, num_tiles, tile_limit, t1.tile_m, a2, a2_sf, a2_scale
+        )
     else:
         quantize_rows(inter, e2p_flat, a2, a2_sf, a2_scale)
     out = torch.empty((rows, hidden), dtype=torch.bfloat16, device=dev)
-    a2_sf_mma = convert_sf_to_mma_layout(a2_sf, m=rows, k=inter_size, num_groups=1, sf_vec_size=SF_VEC)
-    run_gemm2(a2, a2_sf_mma, w2, w2_sf.view(torch.uint8).reshape(num_local, -1), g2, a2_scale, tile_expert,
-              tile_limit, num_tiles, out, t2)
+    a2_sf_mma = convert_sf_to_mma_layout(
+        a2_sf, m=rows, k=inter_size, num_groups=1, sf_vec_size=SF_VEC
+    )
+    run_gemm2(
+        a2,
+        a2_sf_mma,
+        w2,
+        w2_sf.view(torch.uint8).reshape(num_local, -1),
+        g2,
+        a2_scale,
+        tile_expert,
+        tile_limit,
+        num_tiles,
+        out,
+        t2,
+    )
     return out, e2p_flat

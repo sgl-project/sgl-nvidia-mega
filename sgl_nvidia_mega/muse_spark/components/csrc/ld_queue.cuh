@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Per-locality-domain work queues for persistent kernels that stream weights placed by domain.
 //
 // A launch owns two queues of work units, one per locality domain: queue d lists the units whose weights are backed

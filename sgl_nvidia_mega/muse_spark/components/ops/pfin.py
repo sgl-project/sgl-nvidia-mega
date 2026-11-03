@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Sequence-parallel MoE finalize (JIT CUDA): unpermute + post-expert RMSNorm + router-weighted top-k sum, bitwise to
 SGLang's single-CTA CuTe-DSL finalize kernel (cluster size 1, hidden 4096, top-8), on a persistent schedule that keeps
 the GEMM2 rows in flight through a shared-memory ring of bulk copies. See ``csrc/pfin.cuh`` and ``tests/test_pfin.py``.
@@ -18,11 +20,17 @@ CONFIGS = ((8, 1), (12, 1), (16, 2), (16, 3), (24, 3), (24, 4), (24, 5))
 
 
 # test-only builds (tests/test_pfin.py): randomized hand-off delays; a slow consumer (clock64 spin before each release)
-_TEST_BUILDS = {"": None, "fuzz": ["-DMUSE_VR_PFIN_FUZZ=1"], "slow": ["-DMUSE_VR_PFIN_SLOW_CONSUMER=20000"]}
+_TEST_BUILDS = {
+    "": None,
+    "fuzz": ["-DMUSE_VR_PFIN_FUZZ=1"],
+    "slow": ["-DMUSE_VR_PFIN_SLOW_CONSUMER=20000"],
+}
 
 
 @functools.lru_cache(maxsize=None)
-def _module(slots: int, groups: int, weight_first: bool, bf16_weights: bool, build: str = ""):
+def _module(
+    slots: int, groups: int, weight_first: bool, bf16_weights: bool, build: str = ""
+):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
     args = make_cpp_args(slots, groups, weight_first, bf16_weights)
@@ -45,9 +53,19 @@ def grid_for(device: torch.device, ctas_per_sm: int) -> int:
     return _sm_count(idx) * int(ctas_per_sm)
 
 
-def pfin(gemm2: torch.Tensor, expert_weights: torch.Tensor, idx: torch.Tensor, rms_w: torch.Tensor, out: torch.Tensor,
-         eps: float, weight_first: bool, slots: int = 24, groups: int = 4, ctas_per_sm: int = 1,
-         _build: str = "") -> torch.Tensor:
+def pfin(
+    gemm2: torch.Tensor,
+    expert_weights: torch.Tensor,
+    idx: torch.Tensor,
+    rms_w: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    weight_first: bool,
+    slots: int = 24,
+    groups: int = 4,
+    ctas_per_sm: int = 1,
+    _build: str = "",
+) -> torch.Tensor:
     """out[t] = bf16(sum over local experts e of token t, ascending slot: w[t, e] * rmsnorm(gemm2[idx[t, e]]) ...), with
     the stock kernel's arithmetic (module doc of ``csrc/pfin.cuh``).
 
@@ -60,5 +78,12 @@ def pfin(gemm2: torch.Tensor, expert_weights: torch.Tensor, idx: torch.Tensor, r
         raise ValueError(f"(slots, groups) must be one of {CONFIGS}")
     bf16_w = expert_weights.dtype == torch.bfloat16
     _module(int(slots), int(groups), bool(weight_first), bool(bf16_w), _build).pfin(
-        gemm2, expert_weights, idx, rms_w, out, float(eps), grid_for(out.device, ctas_per_sm))
+        gemm2,
+        expert_weights,
+        idx,
+        rms_w,
+        out,
+        float(eps),
+        grid_for(out.device, ctas_per_sm),
+    )
     return out

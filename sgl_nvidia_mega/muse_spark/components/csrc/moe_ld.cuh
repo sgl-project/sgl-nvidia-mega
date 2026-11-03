@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // MoE-LD: one-launch routed NVFP4 experts for small verify batches, with each locality domain streaming the expert
 // weight halves placed on it (Muse Spark expert shapes, one expert-parallel rank).
 //

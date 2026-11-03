@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MoE-LD-W (``csrc/moe_ldw.cuh``): routed NVFP4 experts of one expert-parallel rank for 1..512 token rows in one launch of
 one CTA per SM streaming each active local expert's weights once per pass of up to 128 routed rows.
 
@@ -39,10 +41,18 @@ STAMP_WORDS = 24
 DEFAULT_FLAGS = FLAG_EVICT_FIRST | FLAG_TAIL_TRIGGER
 # the RING4 build: 32-row passes and a 4-stage ring (more weight bytes in flight per CTA); same rows, its own Scratch
 RING4_PASS_ROWS = 32
-RING4 = ("-DMUSE_VR_LDW_GATHER=0", f"-DMUSE_VR_LDW_PASS_ROWS={RING4_PASS_ROWS}", "-DMUSE_VR_LDW_STAGES=4")
+RING4 = (
+    "-DMUSE_VR_LDW_GATHER=0",
+    f"-DMUSE_VR_LDW_PASS_ROWS={RING4_PASS_ROWS}",
+    "-DMUSE_VR_LDW_STAGES=4",
+)
 # RING4 with 48-row passes (experts with 33-48 rows in one pass; fewer passes for hot experts); its own scratch
 RING48_PASS_ROWS = 48
-RING48 = ("-DMUSE_VR_LDW_GATHER=0", "-DMUSE_VR_LDW_PASS_ROWS=48", "-DMUSE_VR_LDW_STAGES=4")
+RING48 = (
+    "-DMUSE_VR_LDW_GATHER=0",
+    "-DMUSE_VR_LDW_PASS_ROWS=48",
+    "-DMUSE_VR_LDW_STAGES=4",
+)
 # the landed build (development, added to RING4 / RING48 / the base build): routed ids and token rows straight from the hop
 # landing buffers (moe_ldw_landed below); default off, never selected by the serving path
 LANDED = ("-DMUSE_VR_LDW_LANDED=1",)
@@ -65,15 +75,23 @@ def scratch_passes(pass_rows: int, max_tokens: int = MAX_TOKENS) -> int:
     """The kernel's kMaxPasses for that pass height and row ceiling (the wide build caps it at 256)."""
     passes = MAX_POOL + max_tokens * TOP_K // pass_rows
     return min(passes, 256) if max_tokens > MAX_TOKENS else passes
-GLOBAL_SCALE_INV = float(torch.tensor(1.0, dtype=torch.float32) / (torch.tensor(448.0) * torch.tensor(6.0)))
+
+
+GLOBAL_SCALE_INV = float(
+    torch.tensor(1.0, dtype=torch.float32) / (torch.tensor(448.0) * torch.tensor(6.0))
+)
 
 
 def _flashinfer_include_paths() -> list[str]:
     import flashinfer
 
     data = Path(flashinfer.__file__).resolve().parent / "data"
-    paths = [data / "csrc" / "nv_internal", data / "csrc" / "nv_internal" / "include", data / "include",
-             data / "cutlass" / "include"]
+    paths = [
+        data / "csrc" / "nv_internal",
+        data / "csrc" / "nv_internal" / "include",
+        data / "include",
+        data / "cutlass" / "include",
+    ]
     return [str(p) for p in paths if p.exists()]
 
 
@@ -87,31 +105,65 @@ def _module(extra: tuple = ()):
 
     from .. import mma_k
 
-    extra = tuple(extra) + mma_k.build_flags("moe_ldw")  # MMA-K form (MUSE_VR_MOE_MMA_K; no define for the default 64)
-    extra = tuple(extra) + epoch_flags()  # launch-counter slot claim (MUSE_VR_MOE_LDW_SLOT_EPOCH=1; default off)
-    extra = tuple(extra) + compact_flags(extra)  # compact prologue (MUSE_VR_MOE_LDW_COMPACT=1; default off)
-    extra = tuple(extra) + split_rel_flags(extra)  # copy phase's split release (MUSE_VR_MOE_LDW_SPLIT_REL=1; default off)
-    extra = tuple(extra) + thead_flags(extra)  # item-0 token rows by tensor-copy gathers (MUSE_VR_MOE_LDW_THEAD=1; default off)
-    extra = tuple(extra) + copy_diet_flags(extra)  # copy phase with operands by value (MUSE_VR_MOE_LDW_COPY_DIET=1; default off)
-    extra = tuple(extra) + early_slottab_flags(extra)  # slot table published before the trigger (MUSE_VR_W_EARLY_SLOTTAB=1)
-    extra = tuple(extra) + rows_ready_flags(extra)  # rows-ready flags (MUSE_VR_W_ROWS_READY=1, with the early slot table)
+    extra = tuple(extra) + mma_k.build_flags(
+        "moe_ldw"
+    )  # MMA-K form (MUSE_VR_MOE_MMA_K; no define for the default 64)
+    extra = (
+        tuple(extra) + epoch_flags()
+    )  # launch-counter slot claim (MUSE_VR_MOE_LDW_SLOT_EPOCH=1; default off)
+    extra = tuple(extra) + compact_flags(
+        extra
+    )  # compact prologue (MUSE_VR_MOE_LDW_COMPACT=1; default off)
+    extra = tuple(extra) + split_rel_flags(
+        extra
+    )  # copy phase's split release (MUSE_VR_MOE_LDW_SPLIT_REL=1; default off)
+    extra = tuple(extra) + thead_flags(
+        extra
+    )  # item-0 token rows by tensor-copy gathers (MUSE_VR_MOE_LDW_THEAD=1; default off)
+    extra = tuple(extra) + copy_diet_flags(
+        extra
+    )  # copy phase with operands by value (MUSE_VR_MOE_LDW_COPY_DIET=1; default off)
+    extra = tuple(extra) + early_slottab_flags(
+        extra
+    )  # slot table published before the trigger (MUSE_VR_W_EARLY_SLOTTAB=1)
+    extra = tuple(extra) + rows_ready_flags(
+        extra
+    )  # rows-ready flags (MUSE_VR_W_ROWS_READY=1, with the early slot table)
     _RR_BUILDS[_key] = ROWS_READY[0] in extra
     # one symbol namespace per build variant (two variants may be loaded in one process)
     abi = "v" + hashlib.sha256(" ".join(extra).encode()).hexdigest()[:12]
     from .. import slot_claim
 
-    extra = tuple(extra) + slot_claim.build_flags("moe_ldw")  # exact slot claim (default) or the UNSAFE form
+    extra = tuple(extra) + slot_claim.build_flags(
+        "moe_ldw"
+    )  # exact slot claim (default) or the UNSAFE form
     parts = [re.sub(r"[^A-Za-z0-9_]", "_", e) for e in extra]
-    if len("_".join(parts)) > 200:  # the build's cache directory name must stay below the file-name limit
+    if (
+        len("_".join(parts)) > 200
+    ):  # the build's cache directory name must stay below the file-name limit
         parts = ["h" + hashlib.sha256(" ".join(extra).encode()).hexdigest()[:16]]
     return load_jit(
         "muse_vr_moe_ldw",
         *parts,
         cuda_files=[str(_CUH)],
-        cuda_wrappers=[("run", "muse_vr_ldw::MuseVrLdw::run"), ("preload", "muse_vr_ldw::MuseVrLdw::preload")]
-        + ([("run_landed", "muse_vr_ldw::MuseVrLdw::run_landed")] if LANDED[0] in extra else []),
+        cuda_wrappers=[
+            ("run", "muse_vr_ldw::MuseVrLdw::run"),
+            ("preload", "muse_vr_ldw::MuseVrLdw::preload"),
+        ]
+        + (
+            [("run_landed", "muse_vr_ldw::MuseVrLdw::run_landed")]
+            if LANDED[0] in extra
+            else []
+        ),
         extra_include_paths=[str(_CSRC)] + _flashinfer_include_paths(),
-        extra_cuda_cflags=["-O3", "-use_fast_math", "-DENABLE_BF16", "-lineinfo", f"-DMUSE_VR_LDW_ABI={abi}", *extra],
+        extra_cuda_cflags=[
+            "-O3",
+            "-use_fast_math",
+            "-DENABLE_BF16",
+            "-lineinfo",
+            f"-DMUSE_VR_LDW_ABI={abi}",
+            *extra,
+        ],
     )
 
 
@@ -156,9 +208,17 @@ def thead_flags(extra: tuple = ()) -> tuple[str, ...]:
         return ()
     if not any(e.startswith("-DMUSE_VR_LDW_STAGES=") for e in extra):
         return ()
-    if any(e.startswith(("-DMUSE_VR_LDW_LANDED=1", "-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_THEAD")) for e in extra):
+    if any(
+        e.startswith(
+            ("-DMUSE_VR_LDW_LANDED=1", "-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_THEAD")
+        )
+        for e in extra
+    ):
         return ()
-    rows = next((e.split("=", 1)[1] for e in extra if e.startswith("-DMUSE_VR_LDW_PASS_ROWS=")), "32")
+    rows = next(
+        (e.split("=", 1)[1] for e in extra if e.startswith("-DMUSE_VR_LDW_PASS_ROWS=")),
+        "32",
+    )
     if not _thead_recorded:
         _thead_recorded.append(True)
         from .. import bed
@@ -177,7 +237,12 @@ def split_rel_flags(extra: tuple = ()) -> tuple[str, ...]:
     on landed or board builds. Routed rows are bitwise the same."""
     if os.environ.get(SPLIT_REL_ENV, "0").strip() != "1":
         return ()
-    if any(e.startswith(("-DMUSE_VR_LDW_LANDED=1", "-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_SPLIT_REL")) for e in extra):
+    if any(
+        e.startswith(
+            ("-DMUSE_VR_LDW_LANDED=1", "-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_SPLIT_REL")
+        )
+        for e in extra
+    ):
         return ()
     if not _split_rel_recorded:
         _split_rel_recorded.append(True)
@@ -197,7 +262,12 @@ def copy_diet_flags(extra: tuple = ()) -> tuple[str, ...]:
     landed or board builds. Same stores and releases; routed rows are bitwise the same."""
     if os.environ.get(COPY_DIET_ENV, "0").strip() != "1":
         return ()
-    if any(e.startswith(("-DMUSE_VR_LDW_LANDED=1", "-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_COPY_DIET")) for e in extra):
+    if any(
+        e.startswith(
+            ("-DMUSE_VR_LDW_LANDED=1", "-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_COPY_DIET")
+        )
+        for e in extra
+    ):
         return ()
     if not _copy_diet_recorded:
         _copy_diet_recorded.append(True)
@@ -217,7 +287,12 @@ def compact_flags(extra: tuple = ()) -> tuple[str, ...]:
     MUSE_VR_MOE_LDW_COMPACT=1 (default off). Routed rows are bitwise the same (tests/test_moe_ldw.py)."""
     if os.environ.get(COMPACT_ENV, "0").strip() != "1":
         return ()
-    if any(e.startswith(("-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_PRO_COMPACT", "-DMUSE_VR_LDW_START")) for e in extra):
+    if any(
+        e.startswith(
+            ("-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_PRO_COMPACT", "-DMUSE_VR_LDW_START")
+        )
+        for e in extra
+    ):
         return ()
     if not _compact_recorded:
         _compact_recorded.append(True)
@@ -243,7 +318,12 @@ def early_slottab_flags(extra: tuple = ()) -> tuple[str, ...]:
     from .. import bed
 
     if any(e.startswith(("-DMUSE_VR_LDW_BALB", "-DMUSE_VR_LDW_LANDED")) for e in extra):
-        bed.report("moe_ldw_early_slottab", False, env=f"{EARLY_SLOTTAB_ENV}=1", reason="landed / balanced build: step aside")
+        bed.report(
+            "moe_ldw_early_slottab",
+            False,
+            env=f"{EARLY_SLOTTAB_ENV}=1",
+            reason="landed / balanced build: step aside",
+        )
         return ()
     bed.report("moe_ldw_early_slottab", True, env=f"{EARLY_SLOTTAB_ENV}=1")
     return EARLY_SLOTTAB
@@ -251,7 +331,9 @@ def early_slottab_flags(extra: tuple = ()) -> tuple[str, ...]:
 
 ROWS_READY_ENV = "MUSE_VR_W_ROWS_READY"
 ROWS_READY = ("-DMUSE_VR_LDW_ROWS_READY=1",)
-RR_PER_PASS = (HIDDEN // 128) * 4  # flags per pass: FC2 tiles x epilogue warps (the kernel's kRrPerPass)
+RR_PER_PASS = (
+    HIDDEN // 128
+) * 4  # flags per pass: FC2 tiles x epilogue warps (the kernel's kRrPerPass)
 RR_LAST = 1024  # the consumer's per-CTA last epochs (the kernel's kRrLast; written by the consumer only)
 _RR_BUILDS: dict = {}  # caller's extra -> the build has the rows-ready flags (filled by _module)
 
@@ -268,7 +350,12 @@ def rows_ready_flags(extra: tuple = ()) -> tuple[str, ...]:
     from .. import bed
 
     if EARLY_SLOTTAB[0] not in tuple(extra):
-        bed.report("moe_ldw_rows_ready", False, env=f"{ROWS_READY_ENV}=1", reason="needs the early slot table: step aside")
+        bed.report(
+            "moe_ldw_rows_ready",
+            False,
+            env=f"{ROWS_READY_ENV}=1",
+            reason="needs the early slot table: step aside",
+        )
         return ()
     bed.report("moe_ldw_rows_ready", True, env=f"{ROWS_READY_ENV}=1")
     return ROWS_READY
@@ -277,7 +364,12 @@ def rows_ready_flags(extra: tuple = ()) -> tuple[str, ...]:
 def rows_ready_words(pass_rows: int, max_tokens: int = MAX_TOKENS) -> int:
     """int64 words of the rows-ready buffer (the kernel's kRrWords): ticket, published epoch, the consumer's per-CTA last
     epochs, flags, e2pass (int16)."""
-    return 2 + RR_LAST + scratch_passes(pass_rows, max_tokens) * RR_PER_PASS + max_tokens * TOP_K // 4
+    return (
+        2
+        + RR_LAST
+        + scratch_passes(pass_rows, max_tokens) * RR_PER_PASS
+        + max_tokens * TOP_K // 4
+    )
 
 
 def rows_ready_built(extra: tuple = ()) -> bool:
@@ -286,23 +378,30 @@ def rows_ready_built(extra: tuple = ()) -> bool:
     return bool(_RR_BUILDS.get(tuple(extra), False))
 
 
-def rows_ready_views(scratch: "Scratch"):
+def rows_ready_views(scratch: Scratch):
     """(published epoch [1], the consumer's per-CTA last epochs, flags, e2pass int16) views of the scratch's rows-ready
     buffer, for the dependent grid."""
     rr = scratch.rr
     nf = scratch_passes(scratch.pass_rows, scratch.max_tokens) * RR_PER_PASS
     b = 2 + RR_LAST
-    return rr[1:2], rr[2:b], rr[b:b + nf], rr[b + nf:].view(torch.int16)
+    return rr[1:2], rr[2:b], rr[b : b + nf], rr[b + nf :].view(torch.int16)
 
 
 class Scratch:
     """Per-device buffers of MoE-LD-W (launches that share it must be ordered by completion). ``pass_rows`` is the build's
     pass height (``PASS_ROWS``, or ``RING4_PASS_ROWS`` for the ``RING4`` build): the per-pass buffers follow it."""
 
-    def __init__(self, device: torch.device, pass_rows: int = PASS_ROWS, max_tokens: int = MAX_TOKENS):
+    def __init__(
+        self,
+        device: torch.device,
+        pass_rows: int = PASS_ROWS,
+        max_tokens: int = MAX_TOKENS,
+    ):
         z = dict(device=device)
         if max_tokens not in (MAX_TOKENS, MAX_TOKENS_WIDE):
-            raise ValueError(f"max_tokens {max_tokens}: {MAX_TOKENS} or {MAX_TOKENS_WIDE}")
+            raise ValueError(
+                f"max_tokens {max_tokens}: {MAX_TOKENS} or {MAX_TOKENS_WIDE}"
+            )
         slots = max_tokens * TOP_K
         passes = scratch_passes(pass_rows, max_tokens)
         self.pass_rows = pass_rows
@@ -314,13 +413,19 @@ class Scratch:
         self.act = torch.zeros(slots * ACT_WORDS, dtype=torch.int64, **z)
         # FC2 token rows at bucket-padded per-pass bases (the kernel's kHs2Rows = 2 slots + 16 passes rows); zero-filled once
         # here, never per launch: padding rows are written by no launch, so FC2 operand boxes never cover another pass's rows
-        self.hs2 = torch.zeros(2 * slots + 16 * passes, HIDDEN // 2, dtype=torch.uint8, **z)
+        self.hs2 = torch.zeros(
+            2 * slots + 16 * passes, HIDDEN // 2, dtype=torch.uint8, **z
+        )
         self.ramax = torch.zeros(slots, dtype=torch.float32, **z)
         self.cnt = torch.zeros(2 * (2 * passes + 32), dtype=torch.int32, **z)
-        self.ctl = torch.zeros(32 + (EPOCH_WORDS if epoch() else 0), dtype=torch.int32, **z)
+        self.ctl = torch.zeros(
+            32 + (EPOCH_WORDS if epoch() else 0), dtype=torch.int32, **z
+        )
         self.err = torch.zeros(1, dtype=torch.int32, **z)
         # rows-ready builds only (never reset: flags carry the launch epoch); allocated for every scratch (small)
-        self.rr = torch.zeros(rows_ready_words(pass_rows, max_tokens), dtype=torch.int64, **z)
+        self.rr = torch.zeros(
+            rows_ready_words(pass_rows, max_tokens), dtype=torch.int64, **z
+        )
 
     def error(self) -> int:
         return int(self.err.item())
@@ -335,7 +440,7 @@ class Scratch:
 HB0_PREFIX = "-DMUSE_VR_LDW_HB0_PUSH="
 
 
-def _hb0_args(extra: tuple, hb, scratch: "Scratch") -> tuple:
+def _hb0_args(extra: tuple, hb, scratch: Scratch) -> tuple:
     """The expert-output hop push build's arguments (empty for other builds): ``hb`` = (site table, ctl table, site args,
     ctl args) as the hop arena gives them (arena.table(name, index), arena.ctl_table(), arena.site_args(name, index),
     arena.ctl_args()); the per-row slot map lives in the scratch (allocated on first use)."""
@@ -344,19 +449,52 @@ def _hb0_args(extra: tuple, hb, scratch: "Scratch") -> tuple:
             raise ValueError("hb given for a build without the expert-output hop push")
         return ()
     if hb is None:
-        raise ValueError("the expert-output hop push build needs hb = (site table, ctl table, site args, ctl args)")
+        raise ValueError(
+            "the expert-output hop push build needs hb = (site table, ctl table, site args, ctl args)"
+        )
     table, ctl_table, site_args, ctl_args = hb
     site_args, ctl_args = tuple(site_args), tuple(ctl_args)
     if len(site_args) != 9 or len(ctl_args) != 4:
-        raise ValueError("hb: 9 site args (rank, rows_max, width, pitch, policy, parity, index, site, units) and 4 ctl args")
+        raise ValueError(
+            "hb: 9 site args (rank, rows_max, width, pitch, policy, parity, index, site, units) and 4 ctl args"
+        )
     if getattr(scratch, "hb_slot", None) is None:
-        scratch.hb_slot = torch.full((scratch.max_tokens * TOP_K,), -1, dtype=torch.int32, device=scratch.err.device)
-    return (table, ctl_table, *(int(v) for v in site_args), *(int(v) for v in ctl_args), scratch.hb_slot)
+        scratch.hb_slot = torch.full(
+            (scratch.max_tokens * TOP_K,),
+            -1,
+            dtype=torch.int32,
+            device=scratch.err.device,
+        )
+    return (
+        table,
+        ctl_table,
+        *(int(v) for v in site_args),
+        *(int(v) for v in ctl_args),
+        scratch.hb_slot,
+    )
 
 
-def moe_ldw(packed, hs, hs_sf, pts, w13, sf13, w2, sf2, gate_alpha, up_alpha, out_alpha, local_offset: int,
-            scratch: Scratch, flags: int | None = None, dbg: int = 0, pdl: bool = False, extra: tuple = (),
-            stamps=None, hb=None):
+def moe_ldw(
+    packed,
+    hs,
+    hs_sf,
+    pts,
+    w13,
+    sf13,
+    w2,
+    sf2,
+    gate_alpha,
+    up_alpha,
+    out_alpha,
+    local_offset: int,
+    scratch: Scratch,
+    flags: int | None = None,
+    dbg: int = 0,
+    pdl: bool = False,
+    extra: tuple = (),
+    stamps=None,
+    hb=None,
+):
     from ..moe_ld_ops import domain_slots
 
     if flags is None:
@@ -366,7 +504,9 @@ def moe_ldw(packed, hs, hs_sf, pts, w13, sf13, w2, sf2, gate_alpha, up_alpha, ou
     if not 1 <= m <= limit:
         raise ValueError(f"num_tokens {m} outside 1..{limit}")
     dev = packed.device
-    table, n0, n1 = domain_slots(dev.index if dev.index is not None else torch.cuda.current_device())
+    table, n0, n1 = domain_slots(
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
     out = torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device=dev)
     ew = torch.empty(m, TOP_K, dtype=torch.bfloat16, device=dev)
     e2p = torch.empty(m * TOP_K, dtype=torch.int32, device=dev)
@@ -378,27 +518,90 @@ def moe_ldw(packed, hs, hs_sf, pts, w13, sf13, w2, sf2, gate_alpha, up_alpha, ou
     if s.max_tokens != limit:
         raise ValueError(f"scratch for {s.max_tokens} rows per call, build for {limit}")
     if s.pass_rows != want:
-        raise ValueError(f"scratch for {s.pass_rows}-row passes, build with {want}-row passes")
+        raise ValueError(
+            f"scratch for {s.pass_rows}-row passes, build with {want}-row passes"
+        )
     rr = rows_ready_built(tuple(extra))
     if rr:  # the epoch (ticket / grid) is consistent only if every launch on this scratch has the same grid
         if getattr(s, "rr_grid", None) is None:
             s.rr_grid = int(n0 + n1)
         elif s.rr_grid != int(n0 + n1):
-            raise ValueError(f"moe_ldw rows-ready: grid {n0 + n1} != this scratch's {s.rr_grid} (one grid per scratch)")
+            raise ValueError(
+                f"moe_ldw rows-ready: grid {n0 + n1} != this scratch's {s.rr_grid} (one grid per scratch)"
+            )
     _module(tuple(extra)).run(
-        packed, hs.view(torch.uint8), hs_sf.view(torch.uint8).reshape(m, -1), pts.reshape(m).float(),
-        w13.view(torch.uint8), sf13.view(torch.uint8), w2.view(torch.uint8), sf2.view(torch.uint8),
-        gate_alpha, up_alpha, out_alpha, table, out, ew.view(torch.int16), e2p, s.hs_perm, s.pts_perm, s.img1,
-        s.img2, s.act, s.hs2, s.ramax, s.cnt, s.ctl, s.err, stamps, int(local_offset), n0, n1, GLOBAL_SCALE_INV, int(flags),
-        int(dbg), int(bool(pdl)), *_hb0_args(tuple(extra), hb, s), *((s.rr,) if rr else ()))
+        packed,
+        hs.view(torch.uint8),
+        hs_sf.view(torch.uint8).reshape(m, -1),
+        pts.reshape(m).float(),
+        w13.view(torch.uint8),
+        sf13.view(torch.uint8),
+        w2.view(torch.uint8),
+        sf2.view(torch.uint8),
+        gate_alpha,
+        up_alpha,
+        out_alpha,
+        table,
+        out,
+        ew.view(torch.int16),
+        e2p,
+        s.hs_perm,
+        s.pts_perm,
+        s.img1,
+        s.img2,
+        s.act,
+        s.hs2,
+        s.ramax,
+        s.cnt,
+        s.ctl,
+        s.err,
+        stamps,
+        int(local_offset),
+        n0,
+        n1,
+        GLOBAL_SCALE_INV,
+        int(flags),
+        int(dbg),
+        int(bool(pdl)),
+        *_hb0_args(tuple(extra), hb, s),
+        *((s.rr,) if rr else ()),
+    )
     return out, ew, e2p
 
 
-def moe_ldw_landed(m: int, ids_land, tok_land, seq64, last_seq, ids_pitch: int, tok_pitch: int, rows_max: int, world: int,
-                   ids_parity: bool, tok_parity: bool, w13, sf13, w2, sf2, gate_alpha, up_alpha, out_alpha,
-                   local_offset: int, scratch: Scratch, flags: int | None = None, dbg: int = 0, pdl: bool = False,
-                   extra: tuple = LANDED, stamps=None, bal_table=None, board=None, bal_rank: int = 0,
-                   norm_w=None, norm_eps: float = 1e-8, test_delay_ns: int = 0):
+def moe_ldw_landed(
+    m: int,
+    ids_land,
+    tok_land,
+    seq64,
+    last_seq,
+    ids_pitch: int,
+    tok_pitch: int,
+    rows_max: int,
+    world: int,
+    ids_parity: bool,
+    tok_parity: bool,
+    w13,
+    sf13,
+    w2,
+    sf2,
+    gate_alpha,
+    up_alpha,
+    out_alpha,
+    local_offset: int,
+    scratch: Scratch,
+    flags: int | None = None,
+    dbg: int = 0,
+    pdl: bool = False,
+    extra: tuple = LANDED,
+    stamps=None,
+    bal_table=None,
+    board=None,
+    bal_rank: int = 0,
+    norm_w=None,
+    norm_eps: float = 1e-8,
+    test_delay_ns: int = 0,
+):
     """Landed build (development): the routed ids and token rows of ``m`` rows come from this rank's landing buffers
     (int64 words, [copy][source rank][rows_max][pitch], copy 0 first): ids as 8 words per row (32-bit tag << 32 | packed
     id), token rows as TOK_WORDS words of 6 payload bytes + a 16-bit tag in bits 63..48. ``seq64`` is the forward
@@ -415,7 +618,9 @@ def moe_ldw_landed(m: int, ids_land, tok_land, seq64, last_seq, ids_pitch: int, 
     if not 1 <= m <= limit:
         raise ValueError(f"num_tokens {m} outside 1..{limit}")
     dev = tok_land.device
-    table, n0, n1 = domain_slots(dev.index if dev.index is not None else torch.cuda.current_device())
+    table, n0, n1 = domain_slots(
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
     out = torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device=dev)
     ew = torch.empty(m, TOP_K, dtype=torch.bfloat16, device=dev)
     e2p = torch.empty(m * TOP_K, dtype=torch.int32, device=dev)
@@ -427,7 +632,9 @@ def moe_ldw_landed(m: int, ids_land, tok_land, seq64, last_seq, ids_pitch: int, 
     if s.max_tokens != limit:
         raise ValueError(f"scratch for {s.max_tokens} rows per call, build for {limit}")
     if s.pass_rows != want:
-        raise ValueError(f"scratch for {s.pass_rows}-row passes, build with {want}-row passes")
+        raise ValueError(
+            f"scratch for {s.pass_rows}-row passes, build with {want}-row passes"
+        )
     epi = EPI[0] in tuple(extra)
     epi_args = ()
     tok_out = None
@@ -435,18 +642,77 @@ def moe_ldw_landed(m: int, ids_land, tok_land, seq64, last_seq, ids_pitch: int, 
         if norm_w is None:
             raise ValueError("the finalize build needs the post-expert norm weight")
         if getattr(s, "epi_moments", None) is None:
-            s.epi_moments = torch.zeros(s.hs_perm.shape[0] * EPI_PARTS, dtype=torch.float32, device=dev)
-            s.epi_pos_slot = torch.zeros(s.hs_perm.shape[0], dtype=torch.int32, device=dev)
+            s.epi_moments = torch.zeros(
+                s.hs_perm.shape[0] * EPI_PARTS, dtype=torch.float32, device=dev
+            )
+            s.epi_pos_slot = torch.zeros(
+                s.hs_perm.shape[0], dtype=torch.int32, device=dev
+            )
             s.epi_tok_cnt = torch.zeros(2 * s.max_tokens, dtype=torch.int32, device=dev)
         tok_out = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device=dev)
-        epi_args = (norm_w.float().contiguous(), float(norm_eps), s.epi_moments, s.epi_pos_slot, s.epi_tok_cnt, tok_out)
+        epi_args = (
+            norm_w.float().contiguous(),
+            float(norm_eps),
+            s.epi_moments,
+            s.epi_pos_slot,
+            s.epi_tok_cnt,
+            tok_out,
+        )
     _module(tuple(extra)).run_landed(
-        int(m), ids_land, tok_land, seq64, last_seq, int(ids_pitch), int(tok_pitch), int(rows_max), int(world),
-        int(bool(ids_parity)), int(bool(tok_parity)), w13.view(torch.uint8), sf13.view(torch.uint8), w2.view(torch.uint8),
-        sf2.view(torch.uint8), gate_alpha, up_alpha, out_alpha, table, out, ew.view(torch.int16), e2p, s.hs_perm,
-        s.pts_perm, s.img1, s.img2, s.act, s.hs2, s.ramax, s.cnt, s.ctl, s.err, stamps, int(local_offset), n0, n1,
-        GLOBAL_SCALE_INV, int(flags), int(dbg), int(bool(pdl)), *epi_args,
-        *((bal_table, board, int(bal_rank)) if any(f.startswith("-DMUSE_VR_LDW_BALB=") for f in extra) else ()),
-        *((int(test_delay_ns),) if any(f.startswith("-DMUSE_VR_LDW_TEST_BOARD_DELAY_NS=") and not f.endswith("=0") for f in extra)
-          else ()))
+        int(m),
+        ids_land,
+        tok_land,
+        seq64,
+        last_seq,
+        int(ids_pitch),
+        int(tok_pitch),
+        int(rows_max),
+        int(world),
+        int(bool(ids_parity)),
+        int(bool(tok_parity)),
+        w13.view(torch.uint8),
+        sf13.view(torch.uint8),
+        w2.view(torch.uint8),
+        sf2.view(torch.uint8),
+        gate_alpha,
+        up_alpha,
+        out_alpha,
+        table,
+        out,
+        ew.view(torch.int16),
+        e2p,
+        s.hs_perm,
+        s.pts_perm,
+        s.img1,
+        s.img2,
+        s.act,
+        s.hs2,
+        s.ramax,
+        s.cnt,
+        s.ctl,
+        s.err,
+        stamps,
+        int(local_offset),
+        n0,
+        n1,
+        GLOBAL_SCALE_INV,
+        int(flags),
+        int(dbg),
+        int(bool(pdl)),
+        *epi_args,
+        *(
+            (bal_table, board, int(bal_rank))
+            if any(f.startswith("-DMUSE_VR_LDW_BALB=") for f in extra)
+            else ()
+        ),
+        *(
+            (int(test_delay_ns),)
+            if any(
+                f.startswith("-DMUSE_VR_LDW_TEST_BOARD_DELAY_NS=")
+                and not f.endswith("=0")
+                for f in extra
+            )
+            else ()
+        ),
+    )
     return (out, ew, e2p, tok_out) if epi else (out, ew, e2p)

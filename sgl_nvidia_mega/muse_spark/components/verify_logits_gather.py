@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``verify_logits_gather`` (env ``MUSE_VR_VERIFY_LOGITS_GATHER=1``, default off).
 
 With speculative verification under non-greedy sampling, SGLang's DFLASH worker leaves the target-verify logits as
@@ -45,7 +47,9 @@ ENV_ROWS = "MUSE_VR_VERIFY_LOGITS_GATHER_ROWS"
 ENV_PUSH = "MUSE_VR_VERIFY_LOGITS_GATHER_PUSH"
 ENV_MAX_ROWS = "MUSE_VR_VERIFY_LOGITS_GATHER_MAX_ROWS"
 ENV_SHADOW = "MUSE_VR_VERIFY_LOGITS_GATHER_SHADOW"  # debug: also run the stock gather and compare bits (host sync)
-EXCLUSIVE_WITH = "verify_topk_sample"  # env MUSE_VR_VERIFY_TOPK_SAMPLE; see the module docstring
+EXCLUSIVE_WITH = (
+    "verify_topk_sample"  # env MUSE_VR_VERIFY_TOPK_SAMPLE; see the module docstring
+)
 DEFAULT_MAX_ROWS = 64  # tunable (tests/dist_verify_logits_gather.py --bench; MUSE_VR_VERIFY_LOGITS_GATHER_MAX_ROWS)
 TARGET = "sglang.srt.layers.logits_processor.LogitsProcessor.finish_deferred_gather"
 
@@ -53,12 +57,27 @@ TARGET = "sglang.srt.layers.logits_processor.LogitsProcessor.finish_deferred_gat
 # the deferred-gather method it mirrors, the NVLink gather class and wrappers it calls, their kernel, and the
 # communicator that owns the push and pull planes.
 PINS = {
-    "sglang/srt/layers/logits_processor.py": ("ecc0318937eee486414f6ae7165f2d1de17c01794a25aae83a99af61cbb0e3d0", "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398"),
+    "sglang/srt/layers/logits_processor.py": (
+        "ecc0318937eee486414f6ae7165f2d1de17c01794a25aae83a99af61cbb0e3d0",
+        "3558330bccf3ea0e46aabdaa0dee6ae7daf294c8e15b9a4e9744dab6883c4398",
+    ),
     "sglang/srt/distributed/device_communicators/vocab_gather.py": "7363debb7d54a2873971c33c14bcb46487db2b9038105ada14fa614a282aff55",
-    "sglang/kernels/ops/communication/nvlink_comm.py": ("6ba171bd054fd70b1248be37214419887f6731eea9c927c6e0aa9ee0997bc3fd", "0388df5a897cc9c437e7fb0a2e6e21231a7a8d0ce0033798846331c0698bdaaa"),
-    "sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh": ("8fb785518279cf8944a6a438036cfe39a2c00ecc6b0b5b86a6a2a0b46ad01e37", "e3c8f3c93a61c8788d4b97b9fbfa9cc0b5b1c9ee1b2154c9e7e04ab642431367"),
-    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": ("277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001", "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5"),
-    "sglang/srt/speculative/dflash_worker_v2.py": ("7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c", "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0"),
+    "sglang/kernels/ops/communication/nvlink_comm.py": (
+        "6ba171bd054fd70b1248be37214419887f6731eea9c927c6e0aa9ee0997bc3fd",
+        "0388df5a897cc9c437e7fb0a2e6e21231a7a8d0ce0033798846331c0698bdaaa",
+    ),
+    "sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh": (
+        "8fb785518279cf8944a6a438036cfe39a2c00ecc6b0b5b86a6a2a0b46ad01e37",
+        "e3c8f3c93a61c8788d4b97b9fbfa9cc0b5b1c9ee1b2154c9e7e04ab642431367",
+    ),
+    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
+        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+    ),
+    "sglang/srt/speculative/dflash_worker_v2.py": (
+        "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
+        "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+    ),
 }
 
 _state: dict = {"gather": None, "key": None}
@@ -84,7 +103,9 @@ def _rows_capacity() -> int:
 
         running = int(get_schedule().max_running_requests or 0)
         ndraft = int(get_spec().speculative_num_draft_tokens or 1)
-        return max(min(running * ndraft, _max_rows()), 0)  # row blocks above the cap take the NCCL gather
+        return max(
+            min(running * ndraft, _max_rows()), 0
+        )  # row blocks above the cap take the NCCL gather
     except Exception:  # noqa: BLE001 - no server context: push path only
         return 0
 
@@ -101,18 +122,33 @@ def _push_allowed() -> bool:
 
 def _nvlink_gather(group, width: int):
     """SGLang's NVLinkVocabGather for ``group`` and this shard width, created once (collective), or None."""
-    from sglang.srt.distributed.device_communicators.vocab_gather import NVLinkVocabGather, make_vocab_gather
+    from sglang.srt.distributed.device_communicators.vocab_gather import (
+        NVLinkVocabGather,
+        make_vocab_gather,
+    )
 
     key = (id(group), width)
     if _state["key"] != key:
-        pull_bounded.prepare(torch.float32)  # before the plane's collective set-up (MUSE_VR_PULL_BOUNDED)
-        vg = make_vocab_gather(group, local_width=width, dtype=torch.float32, symm_rows=_rows_capacity())
+        pull_bounded.prepare(
+            torch.float32
+        )  # before the plane's collective set-up (MUSE_VR_PULL_BOUNDED)
+        vg = make_vocab_gather(
+            group, local_width=width, dtype=torch.float32, symm_rows=_rows_capacity()
+        )
         _state["gather"] = vg if isinstance(vg, NVLinkVocabGather) else None
         _state["key"] = key
-        pull_rows = 0 if _state["gather"] is None or _state["gather"].pull_out is None else (
-            _state["gather"].pull_out.shape[0] // group.world_size)
-        bed.report(NAME + ":plane", _state["gather"] is not None, world=group.world_size, width=width,
-                   pull_rows=pull_rows)
+        pull_rows = (
+            0
+            if _state["gather"] is None or _state["gather"].pull_out is None
+            else (_state["gather"].pull_out.shape[0] // group.world_size)
+        )
+        bed.report(
+            NAME + ":plane",
+            _state["gather"] is not None,
+            world=group.world_size,
+            width=width,
+            pull_rows=pull_rows,
+        )
     return _state["gather"]
 
 
@@ -126,12 +162,18 @@ def gather_stacked(group, local: torch.Tensor):
     vg = _nvlink_gather(group, width)
     if vg is None:
         return None, "no NVLink gather"
-    if _push_allowed() and local.nbytes <= vg.slot_bytes and width * local.element_size() % 16 == 0:
+    if (
+        _push_allowed()
+        and local.nbytes <= vg.slot_bytes
+        and width * local.element_size() % 16 == 0
+    ):
         return vg.gather_stacked(local).view(world, rows, width), "push"
     if vg.pull_out is not None and world * rows <= vg.pull_out.shape[0]:
         out = vg.pull_out[: world * rows]
         # SGLang's pull kernel, or its copy with bounded barrier waits (MUSE_VR_PULL_BOUNDED=1): same bytes
-        pull_bounded.all_gather_pull(vg.comm, local, out, out_mc_ptr=vg.pull_mc_ptr, site=NAME)
+        pull_bounded.all_gather_pull(
+            vg.comm, local, out, out_mc_ptr=vg.pull_mc_ptr, site=NAME
+        )
         # The stack is read by the softcap kernel below on this stream; the pull kernel's entry barrier keeps every
         # other rank from writing it again until this rank has issued its next gather.
         return out.view(world, rows, width), "pull"
@@ -139,7 +181,12 @@ def gather_stacked(group, local: torch.Tensor):
 
 
 def _eligible(lp, logits: torch.Tensor) -> str | None:
-    if not (logits.is_cuda and logits.dtype == torch.float32 and logits.dim() == 2 and logits.is_contiguous()):
+    if not (
+        logits.is_cuda
+        and logits.dtype == torch.float32
+        and logits.dim() == 2
+        and logits.is_contiguous()
+    ):
         return "dtype/layout"
     if not lp.final_logit_softcapping or not lp.is_deferred_shard(logits):
         return "not a deferred softcapped shard"
@@ -155,7 +202,11 @@ def finish_deferred_gather(original, lp, logits: torch.Tensor) -> torch.Tensor:
 
     reason = _eligible(lp, logits)
     # the tensor-parallel group as the stock body names it on each layout
-    group = lpmod.get_tp_group() if hasattr(lpmod, "get_tp_group") else lpmod.get_parallel().tp_group
+    group = (
+        lpmod.get_tp_group()
+        if hasattr(lpmod, "get_tp_group")
+        else lpmod.get_parallel().tp_group
+    )
     if reason is None and group.world_size < 2:
         reason = "single rank"
     gathered = None
@@ -173,7 +224,9 @@ def finish_deferred_gather(original, lp, logits: torch.Tensor) -> torch.Tensor:
     out = lpmod.gathered_softcap_logits(gathered, lp.final_logit_softcapping, output)
     if bed.flag(NAME + "_shadow"):
         ref = original(lp, logits)
-        bed.shadow_result(NAME, bool(torch.equal(ref.view(torch.int32), out.view(torch.int32))))
+        bed.shadow_result(
+            NAME, bool(torch.equal(ref.view(torch.int32), out.view(torch.int32)))
+        )
     return out
 
 

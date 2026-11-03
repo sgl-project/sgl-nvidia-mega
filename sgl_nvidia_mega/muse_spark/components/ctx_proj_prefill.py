@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``ctx_proj_prefill_shard`` (env ``MUSE_VR_CTX_PROJ_PREFILL_SHARD=1``, default off).
 
 On a sequence-parallel prefill pass (``--enable-layernorm-sp``; ``layernorm_sp.runs_sp``), every tensor-parallel rank
@@ -101,14 +103,18 @@ PINS = {
 ENV_MIN_ROWS = "MUSE_VR_CTX_PROJ_PREFILL_SHARD_MIN_ROWS"
 ENV_PICK = "MUSE_VR_CTX_PROJ_PREFILL_SHARD_PICK"  # 1: per class, the fastest of up to 4 bitwise local configurations
 ENV_CHUNKS = "MUSE_VR_CTX_PROJ_PREFILL_SHARD_CHUNKS"  # 2..4: local GEMM in row chunks, each chunk's gather on a side stream
-CHUNK_MIN_ROWS = 256  # smallest local row chunk (fewer chunks when the rank's rows are fewer)
+CHUNK_MIN_ROWS = (
+    256  # smallest local row chunk (fewer chunks when the rank's rows are fewer)
+)
 PICK_CANDIDATES = 3  # heuristic picks asked for the local shape (plus the full configuration itself: at most 4)
 PICK_REPS = 7  # timed runs per candidate in the first-pass check (median; round-robin after two warm runs each)
 PICK_MARGIN = 0.03  # another candidate replaces the first only if its agreed time is at least this much lower
 CACHE_MAX = 8192  # row counts whose agreed decision is cached (oldest dropped first)
 
-_tls = threading.local()  # .ctx = (draft model, expected token count) while a marked target forward runs
-_workers: "weakref.WeakValueDictionary[int, object]" = weakref.WeakValueDictionary()
+_tls = (
+    threading.local()
+)  # .ctx = (draft model, expected token count) while a marked target forward runs
+_workers: weakref.WeakValueDictionary[int, object] = weakref.WeakValueDictionary()
 _pending: dict = {}  # id(draft model) -> the projected rows handed out on this pass (pre-norm, [tokens, hidden])
 _plans: dict = {}  # (device, rows, width) -> plan dict or None (library rejected / no configuration)
 _decisions: dict = {}  # (device, projected rows, local rows, width) -> agreed engage decision (bool)
@@ -133,15 +139,23 @@ def pins_match() -> tuple[bool, str]:
 def _eligible_draft(dm) -> bool:
     from sglang.srt.models.dflash import DFlashDraftModel
 
-    if not isinstance(dm, DFlashDraftModel) or type(dm).project_target_hidden is not DFlashDraftModel.project_target_hidden:
+    if (
+        not isinstance(dm, DFlashDraftModel)
+        or type(dm).project_target_hidden is not DFlashDraftModel.project_target_hidden
+    ):
         return False
     return _eligible_fc(dm)
 
 
 def _eligible_fc(dm) -> bool:
     fc = getattr(dm, "fc", None)
-    return (type(fc) is torch.nn.Linear and fc.bias is None and not getattr(dm, "quantizable", True)
-            and fc.weight.dtype == torch.bfloat16 and fc.weight.is_contiguous())
+    return (
+        type(fc) is torch.nn.Linear
+        and fc.bias is None
+        and not getattr(dm, "quantizable", True)
+        and fc.weight.dtype == torch.bfloat16
+        and fc.weight.is_contiguous()
+    )
 
 
 def _cache_put(d: dict, key, value) -> None:
@@ -171,7 +185,9 @@ def plan(device: torch.device, rows: int, local_rows: int, n: int, k: int):
     full = lt.full_shape_algo(device, rows, n, k)
     if full is not None:
         fcfg = lt.config(full)
-        if _force_split_for_test() is not None:  # negative control only (tests): a different split of the reduction
+        if (
+            _force_split_for_test() is not None
+        ):  # negative control only (tests): a different split of the reduction
             fcfg = list(fcfg)
             fcfg[2], fcfg[3] = _force_split_for_test()
             full = lt._build(lt._device_state(device)["handle"], tuple(fcfg))
@@ -181,7 +197,11 @@ def plan(device: torch.device, rows: int, local_rows: int, n: int, k: int):
             if cands:
                 algo, ws = cands[0]
                 # class key: the full pick's complete descriptor and the local configuration's (all nine config values)
-                out = {"algo": algo, "ws": ws, "key": (tuple(int(v) for v in fcfg), tuple(lt.config(algo)))}
+                out = {
+                    "algo": algo,
+                    "ws": ws,
+                    "key": (tuple(int(v) for v in fcfg), tuple(lt.config(algo))),
+                }
     _cache_put(_plans, ck, out)
     return out
 
@@ -195,13 +215,17 @@ def _force_split_for_test():
 
 
 def _key_hash(key) -> int:
-    return int.from_bytes(hashlib.sha256(repr(key).encode()).digest()[:7], "little")  # fits int64 (MIN of +/-)
+    return int.from_bytes(
+        hashlib.sha256(repr(key).encode()).digest()[:7], "little"
+    )  # fits int64 (MIN of +/-)
 
 
 def _agree(group, values: list) -> list:
     """Elementwise minimum over the group (host collective on its CPU communicator)."""
     t = torch.tensor(values, dtype=torch.int64)
-    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group)
+    torch.distributed.all_reduce(
+        t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
     return [int(v) for v in t.tolist()]
 
 
@@ -211,7 +235,9 @@ def _local_fc(p: dict, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return lt.run_slice(p["algo"], x, weight, workspace=_workspace(x.device, p["ws"]))
 
 
-def _row_form(group, p: dict, taps: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.Tensor:
+def _row_form(
+    group, p: dict, taps: torch.Tensor, weight: torch.Tensor, rows: int
+) -> torch.Tensor:
     local = _local_fc(p, taps, weight)
     out = local.new_empty((local.shape[0] * group.world_size, local.shape[1]))
     group.all_gather_into_tensor(out, local)
@@ -242,7 +268,15 @@ def _segments(local_rows: int, chunks: int) -> list:
     return segs
 
 
-def plan_ext(device: torch.device, rows: int, local_rows: int, n: int, k: int, pick: bool, chunks: int):
+def plan_ext(
+    device: torch.device,
+    rows: int,
+    local_rows: int,
+    n: int,
+    k: int,
+    pick: bool,
+    chunks: int,
+):
     """The extended form's local GEMMs for a pass of ``rows`` tokens, ``local_rows`` of them on this rank: {segs, shapes,
     key}. ``segs``: the rank's row chunks (``_segments``); ``shapes``: per distinct chunk row count, the configurations
     to try, in order (``ctx_proj_lt.slice_candidates``: the full pick's split count and reduction scheme forced; the first
@@ -257,7 +291,9 @@ def plan_ext(device: torch.device, rows: int, local_rows: int, n: int, k: int, p
     full = lt.full_shape_algo(device, rows, n, k)
     if full is not None:
         fcfg = lt.config(full)
-        if _force_split_for_test() is not None:  # negative control only (tests): a different split of the reduction
+        if (
+            _force_split_for_test() is not None
+        ):  # negative control only (tests): a different split of the reduction
             fcfg = list(fcfg)
             fcfg[2], fcfg[3] = _force_split_for_test()
             full = lt._build(lt._device_state(device)["handle"], tuple(fcfg))
@@ -266,24 +302,40 @@ def plan_ext(device: torch.device, rows: int, local_rows: int, n: int, k: int, p
             segs = _segments(local_rows, chunks)
             shapes = {}
             for m in sorted({b - a for a, b in segs}):
-                cands = lt.slice_candidates(device, full, m, n, k, count=PICK_CANDIDATES if pick else 1)
+                cands = lt.slice_candidates(
+                    device, full, m, n, k, count=PICK_CANDIDATES if pick else 1
+                )
                 cands = cands if pick else cands[:1]
                 if not cands:
                     shapes = None
                     break
-                shapes[m] = [(algo, ws, tuple(int(v) for v in lt.config(algo))) for algo, ws in cands]
+                shapes[m] = [
+                    (algo, ws, tuple(int(v) for v in lt.config(algo)))
+                    for algo, ws in cands
+                ]
                 plant = os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_PLANT_CAND")
-                if plant is not None and int(plant) < len(shapes[m]):  # tests only: that candidate gets another split
+                if plant is not None and int(plant) < len(
+                    shapes[m]
+                ):  # tests only: that candidate gets another split
                     i = int(plant)
                     cfg = list(shapes[m][i][2])
                     cfg[2], cfg[3] = 4, 2
                     bad = lt._build(lt._device_state(device)["handle"], tuple(cfg))
-                    bws = None if bad is None else lt.slice_workspace(device, bad, m, n, k)
+                    bws = (
+                        None
+                        if bad is None
+                        else lt.slice_workspace(device, bad, m, n, k)
+                    )
                     if bws is not None:
                         shapes[m][i] = (bad, bws, tuple(cfg))
             if shapes:
-                key = ("ext", tuple(int(v) for v in fcfg), tuple((m, tuple(c[2] for c in shapes[m])) for m in sorted(shapes)),
-                       len(segs), int(bool(pick)))
+                key = (
+                    "ext",
+                    tuple(int(v) for v in fcfg),
+                    tuple((m, tuple(c[2] for c in shapes[m])) for m in sorted(shapes)),
+                    len(segs),
+                    int(bool(pick)),
+                )
                 out = {"segs": segs, "shapes": shapes, "key": key}
     _cache_put(_plans, ck, out)
     return out
@@ -297,24 +349,46 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
     return s
 
 
-def _seg_gemm(p: dict, choice: dict, taps: torch.Tensor, weight: torch.Tensor, a: int, b: int, safe: bool):
+def _seg_gemm(
+    p: dict,
+    choice: dict,
+    taps: torch.Tensor,
+    weight: torch.Tensor,
+    a: int,
+    b: int,
+    safe: bool,
+):
     """The rank's rows ``[a, b)`` through the chosen configuration for that row count, on the current stream: (output,
     library ok). ``safe``: a library error gives zeros and ok False (the caller keeps its collective sequence)."""
     from . import ctx_proj_lt as lt
 
     algo, ws, _ = p["shapes"][b - a][choice[b - a]]
     if not safe:
-        return lt.run_slice(algo, taps[a:b], weight, workspace=_workspace(taps.device, ws)), True
+        return lt.run_slice(
+            algo, taps[a:b], weight, workspace=_workspace(taps.device, ws)
+        ), True
     try:
-        if os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE") == "1":  # tests only: a library error here
+        if (
+            os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE") == "1"
+        ):  # tests only: a library error here
             raise RuntimeError("test-only library error")
-        return lt.run_slice(algo, taps[a:b], weight, workspace=_workspace(taps.device, ws)), True
+        return lt.run_slice(
+            algo, taps[a:b], weight, workspace=_workspace(taps.device, ws)
+        ), True
     except Exception as e:  # noqa: BLE001
         bed.count(NAME, f"plan error: check {type(e).__name__}")
         return taps.new_zeros((b - a, weight.shape[0])), False
 
 
-def _ext_form(group, p: dict, choice: dict, taps: torch.Tensor, weight: torch.Tensor, rows: int, safe: bool = False):
+def _ext_form(
+    group,
+    p: dict,
+    choice: dict,
+    taps: torch.Tensor,
+    weight: torch.Tensor,
+    rows: int,
+    safe: bool = False,
+):
     """The extended sharded form: the rank's local rows through the chosen configurations, gathered rank-major into
     ``[w x local rows, n]`` (the first ``rows`` returned) with the group's gather (the stock collective). One chunk: GEMM
     and gather on the current stream (the base form). Several chunks: each chunk's GEMM on the current stream; behind it
@@ -360,13 +434,20 @@ def _time_candidates(cands: list, x: torch.Tensor, weight: torch.Tensor) -> list
     live = [i for i, c in enumerate(cands) if c is not None]
     for _ in range(2):
         for i in live:
-            lt.run_slice(cands[i][0], x, weight, workspace=_workspace(x.device, cands[i][1]))
+            lt.run_slice(
+                cands[i][0], x, weight, workspace=_workspace(x.device, cands[i][1])
+            )
     ev = {i: [] for i in live}
     for _ in range(PICK_REPS):
         for i in live:
-            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0, e1 = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
             e0.record()
-            lt.run_slice(cands[i][0], x, weight, workspace=_workspace(x.device, cands[i][1]))
+            lt.run_slice(
+                cands[i][0], x, weight, workspace=_workspace(x.device, cands[i][1])
+            )
             e1.record()
             ev[i].append((e0, e1))
     torch.cuda.synchronize(x.device)
@@ -377,7 +458,9 @@ def _time_candidates(cands: list, x: torch.Tensor, weight: torch.Tensor) -> list
     return out
 
 
-def _check_pass_ext(original, group, dm, p, key, hidden_states, expected, rows, w, *args, **kwargs):
+def _check_pass_ext(
+    original, group, dm, p, key, hidden_states, expected, rows, w, *args, **kwargs
+):
     """First pass of an extended-form class on every rank. Collective sequence, the same on every rank: the stock
     gather; one host MIN over (every candidate's bitwise verdict on this rank's rows, minus its GPU time) - the agreed
     choice per chunk row count is the candidate bitwise on every rank whose slowest rank is fastest (ties: the earlier
@@ -400,14 +483,28 @@ def _check_pass_ext(original, group, dm, p, key, hidden_states, expected, rows, 
         for algo, ws, _cfg in p["shapes"][m]:
             good = True
             try:
-                if os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE") == "1":  # tests only
+                if (
+                    os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE") == "1"
+                ):  # tests only
                     raise RuntimeError("test-only library error")
-                if os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE_CAND") == str(len(live)):  # tests only
+                if os.environ.get(
+                    "MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE_CAND"
+                ) == str(len(live)):  # tests only
                     raise RuntimeError("test-only library error (one candidate)")
                 for a, b in segs_m:
-                    o = lt.run_slice(algo, hidden_states[a:b], weight, workspace=_workspace(hidden_states.device, ws))
-                    v = max(0, min(b - a, expected - (base + a)))  # rows of this chunk inside the projected rows
-                    if v and not torch.equal(o[:v].view(torch.int16), ref[base + a:base + a + v].view(torch.int16)):
+                    o = lt.run_slice(
+                        algo,
+                        hidden_states[a:b],
+                        weight,
+                        workspace=_workspace(hidden_states.device, ws),
+                    )
+                    v = max(
+                        0, min(b - a, expected - (base + a))
+                    )  # rows of this chunk inside the projected rows
+                    if v and not torch.equal(
+                        o[:v].view(torch.int16),
+                        ref[base + a : base + a + v].view(torch.int16),
+                    ):
                         good = False
             except Exception as e:  # noqa: BLE001 - this candidate votes 0 on this rank; the sequence stays the same
                 bed.count(NAME, f"plan error: check {type(e).__name__}")
@@ -415,38 +512,61 @@ def _check_pass_ext(original, group, dm, p, key, hidden_states, expected, rows, 
             live.append((algo, ws, _cfg) if good else None)
             oks.append(1 if good else 0)
         a0, b0 = segs_m[0]
-        ts = _time_candidates(live, hidden_states[a0:b0], weight) if pick and any(live) else [0] * len(live)
+        ts = (
+            _time_candidates(live, hidden_states[a0:b0], weight)
+            if pick and any(live)
+            else [0] * len(live)
+        )
         times.extend(ts)
     agreed = _agree(group, oks + [-t for t in times])
-    a_ok, a_t = agreed[:len(oks)], [-v for v in agreed[len(oks):]]
+    a_ok, a_t = agreed[: len(oks)], [-v for v in agreed[len(oks) :]]
     choice, i = {}, 0
     for m in shapes:
         best = None
         for ci in range(len(p["shapes"][m])):
             if a_ok[i + ci] == 1 and (best is None or a_t[i + ci] < a_t[i + best]):
                 best = ci
-        if best is not None and best != 0 and a_ok[i] == 1 and a_t[i + best] > (1.0 - PICK_MARGIN) * a_t[i]:
+        if (
+            best is not None
+            and best != 0
+            and a_ok[i] == 1
+            and a_t[i + best] > (1.0 - PICK_MARGIN) * a_t[i]
+        ):
             best = 0  # near-tie with the first candidate: keep it (timing noise must not pick a slower one)
         if best is not None:
             choice[m] = best
         i += len(p["shapes"][m])
     ok = False
     if len(choice) == len(shapes):
-        got, lib_ok = _ext_form(group, p, choice, hidden_states, weight, rows, safe=True)
+        got, lib_ok = _ext_form(
+            group, p, choice, hidden_states, weight, rows, safe=True
+        )
         got = got[:expected]
-        ok = bool(lib_ok and ref.shape == got.shape and torch.equal(ref.view(torch.int16), got.view(torch.int16)))
+        ok = bool(
+            lib_ok
+            and ref.shape == got.shape
+            and torch.equal(ref.view(torch.int16), got.view(torch.int16))
+        )
     (final,) = _agree(group, [1 if ok else 0])
     _verdicts[key] = bool(final)
     if final:
         _choices[key] = dict(choice)
     bed.count(NAME, "check:" + ("verified" if final else "FAILED"))
     if pick and final:
-        bed.count(NAME, "pick:" + ",".join(f"{m}:{c}" for m, c in sorted(choice.items())))
+        bed.count(
+            NAME, "pick:" + ",".join(f"{m}:{c}" for m, c in sorted(choice.items()))
+        )
     if rows != expected:
         bed.count(NAME, f"check:pad:{rows - expected}")
     if not final:
-        logger.warning("muse_vr_plugin: %s class %s FAILED its first-pass check (this rank: candidates bitwise %s, "
-                       "end to end %s); that class stays stock", NAME, key, oks, ok)
+        logger.warning(
+            "muse_vr_plugin: %s class %s FAILED its first-pass check (this rank: candidates bitwise %s, "
+            "end to end %s); that class stays stock",
+            NAME,
+            key,
+            oks,
+            ok,
+        )
     _report_classes()
     return gathered
 
@@ -462,22 +582,35 @@ def _around_gather(original, hidden_states, *args, **kwargs):
         return original(hidden_states, *args, **kwargs)
     dm, expected = ctx
     fc = dm.fc
-    if not (isinstance(hidden_states, torch.Tensor) and hidden_states.ndim == 2
-            and hidden_states.shape[1] == fc.in_features):
-        return original(hidden_states, *args, **kwargs)  # another exit (e.g. the routed-expert ids): not ours
+    if not (
+        isinstance(hidden_states, torch.Tensor)
+        and hidden_states.ndim == 2
+        and hidden_states.shape[1] == fc.in_features
+    ):
+        return original(
+            hidden_states, *args, **kwargs
+        )  # another exit (e.g. the routed-expert ids): not ours
     _tls.ctx = None  # one taps exit per marked forward
     num_tokens = kwargs.get("num_tokens", args[0] if len(args) == 1 else None)
     if len(args) + len(kwargs) != 1 or num_tokens is None:
         return _step_aside(original, "call form", hidden_states, *args, **kwargs)
     if torch.cuda.is_current_stream_capturing():
         # the marked forward is an eager extend: a capture here breaks this component's contract
-        raise RuntimeError(f"{NAME}: the SP exit of a marked DFLASH extend runs inside CUDA-graph capture")
+        raise RuntimeError(
+            f"{NAME}: the SP exit of a marked DFLASH extend runs inside CUDA-graph capture"
+        )
     if torch.compiler.is_compiling():
         return _step_aside(original, "compiling", hidden_states, *args, **kwargs)
-    if not (hidden_states.is_cuda and hidden_states.dtype == torch.bfloat16 and hidden_states.is_contiguous()):
+    if not (
+        hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+    ):
         return _step_aside(original, "taps layout", hidden_states, *args, **kwargs)
     rows = int(num_tokens)
-    if rows < expected:  # fewer rows than the batch's extend tokens: not a padded pass of this batch
+    if (
+        rows < expected
+    ):  # fewer rows than the batch's extend tokens: not a padded pass of this batch
         return _step_aside(original, "padded rows", hidden_states, *args, **kwargs)
     if expected < bed.env_int(ENV_MIN_ROWS, 1):
         return _step_aside(original, "below min rows", hidden_states, *args, **kwargs)
@@ -500,7 +633,15 @@ def _around_gather(original, hidden_states, *args, **kwargs):
     ext = pick or chunks > 1
     try:
         if ext:
-            p = plan_ext(device, expected, local_rows, fc.out_features, fc.in_features, pick, chunks)
+            p = plan_ext(
+                device,
+                expected,
+                local_rows,
+                fc.out_features,
+                fc.in_features,
+                pick,
+                chunks,
+            )
         else:
             p = plan(device, expected, local_rows, fc.out_features, fc.in_features)
     except Exception as e:  # noqa: BLE001 - no configuration on this rank: the agreement below keeps every rank stock
@@ -512,32 +653,56 @@ def _around_gather(original, hidden_states, *args, **kwargs):
         verified = 1 if (key is not None and _verdicts.get(key) is True) else 0
         failed = 1 if (key is not None and _verdicts.get(key) is False) else 0
         lo, neg_hi, all_verified, none_failed, all_planned = _agree(
-            group, [h, -h, verified, 1 - failed, 1 if p is not None else 0])
+            group, [h, -h, verified, 1 - failed, 1 if p is not None else 0]
+        )
         same = lo == -neg_hi and all_planned == 1
         if same and all_verified == 1:
             engage = True
         elif same and none_failed == 1 and key is not None and key not in _verdicts:
             check = _check_pass_ext if ext else _check_pass
-            return check(original, group, dm, p, key, hidden_states, expected, rows, w, *args, **kwargs)
+            return check(
+                original,
+                group,
+                dm,
+                p,
+                key,
+                hidden_states,
+                expected,
+                rows,
+                w,
+                *args,
+                **kwargs,
+            )
         else:
             engage = False
-            bed.count(NAME, "decide:stock " + ("classes differ" if not same else "class failed"))
+            bed.count(
+                NAME,
+                "decide:stock " + ("classes differ" if not same else "class failed"),
+            )
         _cache_put(_decisions, dk, engage)
     if not engage:
-        return _step_aside(original, "class not verified", hidden_states, *args, **kwargs)
+        return _step_aside(
+            original, "class not verified", hidden_states, *args, **kwargs
+        )
     if ext:
-        out, _ = _ext_form(group, p, _choices[(p["key"], w)], hidden_states, fc.weight, rows)
+        out, _ = _ext_form(
+            group, p, _choices[(p["key"], w)], hidden_states, fc.weight, rows
+        )
         bed.count(NAME, f"ext:chunks{len(p['segs'])}")
     else:
         out = _row_form(group, p, hidden_states, fc.weight, rows)
     _pending[id(dm)] = out
     bed.count(NAME, f"row:w{w}")
     if rows != expected:
-        bed.count(NAME, f"pad:{rows - expected}")  # INFO: an alignment-padded pass took the sharded form
+        bed.count(
+            NAME, f"pad:{rows - expected}"
+        )  # INFO: an alignment-padded pass took the sharded form
     return out
 
 
-def _check_pass(original, group, dm, p, key, hidden_states, expected, rows, w, *args, **kwargs):
+def _check_pass(
+    original, group, dm, p, key, hidden_states, expected, rows, w, *args, **kwargs
+):
     """First pass of a class on every rank: stock gather + stock fc on the ``expected`` leading rows (the rows the stock
     consumer projects) vs the sharded form on the same rows, bit for bit; verdict agreed by minimum; returns the stock
     gather (the worker projects as stock on this pass)."""
@@ -547,7 +712,9 @@ def _check_pass(original, group, dm, p, key, hidden_states, expected, rows, w, *
     ref = torch.nn.functional.linear(gathered[:expected], dm.fc.weight)
     weight = dm.fc.weight
     try:
-        if os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE") == "1":  # tests only: a library error here
+        if (
+            os.environ.get("MUSE_VR_CTX_PROJ_PREFILL_SHARD_TEST_RAISE") == "1"
+        ):  # tests only: a library error here
             raise RuntimeError("test-only library error")
         local = _local_fc(p, hidden_states, weight)
         lib_ok = True
@@ -558,15 +725,26 @@ def _check_pass(original, group, dm, p, key, hidden_states, expected, rows, w, *
     got = local.new_empty((local.shape[0] * w, local.shape[1]))
     group.all_gather_into_tensor(got, local)
     got = got[:expected]
-    ok = bool(lib_ok and ref.shape == got.shape and torch.equal(ref.view(torch.int16), got.view(torch.int16)))
+    ok = bool(
+        lib_ok
+        and ref.shape == got.shape
+        and torch.equal(ref.view(torch.int16), got.view(torch.int16))
+    )
     (agreed,) = _agree(group, [1 if ok else 0])
     _verdicts[key] = bool(agreed)
     bed.count(NAME, "check:" + ("verified" if agreed else "FAILED"))
     if rows != expected:
-        bed.count(NAME, f"check:pad:{rows - expected}")  # INFO: the class's first pass was an alignment-padded one
+        bed.count(
+            NAME, f"check:pad:{rows - expected}"
+        )  # INFO: the class's first pass was an alignment-padded one
     if not agreed:
-        logger.warning("muse_vr_plugin: %s class %s FAILED its first-pass check (this rank bitwise=%s); that class "
-                       "stays stock", NAME, key, ok)
+        logger.warning(
+            "muse_vr_plugin: %s class %s FAILED its first-pass check (this rank bitwise=%s); that class "
+            "stays stock",
+            NAME,
+            key,
+            ok,
+        )
     _report_classes()
     return gathered
 
@@ -580,24 +758,38 @@ def class_list_hash() -> str:
 
 
 def _report_classes() -> None:
-    bed.report(NAME + ":classes", True, seen=len(_verdicts), verified=sum(1 for v in _verdicts.values() if v),
-               failed=sum(1 for v in _verdicts.values() if not v), class_list_sha16=class_list_hash(),
-               failed_keys=[repr(k) for k, v in _verdicts.items() if not v][:8],
-               choices=[f"{k!r}:{sorted(v.items())}" for k, v in _choices.items()][:8])
+    bed.report(
+        NAME + ":classes",
+        True,
+        seen=len(_verdicts),
+        verified=sum(1 for v in _verdicts.values() if v),
+        failed=sum(1 for v in _verdicts.values() if not v),
+        class_list_sha16=class_list_hash(),
+        failed_keys=[repr(k) for k, v in _verdicts.items() if not v][:8],
+        choices=[f"{k!r}:{sorted(v.items())}" for k, v in _choices.items()][:8],
+    )
 
 
 def _around_proj(original, draft_model, target_hidden):
     pend = _pending.pop(id(draft_model), None)
     if pend is None:
         return original(draft_model, target_hidden)
-    if (isinstance(target_hidden, torch.Tensor) and target_hidden.dtype == pend.dtype
-            and target_hidden.device == pend.device and target_hidden.ndim == 2
-            and target_hidden.shape[1] == pend.shape[1] and target_hidden.stride() == pend.stride()
-            and target_hidden.data_ptr() == pend.data_ptr() and target_hidden.shape[0] <= pend.shape[0]):
+    if (
+        isinstance(target_hidden, torch.Tensor)
+        and target_hidden.dtype == pend.dtype
+        and target_hidden.device == pend.device
+        and target_hidden.ndim == 2
+        and target_hidden.shape[1] == pend.shape[1]
+        and target_hidden.stride() == pend.stride()
+        and target_hidden.data_ptr() == pend.data_ptr()
+        and target_hidden.shape[0] <= pend.shape[0]
+    ):
         bed.count(NAME, "take")
         return draft_model.hidden_norm(target_hidden)
-    raise RuntimeError(f"{NAME}: the projection was called on another tensor than the one this pass handed out "
-                       f"({tuple(getattr(target_hidden, 'shape', ()))} vs {tuple(pend.shape)})")
+    raise RuntimeError(
+        f"{NAME}: the projection was called on another tensor than the one this pass handed out "
+        f"({tuple(getattr(target_hidden, 'shape', ()))} vs {tuple(pend.shape)})"
+    )
 
 
 def _after_init(result, worker, *args, **kwargs):
@@ -612,7 +804,9 @@ def _encoder_swa_replay():
     try:
         from sglang.srt.runtime_context import get_exec
 
-        return bool(getattr(get_exec().features, "enable_encoder_swa_bounded_replay", False))
+        return bool(
+            getattr(get_exec().features, "enable_encoder_swa_bounded_replay", False)
+        )
     except Exception:  # noqa: BLE001
         return None
 
@@ -629,8 +823,14 @@ def _around_fwd(original, target_worker, *args, **kwargs):
 
     worker = _workers.get(id(target_worker))
     batch = args[0] if args else kwargs.get("batch")
-    if (worker is None or kwargs.get("is_verify", False) or kwargs.get("capture_hidden_mode") != CaptureHiddenMode.FULL
-            or batch is None or not batch.forward_mode.is_extend() or batch.forward_mode.is_idle()):
+    if (
+        worker is None
+        or kwargs.get("is_verify", False)
+        or kwargs.get("capture_hidden_mode") != CaptureHiddenMode.FULL
+        or batch is None
+        or not batch.forward_mode.is_extend()
+        or batch.forward_mode.is_idle()
+    ):
         return original(target_worker, *args, **kwargs)
     dm = getattr(worker, "draft_model", None)
     if _pending.pop(id(dm), None) is not None:
@@ -642,14 +842,19 @@ def _around_fwd(original, target_worker, *args, **kwargs):
     replay = _encoder_swa_replay()
     if replay is not False:
         # the replay fold drops rows of the captured taps; an unreadable setting counts as on
-        bed.count(NAME, "stock:encoder swa replay" if replay else "stock:exec config unreadable")
+        bed.count(
+            NAME,
+            "stock:encoder swa replay" if replay else "stock:exec config unreadable",
+        )
         return original(target_worker, *args, **kwargs)
     _tls.ctx = (dm, expected)
     try:
         return original(target_worker, *args, **kwargs)
     finally:
         if getattr(_tls, "ctx", None) is not None:
-            bed.count(NAME, "stock:no sp exit")  # a replicated pass (not sequence-parallel): stock projection
+            bed.count(
+                NAME, "stock:no sp exit"
+            )  # a replicated pass (not sequence-parallel): stock projection
         _tls.ctx = None
 
 
@@ -677,5 +882,7 @@ def register() -> bool:
     HookRegistry.register(TARGET_GATHER, gather_hook, HookType.AROUND)
     HookRegistry.register(TARGET_PROJ, proj_hook, HookType.AROUND)
     pick, chunks = _ext_settings()
-    bed.report(NAME, True, min_rows=bed.env_int(ENV_MIN_ROWS, 1), pick=pick, chunks=chunks)
+    bed.report(
+        NAME, True, min_rows=bed.env_int(ENV_MIN_ROWS, 1), pick=pick, chunks=chunks
+    )
     return True

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``pfin``: the sequence-parallel prefill MoE finalize on the plugin's persistent kernel (``ops/pfin.py``).
 
 Under ``--enable-layernorm-sp`` every routed expert layer of a prefill pass ends with SGLang's fused finalize
@@ -28,22 +30,20 @@ from . import bed
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "pfin"
-OP_MODULE = "sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_trtllm"
+OP_MODULE = (
+    "sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_trtllm"
+)
 OP_CLASS = "FusedPostExpertNormWeightedSumTRTLLM"
 # One pin set per validated SGLang layout (the op: cluster-size selection, cluster 1 above 128 tokens at hidden 4096, and
 # launch arguments; the CuTe-DSL kernel whose single-CTA arithmetic csrc/pfin.cuh reproduces). Either set must match.
 SGLANG_PIN_SETS = (
-    {   # SGLang main layout
-        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce.py":
-            "b22ba8b4d895fd38c99a0835b5a37b82adaa8e7587379f09807cb072eceb9948",
-        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce_cutedsl.py":
-            "9e503382ec0d904476aa039d77510486cc71563c2e1a8bfcbb8d9234e7e2e689",
+    {  # SGLang main layout
+        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce.py": "b22ba8b4d895fd38c99a0835b5a37b82adaa8e7587379f09807cb072eceb9948",
+        "sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce_cutedsl.py": "9e503382ec0d904476aa039d77510486cc71563c2e1a8bfcbb8d9234e7e2e689",
     },
-    {   # original branch layout
-        "sglang/kernels/ops/muse_spark_v12/fused_post_expert_norm_weighted_sum_trtllm.py":
-            "d2ba335e91affae92c8563a249f56cfaa2e54b84ae3f8d6d692624c105e0d048",
-        "sglang/kernels/ops/muse_spark_v12/fi_trtllm_moe_finalize_with_rmsnorm_cutedsl.py":
-            "01fac72ef834b126c502252dcef1c83ab5cecef4a2c6241a0ec3e2292fb008a4",
+    {  # original branch layout
+        "sglang/kernels/ops/muse_spark_v12/fused_post_expert_norm_weighted_sum_trtllm.py": "d2ba335e91affae92c8563a249f56cfaa2e54b84ae3f8d6d692624c105e0d048",
+        "sglang/kernels/ops/muse_spark_v12/fi_trtllm_moe_finalize_with_rmsnorm_cutedsl.py": "01fac72ef834b126c502252dcef1c83ab5cecef4a2c6241a0ec3e2292fb008a4",
     },
 )
 HIDDEN = 4096
@@ -84,7 +84,9 @@ def _aligned(t) -> bool:
     return t.data_ptr() % 16 == 0
 
 
-def ineligible(op, gemm2_output, expert_weights, idx, rms_w, output, ar_workspace, cfg: dict) -> str:
+def ineligible(
+    op, gemm2_output, expert_weights, idx, rms_w, output, ar_workspace, cfg: dict
+) -> str:
     """'' when the plugin kernel reproduces this call; otherwise the step-aside reason."""
     import torch
 
@@ -101,19 +103,38 @@ def ineligible(op, gemm2_output, expert_weights, idx, rms_w, output, ar_workspac
     t = int(output.shape[0])
     if t < max(int(cfg["min_t"]), 129):
         return "small_t"
-    if not (gemm2_output.is_cuda and gemm2_output.dim() == 2 and gemm2_output.dtype == torch.bfloat16
-            and gemm2_output.shape[1] >= HIDDEN and gemm2_output.is_contiguous()):
+    if not (
+        gemm2_output.is_cuda
+        and gemm2_output.dim() == 2
+        and gemm2_output.dtype == torch.bfloat16
+        and gemm2_output.shape[1] >= HIDDEN
+        and gemm2_output.is_contiguous()
+    ):
         return "gemm2"
     if not (output.dtype == torch.bfloat16 and output.is_contiguous()):
         return "out"
-    if not (rms_w.dtype == torch.bfloat16 and rms_w.is_contiguous() and rms_w.numel() == HIDDEN):
+    if not (
+        rms_w.dtype == torch.bfloat16
+        and rms_w.is_contiguous()
+        and rms_w.numel() == HIDDEN
+    ):
         return "rms_w"
-    if not (idx.dtype == torch.int32 and idx.is_contiguous() and idx.numel() == t * TOPK):
+    if not (
+        idx.dtype == torch.int32 and idx.is_contiguous() and idx.numel() == t * TOPK
+    ):
         return "idx"
-    if not (expert_weights.dtype in (torch.float32, torch.bfloat16) and expert_weights.is_contiguous()
-            and expert_weights.numel() == t * TOPK):
+    if not (
+        expert_weights.dtype in (torch.float32, torch.bfloat16)
+        and expert_weights.is_contiguous()
+        and expert_weights.numel() == t * TOPK
+    ):
         return "expert_weights"
-    if not (_aligned(gemm2_output) and _aligned(output) and _aligned(rms_w) and (gemm2_output.shape[1] * 2) % 16 == 0):
+    if not (
+        _aligned(gemm2_output)
+        and _aligned(output)
+        and _aligned(rms_w)
+        and (gemm2_output.shape[1] * 2) % 16 == 0
+    ):
         return "align"
     if torch.cuda.get_device_capability(output.device)[0] < 9:
         return "arch"
@@ -122,24 +143,62 @@ def ineligible(op, gemm2_output, expert_weights, idx, rms_w, output, ar_workspac
 
 def _wrap(fn):
     @functools.wraps(fn)
-    def forward_cute_dsl(self, gemm2_output, expert_weights, expanded_idx_to_permuted_idx, rms_norm_weight, output, *,
-                         ar_workspace=None):
+    def forward_cute_dsl(
+        self,
+        gemm2_output,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        rms_norm_weight,
+        output,
+        *,
+        ar_workspace=None,
+    ):
         cfg = _cfg()
-        why = ineligible(self, gemm2_output, expert_weights, expanded_idx_to_permuted_idx, rms_norm_weight, output,
-                         ar_workspace, cfg)
+        why = ineligible(
+            self,
+            gemm2_output,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            rms_norm_weight,
+            output,
+            ar_workspace,
+            cfg,
+        )
         if why:
             bed.count(NAME, "stock:" + why)
-            if why not in ("not_sp", "small_t", "ar_workspace") and why not in _state["warned"]:
+            if (
+                why not in ("not_sp", "small_t", "ar_workspace")
+                and why not in _state["warned"]
+            ):
                 _state["warned"].add(why)
-                logger.warning("muse_vr_plugin: pfin stepped aside to the stock finalize (%s)", why)
-            return fn(self, gemm2_output, expert_weights, expanded_idx_to_permuted_idx, rms_norm_weight, output,
-                      ar_workspace=ar_workspace)
+                logger.warning(
+                    "muse_vr_plugin: pfin stepped aside to the stock finalize (%s)", why
+                )
+            return fn(
+                self,
+                gemm2_output,
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                rms_norm_weight,
+                output,
+                ar_workspace=ar_workspace,
+            )
         from .ops import pfin as pfin_op
 
         if int(output.shape[0]) == 0:
             return None
-        pfin_op.pfin(gemm2_output, expert_weights, expanded_idx_to_permuted_idx, rms_norm_weight, output,
-                     float(self.eps), bool(self.weight_first), slots=cfg["slots"], groups=cfg["groups"], ctas_per_sm=cfg["ctas"])
+        pfin_op.pfin(
+            gemm2_output,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            rms_norm_weight,
+            output,
+            float(self.eps),
+            bool(self.weight_first),
+            slots=cfg["slots"],
+            groups=cfg["groups"],
+            ctas_per_sm=cfg["ctas"],
+        )
         bed.count(NAME, "pfin")
         return None
 
@@ -174,7 +233,10 @@ def engage() -> bool:
     if not bed.enabled(NAME):
         _state["engaged"] = False
         return False
-    if not any(all(bed.file_sha256(rel) == sha for rel, sha in pins.items()) for pins in SGLANG_PIN_SETS):
+    if not any(
+        all(bed.file_sha256(rel) == sha for rel, sha in pins.items())
+        for pins in SGLANG_PIN_SETS
+    ):
         bed.report(NAME, False, reason="pin mismatch: finalize op / kernel sources")
         _state["engaged"] = False
         return False

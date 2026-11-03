@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Sequence-parallel MoE front in one pass: the pre-expert RMSNorm of a [T, 4096] bf16 row (with bf16 weight) and
  * the per-token NVFP4 quantization of its bf16 result, with the arithmetic of the two stock kernels it replaces (the

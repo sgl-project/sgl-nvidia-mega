@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pinned cuBLASLt column slices for ``ctx_proj_overlap`` shard mode (``MUSE_VR_CTX_PROJ_OVERLAP_SHARD_PIN=1``, default
 off; used only by that component).
 
@@ -38,7 +40,9 @@ _DESC_TRANSA, _DESC_TRANSB = 3, 4
 _OP_N, _OP_T = 0, 1
 _PREF_MAX_WORKSPACE_BYTES = 1
 _PREF_MIN_ALIGNMENT = (5, 6, 7, 8)  # A, B, C, D bytes
-_CFG_ATTRS = tuple(range(9))  # CUBLASLT_ALGO_CONFIG_ID .. CLUSTER_SHAPE_ID; 7 and 8 are uint16
+_CFG_ATTRS = tuple(
+    range(9)
+)  # CUBLASLT_ALGO_CONFIG_ID .. CLUSTER_SHAPE_ID; 7 and 8 are uint16
 _CFG_U16 = (7, 8)
 _SUCCESS = 0
 
@@ -48,8 +52,13 @@ class _Algo(ctypes.Structure):
 
 
 class _Heur(ctypes.Structure):
-    _fields_ = [("algo", _Algo), ("ws", ctypes.c_size_t), ("state", ctypes.c_int), ("waves", ctypes.c_float),
-                ("res", ctypes.c_int * 4)]
+    _fields_ = [
+        ("algo", _Algo),
+        ("ws", ctypes.c_size_t),
+        ("state", ctypes.c_int),
+        ("waves", ctypes.c_float),
+        ("res", ctypes.c_int * 4),
+    ]
 
 
 _lock = threading.Lock()
@@ -94,7 +103,10 @@ def torch_workspace_bytes(device: torch.device) -> int:
     if cfg:
         vals = [v for v in cfg.split(":") if v]
         try:
-            return sum(int(vals[i]) * 1024 * int(vals[i + 1]) for i in range(0, len(vals) - 1, 2))
+            return sum(
+                int(vals[i]) * 1024 * int(vals[i + 1])
+                for i in range(0, len(vals) - 1, 2)
+            )
         except ValueError:
             pass
     major = torch.cuda.get_device_properties(device).major
@@ -114,22 +126,48 @@ def _device_state(device: torch.device) -> dict:
         handle = ctypes.c_void_p()
         _check(lt.cublasLtCreate(ctypes.byref(handle)), "create")
         desc = ctypes.c_void_p()
-        _check(lt.cublasLtMatmulDescCreate(ctypes.byref(desc), ctypes.c_int(_COMPUTE_32F), ctypes.c_int(_R_32F)),
-               "matmul desc")
+        _check(
+            lt.cublasLtMatmulDescCreate(
+                ctypes.byref(desc), ctypes.c_int(_COMPUTE_32F), ctypes.c_int(_R_32F)
+            ),
+            "matmul desc",
+        )
         for attr, op in ((_DESC_TRANSA, _OP_T), (_DESC_TRANSB, _OP_N)):
             v = ctypes.c_int32(op)
-            _check(lt.cublasLtMatmulDescSetAttribute(desc, ctypes.c_int(attr), ctypes.byref(v), ctypes.c_size_t(4)),
-                   "transpose")
+            _check(
+                lt.cublasLtMatmulDescSetAttribute(
+                    desc, ctypes.c_int(attr), ctypes.byref(v), ctypes.c_size_t(4)
+                ),
+                "transpose",
+            )
         pref = ctypes.c_void_p()
         _check(lt.cublasLtMatmulPreferenceCreate(ctypes.byref(pref)), "preference")
         ws = ctypes.c_uint64(torch_workspace_bytes(torch.device("cuda", idx)))
-        _check(lt.cublasLtMatmulPreferenceSetAttribute(pref, ctypes.c_int(_PREF_MAX_WORKSPACE_BYTES), ctypes.byref(ws),
-                                                       ctypes.c_size_t(8)), "preference workspace")
+        _check(
+            lt.cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                ctypes.c_int(_PREF_MAX_WORKSPACE_BYTES),
+                ctypes.byref(ws),
+                ctypes.c_size_t(8),
+            ),
+            "preference workspace",
+        )
         for attr in _PREF_MIN_ALIGNMENT:
             v = ctypes.c_uint32(16)
-            _check(lt.cublasLtMatmulPreferenceSetAttribute(pref, ctypes.c_int(attr), ctypes.byref(v), ctypes.c_size_t(4)),
-                   "preference alignment")
-        st = {"handle": handle, "desc": desc, "pref": pref, "layouts": {}, "ws": None, "ws_pref": int(ws.value)}
+            _check(
+                lt.cublasLtMatmulPreferenceSetAttribute(
+                    pref, ctypes.c_int(attr), ctypes.byref(v), ctypes.c_size_t(4)
+                ),
+                "preference alignment",
+            )
+        st = {
+            "handle": handle,
+            "desc": desc,
+            "pref": pref,
+            "layouts": {},
+            "ws": None,
+            "ws_pref": int(ws.value),
+        }
         _dev[idx] = st
     return st
 
@@ -139,8 +177,16 @@ def _layout(st: dict, rows: int, cols: int, ld: int):
     lay = st["layouts"].get(key)
     if lay is None:
         lay = ctypes.c_void_p()
-        _check(_lib().cublasLtMatrixLayoutCreate(ctypes.byref(lay), ctypes.c_int(_R_16BF), ctypes.c_uint64(rows),
-                                                 ctypes.c_uint64(cols), ctypes.c_int64(ld)), "layout")
+        _check(
+            _lib().cublasLtMatrixLayoutCreate(
+                ctypes.byref(lay),
+                ctypes.c_int(_R_16BF),
+                ctypes.c_uint64(rows),
+                ctypes.c_uint64(cols),
+                ctypes.c_int64(ld),
+            ),
+            "layout",
+        )
         st["layouts"][key] = lay
     return lay
 
@@ -158,8 +204,13 @@ def config(algo: _Algo) -> tuple:
     for attr in _CFG_ATTRS:
         v = ctypes.c_uint16(0) if attr in _CFG_U16 else ctypes.c_uint32(0)
         w = ctypes.c_size_t(0)
-        lt.cublasLtMatmulAlgoConfigGetAttribute(ctypes.byref(algo), ctypes.c_int(attr), ctypes.byref(v),
-                                                ctypes.c_size_t(ctypes.sizeof(v)), ctypes.byref(w))
+        lt.cublasLtMatmulAlgoConfigGetAttribute(
+            ctypes.byref(algo),
+            ctypes.c_int(attr),
+            ctypes.byref(v),
+            ctypes.c_size_t(ctypes.sizeof(v)),
+            ctypes.byref(w),
+        )
         out.append(int(v.value))
     return tuple(out)
 
@@ -170,8 +221,18 @@ def full_shape_algo(device: torch.device, m: int, n_full: int, k: int):
     a, b, c = _layouts(st, m, n_full, k, k)
     res = _Heur()
     got = ctypes.c_int(0)
-    rc = _lib().cublasLtMatmulAlgoGetHeuristic(st["handle"], st["desc"], a, b, c, c, st["pref"], ctypes.c_int(1),
-                                               ctypes.byref(res), ctypes.byref(got))
+    rc = _lib().cublasLtMatmulAlgoGetHeuristic(
+        st["handle"],
+        st["desc"],
+        a,
+        b,
+        c,
+        c,
+        st["pref"],
+        ctypes.c_int(1),
+        ctypes.byref(res),
+        ctypes.byref(got),
+    )
     if rc != _SUCCESS or got.value < 1 or res.state != _SUCCESS:
         return None
     return res.algo
@@ -181,19 +242,39 @@ def _build(handle, cfg: tuple):
     """An algorithm descriptor with the nine ``CUBLASLT_ALGO_CONFIG_*`` values ``cfg`` (None if the library refuses)."""
     lt = _lib()
     algo = _Algo()
-    if lt.cublasLtMatmulAlgoInit(handle, ctypes.c_int(_COMPUTE_32F), ctypes.c_int(_R_32F), ctypes.c_int(_R_16BF),
-                                 ctypes.c_int(_R_16BF), ctypes.c_int(_R_16BF), ctypes.c_int(_R_16BF), ctypes.c_int(cfg[0]),
-                                 ctypes.byref(algo)) != _SUCCESS:
+    if (
+        lt.cublasLtMatmulAlgoInit(
+            handle,
+            ctypes.c_int(_COMPUTE_32F),
+            ctypes.c_int(_R_32F),
+            ctypes.c_int(_R_16BF),
+            ctypes.c_int(_R_16BF),
+            ctypes.c_int(_R_16BF),
+            ctypes.c_int(_R_16BF),
+            ctypes.c_int(cfg[0]),
+            ctypes.byref(algo),
+        )
+        != _SUCCESS
+    ):
         return None
     for attr, val in zip(_CFG_ATTRS[1:], cfg[1:]):
         v = ctypes.c_uint16(val) if attr in _CFG_U16 else ctypes.c_uint32(val)
-        if lt.cublasLtMatmulAlgoConfigSetAttribute(ctypes.byref(algo), ctypes.c_int(attr), ctypes.byref(v),
-                                                   ctypes.c_size_t(ctypes.sizeof(v))) != _SUCCESS:
+        if (
+            lt.cublasLtMatmulAlgoConfigSetAttribute(
+                ctypes.byref(algo),
+                ctypes.c_int(attr),
+                ctypes.byref(v),
+                ctypes.c_size_t(ctypes.sizeof(v)),
+            )
+            != _SUCCESS
+        ):
             return None
     return algo
 
 
-def slice_candidates(device: torch.device, full_algo: _Algo, m: int, n: int, k: int, count: int = 3) -> list:
+def slice_candidates(
+    device: torch.device, full_algo: _Algo, m: int, n: int, k: int, count: int = 3
+) -> list:
     """``[(algo, workspace bytes)]`` to try for the slice ``[m, k] x [n, k]^T``, in order: the heuristic's first ``count``
     picks for the slice shape with the full configuration's split count and reduction scheme put in, then the full
     configuration itself; only configurations the library accepts for the slice shape, without repeats."""
@@ -203,12 +284,28 @@ def slice_candidates(device: torch.device, full_algo: _Algo, m: int, n: int, k: 
     res = (_Heur * count)()
     got = ctypes.c_int(0)
     picks = []
-    if _lib().cublasLtMatmulAlgoGetHeuristic(st["handle"], st["desc"], a, b, c, c, st["pref"], ctypes.c_int(count), res,
-                                             ctypes.byref(got)) == _SUCCESS:
+    if (
+        _lib().cublasLtMatmulAlgoGetHeuristic(
+            st["handle"],
+            st["desc"],
+            a,
+            b,
+            c,
+            c,
+            st["pref"],
+            ctypes.c_int(count),
+            res,
+            ctypes.byref(got),
+        )
+        == _SUCCESS
+    ):
         for i in range(got.value):
             if res[i].state == _SUCCESS:
                 cfg = list(config(res[i].algo))
-                cfg[2], cfg[3] = full_cfg[2], full_cfg[3]  # SPLITK_NUM, REDUCTION_SCHEME of the full configuration
+                cfg[2], cfg[3] = (
+                    full_cfg[2],
+                    full_cfg[3],
+                )  # SPLITK_NUM, REDUCTION_SCHEME of the full configuration
                 picks.append(tuple(cfg))
     out, seen = [], set()
     for cfg in picks + [full_cfg]:
@@ -228,7 +325,9 @@ def slice_workspace(device: torch.device, algo: _Algo, m: int, n: int, k: int):
     st = _device_state(device)
     a, b, c = _layouts(st, m, n, k, k)
     res = _Heur()
-    rc = _lib().cublasLtMatmulAlgoCheck(st["handle"], st["desc"], a, b, c, c, ctypes.byref(algo), ctypes.byref(res))
+    rc = _lib().cublasLtMatmulAlgoCheck(
+        st["handle"], st["desc"], a, b, c, c, ctypes.byref(algo), ctypes.byref(res)
+    )
     if rc != _SUCCESS or res.state != _SUCCESS:
         return None
     return int(res.ws)
@@ -248,8 +347,13 @@ def workspace_bytes(device: torch.device) -> int:
     return 0 if st["ws"] is None else int(st["ws"].numel())
 
 
-def run_slice(algo: _Algo, x: torch.Tensor, w_slice: torch.Tensor, stream: torch.cuda.Stream | None = None,
-              workspace: torch.Tensor | None = None) -> torch.Tensor:
+def run_slice(
+    algo: _Algo,
+    x: torch.Tensor,
+    w_slice: torch.Tensor,
+    stream: torch.cuda.Stream | None = None,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``F.linear(x, w_slice)`` (2-D bf16, contiguous rows) through ``algo`` on ``stream`` (default: the current
     stream), into a new tensor. The caller has checked the configuration for this shape and reserved a workspace at
     least as large as the configuration needs for it: this module's (``reserve_workspace``), or ``workspace`` (a uint8
@@ -261,9 +365,23 @@ def run_slice(algo: _Algo, x: torch.Tensor, w_slice: torch.Tensor, stream: torch
     a, b, c = _layouts(st, m, n, k, w_slice.stride(0))
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     ws = st["ws"] if workspace is None else workspace
-    rc = _lib().cublasLtMatmul(st["handle"], st["desc"], ctypes.byref(_ONE), ctypes.c_void_p(w_slice.data_ptr()), a,
-                               ctypes.c_void_p(x.data_ptr()), b, ctypes.byref(_ZERO), ctypes.c_void_p(out.data_ptr()), c,
-                               ctypes.c_void_p(out.data_ptr()), c, ctypes.byref(algo), ctypes.c_void_p(ws.data_ptr()),
-                               ctypes.c_size_t(ws.numel()), ctypes.c_void_p(stream.cuda_stream))
+    rc = _lib().cublasLtMatmul(
+        st["handle"],
+        st["desc"],
+        ctypes.byref(_ONE),
+        ctypes.c_void_p(w_slice.data_ptr()),
+        a,
+        ctypes.c_void_p(x.data_ptr()),
+        b,
+        ctypes.byref(_ZERO),
+        ctypes.c_void_p(out.data_ptr()),
+        c,
+        ctypes.c_void_p(out.data_ptr()),
+        c,
+        ctypes.byref(algo),
+        ctypes.c_void_p(ws.data_ptr()),
+        ctypes.c_size_t(ws.numel()),
+        ctypes.c_void_p(stream.cuda_stream),
+    )
     _check(rc, "matmul")
     return out

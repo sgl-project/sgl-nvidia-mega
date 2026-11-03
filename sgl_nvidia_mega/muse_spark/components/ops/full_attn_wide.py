@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paged FP8 full-attention verify for many requests per step, JIT CUDA (``csrc/full_attn_wide.cuh``).
 
 A persistent kernel (one thread block per SM, grid fixed at the SM count so the launch is CUDA-graph safe) splits the
@@ -32,7 +34,9 @@ MAX_REQUESTS = 256
 # fewest requests per step at which the kernel was faster than the stock decode kernel in the microbench, per KV heads
 # per rank (below it the stock path runs); MUSE_VR_FULL_ATTN_WIDE_MIN_REQS overrides it
 BREAK_EVEN_REQUESTS = {4: 10, 2: 9}
-TRACE_FLOATS = 3 * 16 * 256 * 2  # development mode 4: clock stamps after the partial records
+TRACE_FLOATS = (
+    3 * 16 * 256 * 2
+)  # development mode 4: clock stamps after the partial records
 # K/V ring depth (5: one Q buffer, the fastest ring in the microbench at both KV head counts)
 STAGES = int(os.environ.get("MUSE_VR_FULL_ATTN_WIDE_STAGES", "5"))
 # keys of every 8 whose 2^x is computed on the FMA pipes instead of the transcendental unit (even, 0..8)
@@ -62,7 +66,9 @@ def _skel_from_env() -> int:
 
         logging.getLogger(__name__).warning(
             "muse_vr_plugin: full_attn_wide: MUSE_VR_FULL_ATTN_WIDE_SKEL=%r is not a mask of bits 0-5; using 0 "
-            "(the default code)", raw)
+            "(the default code)",
+            raw,
+        )
         return 0
     return v
 
@@ -81,7 +87,9 @@ def _skel_for(skel: int, pairs: int, tpr: int) -> int:
 
             logging.getLogger(__name__).warning(
                 "muse_vr_plugin: full_attn_wide: skeleton option 32 needs one softmax thread per row at 4 KV heads; "
-                "building SKEL=%d without it", skel)
+                "building SKEL=%d without it",
+                skel,
+            )
         skel &= ~32
     return skel
 
@@ -105,7 +113,9 @@ def skel_selfchecks() -> dict:
     return dict(_skel_checks)
 
 
-def _skel_selfcheck(device, num_q_heads: int, num_kv_heads: int, use_pdl: bool, gate: int) -> None:
+def _skel_selfcheck(
+    device, num_q_heads: int, num_kv_heads: int, use_pdl: bool, gate: int
+) -> None:
     """Run a seeded multi-request case (edge tiles, requests split over blocks) with the default build and with the
     configured skeleton options; any output difference -> loud warning and SKEL 0 for every later call of this process."""
     global _skel_failed
@@ -117,41 +127,86 @@ def _skel_selfcheck(device, num_q_heads: int, num_kv_heads: int, use_pdl: bool, 
     lens = list(_SELFCHECK_LENS)
     need = [(n + PAGE - 1) // PAGE for n in lens]
     rows = sum(need) * PAGE
-    k_pool = torch.randn(rows, num_kv_heads * HEAD_DIM, generator=g, device=device).to(torch.float8_e4m3fn)
-    v_pool = torch.randn(rows, num_kv_heads * HEAD_DIM, generator=g, device=device).to(torch.float8_e4m3fn)
+    k_pool = torch.randn(rows, num_kv_heads * HEAD_DIM, generator=g, device=device).to(
+        torch.float8_e4m3fn
+    )
+    v_pool = torch.randn(rows, num_kv_heads * HEAD_DIM, generator=g, device=device).to(
+        torch.float8_e4m3fn
+    )
     table = torch.zeros(len(lens), max(need), dtype=torch.int32, device=device)
     nxt = 0
     for r, n in enumerate(need):
         table[r, :n] = torch.arange(nxt, nxt + n, dtype=torch.int32, device=device)
         nxt += n
     seq = torch.tensor(lens, dtype=torch.int32, device=device)
-    q = torch.randn(len(lens) * TOKENS_PER_REQUEST, num_q_heads, HEAD_DIM, generator=g, device=device).to(
-        torch.float8_e4m3fn)
+    q = torch.randn(
+        len(lens) * TOKENS_PER_REQUEST,
+        num_q_heads,
+        HEAD_DIM,
+        generator=g,
+        device=device,
+    ).to(torch.float8_e4m3fn)
     gt = None
     if gate:
-        gt = torch.randn(len(lens) * TOKENS_PER_REQUEST, num_q_heads * HEAD_DIM, generator=g, device=device).to(
-            torch.bfloat16)
+        gt = torch.randn(
+            len(lens) * TOKENS_PER_REQUEST,
+            num_q_heads * HEAD_DIM,
+            generator=g,
+            device=device,
+        ).to(torch.bfloat16)
     outs = []
     for s in (0, sk):
-        outs.append(full_attn_wide(q, k_pool, v_pool, table, seq, 0.125, 1.0, use_pdl=use_pdl, gate=gt, norm_eps=1e-6,
-                                   ng_vec=int(gate) if gate else 8, skel=s))
+        outs.append(
+            full_attn_wide(
+                q,
+                k_pool,
+                v_pool,
+                table,
+                seq,
+                0.125,
+                1.0,
+                use_pdl=use_pdl,
+                gate=gt,
+                norm_eps=1e-6,
+                ng_vec=int(gate) if gate else 8,
+                skel=s,
+            )
+        )
     ok = bool(torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16)))
     _skel_checks[key] = ok
     import logging
 
     log = logging.getLogger(__name__)
     if ok:
-        log.info("muse_vr_plugin: full_attn_wide: skeleton options %d self-check passed (%s)", sk, key)
+        log.info(
+            "muse_vr_plugin: full_attn_wide: skeleton options %d self-check passed (%s)",
+            sk,
+            key,
+        )
     else:
         n = int((outs[0].view(torch.int16) != outs[1].view(torch.int16)).sum().item())
         _skel_failed = True
-        log.warning("muse_vr_plugin: full_attn_wide: skeleton options %d self-check FAILED (%s): %d output elements "
-                    "differ from the default build; every later call uses the default build (SKEL 0)", sk, key, n)
+        log.warning(
+            "muse_vr_plugin: full_attn_wide: skeleton options %d self-check FAILED (%s): %d output elements "
+            "differ from the default build; every later call uses the default build (SKEL 0)",
+            sk,
+            key,
+            n,
+        )
 
 
 @functools.lru_cache(maxsize=None)
-def _module(pairs: int, stages: int, use_pdl: bool, poly: int, pf: int = 0, mode: int = 0, tpr: int = 2,
-            ng: int = 0, skel: int = 0):
+def _module(
+    pairs: int,
+    stages: int,
+    use_pdl: bool,
+    poly: int,
+    pf: int = 0,
+    mode: int = 0,
+    tpr: int = 2,
+    ng: int = 0,
+    skel: int = 0,
+):
     """ng: 0 = no output norm + gate; 8 / 16 = with it, in SGLang norm_gate's 8- / 16-byte-vector arithmetic. skel: the
     main kernel's skeleton options (0: the template arguments, and so the build, of the default code)."""
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
@@ -161,9 +216,13 @@ def _module(pairs: int, stages: int, use_pdl: bool, poly: int, pf: int = 0, mode
     if skel < 0 or skel & ~SKEL_BITS:
         raise ValueError(f"skel {skel}: a mask of bits 0-5")
     if skel:
-        args = make_cpp_args(pairs, stages, use_pdl, poly, pf, mode, tpr, ng != 0, ng or 8, skel)
+        args = make_cpp_args(
+            pairs, stages, use_pdl, poly, pf, mode, tpr, ng != 0, ng or 8, skel
+        )
     else:
-        args = make_cpp_args(pairs, stages, use_pdl, poly, pf, mode, tpr, ng != 0, ng or 8)
+        args = make_cpp_args(
+            pairs, stages, use_pdl, poly, pf, mode, tpr, ng != 0, ng or 8
+        )
     return load_jit(
         "muse_vr_full_attn_wide",
         *args,
@@ -190,19 +249,32 @@ def workspace(device, num_kv_heads: int, blocks: int, gate: bool = False):
     """Per-device fp32 partial records and the per-request counters (zero; the kernel leaves them zero). Grows, never
     shrinks; allocate before graph capture. ``gate`` is accepted for callers; the norm + gate variant needs no extra
     records."""
-    key = (device.type, device.index if device.index is not None else torch.cuda.current_device())
+    key = (
+        device.type,
+        device.index if device.index is not None else torch.cuda.current_device(),
+    )
     need = blocks * 2 * num_kv_heads * ROWS * REC_FLOATS + TRACE_FLOATS
     ws = _workspace.get(key)
     if ws is None or ws[0].numel() < need:
-        counters = ws[1] if ws is not None else torch.zeros(MAX_REQUESTS, dtype=torch.int32, device=device)
+        counters = (
+            ws[1]
+            if ws is not None
+            else torch.zeros(MAX_REQUESTS, dtype=torch.int32, device=device)
+        )
         ws = (torch.empty(need, dtype=torch.float32, device=device), counters)
         _workspace[key] = ws
     return ws
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int) -> bool:
-    return (head_dim == HEAD_DIM and num_kv_heads * Q_PER_KV == num_q_heads and num_kv_heads in (2, 4)
-            and page_size == PAGE)
+def supported(
+    num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int
+) -> bool:
+    return (
+        head_dim == HEAD_DIM
+        and num_kv_heads * Q_PER_KV == num_q_heads
+        and num_kv_heads in (2, 4)
+        and page_size == PAGE
+    )
 
 
 def full_attn_wide(
@@ -246,11 +318,36 @@ def full_attn_wide(
     ws, counters = workspace(q.device, hkv, g, use_gate)
     gt = gate if use_gate else _no_gate(q.device)
     tpr = TPR if hkv == 4 else 2
-    sk = _skel_for(SKEL if skel is None else int(skel), hkv // 2, tpr) if (skel is not None or not _skel_failed) else 0
-    _module(hkv // 2, stages or STAGES, bool(use_pdl), POLY if poly is None else int(poly), PF, MODE,
-            tpr, int(ng_vec) if use_gate else 0, sk).full_attn_wide(
-        q, k_pool, v_pool, page_table, seq_lens, out, ws, counters, int(g), float(bmm1_scale), float(bmm2_scale), gt,
-        float(norm_eps))
+    sk = (
+        _skel_for(SKEL if skel is None else int(skel), hkv // 2, tpr)
+        if (skel is not None or not _skel_failed)
+        else 0
+    )
+    _module(
+        hkv // 2,
+        stages or STAGES,
+        bool(use_pdl),
+        POLY if poly is None else int(poly),
+        PF,
+        MODE,
+        tpr,
+        int(ng_vec) if use_gate else 0,
+        sk,
+    ).full_attn_wide(
+        q,
+        k_pool,
+        v_pool,
+        page_table,
+        seq_lens,
+        out,
+        ws,
+        counters,
+        int(g),
+        float(bmm1_scale),
+        float(bmm2_scale),
+        gt,
+        float(norm_eps),
+    )
     return out
 
 
@@ -266,24 +363,61 @@ def _no_gate(device) -> torch.Tensor:
     return t
 
 
-def preload(num_q_heads: int, num_kv_heads: int, device, use_pdl: bool = False, gate: int = 0) -> None:
+def preload(
+    num_q_heads: int, num_kv_heads: int, device, use_pdl: bool = False, gate: int = 0
+) -> None:
     """Build and load the kernel and size the workspace, so that no build, module load, function attribute call or
     allocation happens inside a CUDA-graph capture. gate: 0, or the norm_gate vector width 8 / 16 of the gated variant."""
-    key = (device.type, device.index if device.index is not None else torch.cuda.current_device(), num_q_heads,
-           num_kv_heads, use_pdl) + ((int(gate),) if gate else ())
+    key = (
+        device.type,
+        device.index if device.index is not None else torch.cuda.current_device(),
+        num_q_heads,
+        num_kv_heads,
+        use_pdl,
+    ) + ((int(gate),) if gate else ())
     if key in _preloaded:
         return
-    q = torch.zeros(TOKENS_PER_REQUEST, num_q_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
-    pool = torch.zeros(2 * PAGE, num_kv_heads * HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
+    q = torch.zeros(
+        TOKENS_PER_REQUEST,
+        num_q_heads,
+        HEAD_DIM,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    pool = torch.zeros(
+        2 * PAGE, num_kv_heads * HEAD_DIM, dtype=torch.float8_e4m3fn, device=device
+    )
     table = torch.zeros(1, 2, dtype=torch.int32, device=device)
     lens = torch.full((1,), TOKENS_PER_REQUEST, dtype=torch.int32, device=device)
-    g = torch.zeros(TOKENS_PER_REQUEST, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device) if gate else None
-    full_attn_wide(q, pool, pool, table, lens, 1.0, 1.0, use_pdl=use_pdl, gate=g, norm_eps=1e-6,
-                   ng_vec=int(gate) if gate else 8)
+    g = (
+        torch.zeros(
+            TOKENS_PER_REQUEST,
+            num_q_heads * HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        if gate
+        else None
+    )
+    full_attn_wide(
+        q,
+        pool,
+        pool,
+        table,
+        lens,
+        1.0,
+        1.0,
+        use_pdl=use_pdl,
+        gate=g,
+        norm_eps=1e-6,
+        ng_vec=int(gate) if gate else 8,
+    )
     torch.cuda.current_stream(device).synchronize()
     if SKEL:
         # skeleton options: the load-time bitwise self-check against the default build (outside any graph capture)
-        _skel_selfcheck(torch.device(device.type, key[1]), num_q_heads, num_kv_heads, use_pdl, gate)
+        _skel_selfcheck(
+            torch.device(device.type, key[1]), num_q_heads, num_kv_heads, use_pdl, gate
+        )
         torch.cuda.current_stream(device).synchronize()
     _preloaded.add(key)
 

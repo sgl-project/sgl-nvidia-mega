@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief SWA-T: paged FP8 (e4m3) sliding-window verify attention for mid / large batches (``ops.swa_t``), one thread-block
  * cluster of kC CTAs per request (grid (kC, R), cluster (kC, 1, 1)). CTA c of request r takes chunk c of the request's

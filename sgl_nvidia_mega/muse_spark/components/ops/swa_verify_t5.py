@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Sliding-window FP8 paged attention for speculative verify on the 5th-generation tensor core, JIT CUDA.
 
 See ``csrc/swa_verify_t5.cuh`` for the arithmetic (the rounding points of ``ops.swa_verify_attn`` and of the stock
@@ -65,8 +67,11 @@ def t6_engaged(num_tokens: int) -> bool:
         return True
     if b not in _t6_step_aside_seen:
         _t6_step_aside_seen.add(b)
-        print(f"muse_vr_plugin: swa_verify t6 steps aside to the served kernel for {num_tokens} query tokens "
-              f"(bucket {b if b is not None else 'none'} not enabled in MUSE_VR_SWA_T6_BUCKETS)", flush=True)
+        print(
+            f"muse_vr_plugin: swa_verify t6 steps aside to the served kernel for {num_tokens} query tokens "
+            f"(bucket {b if b is not None else 'none'} not enabled in MUSE_VR_SWA_T6_BUCKETS)",
+            flush=True,
+        )
     return False
 
 
@@ -90,7 +95,9 @@ def splits_for(num_requests: int, num_kv_heads: int, window_left: int, device) -
         s = int(raw)
     else:
         dev = torch.device(device)
-        sms = _sm_count(dev.index if dev.index is not None else torch.cuda.current_device())
+        sms = _sm_count(
+            dev.index if dev.index is not None else torch.cuda.current_device()
+        )
         s = (2 * sms) // max(1, num_requests * num_kv_heads)
     s = max(1, min(MAX_SPLITS, s))
     while pages_per_block(window_left, s) > MAX_PAGES_PER_BLOCK and s < MAX_SPLITS:
@@ -111,22 +118,37 @@ def workspace(device, num_requests: int, num_kv_heads: int, splits: int):
         np_ = max(need_p, cur[0].numel() if cur else 0)
         nc = max(need_c, cur[1].numel() if cur else 0)
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("swa_verify_t5 workspace must be prepared before CUDA-graph capture")
-        cur = (torch.empty(np_, dtype=torch.float32, device=dev), torch.zeros(nc, dtype=torch.int32, device=dev))
+            raise RuntimeError(
+                "swa_verify_t5 workspace must be prepared before CUDA-graph capture"
+            )
+        cur = (
+            torch.empty(np_, dtype=torch.float32, device=dev),
+            torch.zeros(nc, dtype=torch.int32, device=dev),
+        )
         _ws[dev] = cur
     return cur
 
 
 def prepare(device, max_requests: int, num_kv_heads: int, window_left: int) -> None:
     """Allocate the workspace for every request count up to max_requests (no allocation inside a capture)."""
-    worst = max(n * splits_for(n, num_kv_heads, window_left, device) for n in range(1, max_requests + 1))
+    worst = max(
+        n * splits_for(n, num_kv_heads, window_left, device)
+        for n in range(1, max_requests + 1)
+    )
     workspace(device, worst, num_kv_heads, 1)
     workspace(device, max_requests, num_kv_heads, 1)
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, window_left: int, page_size: int) -> bool:
-    return (head_dim == HEAD_DIM and num_kv_heads * Q_PER_KV == num_q_heads and window_left >= 0
-            and page_size == PAGE and pages_per_block(window_left, MAX_SPLITS) <= MAX_PAGES_PER_BLOCK)
+def supported(
+    num_q_heads: int, num_kv_heads: int, head_dim: int, window_left: int, page_size: int
+) -> bool:
+    return (
+        head_dim == HEAD_DIM
+        and num_kv_heads * Q_PER_KV == num_q_heads
+        and window_left >= 0
+        and page_size == PAGE
+        and pages_per_block(window_left, MAX_SPLITS) <= MAX_PAGES_PER_BLOCK
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -138,8 +160,10 @@ def _module6(use_pdl: bool, cluster: bool = False, early: bool = False):
         "muse_vr_swa_verify_t6",
         *args,
         cuda_files=[str(_CSRC)],
-        cuda_wrappers=[("swa_verify_t6", f"muse_vr::SwaVerifyT6Kernel<{args}>::run"),
-                       ("swa_verify_t6_capacity", f"muse_vr::SwaVerifyT6Kernel<{args}>::capacity")],
+        cuda_wrappers=[
+            ("swa_verify_t6", f"muse_vr::SwaVerifyT6Kernel<{args}>::run"),
+            ("swa_verify_t6_capacity", f"muse_vr::SwaVerifyT6Kernel<{args}>::capacity"),
+        ],
     )
 
 
@@ -152,7 +176,9 @@ def _capacity6(device_index: int, splits: int, use_pdl: bool, early: bool) -> in
     return int(out.item())
 
 
-def splits_for6(num_requests: int, num_kv_heads: int, device, use_pdl: bool = False) -> int:
+def splits_for6(
+    num_requests: int, num_kv_heads: int, device, use_pdl: bool = False
+) -> int:
     """Blocks per (request, KV head) for t6: with the cluster merge enabled, the largest of 3, 2 whose grid fits in one
     wave of resident clusters (runtime capacity query), else 1; without it, 1 (the split-K merge through global memory
     cost more than the shorter page run saved, DEV bench). MUSE_VR_SWA_T5_SPLITS forces a count."""
@@ -217,16 +243,42 @@ def swa_verify_attn_t5(
         # prefetch=None: the policy (pre-wait L2 prefetch only with 3 blocks per pair; at 1-2 blocks per pair it
         # measured slower in the DEV bench)
         pf = (cl and s6 == 3) if prefetch is None else bool(prefetch)
-        _module6(bool(use_pdl), cl, bool(use_pdl) and pf).swa_verify_t6(q, k_pool, v_pool, page_table, seq_lens, out,
-                                                                       part, count, int(window_left), int(page_size),
-                                                                       float(bmm1_scale), float(bmm2_scale), s6)
+        _module6(bool(use_pdl), cl, bool(use_pdl) and pf).swa_verify_t6(
+            q,
+            k_pool,
+            v_pool,
+            page_table,
+            seq_lens,
+            out,
+            part,
+            count,
+            int(window_left),
+            int(page_size),
+            float(bmm1_scale),
+            float(bmm2_scale),
+            s6,
+        )
         return out
     s = int(splits) if splits else splits_for(reqs, hkv, window_left, k_pool.device)
     kp = pages_per_block(window_left, s)
     if kp > MAX_PAGES_PER_BLOCK:
-        raise ValueError(f"window_left {window_left} needs more than {MAX_PAGES_PER_BLOCK} pages per block at {s} splits")
+        raise ValueError(
+            f"window_left {window_left} needs more than {MAX_PAGES_PER_BLOCK} pages per block at {s} splits"
+        )
     part, count = workspace(k_pool.device, reqs, hkv, s)
-    _module(kp, bool(use_pdl), bool(prefetch or False)).swa_verify_t5(q, k_pool, v_pool, page_table, seq_lens, out, part, count,
-                                             int(window_left), int(page_size), float(bmm1_scale),
-                                             float(bmm2_scale), s)
+    _module(kp, bool(use_pdl), bool(prefetch or False)).swa_verify_t5(
+        q,
+        k_pool,
+        v_pool,
+        page_table,
+        seq_lens,
+        out,
+        part,
+        count,
+        int(window_left),
+        int(page_size),
+        float(bmm1_scale),
+        float(bmm2_scale),
+        s,
+    )
     return out

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Hop roles on the hop device API v2 (lb_hop): the owner-row reduce-scatter as one persistent launch.
 
 Default off: nothing in the plugin calls this module unless a caller selects it with its own default-off knob.
@@ -11,6 +13,7 @@ The site is a unique lb_hop site whose width is H rounded up to a multiple of 6 
 (one missed-advance word per CTA); size the grid to one resident wave (every CTA pushes before any CTA waits on another
 rank).
 """
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -26,8 +29,12 @@ _CUH = _CSRC / "c3_hops_ops.cuh"
 
 STEP_RELEASE = 1
 STEP_ACQUIRE = 2
-COLLECT_ONLY = 4  # the partials were pushed by another kernel (e.g. an expert epilogue): fold only
-STOCK_ZERO_SIGN = 8  # zero-sign parity with the engine's push all-reduce (see stock_zero_sign_flag)
+COLLECT_ONLY = (
+    4  # the partials were pushed by another kernel (e.g. an expert epilogue): fold only
+)
+STOCK_ZERO_SIGN = (
+    8  # zero-sign parity with the engine's push all-reduce (see stock_zero_sign_flag)
+)
 RS_FLAT = 16  # launch the flat-grid rs_rows form (every CTA pushes and folds; same protocol and arithmetic)
 EARLY_TRIGGER = 32  # trigger PDL dependents at entry + max shared-memory carveout (rs_rows step flag; ag_rows early_trigger)
 SPLIT_ROLES = 64  # RS_FLAT rs_rows / ag_rows_tagged: half of each CTA's warps push while the other half folds / gathers
@@ -53,7 +60,10 @@ def stock_zero_sign_flag(comm, nbytes: int, graph: bool = True) -> int:
         cfg = pick(nbytes, bool(graph))
         algo = None if cfg is None else cfg.algo
     else:  # older communicator: its own query (current capture state decides graph vs eager)
-        push = any(getattr(comm, n, lambda _b: False)(nbytes) for n in ("uses_one_shot_push", "uses_two_shot_push"))
+        push = any(
+            getattr(comm, n, lambda _b: False)(nbytes)
+            for n in ("uses_one_shot_push", "uses_two_shot_push")
+        )
         return STOCK_ZERO_SIGN if push else 0
     name = getattr(algo, "name", str(algo)).upper()
     return STOCK_ZERO_SIGN if (algo is not None and "PUSH" in name) else 0
@@ -64,9 +74,18 @@ def rs_width(hidden: int) -> int:
     return ((int(hidden) + 5) // 6) * 6
 
 
-def rs_spec(name: str, rows_max: int, hidden: int, ctas: int, parity: bool = False) -> HopSpec:
+def rs_spec(
+    name: str, rows_max: int, hidden: int, ctas: int, parity: bool = False
+) -> HopSpec:
     """A unique site for ``rs_rows`` with ``ctas`` consumer units (= the launch grid)."""
-    return HopSpec(name, rows_max=int(rows_max), width=rs_width(hidden), policy="unique", parity=bool(parity), units=int(ctas))
+    return HopSpec(
+        name,
+        rows_max=int(rows_max),
+        width=rs_width(hidden),
+        policy="unique",
+        parity=bool(parity),
+        units=int(ctas),
+    )
 
 
 @lru_cache(maxsize=None)
@@ -79,8 +98,11 @@ def _module(world: int, use_pdl: bool):
         f"muse_vr_c3_hops_w{world}",
         *args,
         cuda_files=[str(_CUH)],
-        cuda_wrappers=[("rows", f"MuseVrC3Rs<{args}>::rows"), ("agt", f"MuseVrC3Rs<{args}>::agt"),
-                       ("fr_unpack", f"MuseVrC3Rs<{args}>::fr_unpack")],
+        cuda_wrappers=[
+            ("rows", f"MuseVrC3Rs<{args}>::rows"),
+            ("agt", f"MuseVrC3Rs<{args}>::agt"),
+            ("fr_unpack", f"MuseVrC3Rs<{args}>::fr_unpack"),
+        ],
         extra_include_paths=[str(_CSRC)],
     )
 
@@ -92,12 +114,25 @@ def _placeholders(dev: torch.device):
     """One-element tensors standing in for absent optional arguments (allocated once per device, never per call)."""
     key = str(dev)
     if key not in _PLACEHOLDERS:
-        _PLACEHOLDERS[key] = (torch.zeros(1, dtype=torch.uint8, device=dev), torch.zeros(1, dtype=torch.int32, device=dev))
+        _PLACEHOLDERS[key] = (
+            torch.zeros(1, dtype=torch.uint8, device=dev),
+            torch.zeros(1, dtype=torch.int32, device=dev),
+        )
     return _PLACEHOLDERS[key]
 
 
-def rs_rows(arena: HopArena, name: str, part: torch.Tensor, out: torch.Tensor, *, mask: Optional[torch.Tensor] = None,
-            skip: Optional[torch.Tensor] = None, step_flags: int = 0, use_pdl: bool = True, rows: Optional[int] = None) -> None:
+def rs_rows(
+    arena: HopArena,
+    name: str,
+    part: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    skip: Optional[torch.Tensor] = None,
+    step_flags: int = 0,
+    use_pdl: bool = True,
+    rows: Optional[int] = None,
+) -> None:
     """Owner-row reduce-scatter of ``part`` [M, H] (bf16) into ``out`` [own_n, H] (bf16) on site ``name``. With
     COLLECT_ONLY, ``part`` may be any [>= 1, H] bf16 tensor and ``rows`` gives M."""
     M, H = (int(rows) if rows is not None else int(part.shape[0])), int(part.shape[1])
@@ -110,9 +145,20 @@ def rs_rows(arena: HopArena, name: str, part: torch.Tensor, out: torch.Tensor, *
         raise ValueError("rs_rows: out must hold the owned rows [own_n, H]")
     none_u8, none_i32 = _placeholders(part.device)
     _module(arena.world, use_pdl).rows(
-        arena.table(name), arena.ctl_table(), arena.tok_table(), *arena.site_args(name), *arena.ctl_args(), int(step_flags),
-        part, out, M, skip if skip is not None else none_u8, 1 if skip is not None else 0,
-        mask if mask is not None else none_i32, 1 if mask is not None else 0)
+        arena.table(name),
+        arena.ctl_table(),
+        arena.tok_table(),
+        *arena.site_args(name),
+        *arena.ctl_args(),
+        int(step_flags),
+        part,
+        out,
+        M,
+        skip if skip is not None else none_u8,
+        1 if skip is not None else 0,
+        mask if mask is not None else none_i32,
+        1 if mask is not None else 0,
+    )
 
 
 # ------------------------------------------------------------------------------------------------------------ AG_x
@@ -137,13 +183,29 @@ class AgxLanding:
     symmetric allocation with a multicast address. ``view(copy)`` is this rank's unicast view of a copy (what a library
     kernel or a capture reads)."""
 
-    def __init__(self, group, device: torch.device, rank: int, world: int, rows_max: int, hidden: int, ctas_max: int,
-                 copies: int = 2, allocator=None):
+    def __init__(
+        self,
+        group,
+        device: torch.device,
+        rank: int,
+        world: int,
+        rows_max: int,
+        hidden: int,
+        ctas_max: int,
+        copies: int = 2,
+        allocator=None,
+    ):
         from .lb_hop import allocate_symmetric
 
         if (hidden * 2) % 16:
             raise ValueError("AgxLanding: row bytes must be a multiple of 16")
-        self.rank, self.world, self.rows_max, self.hidden, self.ctas_max = rank, world, rows_max, hidden, ctas_max
+        self.rank, self.world, self.rows_max, self.hidden, self.ctas_max = (
+            rank,
+            world,
+            rows_max,
+            hidden,
+            ctas_max,
+        )
         self.copies = int(copies)
         data = self.copies * rows_max * hidden * 2
         self._flag_off = (data + 4095) // 4096 * 4096
@@ -156,38 +218,89 @@ class AgxLanding:
         uc.zero_()
         torch.cuda.synchronize(device)
         self._uc = uc
-        self._last = torch.zeros(ctas_max, dtype=torch.int64, device=device)  # missed-advance guard, this rank only
-        self._table = torch.tensor([mc, uc.data_ptr(), mc + self._flag_off, uc.data_ptr() + self._flag_off,
-                                    self._last.data_ptr()], dtype=torch.int64, device="cpu")
+        self._last = torch.zeros(
+            ctas_max, dtype=torch.int64, device=device
+        )  # missed-advance guard, this rank only
+        self._table = torch.tensor(
+            [
+                mc,
+                uc.data_ptr(),
+                mc + self._flag_off,
+                uc.data_ptr() + self._flag_off,
+                self._last.data_ptr(),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
 
     def view(self, copy: int) -> torch.Tensor:
         n = self.rows_max * self.hidden * 2
-        return self._uc[copy * n:(copy + 1) * n].view(torch.bfloat16).view(self.rows_max, self.hidden)
+        return (
+            self._uc[copy * n : (copy + 1) * n]
+            .view(torch.bfloat16)
+            .view(self.rows_max, self.hidden)
+        )
 
     def table(self) -> torch.Tensor:
         return self._table
 
 
-def ag_rows(landing: AgxLanding, arena: HopArena, x_owned: torch.Tensor, M: int, copy: int, layer: int, ctas: int,
-            use_pdl: bool = True, early_trigger: bool = False) -> None:
+def ag_rows(
+    landing: AgxLanding,
+    arena: HopArena,
+    x_owned: torch.Tensor,
+    M: int,
+    copy: int,
+    layer: int,
+    ctas: int,
+    use_pdl: bool = True,
+    early_trigger: bool = False,
+) -> None:
     """Owner-row all-gather of ``x_owned`` [own_n, H] into copy ``copy`` of every rank's landing. The flag stamp is derived on
     the device from ``arena``'s forward sequence word (x 64 + ``layer``, layer < 64), so CUDA-graph replays stay correct; at most
     one call per (forward, layer) and landing. Errors go to ``arena``'s sticky error word."""
     if not 0 <= int(copy) < landing.copies:
         raise ValueError("ag_rows: copy outside the landing")
-    _ag_module(landing.world, use_pdl).rows(landing.table(), arena.ctl_table(), landing.rank, landing.rows_max,
-                                            landing.ctas_max, *arena.ctl_args(), x_owned, int(M), int(copy), arena.seq64,
-                                            int(layer), int(ctas), EARLY_TRIGGER if early_trigger else 0)
+    _ag_module(landing.world, use_pdl).rows(
+        landing.table(),
+        arena.ctl_table(),
+        landing.rank,
+        landing.rows_max,
+        landing.ctas_max,
+        *arena.ctl_args(),
+        x_owned,
+        int(M),
+        int(copy),
+        arena.seq64,
+        int(layer),
+        int(ctas),
+        EARLY_TRIGGER if early_trigger else 0,
+    )
 
 
 # ------------------------------------------------------------------------------------------------------------ AG_x tagged
 def agx_spec(name: str, rows_max: int, hidden: int, ctas: int) -> HopSpec:
     """A unique site for ``ag_rows_tagged`` (one per (forward, layer) use) with ``ctas`` consumer units (= the launch grid)."""
-    return HopSpec(name, rows_max=int(rows_max), width=rs_width(hidden), policy="unique", parity=False, units=int(ctas))
+    return HopSpec(
+        name,
+        rows_max=int(rows_max),
+        width=rs_width(hidden),
+        policy="unique",
+        parity=False,
+        units=int(ctas),
+    )
 
 
-def ag_rows_tagged(arena: HopArena, name: str, x_owned: torch.Tensor, out: torch.Tensor, M: int, *, step_flags: int = 0,
-                   use_pdl: bool = True) -> None:
+def ag_rows_tagged(
+    arena: HopArena,
+    name: str,
+    x_owned: torch.Tensor,
+    out: torch.Tensor,
+    M: int,
+    *,
+    step_flags: int = 0,
+    use_pdl: bool = True,
+) -> None:
     """Owner-row all-gather without flags: this rank's ``x_owned`` [own_n, H] (bf16) to every rank as tagged words on site
     ``name`` (multicast when the arena has multicast pushes on), and every rank's rows of the pass into ``out`` [>= M, H]
     (plain bf16, what the next library kernel reads). step_flags: STEP_ACQUIRE / STEP_RELEASE / EARLY_TRIGGER."""
@@ -197,27 +310,75 @@ def ag_rows_tagged(arena: HopArena, name: str, x_owned: torch.Tensor, out: torch
         raise ValueError("ag_rows_tagged: bf16 rows")
     if x_owned.shape[0] < own1 - own0 or x_owned.shape[1] != H or out.shape[0] < M:
         raise ValueError("ag_rows_tagged: x_owned [own_n, H], out [>= M, H]")
-    _module(arena.world, use_pdl).agt(arena.push_table(name), arena.ctl_table(), arena.tok_table(), *arena.site_args(name),
-                                      *arena.ctl_args(), int(step_flags), x_owned, out, M)
+    _module(arena.world, use_pdl).agt(
+        arena.push_table(name),
+        arena.ctl_table(),
+        arena.tok_table(),
+        *arena.site_args(name),
+        *arena.ctl_args(),
+        int(step_flags),
+        x_owned,
+        out,
+        M,
+    )
 
 
 FR_ROW_WORDS = 387  # the front role's token row: 2320 bytes in kB48 words
 FR_IDS_WORDS = 8
 
 
-def fr_unpack(arena: HopArena, ids_name: str, tok_name: str, M: int, hs_fp4: torch.Tensor, hs_sf: torch.Tensor,
-              pts: torch.Tensor, packed: torch.Tensor, *, use_pdl: bool = True) -> None:
+def fr_unpack(
+    arena: HopArena,
+    ids_name: str,
+    tok_name: str,
+    M: int,
+    hs_fp4: torch.Tensor,
+    hs_sf: torch.Tensor,
+    pts: torch.Tensor,
+    packed: torch.Tensor,
+    *,
+    use_pdl: bool = True,
+) -> None:
     """Front-role landing unpack (default off): every step row's token words and ids words, as the front role published them
     on the unique sites ``tok_name`` / ``ids_name`` (rows by GLOBAL index), read from this rank's receive regions (each word
     accepted on its own matching load; bounded waits set the sticky error word) and written as plain tensors for the stock
     expert stage: hs_fp4 [M, 2048] uint8, hs_sf [M, 256] uint8, pts [M] float32, packed [M, 8] int32. One launch after the
     front role's launch of the same forward."""
     M = int(M)
-    if hs_fp4.dtype != torch.uint8 or hs_sf.dtype != torch.uint8 or pts.dtype != torch.float32 or packed.dtype != torch.int32:
+    if (
+        hs_fp4.dtype != torch.uint8
+        or hs_sf.dtype != torch.uint8
+        or pts.dtype != torch.float32
+        or packed.dtype != torch.int32
+    ):
         raise ValueError("fr_unpack: hs_fp4 / hs_sf uint8, pts float32, packed int32")
-    rank, i_rows, i_width, i_pitch, i_policy, i_parity, _, i_site, _ = arena.site_args(ids_name)
-    _, t_rows, t_width, t_pitch, t_policy, t_parity, _, t_site, _ = arena.site_args(tok_name)
-    _module(arena.world, use_pdl).fr_unpack(arena.table(ids_name), arena.table(tok_name), arena.ctl_table(), rank, i_rows,
-                                            i_width, i_pitch, i_policy, i_parity, i_site, t_rows, t_width, t_pitch, t_policy,
-                                            t_parity, t_site, *arena.ctl_args(), M, hs_fp4, hs_sf, pts, packed)
-
+    rank, i_rows, i_width, i_pitch, i_policy, i_parity, _, i_site, _ = arena.site_args(
+        ids_name
+    )
+    _, t_rows, t_width, t_pitch, t_policy, t_parity, _, t_site, _ = arena.site_args(
+        tok_name
+    )
+    _module(arena.world, use_pdl).fr_unpack(
+        arena.table(ids_name),
+        arena.table(tok_name),
+        arena.ctl_table(),
+        rank,
+        i_rows,
+        i_width,
+        i_pitch,
+        i_policy,
+        i_parity,
+        i_site,
+        t_rows,
+        t_width,
+        t_pitch,
+        t_policy,
+        t_parity,
+        t_site,
+        *arena.ctl_args(),
+        M,
+        hs_fp4,
+        hs_sf,
+        pts,
+        packed,
+    )

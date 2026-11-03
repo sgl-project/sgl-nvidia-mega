@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // MoE-LD-W: routed NVFP4 experts of one expert-parallel rank for verify batches of 1..512 token rows, in one launch of one
 // CTA per SM that streams every active local expert's weights once per pass of up to 128 routed rows.
 //

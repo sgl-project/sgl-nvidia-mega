@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Run-time resolution of the device-specific pieces of the ``moe_x_kernels`` CuTe-DSL kernels.
 
 The block-scaled tensor-core MMA atoms these kernels use are built by a CuTe DSL helper module that depends on the
@@ -26,7 +28,9 @@ def arch_helpers():
     if mod is None:
         name = os.environ.get(HELPERS_ENV, "").strip()
         if not name:
-            raise RuntimeError(f"{HELPERS_ENV} is not set: no MMA builder module for this device")
+            raise RuntimeError(
+                f"{HELPERS_ENV} is not set: no MMA builder module for this device"
+            )
         mod = importlib.import_module(name)
         for fn in ("make_blockscaled_trivial_tiled_mma", "compute_epilogue_tile_shape"):
             if not hasattr(mod, fn):

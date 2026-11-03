@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``sp_combine_inplace``: write the sequence-parallel MoE combine payload straight into the all-to-all
 workspace.
 
@@ -38,12 +40,17 @@ NAME = "sp_combine_inplace"
 
 SGLANG_PINS = {
     # FlashinferDispatcher: SP-prefill instance, payload_in_workspace in dispatch / combine
-    "sglang/srt/layers/moe/token_dispatcher/flashinfer.py":
-        "61d79191720f8231f965be7f971155f139bf683b8b7625733b49e0031fbd2ad3",
+    "sglang/srt/layers/moe/token_dispatcher/flashinfer.py": "61d79191720f8231f965be7f971155f139bf683b8b7625733b49e0031fbd2ad3",
     # NVFP4 experts: forward_dispatched / _finalize_deferred_output (reimplemented below with a destination)
-    "sglang/srt/layers/muse_spark_fp4_moe.py": ("1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352", "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738"),
+    "sglang/srt/layers/muse_spark_fp4_moe.py": (
+        "1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352",
+        "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738",
+    ),
     # BF16 experts: forward_dispatched / _finalize_deferred_output (reimplemented below with a destination)
-    "sglang/srt/layers/muse_spark_bf16_moe.py": ("687680077a7542cb1e2026d321c2f18a650fb56a654b50434acbf7be9c1aa6c5", "57ae1593b4496edfc658343d9ca039dead111484d78ec57ab3eaa14891f6afed"),
+    "sglang/srt/layers/muse_spark_bf16_moe.py": (
+        "687680077a7542cb1e2026d321c2f18a650fb56a654b50434acbf7be9c1aa6c5",
+        "57ae1593b4496edfc658343d9ca039dead111484d78ec57ab3eaa14891f6afed",
+    ),
 }
 FLASHINFER_PINS = {
     "flashinfer/comm/trtllm_moe_alltoall.py": (
@@ -51,13 +58,14 @@ FLASHINFER_PINS = {
         "21da7a12c1ef08e9c87fc5071e3fa1fafe9fbff04f9571ec683f339a01ea5b3c",  # FlashInfer 0.7.2
     ),
     "flashinfer/data/csrc/trtllm_moe_alltoall.cu": "d672681fb81aad57b780bde8ec8e07edfea58b65ab420f91c8df6aa79652f60f",
-    "flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu":
-        "195827d062cf18101b39491a6ecec4379d30f8e9e7e94e3992dda0420e67468f",
+    "flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu": "195827d062cf18101b39491a6ecec4379d30f8e9e7e94e3992dda0420e67468f",
 }
 
 _state: dict = {"engaged": None}
 # destination of the expert finalize of the forward_dispatched call in flight (None: stock allocation)
-_dest: contextvars.ContextVar = contextvars.ContextVar("muse_vr_sp_combine_dest", default=None)
+_dest: contextvars.ContextVar = contextvars.ContextVar(
+    "muse_vr_sp_combine_dest", default=None
+)
 
 
 def _flashinfer_pins_ok() -> tuple[bool, str]:
@@ -71,24 +79,36 @@ def _flashinfer_pins_ok() -> tuple[bool, str]:
         except OSError:
             got = None
         if not bed.sha_ok(got, sha):
-            logger.warning("muse_vr_plugin: %s sha256 %s does not match the pin %s", rel, (got or "<missing>")[:16],
-                           bed.sha_label(sha))
+            logger.warning(
+                "muse_vr_plugin: %s sha256 %s does not match the pin %s",
+                rel,
+                (got or "<missing>")[:16],
+                bed.sha_label(sha),
+            )
             return False, rel
     return True, ""
 
 
-def _fp4_finalize(self, deferred_output, *, num_tokens, post_expert_norm, out_dtype, ar_workspace=None):
+def _fp4_finalize(
+    self, deferred_output, *, num_tokens, post_expert_norm, out_dtype, ar_workspace=None
+):
     """``MuseSpark1xFp4Experts._finalize_deferred_output`` with the fused finalize writing into ``_dest``."""
     import torch
-
     from sglang.srt.layers import muse_spark_fp4_moe as m
 
     dest = _dest.get()
     if dest is None or ar_workspace is not None or out_dtype != torch.bfloat16:
-        return _state["orig_fp4_finalize"](self, deferred_output, num_tokens=num_tokens,
-                                           post_expert_norm=post_expert_norm, out_dtype=out_dtype,
-                                           ar_workspace=ar_workspace)
-    if getattr(self, "expert_tp", None):  # branch layout only (SGLang main has no expert-TP reduce here)
+        return _state["orig_fp4_finalize"](
+            self,
+            deferred_output,
+            num_tokens=num_tokens,
+            post_expert_norm=post_expert_norm,
+            out_dtype=out_dtype,
+            ar_workspace=ar_workspace,
+        )
+    if getattr(
+        self, "expert_tp", None
+    ):  # branch layout only (SGLang main has no expert-TP reduce here)
         deferred_output = m.expert_tp.reduce_deferred(deferred_output)
     use_fused = (
         self._post_expert_norm is not None
@@ -127,13 +147,17 @@ def _fp4_finalize(self, deferred_output, *, num_tokens, post_expert_norm, out_dt
 def _bf16_finalize(self, deferred_output, *, num_tokens, post_expert_norm, out_dtype):
     """``MuseSpark1xBf16Experts._finalize_deferred_output`` with the finalize writing into ``_dest``."""
     import torch
-
     from sglang.srt.layers import muse_spark_bf16_moe as m
 
     dest = _dest.get()
     if dest is None or out_dtype != torch.bfloat16:
-        return _state["orig_bf16_finalize"](self, deferred_output, num_tokens=num_tokens,
-                                            post_expert_norm=post_expert_norm, out_dtype=out_dtype)
+        return _state["orig_bf16_finalize"](
+            self,
+            deferred_output,
+            num_tokens=num_tokens,
+            post_expert_norm=post_expert_norm,
+            out_dtype=out_dtype,
+        )
     if self._finalize_op is None:
         out = m.finalize_with_post_expert_norm(
             gemm2_out=deferred_output.gemm2_out,
@@ -168,14 +192,18 @@ def _wrap_forward_dispatched(fn):
         hidden = moe_output.shape[-1]
         dest = moe_output.view(-1, hidden)
         if dest.shape[0] != dispatch_output.hidden_states.shape[0]:
-            raise RuntimeError("sp_combine_inplace: workspace payload rows do not match the dispatched rows")
+            raise RuntimeError(
+                "sp_combine_inplace: workspace payload rows do not match the dispatched rows"
+            )
         token = _dest.set(dest)
         try:
             out = fn(self, dispatch_output, post_expert_norm)
         finally:
             _dest.reset(token)
         if out.hidden_states.data_ptr() != dest.data_ptr():
-            raise RuntimeError("sp_combine_inplace: expert finalize did not write the workspace payload")
+            raise RuntimeError(
+                "sp_combine_inplace: expert finalize did not write the workspace payload"
+            )
         return out
 
     forward_dispatched.__wrapped_by_sp_combine__ = True
@@ -186,7 +214,10 @@ def _wrap_dispatcher_init(fn):
     @functools.wraps(fn)
     def __init__(self, *args, **kwargs):
         fn(self, *args, **kwargs)
-        if kwargs.get("enable_sp_prefill_a2a", False) and getattr(self, "sp_prefill_moe_a2a", None) is not None:
+        if (
+            kwargs.get("enable_sp_prefill_a2a", False)
+            and getattr(self, "sp_prefill_moe_a2a", None) is not None
+        ):
             # zero-copy combine: dispatch hands out the workspace payload view, combine skips the copy
             self.payload_in_workspace = True
             bed.count(NAME, "sp_dispatcher")
@@ -209,7 +240,9 @@ def install() -> None:
     bf16._finalize_deferred_output = _bf16_finalize
     fp4.forward_dispatched = _wrap_forward_dispatched(fp4.forward_dispatched)
     bf16.forward_dispatched = _wrap_forward_dispatched(bf16.forward_dispatched)
-    fdisp.FlashinferDispatcher.__init__ = _wrap_dispatcher_init(fdisp.FlashinferDispatcher.__init__)
+    fdisp.FlashinferDispatcher.__init__ = _wrap_dispatcher_init(
+        fdisp.FlashinferDispatcher.__init__
+    )
 
 
 def engage() -> bool:

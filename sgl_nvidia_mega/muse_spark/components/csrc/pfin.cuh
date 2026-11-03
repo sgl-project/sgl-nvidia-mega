@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Sequence-parallel MoE finalize (unpermute + post-expert RMSNorm + router-weighted top-k sum) with the per-element
  * arithmetic of SGLang's single-CTA CuTe-DSL finalize kernel (``MOEFinalizeRMSNormKernel`` at cluster size 1, the launch

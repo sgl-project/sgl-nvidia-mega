@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Prefill QK path (JIT CUDA): per-head RMS norm of the q and k heads of a QKV projection output and RoPE.
 
 ``qk_norm``: bf16 q and k exactly as SGLang's fused QK-norm Triton kernel writes them in its no-store launch, for row
@@ -25,8 +27,10 @@ MIN_TRITON_ROWS = 8192
 
 def covers(num_tokens: int, num_q_heads: int, num_kv_heads: int) -> bool:
     """Whether the stock Triton launch for this call uses the column split whose arithmetic this kernel reproduces."""
-    return (num_tokens * (num_q_heads + num_kv_heads) >= MIN_TRITON_ROWS and
-            num_q_heads + 2 * num_kv_heads <= MAX_HEADS)
+    return (
+        num_tokens * (num_q_heads + num_kv_heads) >= MIN_TRITON_ROWS
+        and num_q_heads + 2 * num_kv_heads <= MAX_HEADS
+    )
 
 
 def _unfused() -> bool:
@@ -50,15 +54,29 @@ def _norm_module(rope: bool, unfused: bool = False):
     )
 
 
-def qk_norm(qkv: torch.Tensor, positions: torch.Tensor, cos_sin: torch.Tensor | None, num_q_heads: int,
-            num_kv_heads: int, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+def qk_norm(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor | None,
+    num_q_heads: int,
+    num_kv_heads: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """(q, k): bf16 ``[T, Hq * 64]`` and ``[T, Hkv * 64]``, normed per head (and rotated when ``cos_sin`` is given)."""
     t = qkv.shape[0]
     q = torch.empty(t, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=qkv.device)
     k = torch.empty(t, num_kv_heads * HEAD_DIM, dtype=torch.bfloat16, device=qkv.device)
     rope = cos_sin is not None
-    _norm_module(rope, _unfused()).qk_norm(qkv, positions, cos_sin if rope else positions, q, k, int(num_q_heads), int(num_kv_heads),
-                               float(eps))
+    _norm_module(rope, _unfused()).qk_norm(
+        qkv,
+        positions,
+        cos_sin if rope else positions,
+        q,
+        k,
+        int(num_q_heads),
+        int(num_kv_heads),
+        float(eps),
+    )
     return q, k
 
 
@@ -76,9 +94,18 @@ def _module(rope: bool, unfused: bool = False):
     )
 
 
-def prefill_qkn(qkv: torch.Tensor, positions: torch.Tensor, cos_sin: torch.Tensor | None, k_pool: torch.Tensor,
-                v_pool: torch.Tensor, cache_loc: torch.Tensor, q_out: torch.Tensor, num_q_heads: int, num_kv_heads: int,
-                eps: float) -> torch.Tensor:
+def prefill_qkn(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor | None,
+    k_pool: torch.Tensor,
+    v_pool: torch.Tensor,
+    cache_loc: torch.Tensor,
+    q_out: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    eps: float,
+) -> torch.Tensor:
     """q_out[t] = e4m3(rope(rmsnorm(q heads of qkv[t]))); K / V pools at row cache_loc[t] get e4m3(rope(rmsnorm(k)))
     and e4m3(v) (every location, 0 included, as the stock FP8 store writes them). ``cos_sin`` None: no RoPE.
 
@@ -88,8 +115,18 @@ def prefill_qkn(qkv: torch.Tensor, positions: torch.Tensor, cos_sin: torch.Tenso
     :param cache_loc: ``[T]`` int64. :param q_out: ``[T, Hq * 64]`` e4m3, contiguous.
     """
     rope = cos_sin is not None
-    _module(rope, _unfused()).prefill_qkn(qkv, positions, cos_sin if rope else positions, k_pool, v_pool, cache_loc, q_out,
-                              int(num_q_heads), int(num_kv_heads), float(eps))
+    _module(rope, _unfused()).prefill_qkn(
+        qkv,
+        positions,
+        cos_sin if rope else positions,
+        k_pool,
+        v_pool,
+        cache_loc,
+        q_out,
+        int(num_q_heads),
+        int(num_kv_heads),
+        float(eps),
+    )
     return q_out
 
 

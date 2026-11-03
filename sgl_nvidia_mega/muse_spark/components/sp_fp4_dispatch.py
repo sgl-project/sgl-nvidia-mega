@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``sp_fp4_dispatch``: quantize the sequence-parallel MoE input to NVFP4 before the all-to-all dispatch.
 
 Under ``--enable-layernorm-sp`` the Muse Spark routed NVFP4 expert layers of a prefill pass send each token's
@@ -45,15 +47,22 @@ NAME = "sp_fp4_dispatch"
 
 SGLANG_PINS = {
     # FlashinferDispatcher.dispatch (SP-prefill branch) and its output types
-    "sglang/srt/layers/moe/token_dispatcher/flashinfer.py":
-        "61d79191720f8231f965be7f971155f139bf683b8b7625733b49e0031fbd2ad3",
+    "sglang/srt/layers/moe/token_dispatcher/flashinfer.py": "61d79191720f8231f965be7f971155f139bf683b8b7625733b49e0031fbd2ad3",
     # MuseSpark1xMoE._forward_sp_experts
-    "sglang/srt/models/muse_spark.py": ("7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355", "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
-                                          "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f"),
+    "sglang/srt/models/muse_spark.py": (
+        "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
+        "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+        "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+    ),
     # fused_experts_none_to_flashinfer_trtllm_fp4: per-token quantization call, pre-quantized pass-through branch
-    "sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py":
-        ("2f6f14ae1d95030db1ec249856b331f4e6880b0218727e8701c3944376acaaf9", "70db650773c0dcbeec8056d70ad6f6a0c06acd5d583e9bbbe8f4d5548cf25929"),
-    "sglang/srt/layers/muse_spark_fp4_moe.py": ("1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352", "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738"),
+    "sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py": (
+        "2f6f14ae1d95030db1ec249856b331f4e6880b0218727e8701c3944376acaaf9",
+        "70db650773c0dcbeec8056d70ad6f6a0c06acd5d583e9bbbe8f4d5548cf25929",
+    ),
+    "sglang/srt/layers/muse_spark_fp4_moe.py": (
+        "1d377424e4c1f486f72a0e8ea67ea41dca4bd3f6929aa3729f5f7480861ed352",
+        "1d7676d6d086e6aa45139671e345ef32d28a81b7de1b50810d0e512ee95cc738",
+    ),
 }
 FLASHINFER_PINS = {
     "flashinfer/comm/trtllm_moe_alltoall.py": (
@@ -67,7 +76,13 @@ FLASHINFER_PINS = {
     ),
 }
 
-_state: dict = {"engaged": None, "orig_dispatch": None, "orig_moe": None, "orig_norm": None, "pfront": None}
+_state: dict = {
+    "engaged": None,
+    "orig_dispatch": None,
+    "orig_moe": None,
+    "orig_norm": None,
+    "pfront": None,
+}
 PFRONT = "pfront"
 # sha256 of the sources whose arithmetic csrc/pfront.cuh reproduces (relative to site-packages)
 PFRONT_PINS = {
@@ -77,14 +92,14 @@ PFRONT_PINS = {
     "torch/_vendor/quack/reduction_base.py": "10737ec0dc31ac3ede1cec83f503f0598f460fb373296f7e52bef38f60f73ce2",
     "torch/_native/ops/norm/norms.py": "2e4e9d3f673cbdeb36febe5e64786e20d3f5a99c963b5c3c0fc7e399db00105e",
     "torch/_native/ops/norm/rmsnorm_impl.py": "101b23b9d0a9a2ad403d0ed52d3d93642d494285f7236b06af2e985226eb804d",
-    "flashinfer/quantization/kernels/nvfp4_quantize.py":
-        "88550172a3923e6e3417d151b22b0a97d5581bc9abc378d705d737058b4a6304",
-    "flashinfer/quantization/quantization_cute_dsl_utils.py":
-        "c4e2a0d938ce01953610a62f02a783aff82e877854cfab101dc79000c39f63c6",
+    "flashinfer/quantization/kernels/nvfp4_quantize.py": "88550172a3923e6e3417d151b22b0a97d5581bc9abc378d705d737058b4a6304",
+    "flashinfer/quantization/quantization_cute_dsl_utils.py": "c4e2a0d938ce01953610a62f02a783aff82e877854cfab101dc79000c39f63c6",
     "flashinfer/cute_dsl/fp4_common.py": "6cda2e2fa955ca608844209e5792d5a2136f6a2e6e0a8d3fb7cc285ebc01531d",
 }
 # {"on": True} while an NVFP4 expert layer's sequence-parallel expert call runs; the dispatch adds "x" and "pts"
-_ctx: contextvars.ContextVar = contextvars.ContextVar("muse_vr_sp_fp4_dispatch", default=None)
+_ctx: contextvars.ContextVar = contextvars.ContextVar(
+    "muse_vr_sp_fp4_dispatch", default=None
+)
 
 
 def _flashinfer_pins_ok() -> tuple[bool, str]:
@@ -98,8 +113,12 @@ def _flashinfer_pins_ok() -> tuple[bool, str]:
         except OSError:
             got = None
         if not bed.sha_ok(got, sha):
-            logger.warning("muse_vr_plugin: %s sha256 %s does not match the pin %s", rel, (got or "<missing>")[:16],
-                           bed.sha_label(sha))
+            logger.warning(
+                "muse_vr_plugin: %s sha256 %s does not match the pin %s",
+                rel,
+                (got or "<missing>")[:16],
+                bed.sha_label(sha),
+            )
             return False, rel
     return True, ""
 
@@ -159,17 +178,31 @@ def _pfront_norm_ok(norm, x) -> bool:
         return False
     w = norm._get_effective_weight()
     return bool(
-        w is not None and w.dtype == torch.bfloat16 and w.is_contiguous() and w.numel() == 4096
-        and w.data_ptr() % 16 == 0 and x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
-        and x.shape[1] == 4096 and x.shape[0] > 0 and x.is_contiguous() and x.data_ptr() % 16 == 0)
+        w is not None
+        and w.dtype == torch.bfloat16
+        and w.is_contiguous()
+        and w.numel() == 4096
+        and w.data_ptr() % 16 == 0
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.dim() == 2
+        and x.shape[1] == 4096
+        and x.shape[0] > 0
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+    )
 
 
 def _wrap_norm_forward(fn):
     @functools.wraps(fn)
     def forward(self, x):
         ctx = _ctx.get()
-        if (ctx is not None and ctx.get("pfront_norm") is self and not ctx.get("pfront_done")
-                and _pfront_norm_ok(self, x)):
+        if (
+            ctx is not None
+            and ctx.get("pfront_norm") is self
+            and not ctx.get("pfront_done")
+            and _pfront_norm_ok(self, x)
+        ):
             ctx["pfront_done"] = True  # at most one deferral per expert call
             ctx["pfront_raw"] = x
             bed.count(PFRONT, "deferred")
@@ -186,7 +219,9 @@ def _take_deferred(ctx, hidden_states):
         return None
     raw = ctx["pfront_raw"]
     if raw.data_ptr() != hidden_states.data_ptr() or raw.shape != hidden_states.shape:
-        raise RuntimeError("sp_fp4_dispatch pfront: the dispatched rows are not the rows whose norm was deferred")
+        raise RuntimeError(
+            "sp_fp4_dispatch pfront: the dispatched rows are not the rows whose norm was deferred"
+        )
     ctx["pfront_raw"] = None
     return ctx["pfront_norm"]
 
@@ -195,17 +230,30 @@ def quantize_rows(x):
     """Per-token NVFP4 quantization exactly as the sequence-parallel expert runner does it on the receiving rank."""
     import torch
     from flashinfer import SfLayout, nvfp4_quantize
-
     from sglang.srt.environ import envs
 
     e4m3_max = 448.0
-    if envs.FLASHINFER_NVFP4_4OVER6.get() and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get():
+    if (
+        envs.FLASHINFER_NVFP4_4OVER6.get()
+        and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+    ):
         e4m3_max = 256.0
-    global_scale_inv = torch.full((1,), 1.0 / (e4m3_max * 6.0), dtype=torch.float32, device=x.device)
+    global_scale_inv = torch.full(
+        (1,), 1.0 / (e4m3_max * 6.0), dtype=torch.float32, device=x.device
+    )
     fp4_bytes, sf_bytes, per_token_scale = nvfp4_quantize(
-        x, global_scale_inv, sfLayout=SfLayout.layout_linear, per_token_activation=True, backend="cute-dsl")
+        x,
+        global_scale_inv,
+        sfLayout=SfLayout.layout_linear,
+        per_token_activation=True,
+        backend="cute-dsl",
+    )
     t, h = x.shape
-    return fp4_bytes.reshape(t, h // 2), sf_bytes.reshape(t, h // 16), per_token_scale.reshape(t)
+    return (
+        fp4_bytes.reshape(t, h // 2),
+        sf_bytes.reshape(t, h // 16),
+        per_token_scale.reshape(t),
+    )
 
 
 def _fp4_layer_eligible(moe) -> bool:
@@ -244,17 +292,26 @@ def _wrap_dispatch(fn):
     @functools.wraps(fn)
     def dispatch(self, hidden_states, topk_output):
         import torch
-
-        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_is_extend_in_batch
-        from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatchOutput
+        from sglang.srt.layers.dp_attention import (
+            get_dp_global_num_tokens,
+            get_is_extend_in_batch,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferDispatchOutput,
+        )
         from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
         from sglang.srt.runtime_context import get_forward
 
         ctx = _ctx.get()
         deferred = _take_deferred(ctx, hidden_states)
         dp_global = get_dp_global_num_tokens()
-        if (ctx is None or not get_forward().sp_active or hidden_states.dtype != torch.bfloat16
-                or self.hidden_size % 16 or (dp_global is not None and len(dp_global) > 1)):
+        if (
+            ctx is None
+            or not get_forward().sp_active
+            or hidden_states.dtype != torch.bfloat16
+            or self.hidden_size % 16
+            or (dp_global is not None and len(dp_global) > 1)
+        ):
             bed.count(NAME, "stock")
             if deferred is not None:
                 bed.count(PFRONT, "stock_norm")
@@ -270,35 +327,56 @@ def _wrap_dispatch(fn):
         if deferred is not None:
             from .ops import pfront as pfront_op
 
-            x_fp4, x_sf, pts = pfront_op.pfront(hidden_states, deferred._get_effective_weight(), float(deferred.eps),
-                                                1.0 / (_e4m3_max() * 6.0))
+            x_fp4, x_sf, pts = pfront_op.pfront(
+                hidden_states,
+                deferred._get_effective_weight(),
+                float(deferred.eps),
+                1.0 / (_e4m3_max() * 6.0),
+            )
             bed.count(PFRONT, "fused")
         else:
             x_fp4, x_sf, pts = quantize_rows(hidden_states)
-        runtime_max = hidden_states.shape[0]  # the stock geometry without a per-rank DP token list
+        runtime_max = hidden_states.shape[
+            0
+        ]  # the stock geometry without a per-rank DP token list
         if runtime_max > self.max_num_tokens:
-            raise RuntimeError("sp_fp4_dispatch: runtime token geometry exceeds the all-to-all workspace")
+            raise RuntimeError(
+                "sp_fp4_dispatch: runtime token geometry exceeds the all-to-all workspace"
+            )
         # largest element size first, as the all-to-all requires
         payloads = [pts.view(-1, 1).contiguous(), topk_ids, topk_weights, x_fp4, x_sf]
         self.runtime_max_tokens_per_rank = runtime_max
         self._start_a2a(sp_prefill=is_sp_prefill)
         try:
             pts_r, ids_r, w_r, x_r, sf_r = self.active_moe_a2a.dispatch(
-                topk_ids, payloads, runtime_max,
-                invalid_token_expert_id=self.invalid_token_expert_id, expert_id_payload_index=1)
+                topk_ids,
+                payloads,
+                runtime_max,
+                invalid_token_expert_id=self.invalid_token_expert_id,
+                expert_id_payload_index=1,
+            )
             x = x_r.view(-1, x_r.shape[-1])
             moe_output = None
             if self.payload_in_workspace:
-                moe_output = self.active_moe_a2a.get_combine_payload_tensor_in_workspace(
-                    runtime_max, self.hidden_size, torch.bfloat16).view(-1, self.hidden_size)
+                moe_output = (
+                    self.active_moe_a2a.get_combine_payload_tensor_in_workspace(
+                        runtime_max, self.hidden_size, torch.bfloat16
+                    ).view(-1, self.hidden_size)
+                )
             ctx["x"] = x
             ctx["pts"] = pts_r.view(-1)
             bed.count(NAME, "fp4_dispatch")
             return FlashinferDispatchOutput(
-                x, sf_r.view(-1, sf_r.shape[-1]),
-                StandardTopKOutput(w_r.view(-1, w_r.shape[-1]), ids_r.view(-1, ids_r.shape[-1]),
-                                   topk_output.router_logits),
-                moe_output, torch.bfloat16)
+                x,
+                sf_r.view(-1, sf_r.shape[-1]),
+                StandardTopKOutput(
+                    w_r.view(-1, w_r.shape[-1]),
+                    ids_r.view(-1, ids_r.shape[-1]),
+                    topk_output.router_logits,
+                ),
+                moe_output,
+                torch.bfloat16,
+            )
         except Exception:
             self._clear_active_a2a()
             raise
@@ -311,9 +389,18 @@ def _routed_moe(*args, **kwargs):
     """Stand-in for ``flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe``: adds the dispatched per-token scales to
     the call made for the dispatched codes (identified by tensor identity); every other call passes through."""
     ctx = _ctx.get()
-    if ctx is not None and "x" in ctx and not args and kwargs.get("per_token_scale") is None:
+    if (
+        ctx is not None
+        and "x" in ctx
+        and not args
+        and kwargs.get("per_token_scale") is None
+    ):
         hs = kwargs.get("hidden_states")
-        if hs is not None and hs.data_ptr() == ctx["x"].data_ptr() and hs.shape == ctx["x"].shape:
+        if (
+            hs is not None
+            and hs.data_ptr() == ctx["x"].data_ptr()
+            and hs.shape == ctx["x"].shape
+        ):
             kwargs["per_token_scale"] = ctx["pts"]
             bed.count(NAME, "per_token_scale")
     return _state["orig_moe"](*args, **kwargs)
@@ -321,7 +408,6 @@ def _routed_moe(*args, **kwargs):
 
 def install() -> None:
     import flashinfer.fused_moe as ffm
-
     from sglang.srt.layers.moe.token_dispatcher import flashinfer as fdisp
     from sglang.srt.models import muse_spark
 
@@ -329,13 +415,17 @@ def install() -> None:
         return
     _state["orig_moe"] = ffm.trtllm_fp4_block_scale_routed_moe
     ffm.trtllm_fp4_block_scale_routed_moe = _routed_moe
-    fdisp.FlashinferDispatcher.dispatch = _wrap_dispatch(fdisp.FlashinferDispatcher.dispatch)
+    fdisp.FlashinferDispatcher.dispatch = _wrap_dispatch(
+        fdisp.FlashinferDispatcher.dispatch
+    )
     moe_cls = muse_spark.MuseSpark1xMoE
     moe_cls._forward_sp_experts = _wrap_forward_sp_experts(moe_cls._forward_sp_experts)
     if _pfront_on():
         from . import sgl_compat
 
-        norm_cls = sgl_compat.module("sglang.srt.layers.muse_spark_layers").MuseSpark1xRMSNorm
+        norm_cls = sgl_compat.module(
+            "sglang.srt.layers.muse_spark_layers"
+        ).MuseSpark1xRMSNorm
         if not getattr(norm_cls.forward, "__wrapped_by_pfront__", False):
             _state["orig_norm"] = norm_cls.forward
             norm_cls.forward = _wrap_norm_forward(norm_cls.forward)

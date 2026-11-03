@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paged NVFP4-KV verify attention on tensor-core MMA (tcgen05) with a length-proportional key split, JIT CUDA.
 
 See ``csrc/nvfp4_verify_attn.cuh`` for the arithmetic, the work split and the synchronization. The op covers the verify
@@ -41,7 +43,9 @@ def _module(use_pdl: bool):
         "muse_vr_nvfp4_verify_attn",
         *args,
         cuda_files=[str(_CSRC)],
-        cuda_wrappers=[("nvfp4_verify_attn", f"muse_vr::Nvfp4VerifyAttnKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("nvfp4_verify_attn", f"muse_vr::Nvfp4VerifyAttnKernel<{args}>::run")
+        ],
     )
 
 
@@ -50,7 +54,9 @@ def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def num_splits(num_requests: int, num_kv_heads: int, device, window_left: int = -1) -> int:
+def num_splits(
+    num_requests: int, num_kv_heads: int, device, window_left: int = -1
+) -> int:
     idx = device.index if device.index is not None else torch.cuda.current_device()
     sms = _sm_count(idx)
     units = max(1, num_requests * (num_kv_heads // 2))
@@ -92,9 +98,15 @@ def workspace_floats(num_requests: int, num_kv_heads: int, splits: int) -> int:
     return num_requests * num_kv_heads * splits * ROWS * REC_FLOATS
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int) -> bool:
-    return (head_dim == HEAD_DIM and num_kv_heads * Q_PER_KV == num_q_heads and num_kv_heads % 2 == 0
-            and page_size == PAGE)
+def supported(
+    num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int
+) -> bool:
+    return (
+        head_dim == HEAD_DIM
+        and num_kv_heads * Q_PER_KV == num_q_heads
+        and num_kv_heads % 2 == 0
+        and page_size == PAGE
+    )
 
 
 def nvfp4_verify_attn(
@@ -130,25 +142,58 @@ def nvfp4_verify_attn(
     s = splits or num_splits(reqs, hkv, q.device, int(window_left))
     ws = workspace(q.device, workspace_floats(reqs, hkv, s))
     _module(bool(use_pdl)).nvfp4_verify_attn(
-        q, kp, vp, k_scales.view(torch.uint8), v_scales.view(torch.uint8), page_table, seq_lens, out, ws,
-        int(window_left), PAGE, int(s), float(bmm1_scale), float(bmm2_scale))
+        q,
+        kp,
+        vp,
+        k_scales.view(torch.uint8),
+        v_scales.view(torch.uint8),
+        page_table,
+        seq_lens,
+        out,
+        ws,
+        int(window_left),
+        PAGE,
+        int(s),
+        float(bmm1_scale),
+        float(bmm2_scale),
+    )
     return out
 
 
-def preload(max_requests: int, num_q_heads: int, num_kv_heads: int, device, use_pdl: bool = False) -> None:
+def preload(
+    max_requests: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    device,
+    use_pdl: bool = False,
+) -> None:
     """Build and load the kernels and size the workspace for up to ``max_requests`` requests, so that no build,
     module load, function attribute call or allocation happens inside a CUDA-graph capture."""
     key = (device.type, device.index, max_requests, num_q_heads, num_kv_heads, use_pdl)
     if key in _preloaded:
         return
-    workspace(device, max(workspace_floats(n, num_kv_heads, num_splits(n, num_kv_heads, device, w))
-                          for n in range(1, max_requests + 1) for w in (-1, 0)))
-    q = torch.zeros(TOKENS_PER_REQUEST, num_q_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
-    pool = torch.zeros(2 * PAGE, num_kv_heads, HEAD_DIM // 2, dtype=torch.uint8, device=device)
-    scales = torch.zeros(2, num_kv_heads, PAGE, HEAD_DIM // 16, dtype=torch.uint8, device=device)
+    workspace(
+        device,
+        max(
+            workspace_floats(n, num_kv_heads, num_splits(n, num_kv_heads, device, w))
+            for n in range(1, max_requests + 1)
+            for w in (-1, 0)
+        ),
+    )
+    q = torch.zeros(
+        TOKENS_PER_REQUEST, num_q_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    pool = torch.zeros(
+        2 * PAGE, num_kv_heads, HEAD_DIM // 2, dtype=torch.uint8, device=device
+    )
+    scales = torch.zeros(
+        2, num_kv_heads, PAGE, HEAD_DIM // 16, dtype=torch.uint8, device=device
+    )
     table = torch.zeros(1, 2, dtype=torch.int32, device=device)
     lens = torch.full((1,), TOKENS_PER_REQUEST, dtype=torch.int32, device=device)
-    nvfp4_verify_attn(q, pool, pool, scales, scales, table, lens, -1, 1.0, 1.0, use_pdl=use_pdl)
+    nvfp4_verify_attn(
+        q, pool, pool, scales, scales, table, lens, -1, 1.0, 1.0, use_pdl=use_pdl
+    )
     torch.cuda.current_stream(device).synchronize()
     _preloaded.add(key)
 

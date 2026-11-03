@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Launch wrappers for the route all-gather form of the expert-output hop (c3_hb0.cuh):
 //   push    stand-in producer after the expert kernel: every local slot row to every other rank (one warp per row);
 //   consume one 512-thread CTA per token: the engine's fused finalize + one-shot push all-reduce result, computed on every

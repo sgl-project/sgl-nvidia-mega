@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Front roles for a fused MoE front launch (csrc/wfc_front_roles.cuh): dev, not wired into the server.
 
 The header provides device functions that a larger launch calls for the rows it owns:
@@ -22,10 +24,9 @@ _CUH = _CSRC / "wfc_front_roles.cuh"
 
 @functools.lru_cache(maxsize=None)
 def module(q_threads: int = 256, groups: int = 1, route_warps: int = 4):
+    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
-
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
 
     name = f"WfcFrontRoles<{q_threads}, {groups}, {route_warps}>"
     return load_jit(
@@ -34,9 +35,15 @@ def module(q_threads: int = 256, groups: int = 1, route_warps: int = 4):
         str(groups),
         str(route_warps),
         cuda_files=[str(_CUH)],
-        cuda_wrappers=[("run", f"{name}::run"), ("run_p", f"{name}::run_p"), ("wait", f"{name}::wait"),
-                       ("bump", f"{name}::bump"), ("plant", f"{name}::plant"), ("kfm_1a", f"{name}::kfm_1a"),
-                       ("kfm_1b", f"{name}::kfm_1b")],
+        cuda_wrappers=[
+            ("run", f"{name}::run"),
+            ("run_p", f"{name}::run_p"),
+            ("wait", f"{name}::wait"),
+            ("bump", f"{name}::bump"),
+            ("plant", f"{name}::plant"),
+            ("kfm_1a", f"{name}::kfm_1a"),
+            ("kfm_1b", f"{name}::kfm_1b"),
+        ],
         extra_include_paths=csrc_include_paths(KERNEL_PATH / "csrc") + [str(_CSRC)],
     )
 
@@ -60,31 +67,113 @@ class State:
         self.got = torch.zeros(m, 9, dtype=torch.int32, device=d)
         self._dummy_i32 = torch.zeros(256, dtype=torch.int32, device=d)
 
-    def run(self, logits, bias, x, weight, *, layer: int = 0, grid: int = 8, cfg=(256, 1, 4), mult: float = 1.0,
-            route_scale: float = 1.0, div_eps: float = 0.0, qeps: float = 1e-6, gsi: float = 1.0 / (448.0 * 6.0),
-            lem=None, nvalid=None):
+    def run(
+        self,
+        logits,
+        bias,
+        x,
+        weight,
+        *,
+        layer: int = 0,
+        grid: int = 8,
+        cfg=(256, 1, 4),
+        mult: float = 1.0,
+        route_scale: float = 1.0,
+        div_eps: float = 0.0,
+        qeps: float = 1e-6,
+        gsi: float = 1.0 / (448.0 * 6.0),
+        lem=None,
+        nvalid=None,
+    ):
         mod = module(*cfg)
-        mod.run(logits, bias, self.topk_w, self.topk_ids, self.packed,
-                lem if lem is not None else self._dummy_i32, int(lem is not None),
-                nvalid if nvalid is not None else self._dummy_i32, int(nvalid is not None), self.rwords,
-                x, weight if weight is not None else x[0], int(weight is not None), self.fp4, self.sf, self.pts,
-                self.qwords, self.epoch, int(layer), self.m, int(grid), float(mult), float(route_scale), float(div_eps),
-                float(qeps), float(gsi))
+        mod.run(
+            logits,
+            bias,
+            self.topk_w,
+            self.topk_ids,
+            self.packed,
+            lem if lem is not None else self._dummy_i32,
+            int(lem is not None),
+            nvalid if nvalid is not None else self._dummy_i32,
+            int(nvalid is not None),
+            self.rwords,
+            x,
+            weight if weight is not None else x[0],
+            int(weight is not None),
+            self.fp4,
+            self.sf,
+            self.pts,
+            self.qwords,
+            self.epoch,
+            int(layer),
+            self.m,
+            int(grid),
+            float(mult),
+            float(route_scale),
+            float(div_eps),
+            float(qeps),
+            float(gsi),
+        )
 
-    def run_p(self, logits, bias, partials, weight, *, layer: int = 0, grid: int = 8, cfg=(256, 1, 4), mult: float = 1.0,
-              route_scale: float = 1.0, div_eps: float = 0.0, qeps: float = 1e-6, gsi: float = 1.0 / (448.0 * 6.0),
-              pooled=None):
+    def run_p(
+        self,
+        logits,
+        bias,
+        partials,
+        weight,
+        *,
+        layer: int = 0,
+        grid: int = 8,
+        cfg=(256, 1, 4),
+        mult: float = 1.0,
+        route_scale: float = 1.0,
+        div_eps: float = 0.0,
+        qeps: float = 1e-6,
+        gsi: float = 1.0 / (448.0 * 6.0),
+        pooled=None,
+    ):
         """Partials form: partials [S, M, 4096] fp32 (contiguous); pooled: optional [M, 4096] bf16 output of the slice sum."""
         mod = module(*cfg)
         S = partials.shape[0]
-        mod.run_p(logits, bias, self.topk_w, self.topk_ids, self.packed, self.rwords, partials, S,
-                  pooled if pooled is not None else self.fp4, int(pooled is not None),
-                  weight if weight is not None else self.fp4, int(weight is not None), self.fp4, self.sf, self.pts,
-                  self.qwords, self.epoch, int(layer), self.m, int(grid), float(mult), float(route_scale), float(div_eps),
-                  float(qeps), float(gsi))
+        mod.run_p(
+            logits,
+            bias,
+            self.topk_w,
+            self.topk_ids,
+            self.packed,
+            self.rwords,
+            partials,
+            S,
+            pooled if pooled is not None else self.fp4,
+            int(pooled is not None),
+            weight if weight is not None else self.fp4,
+            int(weight is not None),
+            self.fp4,
+            self.sf,
+            self.pts,
+            self.qwords,
+            self.epoch,
+            int(layer),
+            self.m,
+            int(grid),
+            float(mult),
+            float(route_scale),
+            float(div_eps),
+            float(qeps),
+            float(gsi),
+        )
 
     def wait(self, *, layer: int = 0, max_polls: int = 1 << 20, cfg=(256, 1, 4)):
-        module(*cfg).wait(self.rwords, self.qwords, self.m, self.epoch, int(layer), int(max_polls), self.err, self.got)
+        module(*cfg).wait(
+            self.rwords,
+            self.qwords,
+            self.m,
+            self.epoch,
+            int(layer),
+            int(max_polls),
+            self.err,
+            self.got,
+        )
 
     def bump(self, cfg=(256, 1, 4)):
         module(*cfg).bump(self.epoch)
@@ -95,14 +184,60 @@ class State:
         module().plant(x, self.fp4, self.sf, self.pts, self.m)
 
     # K_FM entries (test launches): 1a writes the routed-ids board; 1b writes the expert-major token image.
-    def kfm_1a(self, logits, bias, ids64, *, layer: int = 0, grid: int = 8, mult: float = 1.0, route_scale: float = 1.0,
-               div_eps: float = 0.0):
-        module().kfm_1a(logits, bias, ids64, self.epoch, int(layer), self.m, int(grid), float(mult), float(route_scale),
-                        float(div_eps))
+    def kfm_1a(
+        self,
+        logits,
+        bias,
+        ids64,
+        *,
+        layer: int = 0,
+        grid: int = 8,
+        mult: float = 1.0,
+        route_scale: float = 1.0,
+        div_eps: float = 0.0,
+    ):
+        module().kfm_1a(
+            logits,
+            bias,
+            ids64,
+            self.epoch,
+            int(layer),
+            self.m,
+            int(grid),
+            float(mult),
+            float(route_scale),
+            float(div_eps),
+        )
 
-    def kfm_1b(self, src, weight, hs_perm, img1, row_img, pts_perm, row_tok, *, grid: int = 8, qeps: float = 1e-6,
-               gsi: float = 1.0 / (448.0 * 6.0)):
+    def kfm_1b(
+        self,
+        src,
+        weight,
+        hs_perm,
+        img1,
+        row_img,
+        pts_perm,
+        row_tok,
+        *,
+        grid: int = 8,
+        qeps: float = 1e-6,
+        gsi: float = 1.0 / (448.0 * 6.0),
+    ):
         """src: bf16 [M, 4096] pooled rows, or fp32 [S, M, 4096] partials (S = 1, 2)."""
         S = 0 if src.dim() == 2 else src.shape[0]
-        module().kfm_1b(src, S, self.m, weight if weight is not None else src, int(weight is not None), hs_perm, img1,
-                        row_img, pts_perm, row_tok, int(row_tok.numel()), int(grid), float(qeps), float(gsi))
+        module().kfm_1b(
+            src,
+            S,
+            self.m,
+            weight if weight is not None else src,
+            int(weight is not None),
+            hs_perm,
+            img1,
+            row_img,
+            pts_perm,
+            row_tok,
+            int(row_tok.numel()),
+            int(grid),
+            float(qeps),
+            float(gsi),
+        )

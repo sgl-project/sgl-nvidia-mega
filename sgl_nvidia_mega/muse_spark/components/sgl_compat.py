@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """SGLang source-layout compatibility for the plugin's imports, hook targets and source pins.
 
 SGLang moved several Muse Spark modules between the branch the plugin was first built on (``kernels/ops/muse_spark_v12``,
@@ -22,23 +24,49 @@ from pathlib import Path
 
 # original dotted module -> alternatives, in the order tried after the original
 MODULE_MOVES: dict[str, tuple[str, ...]] = {
-    "sglang.srt.layers.muse_spark_fp4_moe": ("sglang.srt.layers.muse_spark.muse_spark_fp4_moe",),
-    "sglang.srt.layers.muse_spark_bf16_moe": ("sglang.srt.layers.muse_spark.muse_spark_bf16_moe",),
-    "sglang.srt.layers.muse_spark_layers": ("sglang.srt.layers.muse_spark.muse_spark_layers",),
-    "sglang.srt.layers.quantization.muse_spark_nvfp4_moe": ("sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe",),
+    "sglang.srt.layers.muse_spark_fp4_moe": (
+        "sglang.srt.layers.muse_spark.muse_spark_fp4_moe",
+    ),
+    "sglang.srt.layers.muse_spark_bf16_moe": (
+        "sglang.srt.layers.muse_spark.muse_spark_bf16_moe",
+    ),
+    "sglang.srt.layers.muse_spark_layers": (
+        "sglang.srt.layers.muse_spark.muse_spark_layers",
+    ),
+    "sglang.srt.layers.quantization.muse_spark_nvfp4_moe": (
+        "sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe",
+    ),
     # operators: branch kernels/ops/muse_spark_v12/<name> -> main's per-computation modules
-    "sglang.kernels.ops.muse_spark_v12.norm_residual": ("sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit",),
-    "sglang.kernels.ops.muse_spark_v12.fused_norm_residual": ("sglang.kernels.ops.layernorm.muse_spark_norm_residual",),
+    "sglang.kernels.ops.muse_spark_v12.norm_residual": (
+        "sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit",
+    ),
+    "sglang.kernels.ops.muse_spark_v12.fused_norm_residual": (
+        "sglang.kernels.ops.layernorm.muse_spark_norm_residual",
+    ),
     "sglang.kernels.ops.muse_spark_v12.all_gather_norm_residual": (
         "sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual",
     ),
-    "sglang.kernels.ops.muse_spark_v12.norm_fp4_quant": ("sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant",),
-    "sglang.kernels.ops.muse_spark_v12.norm_gate": ("sglang.kernels.ops.layernorm.muse_spark_norm_gate_jit",),
-    "sglang.kernels.ops.muse_spark_v12.fused_norm_gate": ("sglang.kernels.ops.layernorm.muse_spark_norm_gate",),
-    "sglang.kernels.ops.muse_spark_v12.fused_qk_norm": ("sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store",),
-    "sglang.kernels.ops.muse_spark_v12.gemm_ag": ("sglang.srt.layers.communication.muse_spark_gemm_ag",),
-    "sglang.kernels.ops.muse_spark_v12.fused_muse_spark_routing": ("sglang.kernels.ops.moe.muse_spark_routing",),
-    "sglang.kernels.ops.muse_spark_v12.router_gemm": ("sglang.kernels.ops.gemm.muse_spark_router_gemm",),
+    "sglang.kernels.ops.muse_spark_v12.norm_fp4_quant": (
+        "sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant",
+    ),
+    "sglang.kernels.ops.muse_spark_v12.norm_gate": (
+        "sglang.kernels.ops.layernorm.muse_spark_norm_gate_jit",
+    ),
+    "sglang.kernels.ops.muse_spark_v12.fused_norm_gate": (
+        "sglang.kernels.ops.layernorm.muse_spark_norm_gate",
+    ),
+    "sglang.kernels.ops.muse_spark_v12.fused_qk_norm": (
+        "sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store",
+    ),
+    "sglang.kernels.ops.muse_spark_v12.gemm_ag": (
+        "sglang.srt.layers.communication.muse_spark_gemm_ag",
+    ),
+    "sglang.kernels.ops.muse_spark_v12.fused_muse_spark_routing": (
+        "sglang.kernels.ops.moe.muse_spark_routing",
+    ),
+    "sglang.kernels.ops.muse_spark_v12.router_gemm": (
+        "sglang.kernels.ops.gemm.muse_spark_router_gemm",
+    ),
     "sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_trtllm": (
         "sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce",
     ),
@@ -46,33 +74,63 @@ MODULE_MOVES: dict[str, tuple[str, ...]] = {
 
 # original source path -> alternatives (relative to the directory holding the ``sglang`` package)
 PATH_MOVES: dict[str, tuple[str, ...]] = {
-    "sglang/srt/layers/muse_spark_fp4_moe.py": ("sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py",),
-    "sglang/srt/layers/muse_spark_bf16_moe.py": ("sglang/srt/layers/muse_spark/muse_spark_bf16_moe.py",),
-    "sglang/srt/layers/muse_spark_layers.py": ("sglang/srt/layers/muse_spark/muse_spark_layers.py",),
-    "sglang/srt/layers/quantization/muse_spark_nvfp4_moe.py": ("sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py",),
+    "sglang/srt/layers/muse_spark_fp4_moe.py": (
+        "sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py",
+    ),
+    "sglang/srt/layers/muse_spark_bf16_moe.py": (
+        "sglang/srt/layers/muse_spark/muse_spark_bf16_moe.py",
+    ),
+    "sglang/srt/layers/muse_spark_layers.py": (
+        "sglang/srt/layers/muse_spark/muse_spark_layers.py",
+    ),
+    "sglang/srt/layers/quantization/muse_spark_nvfp4_moe.py": (
+        "sglang/srt/layers/muse_spark/muse_spark_nvfp4_moe.py",
+    ),
     "sglang/kernels/jit/csrc/muse_spark_v12/all_gather_norm_residual.cuh": (
         "sglang/kernels/jit/csrc/muse_spark/all_gather_norm_residual.cuh",
     ),
-    "sglang/kernels/jit/csrc/muse_spark_v12/norm_fp4_quant.cuh": ("sglang/kernels/jit/csrc/muse_spark/norm_fp4_quant.cuh",),
-    "sglang/kernels/jit/csrc/muse_spark_v12/norm_gate.cuh": ("sglang/kernels/jit/csrc/muse_spark/norm_gate.cuh",),
-    "sglang/kernels/jit/csrc/muse_spark_v12/norm_residual.cuh": ("sglang/kernels/jit/csrc/muse_spark/norm_residual.cuh",),
-    "sglang/kernels/jit/csrc/muse_spark_v12/routing.cuh": ("sglang/kernels/jit/csrc/muse_spark/routing.cuh",),
-    "sglang/kernels/ops/muse_spark_v12/norm_residual.py": ("sglang/kernels/ops/layernorm/muse_spark_norm_residual_jit.py",),
-    "sglang/kernels/ops/muse_spark_v12/fused_norm_residual.py": ("sglang/kernels/ops/layernorm/muse_spark_norm_residual.py",),
+    "sglang/kernels/jit/csrc/muse_spark_v12/norm_fp4_quant.cuh": (
+        "sglang/kernels/jit/csrc/muse_spark/norm_fp4_quant.cuh",
+    ),
+    "sglang/kernels/jit/csrc/muse_spark_v12/norm_gate.cuh": (
+        "sglang/kernels/jit/csrc/muse_spark/norm_gate.cuh",
+    ),
+    "sglang/kernels/jit/csrc/muse_spark_v12/norm_residual.cuh": (
+        "sglang/kernels/jit/csrc/muse_spark/norm_residual.cuh",
+    ),
+    "sglang/kernels/jit/csrc/muse_spark_v12/routing.cuh": (
+        "sglang/kernels/jit/csrc/muse_spark/routing.cuh",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/norm_residual.py": (
+        "sglang/kernels/ops/layernorm/muse_spark_norm_residual_jit.py",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/fused_norm_residual.py": (
+        "sglang/kernels/ops/layernorm/muse_spark_norm_residual.py",
+    ),
     "sglang/kernels/ops/muse_spark_v12/all_gather_norm_residual.py": (
         "sglang/kernels/ops/communication/muse_spark_all_gather_norm_residual.py",
     ),
     "sglang/kernels/ops/muse_spark_v12/norm_fp4_quant.py": (
         "sglang/kernels/ops/layernorm/muse_spark_rmsnorm_nvfp4_quant.py",
     ),
-    "sglang/kernels/ops/muse_spark_v12/norm_gate.py": ("sglang/kernels/ops/layernorm/muse_spark_norm_gate_jit.py",),
-    "sglang/kernels/ops/muse_spark_v12/fused_norm_gate.py": ("sglang/kernels/ops/layernorm/muse_spark_norm_gate.py",),
+    "sglang/kernels/ops/muse_spark_v12/norm_gate.py": (
+        "sglang/kernels/ops/layernorm/muse_spark_norm_gate_jit.py",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/fused_norm_gate.py": (
+        "sglang/kernels/ops/layernorm/muse_spark_norm_gate.py",
+    ),
     "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": (
         "sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py",
     ),
-    "sglang/kernels/ops/muse_spark_v12/gemm_ag.py": ("sglang/srt/layers/communication/muse_spark_gemm_ag.py",),
-    "sglang/kernels/ops/muse_spark_v12/routing.py": ("sglang/kernels/ops/moe/muse_spark_routing_jit.py",),
-    "sglang/kernels/ops/muse_spark_v12/fused_muse_spark_routing.py": ("sglang/kernels/ops/moe/muse_spark_routing.py",),
+    "sglang/kernels/ops/muse_spark_v12/gemm_ag.py": (
+        "sglang/srt/layers/communication/muse_spark_gemm_ag.py",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/routing.py": (
+        "sglang/kernels/ops/moe/muse_spark_routing_jit.py",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/fused_muse_spark_routing.py": (
+        "sglang/kernels/ops/moe/muse_spark_routing.py",
+    ),
 }
 
 
@@ -134,7 +192,12 @@ def relpath(path: str) -> str:
 def layout() -> str:
     """Decided from the installed files (aliases do not change it)."""
     root = _root()
-    return "branch" if root is not None and (root / "sglang/srt/layers/muse_spark_fp4_moe.py").is_file() else "main"
+    return (
+        "branch"
+        if root is not None
+        and (root / "sglang/srt/layers/muse_spark_fp4_moe.py").is_file()
+        else "main"
+    )
 
 
 _COMPAT_INCLUDE = Path(__file__).resolve().parent / "include" / "compat_main"

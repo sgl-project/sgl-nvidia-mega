@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Option ``pull_bounded`` (env ``MUSE_VR_PULL_BOUNDED=1``, default off): bounded barrier waits for the NVLink pull
 all-gather that ``verify_logits_gather`` and ``ctx_proj_overlap`` (shard mode) issue.
 
@@ -42,10 +44,16 @@ _CUH = Path(__file__).resolve().parent / "csrc" / "pull_gather_bounded.cuh"
 # the pull kernel and its launcher, the barrier and semaphore operations, the PTX wrappers they use, and the Python
 # wrapper whose defaults (unroll, multicast pointer, block hint) the copy is launched with.
 PINS = {
-    "sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh": ("8fb785518279cf8944a6a438036cfe39a2c00ecc6b0b5b86a6a2a0b46ad01e37", "e3c8f3c93a61c8788d4b97b9fbfa9cc0b5b1c9ee1b2154c9e7e04ab642431367"),
+    "sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh": (
+        "8fb785518279cf8944a6a438036cfe39a2c00ecc6b0b5b86a6a2a0b46ad01e37",
+        "e3c8f3c93a61c8788d4b97b9fbfa9cc0b5b1c9ee1b2154c9e7e04ab642431367",
+    ),
     "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
     "sglang/kernels/jit/include/sgl_kernel/distributed/ptx.cuh": "1ef631431ff74974a5d05758c4af9335cf8937e42ed9f0dc591a8341598be822",
-    "sglang/kernels/ops/communication/nvlink_comm.py": ("6ba171bd054fd70b1248be37214419887f6731eea9c927c6e0aa9ee0997bc3fd", "0388df5a897cc9c437e7fb0a2e6e21231a7a8d0ce0033798846331c0698bdaaa"),
+    "sglang/kernels/ops/communication/nvlink_comm.py": (
+        "6ba171bd054fd70b1248be37214419887f6731eea9c927c6e0aa9ee0997bc3fd",
+        "0388df5a897cc9c437e7fb0a2e6e21231a7a8d0ce0033798846331c0698bdaaa",
+    ),
 }
 
 # sha256 of csrc/pull_gather_bounded.cuh as validated (bitwise, fault and sanitizer tests); any other file is not used.
@@ -57,7 +65,9 @@ _state: dict = {"engaged": None, "max_polls": None}
 def _max_polls() -> int:
     v = bed.env_int(ENV_MAX_POLLS, DEFAULT_MAX_POLLS)
     if not MIN_MAX_POLLS <= v <= MAX_MAX_POLLS:
-        raise ValueError(f"{ENV_MAX_POLLS}={v} outside [{MIN_MAX_POLLS}, {MAX_MAX_POLLS}]")
+        raise ValueError(
+            f"{ENV_MAX_POLLS}={v} outside [{MIN_MAX_POLLS}, {MAX_MAX_POLLS}]"
+        )
     return v
 
 
@@ -75,7 +85,11 @@ def engage() -> bool:
             return False
     got = hashlib.sha256(_CUH.read_bytes()).hexdigest()
     if got != SOURCE_SHA256:
-        bed.report(NAME, False, reason=f"{_CUH.name} sha256 {got[:16]} is not the validated {SOURCE_SHA256[:16]}")
+        bed.report(
+            NAME,
+            False,
+            reason=f"{_CUH.name} sha256 {got[:16]} is not the validated {SOURCE_SHA256[:16]}",
+        )
         _state["engaged"] = False
         return False
     try:
@@ -94,7 +108,11 @@ def _jit_module(dtype: torch.dtype):
     key = ("module", dtype)
     mod = _state.get(key)
     if mod is None:
-        from sglang.kernels.jit.utils import is_arch_support_pdl, load_jit, make_cpp_args
+        from sglang.kernels.jit.utils import (
+            is_arch_support_pdl,
+            load_jit,
+            make_cpp_args,
+        )
 
         args = make_cpp_args(dtype, is_arch_support_pdl())
         mod = _state[key] = load_jit(
@@ -103,7 +121,10 @@ def _jit_module(dtype: torch.dtype):
             f"unroll{NUM_UNROLL}",
             cuda_files=[str(_CUH)],
             cuda_wrappers=[
-                ("all_gather", f"sglang::muse_vr_pull::MuseVrPullBounded<{args}>::all_gather_pull<{NUM_UNROLL}>")
+                (
+                    "all_gather",
+                    f"sglang::muse_vr_pull::MuseVrPullBounded<{args}>::all_gather_pull<{NUM_UNROLL}>",
+                )
             ],
         )
     return mod
@@ -116,7 +137,14 @@ def prepare(dtype: torch.dtype) -> None:
         _jit_module(dtype)
 
 
-def all_gather_pull(comm, input: torch.Tensor, output: torch.Tensor, *, out_mc_ptr: int = 0, site: str = "") -> bool:
+def all_gather_pull(
+    comm,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    out_mc_ptr: int = 0,
+    site: str = "",
+) -> bool:
     """``nvlink_comm.all_gather_pull(comm, input, output, out_mc_ptr=...)``, with bounded barrier waits when engaged
     (tallied per call site under this option's name). Returns whether the bounded copy ran."""
     from sglang.kernels.ops.communication import nvlink_comm
@@ -125,7 +153,13 @@ def all_gather_pull(comm, input: torch.Tensor, output: torch.Tensor, *, out_mc_p
         nvlink_comm.all_gather_pull(comm, input, output, out_mc_ptr=out_mc_ptr)
         return False
     _jit_module(input.dtype).all_gather(
-        comm, input, output, None, out_mc_ptr or nvlink_comm.get_multicast_ptr(output), 0, _state["max_polls"]
+        comm,
+        input,
+        output,
+        None,
+        out_mc_ptr or nvlink_comm.get_multicast_ptr(output),
+        0,
+        _state["max_polls"],
     )
     bed.count(NAME, site or "calls")
     return True

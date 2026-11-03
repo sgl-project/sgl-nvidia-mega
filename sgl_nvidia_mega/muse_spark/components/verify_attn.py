@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Components ``swa_verify_attn`` and ``full_attn_split`` (both opt-in, default off), served by one AROUND hook on
 ``MuseSpark1xAttention.gated_attention``.
 
@@ -120,19 +122,43 @@ SWAT6 = "swa_t6"
 TARGET = "sglang.srt.models.muse_spark.MuseSpark1xAttention.gated_attention"
 
 PINS = {
-    "sglang/srt/models/muse_spark.py": ("7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355", "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
-                                          "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f"),
-    "sglang/srt/layers/attention/trtllm_mha_backend.py": ("566d1031d644f71a8adb84d1e2a1581d3a6d1c3cac1e507451ac4cf034c39da4", "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646"),
-    "sglang/srt/layers/radix_attention.py": ("df6e94b67b61feb4f8e3a7b1fdb0c0444cc56e4bf9d90a622e028bddff31619e", "56a6acb0aaeb78c7c9bb8d1d78e5a23ac51fa35436b993aeb5a630cc9f285ff0"),
-    "sglang/srt/layers/attention/base_attn_backend.py": ("66803e0026f90cdeced7471ca3e28ca1949229f06e6e627450f5a2598f4b1de8", "3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0"),
-    "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": ("99ed08f1f35bbd4174c4a40becfc7978b7a5ba0a055818e79470254e5c8a2b67", "af4a5bb8de205a99761e6959447748e2e00af0831e58e37fa0f862ce9e964a25"),
+    "sglang/srt/models/muse_spark.py": (
+        "7e5018b3cb2ef41ee6cf09407e91e28dde069e5a33719ea58beb0d7137087355",
+        "8bafbb8802fb0d9f81c190e87b9012fca546182be08bef6c8b3db814d27bfe19",
+        "c0db42467a960c509b658c3c40570ee889f73d41b52cdbd80b9c291c1792a33f",
+    ),
+    "sglang/srt/layers/attention/trtllm_mha_backend.py": (
+        "566d1031d644f71a8adb84d1e2a1581d3a6d1c3cac1e507451ac4cf034c39da4",
+        "07223cbf82ab5ac14fcbaa9a47a8351132991016bae66c122bf09762ed8ed646",
+    ),
+    "sglang/srt/layers/radix_attention.py": (
+        "df6e94b67b61feb4f8e3a7b1fdb0c0444cc56e4bf9d90a622e028bddff31619e",
+        "56a6acb0aaeb78c7c9bb8d1d78e5a23ac51fa35436b993aeb5a630cc9f285ff0",
+    ),
+    "sglang/srt/layers/attention/base_attn_backend.py": (
+        "66803e0026f90cdeced7471ca3e28ca1949229f06e6e627450f5a2598f4b1de8",
+        "3ed449219c73b146bc3e6472390c933cdd1da18c88edcd6bfbb7d530cf4dafe0",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/fused_qk_norm.py": (
+        "99ed08f1f35bbd4174c4a40becfc7978b7a5ba0a055818e79470254e5c8a2b67",
+        "af4a5bb8de205a99761e6959447748e2e00af0831e58e37fa0f862ce9e964a25",
+    ),
 }
 # Additionally for the fused output norm + gate.
 PINS_NORM_GATE = {
-    "sglang/kernels/ops/muse_spark_v12/fused_norm_gate.py": ("f127386eafe01455722466c9abf58c8f265c680e90a5e8b8b30175a6b27b44a6", "9463859fa6df630123239833d6486c8b8069942ebf127246c49217b44683c662"),
-    "sglang/kernels/ops/muse_spark_v12/norm_gate.py": ("376f33a77014dd3f6ed160d3b6a46eb7ef50f3f4bde783bafdbcbaa4fe39aed9", "fb66534284d3980d9add7f2417d2b5f7c6e94c5f230c05eba93bf31db72d4815"),
+    "sglang/kernels/ops/muse_spark_v12/fused_norm_gate.py": (
+        "f127386eafe01455722466c9abf58c8f265c680e90a5e8b8b30175a6b27b44a6",
+        "9463859fa6df630123239833d6486c8b8069942ebf127246c49217b44683c662",
+    ),
+    "sglang/kernels/ops/muse_spark_v12/norm_gate.py": (
+        "376f33a77014dd3f6ed160d3b6a46eb7ef50f3f4bde783bafdbcbaa4fe39aed9",
+        "fb66534284d3980d9add7f2417d2b5f7c6e94c5f230c05eba93bf31db72d4815",
+    ),
     "sglang/kernels/jit/csrc/muse_spark_v12/norm_gate.cuh": "c2a99a7b37fb810310539010cebea30352b25c1e841b41f8a0fb44aae657bf80",
-    "sglang/kernels/fused_op.py": ("652ceeea3bbbdc2b864c3fa3cf914148d486392a90384506043d5c2ccf60eb3e", "749bc702db4102bb6e2620626a906ada67856daa1459bb5141bd1d652168cbd7"),
+    "sglang/kernels/fused_op.py": (
+        "652ceeea3bbbdc2b864c3fa3cf914148d486392a90384506043d5c2ccf60eb3e",
+        "749bc702db4102bb6e2620626a906ada67856daa1459bb5141bd1d652168cbd7",
+    ),
 }
 # The prologue arithmetic reproduces the fused QK-norm Triton kernel as each validated Triton release compiles it
 # (ops/swa_verify_attn.py, QK_ARITH / qk_arith); other releases keep the stock call.
@@ -153,12 +179,33 @@ _LIMITS = {
     "qk_max_reqs": ("MUSE_VR_ATTN_QK_PROLOGUE_MAX_REQS", {2: 4, 4: 3, 8: 1}),
     "fullv_max_reqs": ("MUSE_VR_FULL_VERIFY_ATTN_MAX_REQS", {2: 8, 4: 4, 8: 1}),
 }
-_state = {"swa": False, "norm_gate": False, "qk": False, "full": False, "factor": 0.75, "max_reqs": None,
-          "qk_max_reqs": None, "fullv": False, "fullv_max_reqs": None, "fullv_pdl": True, "scale_sm": None,
-          "fullv_qk": False, "fullw": False, "fullw_ng": False, "ng16": False, "fullw_min": None, "fullw_pdl": True,
-          "swa_t": False, "swa_t_min": 12,
-          "swa_t_max": 32, "swa_t_qk": False, "swa_t_min4": 6, "swa_t_max4": 48, "swa_t6": False,
-          "swa_t6_buckets": frozenset()}
+_state = {
+    "swa": False,
+    "norm_gate": False,
+    "qk": False,
+    "full": False,
+    "factor": 0.75,
+    "max_reqs": None,
+    "qk_max_reqs": None,
+    "fullv": False,
+    "fullv_max_reqs": None,
+    "fullv_pdl": True,
+    "scale_sm": None,
+    "fullv_qk": False,
+    "fullw": False,
+    "fullw_ng": False,
+    "ng16": False,
+    "fullw_min": None,
+    "fullw_pdl": True,
+    "swa_t": False,
+    "swa_t_min": 12,
+    "swa_t_max": 32,
+    "swa_t_qk": False,
+    "swa_t_min4": 6,
+    "swa_t_max4": 48,
+    "swa_t6": False,
+    "swa_t6_buckets": frozenset(),
+}
 _warned: set = set()
 _t6_ready: set = set()  # (device index, KV heads, window) whose t6 workspace and kernel variants are prepared
 # device indices on which a t6 call has been captured into a CUDA graph: the op's workspace is per device and a graph
@@ -206,33 +253,54 @@ def _flashinfer_decode_pinned() -> bool:
     except OSError:
         return False
     if not bed.sha_ok(got, FLASHINFER_DECODE_SHA256):
-        logger.warning("muse_vr_plugin: flashinfer/decode.py sha256 %s does not match the pin %s", got[:16],
-                       bed.sha_label(FLASHINFER_DECODE_SHA256))
+        logger.warning(
+            "muse_vr_plugin: flashinfer/decode.py sha256 %s does not match the pin %s",
+            got[:16],
+            bed.sha_label(FLASHINFER_DECODE_SHA256),
+        )
         return False
     return True
 
 
 def register() -> bool:
     """Register the hook when at least one component is enabled and its pins match."""
-    want_swa, want_full, want_fullv = bed.enabled(SWA), bed.enabled(FULL), bed.enabled(FULLV)
+    want_swa, want_full, want_fullv = (
+        bed.enabled(SWA),
+        bed.enabled(FULL),
+        bed.enabled(FULLV),
+    )
     want_fullw = bed.enabled(FULLW)
     want_swat = bed.enabled(SWAT)
     want_swat6 = bed.enabled(SWAT6)
-    if not (want_swa or want_full or want_fullv or want_fullw or want_swat or want_swat6):
+    if not (
+        want_swa or want_full or want_fullv or want_fullw or want_swat or want_swat6
+    ):
         return False
     pins_ok = all(bed.pinned(rel, sha) for rel, sha in PINS.items())
     _state["swa"] = want_swa and pins_ok
     ng_env = os.environ.get("MUSE_VR_SWA_VERIFY_ATTN_NORM_GATE", "0").strip().lower()
-    want_ng = (want_swa or want_fullv or want_swat) and ng_env in ("1", "true", "yes", "on")
-    _state["norm_gate"] = (_state["swa"] or ((want_fullv or want_swat) and pins_ok)) and want_ng and all(
-        bed.pinned(rel, sha) for rel, sha in PINS_NORM_GATE.items())
+    want_ng = (want_swa or want_fullv or want_swat) and ng_env in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    _state["norm_gate"] = (
+        (_state["swa"] or ((want_fullv or want_swat) and pins_ok))
+        and want_ng
+        and all(bed.pinned(rel, sha) for rel, sha in PINS_NORM_GATE.items())
+    )
     _state["swa_t"] = want_swat and pins_ok
     # The SWA-T QK prologue reproduces the stock fused QK-norm kernel's arithmetic as the running Triton release compiles
     # it (ops.swa_t.qk_arith: a validated (release, FP-fusion default) pair); otherwise SWA-T runs without it.
     from .ops.swa_t import qk_arith as _swat_qk_arith
 
-    _state["swa_t_qk"] = _state["swa_t"] and _swat_qk_arith() is not None and os.environ.get(
-        "MUSE_VR_SWA_T_QK", "0").strip().lower() in ("1", "true", "yes", "on")
+    _state["swa_t_qk"] = (
+        _state["swa_t"]
+        and _swat_qk_arith() is not None
+        and os.environ.get("MUSE_VR_SWA_T_QK", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
     _state["swa_t_min"] = _env_int("MUSE_VR_SWA_T_MIN_REQS", 12)
     _state["swa_t_max"] = _env_int("MUSE_VR_SWA_T_MAX_REQS", 32)
     # 4 KV heads per rank (one cluster per request and KV-head pair): its own request window
@@ -240,51 +308,108 @@ def register() -> bool:
     _state["swa_t_max4"] = _env_int("MUSE_VR_SWA_T_KV4_MAX_REQS", 48)
     _state["fullv"] = want_fullv and pins_ok
     _state["fullv_max_reqs"] = _env_limit("fullv_max_reqs")
-    _state["fullv_pdl"] = os.environ.get("MUSE_VR_FULL_VERIFY_ATTN_PDL", "1").strip() not in ("0", "false", "no")
+    _state["fullv_pdl"] = os.environ.get(
+        "MUSE_VR_FULL_VERIFY_ATTN_PDL", "1"
+    ).strip() not in ("0", "false", "no")
     want_qk = bed.enabled(QK)
     from .ops.swa_verify_attn import qk_arith
 
     triton_ok = qk_arith() is not None
     _state["qk"] = _state["swa"] and want_qk and triton_ok
     _state["fullw"] = want_fullw and pins_ok
-    _state["fullw_ng"] = _state["fullw"] and os.environ.get("MUSE_VR_FULL_ATTN_WIDE_NORM_GATE", "0").strip().lower() in (
-        "1", "true", "yes", "on") and all(bed.pinned(rel, sha) for rel, sha in PINS_NORM_GATE.items())
+    _state["fullw_ng"] = (
+        _state["fullw"]
+        and os.environ.get("MUSE_VR_FULL_ATTN_WIDE_NORM_GATE", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+        and all(bed.pinned(rel, sha) for rel, sha in PINS_NORM_GATE.items())
+    )
     # the fused norm + gate epilogues of full_attn_wide (and SWA-T) also in SGLang norm_gate's 16-byte configuration
-    _state["ng16"] = os.environ.get("MUSE_VR_NORM_GATE_VEC16", "0").strip().lower() in ("1", "true", "yes", "on")
+    _state["ng16"] = os.environ.get("MUSE_VR_NORM_GATE_VEC16", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     raw_min = os.environ.get("MUSE_VR_FULL_ATTN_WIDE_MIN_REQS", "").strip()
     _state["fullw_min"] = int(raw_min) if raw_min.isdigit() else None
-    _state["fullw_pdl"] = os.environ.get("MUSE_VR_FULL_ATTN_WIDE_PDL", "1").strip() not in ("0", "false", "no")
-    _state["fullv_qk"] = _state["fullv"] and want_qk and triton_ok and os.environ.get(
-        "MUSE_VR_FULL_VERIFY_ATTN_QK", "1").strip() not in ("0", "false", "no")
+    _state["fullw_pdl"] = os.environ.get(
+        "MUSE_VR_FULL_ATTN_WIDE_PDL", "1"
+    ).strip() not in ("0", "false", "no")
+    _state["fullv_qk"] = (
+        _state["fullv"]
+        and want_qk
+        and triton_ok
+        and os.environ.get("MUSE_VR_FULL_VERIFY_ATTN_QK", "1").strip()
+        not in ("0", "false", "no")
+    )
     _state["qk_max_reqs"] = _env_limit("qk_max_reqs")
     _state["full"] = want_full and pins_ok and _flashinfer_decode_pinned()
     _state["max_reqs"] = _env_limit("max_reqs")
     factor = _env_float("MUSE_VR_FULL_ATTN_SPLIT_FACTOR", 0.75)
     if not 0.0 < factor <= 1.0:
         # FlashInfer sizes its workspace and counters for at most the device's SM count; above 1 is not allowed.
-        logger.warning("muse_vr_plugin: MUSE_VR_FULL_ATTN_SPLIT_FACTOR=%s outside (0, 1]; using %s", factor,
-                       1.0 if factor > 1.0 else 0.75)
+        logger.warning(
+            "muse_vr_plugin: MUSE_VR_FULL_ATTN_SPLIT_FACTOR=%s outside (0, 1]; using %s",
+            factor,
+            1.0 if factor > 1.0 else 0.75,
+        )
         factor = 1.0 if factor > 1.0 else 0.75
     _state["factor"] = factor
     if want_swa:
-        bed.report(SWA, _state["swa"], pins=pins_ok, max_reqs=_limit_desc("max_reqs"), norm_gate=_state["norm_gate"])
+        bed.report(
+            SWA,
+            _state["swa"],
+            pins=pins_ok,
+            max_reqs=_limit_desc("max_reqs"),
+            norm_gate=_state["norm_gate"],
+        )
     if want_qk:
-        bed.report(QK, _state["qk"] or _state["fullv_qk"], swa=_state["swa"], full=_state["fullv_qk"],
-                   triton=_triton_version(), arith=qk_arith(), max_reqs=_limit_desc("qk_max_reqs"))
+        bed.report(
+            QK,
+            _state["qk"] or _state["fullv_qk"],
+            swa=_state["swa"],
+            full=_state["fullv_qk"],
+            triton=_triton_version(),
+            arith=qk_arith(),
+            max_reqs=_limit_desc("qk_max_reqs"),
+        )
     if want_full:
         bed.report(FULL, _state["full"], pins=pins_ok, factor=_state["factor"])
     if want_fullv:
-        bed.report(FULLV, _state["fullv"], pins=pins_ok, max_reqs=_limit_desc("fullv_max_reqs"),
-                   pdl=_state["fullv_pdl"], norm_gate=_state["norm_gate"])
+        bed.report(
+            FULLV,
+            _state["fullv"],
+            pins=pins_ok,
+            max_reqs=_limit_desc("fullv_max_reqs"),
+            pdl=_state["fullv_pdl"],
+            norm_gate=_state["norm_gate"],
+        )
     if want_fullw:
-        bed.report(FULLW, _state["fullw"], pins=pins_ok,
-                   min_reqs=_state["fullw_min"] or "break-even per KV heads (and above full_verify_attn)",
-                   pdl=_state["fullw_pdl"], norm_gate=_state["fullw_ng"], norm_gate_vec16=_state["ng16"],
-                   **_fullw_skel_report())
+        bed.report(
+            FULLW,
+            _state["fullw"],
+            pins=pins_ok,
+            min_reqs=_state["fullw_min"]
+            or "break-even per KV heads (and above full_verify_attn)",
+            pdl=_state["fullw_pdl"],
+            norm_gate=_state["fullw_ng"],
+            norm_gate_vec16=_state["ng16"],
+            **_fullw_skel_report(),
+        )
     if want_swat:
-        bed.report(SWAT, _state["swa_t"], pins=pins_ok, min_reqs=_state["swa_t_min"], max_reqs=_state["swa_t_max"],
-                   min_reqs_kv4=_state["swa_t_min4"], max_reqs_kv4=_state["swa_t_max4"], norm_gate=_state["norm_gate"],
-                   qk_prologue=_state["swa_t_qk"], triton=_triton_version(), qk_arith=_swat_qk_arith())
+        bed.report(
+            SWAT,
+            _state["swa_t"],
+            pins=pins_ok,
+            min_reqs=_state["swa_t_min"],
+            max_reqs=_state["swa_t_max"],
+            min_reqs_kv4=_state["swa_t_min4"],
+            max_reqs_kv4=_state["swa_t_max4"],
+            norm_gate=_state["norm_gate"],
+            qk_prologue=_state["swa_t_qk"],
+            triton=_triton_version(),
+            qk_arith=_swat_qk_arith(),
+        )
     if want_swat6:
         impl6 = os.environ.get("MUSE_VR_SWA_T5_IMPL", "5").strip() == "6"
         from .ops.swa_verify_t5 import t6_enabled_buckets
@@ -292,12 +417,33 @@ def register() -> bool:
         buckets = t6_enabled_buckets()
         _state["swa_t6_buckets"] = buckets
         _state["swa_t6"] = pins_ok and impl6 and bool(buckets)
-        why = None if _state["swa_t6"] else ("pins" if not pins_ok else
-                                             "MUSE_VR_SWA_T5_IMPL is not 6" if not impl6 else
-                                             "MUSE_VR_SWA_T6_BUCKETS is empty")
-        bed.report(SWAT6, _state["swa_t6"], pins=pins_ok, buckets=",".join(str(b) for b in sorted(buckets)),
-                   cluster=os.environ.get("MUSE_VR_SWA_T6_CLUSTER", "0"), reason=why)
-    if not (_state["swa"] or _state["full"] or _state["fullv"] or _state["fullw"] or _state["swa_t"] or _state["swa_t6"]):
+        why = (
+            None
+            if _state["swa_t6"]
+            else (
+                "pins"
+                if not pins_ok
+                else "MUSE_VR_SWA_T5_IMPL is not 6"
+                if not impl6
+                else "MUSE_VR_SWA_T6_BUCKETS is empty"
+            )
+        )
+        bed.report(
+            SWAT6,
+            _state["swa_t6"],
+            pins=pins_ok,
+            buckets=",".join(str(b) for b in sorted(buckets)),
+            cluster=os.environ.get("MUSE_VR_SWA_T6_CLUSTER", "0"),
+            reason=why,
+        )
+    if not (
+        _state["swa"]
+        or _state["full"]
+        or _state["fullv"]
+        or _state["fullw"]
+        or _state["swa_t"]
+        or _state["swa_t6"]
+    ):
         return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -312,7 +458,9 @@ def _limit_desc(name: str):
     """The request limit as recorded at install: the override, or the per-KV-head table."""
     if _state[name] is not None:
         return _state[name]
-    return "kv_heads " + " ".join(f"{h}:{n}" for h, n in sorted(_LIMITS[name][1].items()))
+    return "kv_heads " + " ".join(
+        f"{h}:{n}" for h, n in sorted(_LIMITS[name][1].items())
+    )
 
 
 def _triton_version() -> str | None:
@@ -327,8 +475,11 @@ def _triton_version() -> str | None:
 def _qk_prologue_args(attn, positions, qkv, kv_store):
     """(positions, cos_sin, eps) when the stock fused QK-norm call would run SGLang's Triton kernel on a row count
     the kernel prologue covers, else None."""
-    if not _state["qk"] or kv_store is None or qkv.shape[0] // TOKENS > _limit("qk_max_reqs",
-                                                                                  attn.attn.tp_k_head_num):
+    if (
+        not _state["qk"]
+        or kv_store is None
+        or qkv.shape[0] // TOKENS > _limit("qk_max_reqs", attn.attn.tp_k_head_num)
+    ):
         return None
     from sglang.kernels import fused_op
     from sglang.kernels.spec import KernelBackend
@@ -339,21 +490,33 @@ def _qk_prologue_args(attn, positions, qkv, kv_store):
     rope = attn.rotary_emb
     if rope is None or qkn.is_torch_compile or qkn._head_dim != 64:
         return None
-    if fused_op.get_fused_op_backend() is not None or fused_op._oot_dispatch_key() is not None:
+    if (
+        fused_op.get_fused_op_backend() is not None
+        or fused_op._oot_dispatch_key() is not None
+    ):
         return None
     cands = qkn._auto_backend_candidates()
     cos_sin = rope.cos_sin_cache
     if not cands or cands[0] is not KernelBackend.TRITON:
         return None
-    if not qkn.backend_eligible(KernelBackend.TRITON, qkv, positions, cos_sin, kv_store):
+    if not qkn.backend_eligible(
+        KernelBackend.TRITON, qkv, positions, cos_sin, kv_store
+    ):
         return None
     layer = attn.attn
     if op.qk_class(qkv.shape[0], layer.tp_q_head_num, layer.tp_k_head_num) is None:
         return None
     loc = kv_store[2]
-    if not (positions.dtype == torch.int64 and positions.is_contiguous() and loc.dtype == torch.int64
-            and loc.is_contiguous() and cos_sin.is_contiguous() and qkv.stride(0) % 8 == 0
-            and qkv.data_ptr() % 16 == 0 and cos_sin.data_ptr() % 16 == 0):
+    if not (
+        positions.dtype == torch.int64
+        and positions.is_contiguous()
+        and loc.dtype == torch.int64
+        and loc.is_contiguous()
+        and cos_sin.is_contiguous()
+        and qkv.stride(0) % 8 == 0
+        and qkv.data_ptr() % 16 == 0
+        and cos_sin.data_ptr() % 16 == 0
+    ):
         return None
     return positions, cos_sin, float(qkn._eps)
 
@@ -372,22 +535,35 @@ def _qk_rope_args(attn, positions, qkv, kv_store):
     rope = attn.rotary_emb
     if rope is None or qkn.is_torch_compile or qkn._head_dim != 64:
         return None
-    if fused_op.get_fused_op_backend() is not None or fused_op._oot_dispatch_key() is not None:
+    if (
+        fused_op.get_fused_op_backend() is not None
+        or fused_op._oot_dispatch_key() is not None
+    ):
         return None
     cands = qkn._auto_backend_candidates()
     cos_sin = rope.cos_sin_cache
     if not cands or cands[0] is not KernelBackend.TRITON:
         return None
-    if not qkn.backend_eligible(KernelBackend.TRITON, qkv, positions, cos_sin, kv_store):
+    if not qkn.backend_eligible(
+        KernelBackend.TRITON, qkv, positions, cos_sin, kv_store
+    ):
         return None
     layer = attn.attn
     if op.qk_class(qkv.shape[0], layer.tp_q_head_num, layer.tp_k_head_num) is None:
         return None
     loc = kv_store[2]
-    if not (positions.dtype == torch.int64 and positions.is_contiguous() and loc.dtype == torch.int64
-            and loc.is_contiguous() and cos_sin.is_contiguous() and qkv.stride(0) % 8 == 0
-            and qkv.data_ptr() % 16 == 0 and cos_sin.data_ptr() % 16 == 0 and cos_sin.dtype == torch.float32
-            and qkv.stride(1) == 1):
+    if not (
+        positions.dtype == torch.int64
+        and positions.is_contiguous()
+        and loc.dtype == torch.int64
+        and loc.is_contiguous()
+        and cos_sin.is_contiguous()
+        and qkv.stride(0) % 8 == 0
+        and qkv.data_ptr() % 16 == 0
+        and cos_sin.data_ptr() % 16 == 0
+        and cos_sin.dtype == torch.float32
+        and qkv.stride(1) == 1
+    ):
         return None
     return positions, cos_sin, float(qkn._eps)
 
@@ -405,7 +581,10 @@ def _qk_full_prologue_eps(attn, qkv, kv_store):
     qkn = attn._fused_qk_norm
     if attn.rotary_emb is not None or qkn.is_torch_compile or qkn._head_dim != 64:
         return None
-    if fused_op.get_fused_op_backend() is not None or fused_op._oot_dispatch_key() is not None:
+    if (
+        fused_op.get_fused_op_backend() is not None
+        or fused_op._oot_dispatch_key() is not None
+    ):
         return None
     cands = qkn._auto_backend_candidates()
     if not cands or cands[0] is not KernelBackend.TRITON:
@@ -416,8 +595,13 @@ def _qk_full_prologue_eps(attn, qkv, kv_store):
     if op.qk_class(qkv.shape[0], layer.tp_q_head_num, layer.tp_k_head_num) is None:
         return None
     loc = kv_store[2]
-    if not (loc.dtype == torch.int64 and loc.is_contiguous() and qkv.stride(1) == 1 and qkv.stride(0) % 8 == 0
-            and qkv.data_ptr() % 16 == 0):
+    if not (
+        loc.dtype == torch.int64
+        and loc.is_contiguous()
+        and qkv.stride(1) == 1
+        and qkv.stride(0) % 8 == 0
+        and qkv.data_ptr() % 16 == 0
+    ):
         return None
     return float(qkn._eps)
 
@@ -428,8 +612,11 @@ def _stock_diverts_attention(ra, forward_batch) -> bool:
     attention inside a prefill graph scope under a breakable or full prefill CUDA graph, for extend modes."""
     if hasattr(ra, "get_tc_piecewise_forward_context"):
         return ra.get_tc_piecewise_forward_context() is not None
-    return bool(ra.is_in_prefill_graph_scope() and forward_batch.forward_mode.is_extend()
-                and (ra.is_in_breakable_cuda_graph() or ra.is_in_full_prefill_graph()))
+    return bool(
+        ra.is_in_prefill_graph_scope()
+        and forward_batch.forward_mode.is_extend()
+        and (ra.is_in_breakable_cuda_graph() or ra.is_in_full_prefill_graph())
+    )
 
 
 def _common_reason(attn, qkv, forward_batch):
@@ -447,7 +634,9 @@ def _common_reason(attn, qkv, forward_batch):
     layer = attn.attn
     if layer.attn_type != ra.AttentionType.DECODER:
         return "attention type", None
-    if layer.use_prefill_attention_wrapper and _stock_diverts_attention(ra, forward_batch):
+    if layer.use_prefill_attention_wrapper and _stock_diverts_attention(
+        ra, forward_batch
+    ):
         return "piecewise prefill context", None
     backend = get_attn_backend()
     if type(backend) is not TRTLLMHAAttnBackend:
@@ -455,9 +644,15 @@ def _common_reason(attn, qkv, forward_batch):
     md = backend.forward_metadata
     if md is None or md.is_ragged_verify or md.max_seq_len_q != TOKENS:
         return "verify layout", None
-    if backend.data_type != torch.float8_e4m3fn or backend.is_nvfp4_kvcache or backend.is_xqa_impl:
+    if (
+        backend.data_type != torch.float8_e4m3fn
+        or backend.is_nvfp4_kvcache
+        or backend.is_xqa_impl
+    ):
         return "kv cache format", None
-    if backend._forward_extend_uses_native_fp4(forward_batch) or is_cp_active(forward_batch):
+    if backend._forward_extend_uses_native_fp4(forward_batch) or is_cp_active(
+        forward_batch
+    ):
         return "nvfp4 / context parallel", None
     if attn._fused_qk_norm is None or not attn.use_o_gate:
         return "model configuration", None
@@ -474,12 +669,24 @@ def _norm_gate_eps(attn, qkv, enabled=None):
     from sglang.kernels.spec import KernelBackend
 
     og = attn._fused_o_norm_gate
-    if type(og) is not FusedRMSNormGate or not (og._use_o_norm and og._use_o_gate) or og._head_dim != 64:
+    if (
+        type(og) is not FusedRMSNormGate
+        or not (og._use_o_norm and og._use_o_gate)
+        or og._head_dim != 64
+    ):
         return None
-    if fused_op.get_fused_op_backend() is not None or fused_op._oot_dispatch_key() is not None or og.is_torch_compile:
+    if (
+        fused_op.get_fused_op_backend() is not None
+        or fused_op._oot_dispatch_key() is not None
+        or og.is_torch_compile
+    ):
         return None
     cands = og._auto_backend_candidates()
-    if not cands or cands[0] is not KernelBackend.JIT or not og.backend_eligible(KernelBackend.JIT, qkv[:1, :64]):
+    if (
+        not cands
+        or cands[0] is not KernelBackend.JIT
+        or not og.backend_eligible(KernelBackend.JIT, qkv[:1, :64])
+    ):
         return None
     og._ensure_cached_weight()
     if og._effective_weight is not None:
@@ -495,8 +702,24 @@ def _norm_gate_eps(attn, qkv, enabled=None):
 # SGLang norm_gate's configuration table (vector bytes, warps per block) and its selection rule (select_config in its
 # norm_gate.cuh, pinned in PINS_NORM_GATE), for head_dim 64 and bf16; the fused epilogues reproduce the 8- and 16-byte
 # vector arithmetic only.
-_NG_CONFIGS = ((4, 1), (4, 2), (4, 4), (4, 8), (8, 1), (8, 2), (8, 4), (8, 8), (16, 1), (16, 2), (16, 4), (16, 8),
-               (32, 1), (32, 2), (32, 4), (32, 8))
+_NG_CONFIGS = (
+    (4, 1),
+    (4, 2),
+    (4, 4),
+    (4, 8),
+    (8, 1),
+    (8, 2),
+    (8, 4),
+    (8, 8),
+    (16, 1),
+    (16, 2),
+    (16, 4),
+    (16, 8),
+    (32, 1),
+    (32, 2),
+    (32, 4),
+    (32, 8),
+)
 
 
 def _ng_rows_per_block(vec: int, warps: int, vec32_ok: bool, max_vec: int) -> int:
@@ -511,7 +734,9 @@ def _ng_rows_per_block(vec: int, warps: int, vec32_ok: bool, max_vec: int) -> in
     return (32 // tpr) * warps
 
 
-def _ng_select_vec(num_tokens: int, num_heads: int, vec32_ok: bool, num_sm: int, max_vec: int):
+def _ng_select_vec(
+    num_tokens: int, num_heads: int, vec32_ok: bool, num_sm: int, max_vec: int
+):
     rows = num_tokens * num_heads
     desired = 8
     if rows * 128 // 8 > num_sm * 256:
@@ -526,7 +751,12 @@ def _ng_select_vec(num_tokens: int, num_heads: int, vec32_ok: bool, num_sm: int,
             continue
         threads = warps * 32
         dist = min(abs(threads - target), 1023)
-        key = (int(threads >= 128) << 40) | (int(vec == desired) << 32) | ((1024 - dist) << 8) | vec
+        key = (
+            (int(threads >= 128) << 40)
+            | (int(vec == desired) << 32)
+            | ((1024 - dist) << 8)
+            | vec
+        )
         if best < 0 or key > best_key:
             best, best_key = i, key
     if best < 0:
@@ -547,12 +777,24 @@ def _norm_gate_cfg(attn, qkv, enabled, allow16: bool):
     from sglang.kernels.spec import KernelBackend
 
     og = attn._fused_o_norm_gate
-    if type(og) is not FusedRMSNormGate or not (og._use_o_norm and og._use_o_gate) or og._head_dim != 64:
+    if (
+        type(og) is not FusedRMSNormGate
+        or not (og._use_o_norm and og._use_o_gate)
+        or og._head_dim != 64
+    ):
         return None
-    if fused_op.get_fused_op_backend() is not None or fused_op._oot_dispatch_key() is not None or og.is_torch_compile:
+    if (
+        fused_op.get_fused_op_backend() is not None
+        or fused_op._oot_dispatch_key() is not None
+        or og.is_torch_compile
+    ):
         return None
     cands = og._auto_backend_candidates()
-    if not cands or cands[0] is not KernelBackend.JIT or not og.backend_eligible(KernelBackend.JIT, qkv[:1, :64]):
+    if (
+        not cands
+        or cands[0] is not KernelBackend.JIT
+        or not og.backend_eligible(KernelBackend.JIT, qkv[:1, :64])
+    ):
         return None
     og._ensure_cached_weight()
     if og._effective_weight is not None:
@@ -561,8 +803,13 @@ def _norm_gate_cfg(attn, qkv, enabled, allow16: bool):
     # outputs are fresh allocations, the gate a view of qkv; either way the 8 / 16-byte answer only depends on the rows)
     tokens, heads = qkv.shape[0], attn.attn.tp_q_head_num
     gate_off = attn.q_size + 2 * attn.kv_size
-    vec32_ok = (qkv.data_ptr() + 2 * gate_off) % 32 == 0 and (qkv.stride(0) * 2) % 32 == 0
-    vecs = {_ng_select_vec(tokens, heads, vec32_ok, _sm_count(qkv.device), mv) for mv in (16, 32)}
+    vec32_ok = (qkv.data_ptr() + 2 * gate_off) % 32 == 0 and (
+        qkv.stride(0) * 2
+    ) % 32 == 0
+    vecs = {
+        _ng_select_vec(tokens, heads, vec32_ok, _sm_count(qkv.device), mv)
+        for mv in (16, 32)
+    }
     if len(vecs) != 1:
         return None
     vec = vecs.pop()
@@ -590,7 +837,12 @@ def _swa_reason(attn, qkv, forward_batch, backend):
     hkv = layer.tp_k_head_num
     if qkv.shape[0] // TOKENS > _limit("max_reqs", hkv):
         return "requests above max"
-    if not op.supported(layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, layer.sliding_window_size):
+    if not op.supported(
+        layer.tp_q_head_num,
+        layer.tp_k_head_num,
+        layer.head_dim,
+        layer.sliding_window_size,
+    ):
         return "shape"
     if backend.q_data_type != torch.bfloat16:
         return "output dtype"
@@ -604,17 +856,38 @@ def _swa_reason(attn, qkv, forward_batch, backend):
     ng = _norm_gate_eps(attn, qkv) is not None
     reqs = qkv.shape[0] // TOKENS
     fuse_qk = _state["qk"] and reqs <= _limit("qk_max_reqs", hkv)
-    qk = op.qk_class(qkv.shape[0], layer.tp_q_head_num, layer.tp_k_head_num) if fuse_qk else 0
+    qk = (
+        op.qk_class(qkv.shape[0], layer.tp_q_head_num, layer.tp_k_head_num)
+        if fuse_qk
+        else 0
+    )
     if torch.cuda.is_current_stream_capturing():
         if not op.is_loaded(op.module_key(reqs, layer.sliding_window_size, ng)):
             return "kernel not loaded before graph capture"
-        if qk and not op.is_loaded(op.module_key(reqs, layer.sliding_window_size, ng, qk=qk, rope=True)):
+        if qk and not op.is_loaded(
+            op.module_key(reqs, layer.sliding_window_size, ng, qk=qk, rope=True)
+        ):
             return "kernel not loaded before graph capture"
     else:
-        op.preload(layer.sliding_window_size, _limit("max_reqs", hkv), layer.tp_q_head_num, hkv, qkv.device, ng)
+        op.preload(
+            layer.sliding_window_size,
+            _limit("max_reqs", hkv),
+            layer.tp_q_head_num,
+            hkv,
+            qkv.device,
+            ng,
+        )
         if _state["qk"]:
-            op.preload(layer.sliding_window_size, min(_limit("max_reqs", hkv), _limit("qk_max_reqs", hkv)),
-                       layer.tp_q_head_num, layer.tp_k_head_num, qkv.device, ng, fuse_qk=True, rope=True)
+            op.preload(
+                layer.sliding_window_size,
+                min(_limit("max_reqs", hkv), _limit("qk_max_reqs", hkv)),
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                qkv.device,
+                ng,
+                fuse_qk=True,
+                rope=True,
+            )
     return None
 
 
@@ -623,13 +896,18 @@ def _swa_path(attn, positions, qkv, forward_batch, backend):
     from .ops import swa_verify_attn as op
 
     layer = attn.attn
-    q, k, v, o_gate = qkv.split([attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1)
+    q, k, v, o_gate = qkv.split(
+        [attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1
+    )
     fuse_rope = attn.rotary_emb is not None
     kv_store = attn._fused_kv_store(forward_batch)
     if kv_store is None or kv_store[0].dtype != torch.float8_e4m3fn:
         return None  # nothing done yet: caller runs stock
     k_read, v_read = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-    if k_read.data_ptr() != kv_store[0].data_ptr() or v_read.data_ptr() != kv_store[1].data_ptr():
+    if (
+        k_read.data_ptr() != kv_store[0].data_ptr()
+        or v_read.data_ptr() != kv_store[1].data_ptr()
+    ):
         return None  # the stock kernel would read other buffers than the store writes
     m = qkv.shape[0]
     reqs = m // TOKENS
@@ -642,10 +920,24 @@ def _swa_path(attn, positions, qkv, forward_batch, backend):
         pos, cos_sin, qk_eps = qk_args
         out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=qkv.device)
         op.swa_verify_attn(
-            None, kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch),
-            md.cache_seqlens_int32[:reqs], layer.sliding_window_size, backend.page_size, bmm1, bmm2,
-            out=out.view(m, hq, d), gate=o_gate if eps is not None else None, norm_eps=eps or 0.0, qkv=qkv,
-            positions=pos, cos_sin=cos_sin, cache_loc=kv_store[2], qk_eps=qk_eps, num_q_heads=hq,
+            None,
+            kv_store[0],
+            kv_store[1],
+            backend._get_layer_page_table(layer, forward_batch),
+            md.cache_seqlens_int32[:reqs],
+            layer.sliding_window_size,
+            backend.page_size,
+            bmm1,
+            bmm2,
+            out=out.view(m, hq, d),
+            gate=o_gate if eps is not None else None,
+            norm_eps=eps or 0.0,
+            qkv=qkv,
+            positions=pos,
+            cos_sin=cos_sin,
+            cache_loc=kv_store[2],
+            qk_eps=qk_eps,
+            num_q_heads=hq,
         )
         bed.count(QK, f"fused_reqs{reqs}")
         if eps is not None:
@@ -656,16 +948,27 @@ def _swa_path(attn, positions, qkv, forward_batch, backend):
     if _state["qk"]:
         bed.count(QK, "unfused")
     if fuse_rope:
-        q, k = attn._fused_qk_norm(qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store)
+        q, k = attn._fused_qk_norm(
+            qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store
+        )
     else:
         q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
     if q.dtype != torch.float8_e4m3fn:
         q = q.to(torch.float8_e4m3fn)  # what forward_extend does for an FP8 cache
     out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=q.device)
     op.swa_verify_attn(
-        q.reshape(m, hq, d), kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch),
-        md.cache_seqlens_int32[:reqs], layer.sliding_window_size, backend.page_size, bmm1, bmm2,
-        out=out.view(m, hq, d), gate=o_gate if eps is not None else None, norm_eps=eps or 0.0,
+        q.reshape(m, hq, d),
+        kv_store[0],
+        kv_store[1],
+        backend._get_layer_page_table(layer, forward_batch),
+        md.cache_seqlens_int32[:reqs],
+        layer.sliding_window_size,
+        backend.page_size,
+        bmm1,
+        bmm2,
+        out=out.view(m, hq, d),
+        gate=o_gate if eps is not None else None,
+        norm_eps=eps or 0.0,
     )
     if eps is not None:
         bed.count(SWA, f"fused_norm_gate_reqs{reqs}")
@@ -686,7 +989,9 @@ def _swat6_reason(attn, qkv, forward_batch, backend):
     if b is None or b not in _state["swa_t6_buckets"]:
         return "bucket not enabled"
     hkv, window = layer.tp_k_head_num, layer.sliding_window_size
-    if not op.supported(layer.tp_q_head_num, hkv, layer.head_dim, window, backend.page_size):
+    if not op.supported(
+        layer.tp_q_head_num, hkv, layer.head_dim, window, backend.page_size
+    ):
         return "shape"
     if backend.q_data_type != torch.bfloat16:
         return "output dtype"
@@ -698,7 +1003,11 @@ def _swat6_reason(attn, qkv, forward_batch, backend):
     if not isinstance(bmm1, float) or not isinstance(bmm2, float):
         return "tensor scales"
     dev = qkv.device
-    key = (dev.index if dev.index is not None else torch.cuda.current_device(), hkv, window)
+    key = (
+        dev.index if dev.index is not None else torch.cuda.current_device(),
+        hkv,
+        window,
+    )
     if key not in _t6_ready:
         if torch.cuda.is_current_stream_capturing():
             return "kernel not loaded before graph capture"
@@ -706,7 +1015,9 @@ def _swat6_reason(attn, qkv, forward_batch, backend):
             return "late key after capture"  # preparing it could reallocate a workspace a captured graph still uses
         max_reqs = max(_state["swa_t6_buckets"]) // TOKENS
         op.prepare(dev, max_reqs, hkv, window)
-        for r in range(1, max_reqs + 1):  # the per-request-count split choice and its kernel variant, before capture
+        for r in range(
+            1, max_reqs + 1
+        ):  # the per-request-count split choice and its kernel variant, before capture
             s6 = op.splits_for6(r, hkv, dev, use_pdl=True)
             cl = 1 < s6 <= 3 and os.environ.get("MUSE_VR_SWA_T6_CLUSTER", "0") == "1"
             op._module6(True, cl, cl and s6 == 3)
@@ -719,12 +1030,17 @@ def _swat6_path(attn, positions, qkv, forward_batch, backend):
     from .ops import swa_verify_t5 as op
 
     layer = attn.attn
-    q, k, v, o_gate = qkv.split([attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1)
+    q, k, v, o_gate = qkv.split(
+        [attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1
+    )
     kv_store = attn._fused_kv_store(forward_batch)
     if kv_store is None or kv_store[0].dtype != torch.float8_e4m3fn:
         return None  # nothing done yet: caller runs the next path
     k_read, v_read = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-    if k_read.data_ptr() != kv_store[0].data_ptr() or v_read.data_ptr() != kv_store[1].data_ptr():
+    if (
+        k_read.data_ptr() != kv_store[0].data_ptr()
+        or v_read.data_ptr() != kv_store[1].data_ptr()
+    ):
         return None  # the stock kernel would read other buffers than the store writes
     m = qkv.shape[0]
     reqs = m // TOKENS
@@ -732,18 +1048,34 @@ def _swat6_path(attn, positions, qkv, forward_batch, backend):
     bmm1, bmm2 = backend._get_bmm_scales(layer)
     md = backend.forward_metadata
     if attn.rotary_emb is not None:
-        q, k = attn._fused_qk_norm(qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store)
+        q, k = attn._fused_qk_norm(
+            qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store
+        )
     else:
         q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
     if q.dtype != torch.float8_e4m3fn:
         q = q.to(torch.float8_e4m3fn)  # what forward_extend does for an FP8 cache
     out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=q.device)
     if torch.cuda.is_current_stream_capturing():
-        _t6_captured.add(q.device.index if q.device.index is not None else torch.cuda.current_device())
+        _t6_captured.add(
+            q.device.index
+            if q.device.index is not None
+            else torch.cuda.current_device()
+        )
     op.swa_verify_attn_t5(
-        q.reshape(m, hq, d), kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch),
-        md.cache_seqlens_int32[:reqs], layer.sliding_window_size, backend.page_size, bmm1, bmm2,
-        out=out.view(m, hq, d), splits=None, use_pdl=True, prefetch=None,
+        q.reshape(m, hq, d),
+        kv_store[0],
+        kv_store[1],
+        backend._get_layer_page_table(layer, forward_batch),
+        md.cache_seqlens_int32[:reqs],
+        layer.sliding_window_size,
+        backend.page_size,
+        bmm1,
+        bmm2,
+        out=out.view(m, hq, d),
+        splits=None,
+        use_pdl=True,
+        prefetch=None,
     )
     bed.count(SWAT6, f"t6:M{m}:b{op.t6_bucket(m)}")
     return attn._fused_o_norm_gate(out, o_gate)
@@ -758,7 +1090,11 @@ def _swat_reason(attn, qkv, forward_batch, backend):
         return "full attention layer"
     reqs = qkv.shape[0] // TOKENS
     hkv = layer.tp_k_head_num
-    lo_r, hi_r = (_state["swa_t_min"], _state["swa_t_max"]) if hkv == 2 else (_state["swa_t_min4"], _state["swa_t_max4"])
+    lo_r, hi_r = (
+        (_state["swa_t_min"], _state["swa_t_max"])
+        if hkv == 2
+        else (_state["swa_t_min4"], _state["swa_t_max4"])
+    )
     if reqs < lo_r:
         return "requests below min"
     if reqs > hi_r:
@@ -780,8 +1116,16 @@ def _swat_reason(attn, qkv, forward_batch, backend):
             return "kernel not loaded before graph capture"
     else:
         # the 16-byte norm-gate form serves the larger row counts of the same request window: build both variants
-        for g in ((gate, 1, 2) if gate and _state["ng16"] else (gate,)):
-            op.preload(hi_r, qkv.device, g, True, min_reqs=lo_r, qk=_state["swa_t_qk"], kv_heads=hkv)
+        for g in (gate, 1, 2) if gate and _state["ng16"] else (gate,):
+            op.preload(
+                hi_r,
+                qkv.device,
+                g,
+                True,
+                min_reqs=lo_r,
+                qk=_state["swa_t_qk"],
+                kv_heads=hkv,
+            )
         if not op.kc_for(reqs, qkv.device, gate, True, hkv):
             return "no cluster size fits"
     return None
@@ -801,11 +1145,16 @@ def _swat_qk_args(attn, positions, qkv, kv_store):
     from .ops import swa_t as op
 
     args = _qk_rope_args(attn, positions, qkv, kv_store)
-    if args is None or op.qk_class(qkv.shape[0], attn.attn.tp_q_head_num, attn.attn.tp_k_head_num) is None:
+    if (
+        args is None
+        or op.qk_class(qkv.shape[0], attn.attn.tp_q_head_num, attn.attn.tp_k_head_num)
+        is None
+    ):
         return None
     gate = _swat_gate_key(attn, qkv)
-    if torch.cuda.is_current_stream_capturing() and not op.is_loaded_qk(qkv.shape[0] // TOKENS, qkv.device, gate, True,
-                                                                       attn.attn.tp_k_head_num):
+    if torch.cuda.is_current_stream_capturing() and not op.is_loaded_qk(
+        qkv.shape[0] // TOKENS, qkv.device, gate, True, attn.attn.tp_k_head_num
+    ):
         return None
     return args
 
@@ -817,7 +1166,9 @@ def _swat_path(attn, positions, qkv, forward_batch, backend):
     from .ops import swa_t as op
 
     layer = attn.attn
-    q, k, v, o_gate = qkv.split([attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1)
+    q, k, v, o_gate = qkv.split(
+        [attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1
+    )
     fuse_rope = attn.rotary_emb is not None
     kv_store = _kv_store_ok(attn, forward_batch, backend, True)
     if kv_store is None:
@@ -835,31 +1186,67 @@ def _swat_path(attn, positions, qkv, forward_batch, backend):
         pos, cos_sin, qk_eps = qk_args
         out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=qkv.device)
         res = op.swa_t_verify_attn_qk(
-            qkv, kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch), md.cache_seqlens_int32[:reqs],
-            layer.sliding_window_size, bmm1, bmm2, pos, cos_sin, kv_store[2], qk_eps, out=out.view(m, hq, d), use_pdl=True,
-            gate=o_gate if eps is not None else None, norm_eps=eps or 0.0, ng_vec=ng_vec,
+            qkv,
+            kv_store[0],
+            kv_store[1],
+            backend._get_layer_page_table(layer, forward_batch),
+            md.cache_seqlens_int32[:reqs],
+            layer.sliding_window_size,
+            bmm1,
+            bmm2,
+            pos,
+            cos_sin,
+            kv_store[2],
+            qk_eps,
+            out=out.view(m, hq, d),
+            use_pdl=True,
+            gate=o_gate if eps is not None else None,
+            norm_eps=eps or 0.0,
+            ng_vec=ng_vec,
         )
-        if res is None:  # cannot happen after _swat_qk_args (class and cluster size known); nothing was stored
-            raise RuntimeError("swa_t: no QK-prologue variant for a call its checks admitted")
+        if (
+            res is None
+        ):  # cannot happen after _swat_qk_args (class and cluster size known); nothing was stored
+            raise RuntimeError(
+                "swa_t: no QK-prologue variant for a call its checks admitted"
+            )
         if eps is not None:
-            bed.count(SWAT, f"qk_fused_norm_gate{'' if ng_vec == 8 else ng_vec}_reqs{reqs}")
+            bed.count(
+                SWAT, f"qk_fused_norm_gate{'' if ng_vec == 8 else ng_vec}_reqs{reqs}"
+            )
             return out
         bed.count(SWAT, f"qk_reqs{reqs}")
         return attn._fused_o_norm_gate(out, o_gate)
     if fuse_rope:
-        q, k = attn._fused_qk_norm(qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store)
+        q, k = attn._fused_qk_norm(
+            qkv, positions, attn.rotary_emb.cos_sin_cache, kv_store=kv_store
+        )
     else:
         q, k = attn._fused_qk_norm(qkv, kv_store=kv_store)
     if q.dtype != torch.float8_e4m3fn:
         q = q.to(torch.float8_e4m3fn)  # what forward_extend does for an FP8 cache
     out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=q.device)
     res = op.swa_t_verify_attn(
-        q.reshape(m, hq, d), kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch),
-        md.cache_seqlens_int32[:reqs], layer.sliding_window_size, bmm1, bmm2, out=out.view(m, hq, d), use_pdl=True,
-        gate=o_gate if eps is not None else None, norm_eps=eps or 0.0, ng_vec=ng_vec,
+        q.reshape(m, hq, d),
+        kv_store[0],
+        kv_store[1],
+        backend._get_layer_page_table(layer, forward_batch),
+        md.cache_seqlens_int32[:reqs],
+        layer.sliding_window_size,
+        bmm1,
+        bmm2,
+        out=out.view(m, hq, d),
+        use_pdl=True,
+        gate=o_gate if eps is not None else None,
+        norm_eps=eps or 0.0,
+        ng_vec=ng_vec,
     )
-    if res is None:  # cannot happen after _swat_reason (kC known); kept as a guard - the QK-norm call already ran
-        raise RuntimeError("swa_t: no cluster size for a call its reason check admitted")
+    if (
+        res is None
+    ):  # cannot happen after _swat_reason (kC known); kept as a guard - the QK-norm call already ran
+        raise RuntimeError(
+            "swa_t: no cluster size for a call its reason check admitted"
+        )
     if eps is not None:
         bed.count(SWAT, f"fused_norm_gate{'' if ng_vec == 8 else ng_vec}_reqs{reqs}")
         return out
@@ -872,7 +1259,10 @@ def _kv_store_ok(attn, forward_batch, backend, contiguous: bool):
     if kv_store is None or kv_store[0].dtype != torch.float8_e4m3fn:
         return None
     k_read, v_read = backend.token_to_kv_pool.get_kv_buffer(attn.attn.layer_id)
-    if k_read.data_ptr() != kv_store[0].data_ptr() or v_read.data_ptr() != kv_store[1].data_ptr():
+    if (
+        k_read.data_ptr() != kv_store[0].data_ptr()
+        or v_read.data_ptr() != kv_store[1].data_ptr()
+    ):
         return None
     if contiguous and not (kv_store[0].is_contiguous() and kv_store[1].is_contiguous()):
         return None
@@ -889,7 +1279,9 @@ def _fullv_reason(attn, qkv, forward_batch, backend):
     max_reqs = _limit("fullv_max_reqs", layer.tp_k_head_num)
     if reqs > max_reqs:
         return "requests above max"
-    if not op.supported(layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, backend.page_size):
+    if not op.supported(
+        layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, backend.page_size
+    ):
         return "shape"
     if backend.q_data_type != torch.bfloat16:
         return "output dtype"
@@ -902,14 +1294,29 @@ def _fullv_reason(attn, qkv, forward_batch, backend):
         return "tensor scales"
     ng = _norm_gate_eps(attn, qkv) is not None
     qk_reqs = max_reqs if _state["fullv_qk"] else 0
-    key = (qkv.device.type, qkv.device.index, max_reqs, layer.tp_q_head_num, layer.tp_k_head_num, ng,
-           _state["fullv_pdl"], qk_reqs)
+    key = (
+        qkv.device.type,
+        qkv.device.index,
+        max_reqs,
+        layer.tp_q_head_num,
+        layer.tp_k_head_num,
+        ng,
+        _state["fullv_pdl"],
+        qk_reqs,
+    )
     if torch.cuda.is_current_stream_capturing():
         if key not in op._preloaded:
             return "kernel not loaded before graph capture"
     else:
-        op.preload(max_reqs, layer.tp_q_head_num, layer.tp_k_head_num, qkv.device, ng, _state["fullv_pdl"],
-                   qk_max_requests=qk_reqs)
+        op.preload(
+            max_reqs,
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            qkv.device,
+            ng,
+            _state["fullv_pdl"],
+            qk_max_requests=qk_reqs,
+        )
     return None
 
 
@@ -918,14 +1325,19 @@ def _fullv_path(attn, positions, qkv, forward_batch, backend):
     from .ops import full_verify_attn as op
 
     layer = attn.attn
-    q, k, v, o_gate = qkv.split([attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1)
+    q, k, v, o_gate = qkv.split(
+        [attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1
+    )
     if attn.rotary_emb is not None:
         return None  # the full-attention layers of this model have no RoPE; anything else runs stock
     kv_store = attn._fused_kv_store(forward_batch)
     if kv_store is None or kv_store[0].dtype != torch.float8_e4m3fn:
         return None
     k_read, v_read = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-    if k_read.data_ptr() != kv_store[0].data_ptr() or v_read.data_ptr() != kv_store[1].data_ptr():
+    if (
+        k_read.data_ptr() != kv_store[0].data_ptr()
+        or v_read.data_ptr() != kv_store[1].data_ptr()
+    ):
         return None
     if not (kv_store[0].is_contiguous() and kv_store[1].is_contiguous()):
         return None
@@ -939,10 +1351,23 @@ def _fullv_path(attn, positions, qkv, forward_batch, backend):
         eps = _norm_gate_eps(attn, qkv)
         out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=qkv.device)
         op.full_verify_attn(
-            None, kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch),
-            md.cache_seqlens_int32[:reqs], -1, backend.page_size, bmm1, bmm2, out=out.view(m, hq, d),
-            use_pdl=_state["fullv_pdl"], gate=o_gate if eps is not None else None, norm_eps=eps or 0.0, qkv=qkv,
-            cache_loc=kv_store[2], qk_eps=qk_eps, num_q_heads=hq,
+            None,
+            kv_store[0],
+            kv_store[1],
+            backend._get_layer_page_table(layer, forward_batch),
+            md.cache_seqlens_int32[:reqs],
+            -1,
+            backend.page_size,
+            bmm1,
+            bmm2,
+            out=out.view(m, hq, d),
+            use_pdl=_state["fullv_pdl"],
+            gate=o_gate if eps is not None else None,
+            norm_eps=eps or 0.0,
+            qkv=qkv,
+            cache_loc=kv_store[2],
+            qk_eps=qk_eps,
+            num_q_heads=hq,
         )
         if eps is not None:
             bed.count(FULLV, f"fused_qk_norm_gate_reqs{reqs}")
@@ -960,9 +1385,19 @@ def _fullv_path(attn, positions, qkv, forward_batch, backend):
     eps = _norm_gate_eps(attn, qkv)
     out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=q.device)
     op.full_verify_attn(
-        q.reshape(m, hq, d), kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch),
-        md.cache_seqlens_int32[:reqs], -1, backend.page_size, bmm1, bmm2, out=out.view(m, hq, d),
-        use_pdl=_state["fullv_pdl"], gate=o_gate if eps is not None else None, norm_eps=eps or 0.0,
+        q.reshape(m, hq, d),
+        kv_store[0],
+        kv_store[1],
+        backend._get_layer_page_table(layer, forward_batch),
+        md.cache_seqlens_int32[:reqs],
+        -1,
+        backend.page_size,
+        bmm1,
+        bmm2,
+        out=out.view(m, hq, d),
+        use_pdl=_state["fullv_pdl"],
+        gate=o_gate if eps is not None else None,
+        norm_eps=eps or 0.0,
     )
     if eps is not None:
         bed.count(FULLV, f"fused_norm_gate_reqs{reqs}")
@@ -994,7 +1429,9 @@ def _fullw_reason(attn, qkv, forward_batch, backend):
         return "requests below min"
     if reqs > op.MAX_REQUESTS:
         return "requests above 256"
-    if not op.supported(layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, backend.page_size):
+    if not op.supported(
+        layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, backend.page_size
+    ):
         return "shape"
     if backend.q_data_type != torch.bfloat16:
         return "output dtype"
@@ -1007,13 +1444,24 @@ def _fullw_reason(attn, qkv, forward_batch, backend):
         return "tensor scales"
     ng = _norm_gate_cfg(attn, qkv, _state["fullw_ng"], _state["ng16"])
     gate = ng[1] if ng is not None else 0
-    key = (qkv.device.type, qkv.device.index, layer.tp_q_head_num, layer.tp_k_head_num, _state["fullw_pdl"]) + (
-        (gate,) if gate else ())
+    key = (
+        qkv.device.type,
+        qkv.device.index,
+        layer.tp_q_head_num,
+        layer.tp_k_head_num,
+        _state["fullw_pdl"],
+    ) + ((gate,) if gate else ())
     if torch.cuda.is_current_stream_capturing():
         if key not in op._preloaded:
             return "kernel not loaded before graph capture"
     else:
-        op.preload(layer.tp_q_head_num, layer.tp_k_head_num, qkv.device, _state["fullw_pdl"], gate=gate)
+        op.preload(
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            qkv.device,
+            _state["fullw_pdl"],
+            gate=gate,
+        )
         if op.SKEL:
             _fullw_skel_selfcheck_counts(op)
     return None
@@ -1025,7 +1473,10 @@ def _fullw_skel_selfcheck_counts(op) -> None:
     for k, ok in op.skel_selfchecks().items():
         if k not in seen:
             seen.add(k)
-            bed.count(FULLW, f"skel_selfcheck_{'pass' if ok else 'FAIL'}_kv{k[1]}_pdl{int(k[2])}_gate{k[3]}")
+            bed.count(
+                FULLW,
+                f"skel_selfcheck_{'pass' if ok else 'FAIL'}_kv{k[1]}_pdl{int(k[2])}_gate{k[3]}",
+            )
 
 
 def _fullw_path(attn, positions, qkv, forward_batch, backend):
@@ -1033,14 +1484,19 @@ def _fullw_path(attn, positions, qkv, forward_batch, backend):
     from .ops import full_attn_wide as op
 
     layer = attn.attn
-    q, k, v, o_gate = qkv.split([attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1)
+    q, k, v, o_gate = qkv.split(
+        [attn.q_size, attn.kv_size, attn.kv_size, attn.q_size], dim=-1
+    )
     if attn.rotary_emb is not None:
         return None
     kv_store = attn._fused_kv_store(forward_batch)
     if kv_store is None or kv_store[0].dtype != torch.float8_e4m3fn:
         return None
     k_read, v_read = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-    if k_read.data_ptr() != kv_store[0].data_ptr() or v_read.data_ptr() != kv_store[1].data_ptr():
+    if (
+        k_read.data_ptr() != kv_store[0].data_ptr()
+        or v_read.data_ptr() != kv_store[1].data_ptr()
+    ):
         return None
     if not (kv_store[0].is_contiguous() and kv_store[1].is_contiguous()):
         return None
@@ -1051,16 +1507,31 @@ def _fullw_path(attn, positions, qkv, forward_batch, backend):
     reqs = m // TOKENS
     hq, d = layer.tp_q_head_num, layer.head_dim
     q3 = q.reshape(m, hq, d)
-    if q3.stride(2) != 1 or q3.stride(1) != d or (q3.stride(0) * q3.element_size()) % 16 or q3.data_ptr() % 16:
+    if (
+        q3.stride(2) != 1
+        or q3.stride(1) != d
+        or (q3.stride(0) * q3.element_size()) % 16
+        or q3.data_ptr() % 16
+    ):
         q3 = q3.contiguous()
     bmm1, bmm2 = backend._get_bmm_scales(layer)
     md = backend.forward_metadata
     out = torch.empty(m, hq * d, dtype=torch.bfloat16, device=q.device)
     ng = _norm_gate_cfg(attn, qkv, _state["fullw_ng"], _state["ng16"])
-    op.full_attn_wide(q3, kv_store[0], kv_store[1], backend._get_layer_page_table(layer, forward_batch),
-                      md.cache_seqlens_int32[:reqs], bmm1, bmm2, out=out.view(m, hq, d), use_pdl=_state["fullw_pdl"],
-                      gate=o_gate if ng is not None else None, norm_eps=ng[0] if ng is not None else 0.0,
-                      ng_vec=ng[1] if ng is not None else 8)
+    op.full_attn_wide(
+        q3,
+        kv_store[0],
+        kv_store[1],
+        backend._get_layer_page_table(layer, forward_batch),
+        md.cache_seqlens_int32[:reqs],
+        bmm1,
+        bmm2,
+        out=out.view(m, hq, d),
+        use_pdl=_state["fullw_pdl"],
+        gate=o_gate if ng is not None else None,
+        norm_eps=ng[0] if ng is not None else 0.0,
+        ng_vec=ng[1] if ng is not None else 8,
+    )
     bed.count(FULLW, f"reqs{reqs}")
     if op.SKEL:
         bed.count(FULLW, f"skel{op.effective_skel(layer.tp_k_head_num)}_reqs{reqs}")
@@ -1126,7 +1597,11 @@ def _around_gated_attention(original, attn, positions, qkv, forward_batch):
             if res is not None:
                 return res
             r = "no fused FP8 KV store / buffer mismatch"
-        if r not in ("full attention layer", "requests below min", "requests above max"):
+        if r not in (
+            "full attention layer",
+            "requests below min",
+            "requests above max",
+        ):
             bed.count(SWAT, "step aside:" + r)
     if reason is None and _state["swa"]:
         r = _swa_reason(attn, qkv, forward_batch, backend)
@@ -1135,7 +1610,10 @@ def _around_gated_attention(original, attn, positions, qkv, forward_batch):
             if res is not None:
                 return res
             r = "no fused FP8 KV store / buffer mismatch"
-        if attn.attn.sliding_window_size is not None and attn.attn.sliding_window_size >= 0:
+        if (
+            attn.attn.sliding_window_size is not None
+            and attn.attn.sliding_window_size >= 0
+        ):
             bed.count(SWA, "stock:" + r)
     if reason is None and _state["fullv"]:
         r = _fullv_reason(attn, qkv, forward_batch, backend)
@@ -1146,7 +1624,9 @@ def _around_gated_attention(original, attn, positions, qkv, forward_batch):
             r = "no fused FP8 KV store / buffer mismatch / RoPE"
         if attn.attn.sliding_window_size is None or attn.attn.sliding_window_size < 0:
             bed.count(FULLV, "stock:" + r)
-    is_full_layer = attn.attn.sliding_window_size is None or attn.attn.sliding_window_size < 0
+    is_full_layer = (
+        attn.attn.sliding_window_size is None or attn.attn.sliding_window_size < 0
+    )
     if _state["fullw"] and is_full_layer:
         if reason is None:
             r = _fullw_reason(attn, qkv, forward_batch, backend)

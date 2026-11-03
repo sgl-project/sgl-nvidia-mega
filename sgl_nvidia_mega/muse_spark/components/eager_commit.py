@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``eager_commit`` (env ``MUSE_VR_EAGER_COMMIT=1``, default off).
 
 After the target verify, SGLang's DFLASH worker (selector path, ``DFlashWorkerV2._accept_block``) samples the accept
@@ -37,10 +39,22 @@ TARGET_ACCEPT = "sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2._accept_
 _CUH = Path(__file__).resolve().parent / "csrc" / "dflash_commit.cuh"
 
 PINS = {
-    "sglang/srt/speculative/dflash_worker_v2.py": ("7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c", "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0"),
-    "sglang/srt/speculative/spec_utils.py": ("3ad5d2e1b00d7f79fc535379844011aebfe03f09b515274afc5fab36cf01a596", "bfa9d4cd9565b808684f6a51cf5cf27804fc2914c0053beb04ad2ed01eadac64"),
-    "sglang/srt/speculative/spec_tp_sync.py": ("da69ea9437ecbae9378c4fbf5d965da3c74c9d3b2d9663f991008c2f1968bf7a", "224fdb1aa782044fc7d253b72962c19ed105db39b772b19a3b2b71ebf799ce3f"),
-    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": ("277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001", "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5"),
+    "sglang/srt/speculative/dflash_worker_v2.py": (
+        "7d462f5f175828bcc3b4d47fcdfa33cb6af4b14669ef016eeb79b1a5191eec8c",
+        "8f82de8d666f81f3c1aa43dc651006f4182ff58593fdfe4eea28c5ee2a14bfc0",
+    ),
+    "sglang/srt/speculative/spec_utils.py": (
+        "3ad5d2e1b00d7f79fc535379844011aebfe03f09b515274afc5fab36cf01a596",
+        "bfa9d4cd9565b808684f6a51cf5cf27804fc2914c0053beb04ad2ed01eadac64",
+    ),
+    "sglang/srt/speculative/spec_tp_sync.py": (
+        "da69ea9437ecbae9378c4fbf5d965da3c74c9d3b2d9663f991008c2f1968bf7a",
+        "224fdb1aa782044fc7d253b72962c19ed105db39b772b19a3b2b71ebf799ce3f",
+    ),
+    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
+        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+    ),
     "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
 }
 
@@ -72,7 +86,10 @@ def module(world: int, pdl: bool):
         "muse_vr_dflash_commit",
         *args,
         cuda_files=[str(_CUH)],
-        cuda_wrappers=[("run", f"MuseVrCommit<{args}>::run"), ("run_local", f"MuseVrCommit<{args}>::run_local")],
+        cuda_wrappers=[
+            ("run", f"MuseVrCommit<{args}>::run"),
+            ("run_local", f"MuseVrCommit<{args}>::run_local"),
+        ],
     )
 
 
@@ -83,15 +100,21 @@ def commit(candidates, accept_len, bonus, comm=None):
     out_tokens = torch.empty_like(candidates, dtype=torch.int64)
     commit_lens = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
     if comm is not None:
-        module(comm.world_size, _use_pdl()).run(comm.obj, candidates, accept_len, bonus, out_tokens, commit_lens)
+        module(comm.world_size, _use_pdl()).run(
+            comm.obj, candidates, accept_len, bonus, out_tokens, commit_lens
+        )
     else:
-        module(1, _use_pdl()).run_local(candidates, accept_len, bonus, out_tokens, commit_lens)
+        module(1, _use_pdl()).run_local(
+            candidates, accept_len, bonus, out_tokens, commit_lens
+        )
     return out_tokens, commit_lens
 
 
 def _exchange_comm(worker):
     """(needs broadcast, communicator or None, reason)."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
     from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 
     sync = worker._tp_sync
@@ -101,7 +124,11 @@ def _exchange_comm(worker):
     if group.world_size == 1:
         return False, None, None
     comm = getattr(group, "ca_comm", None)
-    if group.world_size not in (2, 4, 8) or not isinstance(comm, CustomAllReduceV2) or comm.disabled:
+    if (
+        group.world_size not in (2, 4, 8)
+        or not isinstance(comm, CustomAllReduceV2)
+        or comm.disabled
+    ):
         return True, None, "no custom all-reduce for the broadcast"
     return True, comm, None
 
@@ -114,7 +141,14 @@ def _result(kw, accept_len, commit_lens, bonus, out_tokens):
     from . import sgl_compat
 
     if sgl_compat.layout() != "main":
-        return accept_len, commit_lens, bonus, out_tokens, None, kw.get("target_predict")
+        return (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            None,
+            kw.get("target_predict"),
+        )
     from sglang.srt.speculative import dflash_worker_v2 as w
 
     if w.SIMULATE_ACC_LEN > 0:
@@ -138,7 +172,12 @@ def accept_block(original, worker, **kw):
     if worker._selector_sample is None:
         return original(worker, **kw)
     cand = kw["candidates"]
-    if cand.dtype != torch.int64 or cand.dim() != 2 or not cand.is_contiguous() or cand.shape[0] > 1024:
+    if (
+        cand.dtype != torch.int64
+        or cand.dim() != 2
+        or not cand.is_contiguous()
+        or cand.shape[0] > 1024
+    ):
         bed.count(NAME, "stock:candidates layout")
         return original(worker, **kw)
     need, comm, why = _exchange_comm(worker)
@@ -154,8 +193,11 @@ def accept_block(original, worker, **kw):
         sampling_info=kw["sampling_info"],
         draft_input=kw["draft_input"],
     )
-    if accept_len.dtype != torch.int32 or bonus.dtype != torch.int64 or not (
-            accept_len.is_contiguous() and bonus.is_contiguous()):
+    if (
+        accept_len.dtype != torch.int32
+        or bonus.dtype != torch.int64
+        or not (accept_len.is_contiguous() and bonus.is_contiguous())
+    ):
         # the sampled values are ready; finish exactly as stock does from here
         bed.count(NAME, "stock:sampled dtypes")
         from sglang.srt.speculative.dflash_worker_v2 import _commit_accept

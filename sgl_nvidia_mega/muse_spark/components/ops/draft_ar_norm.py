@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DFlash draft layer boundary: all-reduce + output-side block convolution + residual add + RMSNorm, JIT CUDA.
 
 See ``csrc/draft_ar_norm.cuh`` for the arithmetic and the work split.
@@ -47,7 +49,19 @@ def module(hidden: int, world: int, pdl: bool, cluster: int = CLUSTER):
     )
 
 
-def run(comm, partial, coef, coef_offset, coef_stride, base, residual, weight, eps, out=None, cluster=None):
+def run(
+    comm,
+    partial,
+    coef,
+    coef_offset,
+    coef_stride,
+    base,
+    residual,
+    weight,
+    eps,
+    out=None,
+    cluster=None,
+):
     """All-reduce ``partial`` over the communicator's push plane and apply the boundary; updates ``residual`` in place
     and returns the normalized rows."""
     hidden = partial.shape[-1]
@@ -55,16 +69,48 @@ def run(comm, partial, coef, coef_offset, coef_stride, base, residual, weight, e
         out = torch.empty_like(partial)
     if cluster is None:
         cluster = cluster_for(partial.shape[0])
-    module(hidden, comm.world_size, use_pdl(), cluster).run(comm.obj, partial, coef, int(coef_offset), int(coef_stride), base,
-                                                   residual, weight, out, float(eps))
+    module(hidden, comm.world_size, use_pdl(), cluster).run(
+        comm.obj,
+        partial,
+        coef,
+        int(coef_offset),
+        int(coef_stride),
+        base,
+        residual,
+        weight,
+        out,
+        float(eps),
+    )
     return out
 
 
-def loopback(partial_all, rank, coef, coef_offset, coef_stride, base, residual, weight, eps, cluster=CLUSTER,
-             max_clusters=0):
+def loopback(
+    partial_all,
+    rank,
+    coef,
+    coef_offset,
+    coef_stride,
+    base,
+    residual,
+    weight,
+    eps,
+    cluster=CLUSTER,
+    max_clusters=0,
+):
     """Test entry: every rank's partial as ``[world, M, H]`` on one GPU; plays ``rank``."""
     world, _, hidden = partial_all.shape
     out = torch.empty_like(residual)
-    module(hidden, world, False, cluster).loopback(partial_all, int(rank), coef, int(coef_offset), int(coef_stride), base,
-                                          residual, weight, out, float(eps), int(max_clusters))
+    module(hidden, world, False, cluster).loopback(
+        partial_all,
+        int(rank),
+        coef,
+        int(coef_offset),
+        int(coef_stride),
+        base,
+        residual,
+        weight,
+        out,
+        float(eps),
+        int(max_clusters),
+    )
     return out

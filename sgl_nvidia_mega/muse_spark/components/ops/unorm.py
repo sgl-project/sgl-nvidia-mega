@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Boundary norm with an early dependent release (csrc/unorm.cuh): development form, not wired into the server.
 
 SGLang's fused post-norm + gated residual + pre-norm (its one-CTA-per-row path, used above 64 rows) with the same
@@ -37,19 +39,26 @@ def _use_pdl() -> bool:
 
 @functools.lru_cache(maxsize=None)
 def module(hidden: int, vt: int, rows: int, pdl: bool, trig: int):
+    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
-
-    negctl = os.environ.get("MUSE_VR_UNORM_TEST_NEGCTL", "")  # tests only (sanitizer negative controls)
-    delay = os.environ.get("MUSE_VR_UNORM_TEST_DELAY_G2", "") == "1"  # tests only (late second copy group)
-    flags = ([f"-DMUSE_VR_UNORM_NEGCTL={int(negctl)}"] if negctl else []) + (["-DMUSE_VR_UNORM_TEST_DELAY_G2=1"] if delay else [])
+    negctl = os.environ.get(
+        "MUSE_VR_UNORM_TEST_NEGCTL", ""
+    )  # tests only (sanitizer negative controls)
+    delay = (
+        os.environ.get("MUSE_VR_UNORM_TEST_DELAY_G2", "") == "1"
+    )  # tests only (late second copy group)
+    flags = ([f"-DMUSE_VR_UNORM_NEGCTL={int(negctl)}"] if negctl else []) + (
+        ["-DMUSE_VR_UNORM_TEST_DELAY_G2=1"] if delay else []
+    )
     extra = {"extra_cuda_cflags": flags} if flags else {}
     args = make_cpp_args(hidden, vt, rows, pdl, trig)
     t = "sglang::muse_vr_unorm::UnormNormResidual"
     return load_jit(
-        "muse_vr_unorm" + (f"_negctl{int(negctl)}" if negctl else "") + ("_delayg2" if delay else ""),
+        "muse_vr_unorm"
+        + (f"_negctl{int(negctl)}" if negctl else "")
+        + ("_delayg2" if delay else ""),
         *args,
         cuda_files=[str(_CUH)],
         cuda_wrappers=[
@@ -66,21 +75,32 @@ def module(hidden: int, vt: int, rows: int, pdl: bool, trig: int):
 @functools.lru_cache(maxsize=None)
 def module_cl(hidden: int, vt: int, rows: int, kk: int, pdl: bool, trig: int):
     """Column-split form (csrc/unorm_cl.cuh): a cluster of kk CTAs per group of ``rows`` rows."""
+    from muse_vr_plugin.sgl_compat import csrc_include_paths
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 
-    from muse_vr_plugin.sgl_compat import csrc_include_paths
-
-    negctl = os.environ.get("MUSE_VR_UNORM_TEST_NEGCTL", "")  # tests only (negative controls)
-    bounded = os.environ.get("MUSE_VR_UNORM_CL_TEST_BOUNDED", "") == "1"  # tests only (bounded exchange wait)
-    delay = os.environ.get("MUSE_VR_UNORM_TEST_DELAY_G2", "") == "1"  # tests only (late second copy group)
-    flags = ([f"-DMUSE_VR_UNORM_NEGCTL={int(negctl)}"] if negctl else []) + (["-DMUSE_VR_UNORM_CL_TEST_BOUNDED=1"] if bounded else []) \
+    negctl = os.environ.get(
+        "MUSE_VR_UNORM_TEST_NEGCTL", ""
+    )  # tests only (negative controls)
+    bounded = (
+        os.environ.get("MUSE_VR_UNORM_CL_TEST_BOUNDED", "") == "1"
+    )  # tests only (bounded exchange wait)
+    delay = (
+        os.environ.get("MUSE_VR_UNORM_TEST_DELAY_G2", "") == "1"
+    )  # tests only (late second copy group)
+    flags = (
+        ([f"-DMUSE_VR_UNORM_NEGCTL={int(negctl)}"] if negctl else [])
+        + (["-DMUSE_VR_UNORM_CL_TEST_BOUNDED=1"] if bounded else [])
         + (["-DMUSE_VR_UNORM_TEST_DELAY_G2=1"] if delay else [])
+    )
     extra = {"extra_cuda_cflags": flags} if flags else {}
     args = make_cpp_args(hidden, vt, rows, kk, pdl, trig)
     t = "sglang::muse_vr_unorm::UnormClNormResidual"
     return load_jit(
-        "muse_vr_unorm_cl" + (f"_negctl{int(negctl)}" if negctl else "") + ("_bounded" if bounded else "") + ("_delayg2" if delay else ""),
+        "muse_vr_unorm_cl"
+        + (f"_negctl{int(negctl)}" if negctl else "")
+        + ("_bounded" if bounded else "")
+        + ("_delayg2" if delay else ""),
         *args,
         cuda_files=[str(_CSRC / "unorm_cl.cuh")],
         cuda_wrappers=[
@@ -138,7 +158,9 @@ def static_is_synced(*tensors: torch.Tensor) -> bool:
     return True
 
 
-def supported(num_tokens: int, hidden: int, alpha, beta, post_weight, pre_weight) -> bool:
+def supported(
+    num_tokens: int, hidden: int, alpha, beta, post_weight, pre_weight
+) -> bool:
     if hidden != _H or num_tokens <= 0:
         return False
     if post_weight is None or pre_weight is None or alpha is None or beta is None:
@@ -172,27 +194,73 @@ def norm_residual(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """``(output bf16, new_stream fp32, router fp32 or None)``, byte-equal to SGLang's fused_norm_residual."""
     assert branch.dtype == torch.bfloat16 and stream.dtype == torch.float32
-    assert branch.is_contiguous() and stream.is_contiguous() and stream.shape == branch.shape
+    assert (
+        branch.is_contiguous()
+        and stream.is_contiguous()
+        and stream.shape == branch.shape
+    )
     m, hidden = branch.shape
     if not supported(m, hidden, alpha, beta, post_weight, pre_weight):
         raise ValueError(f"unorm: unsupported shape / form (M={m}, H={hidden})")
     assert rows >= 1 and trig in (0, 1, 2) and cluster in (1, 2, 4, 8)
     a1, b1 = alpha.reshape(-1), beta.reshape(-1)
-    assert a1.is_contiguous() and b1.is_contiguous() and post_weight.is_contiguous() and pre_weight.is_contiguous()
+    assert (
+        a1.is_contiguous()
+        and b1.is_contiguous()
+        and post_weight.is_contiguous()
+        and pre_weight.is_contiguous()
+    )
     if static_pre_wait and not static_is_synced(a1, b1, post_weight, pre_weight):
-        raise RuntimeError("unorm: static_pre_wait=True needs mark_static_synced() on these operands after their last "
-                           "write; pass static_pre_wait=False instead")
+        raise RuntimeError(
+            "unorm: static_pre_wait=True needs mark_static_synced() on these operands after their last "
+            "write; pass static_pre_wait=False instead"
+        )
     vt_ = stock_threads(m, hidden)
-    if rows * (256 if cluster == 1 else vt_ // cluster) > 1024 or (cluster > 1 and vt_ // cluster < 32):
-        raise ValueError(f"unorm: rows={rows} cluster={cluster} exceeds the CTA thread limit at M={m}")
-    if -(-m // rows) * cluster > torch.cuda.get_device_properties(branch.device).multi_processor_count:
-        raise ValueError("unorm: the launch must fit one wave (rows per CTA too small for this row count)")
+    if rows * (256 if cluster == 1 else vt_ // cluster) > 1024 or (
+        cluster > 1 and vt_ // cluster < 32
+    ):
+        raise ValueError(
+            f"unorm: rows={rows} cluster={cluster} exceeds the CTA thread limit at M={m}"
+        )
+    if (
+        -(-m // rows) * cluster
+        > torch.cuda.get_device_properties(branch.device).multi_processor_count
+    ):
+        raise ValueError(
+            "unorm: the launch must fit one wave (rows per CTA too small for this row count)"
+        )
     vt = stock_threads(m, hidden)
     out = output if output is not None else torch.empty_like(branch)
     ns = new_stream_out if new_stream_out is not None else torch.empty_like(stream)
-    rt = (router_out if router_out is not None else torch.empty_like(stream)) if want_router else None
-    mod = module(hidden, vt, rows, _use_pdl(), trig) if cluster == 1 else module_cl(hidden, vt, rows, cluster, _use_pdl(), trig)
-    fn = getattr(mod, ("run_scale" if post_norm_is_input_scale else "run_std") + ("_router" if want_router else ""))
-    fn(branch, stream, out, ns, rt, post_weight, pre_weight, a1, b1,
-       float(post_eps), float(pre_eps), bool(pre_norm_bf16), bool(static_pre_wait), bool(prefetch_stream))
+    rt = (
+        (router_out if router_out is not None else torch.empty_like(stream))
+        if want_router
+        else None
+    )
+    mod = (
+        module(hidden, vt, rows, _use_pdl(), trig)
+        if cluster == 1
+        else module_cl(hidden, vt, rows, cluster, _use_pdl(), trig)
+    )
+    fn = getattr(
+        mod,
+        ("run_scale" if post_norm_is_input_scale else "run_std")
+        + ("_router" if want_router else ""),
+    )
+    fn(
+        branch,
+        stream,
+        out,
+        ns,
+        rt,
+        post_weight,
+        pre_weight,
+        a1,
+        b1,
+        float(post_eps),
+        float(pre_eps),
+        bool(pre_norm_bf16),
+        bool(static_pre_wait),
+        bool(prefetch_stream),
+    )
     return out, ns, rt

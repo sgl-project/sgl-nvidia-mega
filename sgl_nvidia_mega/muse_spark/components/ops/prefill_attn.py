@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paged FP8 causal prefill attention on tensor-core MMA (tcgen05), JIT CUDA.
 
 See ``csrc/prefill_attn.cuh`` for the arithmetic, the work split and the synchronization. The op covers prefill
@@ -41,19 +43,45 @@ def _module(use_pdl: bool, poly_pairs: int):
     )
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int, *, window_left: int = -1,
-              causal: bool = True, has_sinks: bool = False, q_dtype=None, kv_dtype=None, out_dtype=None) -> bool:
+def supported(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    *,
+    window_left: int = -1,
+    causal: bool = True,
+    has_sinks: bool = False,
+    q_dtype=None,
+    kv_dtype=None,
+    out_dtype=None,
+) -> bool:
     """Shapes and options the kernel computes exactly: full causal attention (no sliding window, no attention sinks),
     8 query heads per KV head, head_dim 64, page size 128, e4m3 Q / K / V, bf16 output."""
     e4m3 = torch.float8_e4m3fn
-    return (head_dim == HEAD_DIM and num_kv_heads > 0 and num_kv_heads * Q_PER_KV == num_q_heads and
-            page_size == PAGE and window_left == -1 and causal and not has_sinks and
-            (q_dtype is None or q_dtype == e4m3) and (kv_dtype is None or kv_dtype == e4m3) and
-            (out_dtype is None or out_dtype == torch.bfloat16))
+    return (
+        head_dim == HEAD_DIM
+        and num_kv_heads > 0
+        and num_kv_heads * Q_PER_KV == num_q_heads
+        and page_size == PAGE
+        and window_left == -1
+        and causal
+        and not has_sinks
+        and (q_dtype is None or q_dtype == e4m3)
+        and (kv_dtype is None or kv_dtype == e4m3)
+        and (out_dtype is None or out_dtype == torch.bfloat16)
+    )
 
 
-def plan_units(seq_lens_cpu, cu_q_cpu, num_kv_heads: int, num_sms: int, chunk_tiles: int | None = None,
-               per_request: bool = False, include=None):
+def plan_units(
+    seq_lens_cpu,
+    cu_q_cpu,
+    num_kv_heads: int,
+    num_sms: int,
+    chunk_tiles: int | None = None,
+    per_request: bool = False,
+    include=None,
+):
     """Work units for one call (host side, from CPU lengths).
 
     Each 32-token query block of a request and KV head needs the key tiles [0, ceil(key_end / 128)). Blocks longer than
@@ -94,7 +122,12 @@ def plan_units(seq_lens_cpu, cu_q_cpu, num_kv_heads: int, num_sms: int, chunk_ti
         bounds = [(i * tiles) // n for i in range(n + 1)]
         merges.append([r, h, tok0, slot, n, 0, 0, 0])
         for i in range(n):
-            units.append((bounds[i + 1] - bounds[i], [r, h, tok0, bounds[i], bounds[i + 1], slot + i, 0, 0]))
+            units.append(
+                (
+                    bounds[i + 1] - bounds[i],
+                    [r, h, tok0, bounds[i], bounds[i + 1], slot + i, 0, 0],
+                )
+            )
         slot += n
     # KV-head major (concurrent blocks read the same head's pages), largest first within a head
     units.sort(key=lambda u: (u[1][1], -u[0]))
@@ -108,7 +141,14 @@ def plan_units(seq_lens_cpu, cu_q_cpu, num_kv_heads: int, num_sms: int, chunk_ti
 SK_MIN_TILES = 64
 
 
-def plan_sk(seq_lens_cpu, cu_q_cpu, num_kv_heads: int, num_sms: int, include=None, min_tiles: int = SK_MIN_TILES):
+def plan_sk(
+    seq_lens_cpu,
+    cu_q_cpu,
+    num_kv_heads: int,
+    num_sms: int,
+    include=None,
+    min_tiles: int = SK_MIN_TILES,
+):
     """Balanced work split: per request, its work line (KV heads in order; per head its 32-token query blocks in order;
     per block its 128-key tiles in key order) is cut into P contiguous ranges of equal length (to one tile), P =
     min(num_sms, max(1, total tiles // min_tiles)). Block i of the launch runs range i of every request, one range after
@@ -130,7 +170,14 @@ def plan_sk(seq_lens_cpu, cu_q_cpu, num_kv_heads: int, num_sms: int, include=Non
         blocks = []
         for h in range(num_kv_heads):
             for tok0 in range(0, q_len, TOKENS_PER_BLOCK):
-                blocks.append((h, tok0, (prefix + min(tok0 + TOKENS_PER_BLOCK, q_len) + PAGE - 1) // PAGE))
+                blocks.append(
+                    (
+                        h,
+                        tok0,
+                        (prefix + min(tok0 + TOKENS_PER_BLOCK, q_len) + PAGE - 1)
+                        // PAGE,
+                    )
+                )
         total = sum(blk[2] for blk in blocks)
         nblk = min(len(per_cta), max(1, total // max(1, min_tiles)))
         bounds = [(i * total) // nblk for i in range(nblk + 1)]
@@ -175,19 +222,51 @@ def _stream_key(device) -> tuple:
     return str(device), torch.cuda.current_stream(device).cuda_stream
 
 
-def _plan(seq_lens_cpu, cu_q_cpu, num_kv_heads, device, chunk_tiles, per_request=False, include=None, plan="units",
-          sk_min_tiles=None):
+def _plan(
+    seq_lens_cpu,
+    cu_q_cpu,
+    num_kv_heads,
+    device,
+    chunk_tiles,
+    per_request=False,
+    include=None,
+    plan="units",
+    sk_min_tiles=None,
+):
     inc = None if include is None else tuple(bool(v) for v in include)
-    key = (tuple(int(v) for v in seq_lens_cpu), tuple(int(v) for v in cu_q_cpu), num_kv_heads, _stream_key(device),
-           chunk_tiles, bool(per_request), inc, plan, sk_min_tiles)
+    key = (
+        tuple(int(v) for v in seq_lens_cpu),
+        tuple(int(v) for v in cu_q_cpu),
+        num_kv_heads,
+        _stream_key(device),
+        chunk_tiles,
+        bool(per_request),
+        inc,
+        plan,
+        sk_min_tiles,
+    )
     hit = _PLAN_CACHE.get(key)
     if hit is None:
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         if plan == "sk":
-            ut, ct, mt, slots = plan_sk(seq_lens_cpu, cu_q_cpu, num_kv_heads, num_sms, inc,
-                                        SK_MIN_TILES if sk_min_tiles is None else int(sk_min_tiles))
+            ut, ct, mt, slots = plan_sk(
+                seq_lens_cpu,
+                cu_q_cpu,
+                num_kv_heads,
+                num_sms,
+                inc,
+                SK_MIN_TILES if sk_min_tiles is None else int(sk_min_tiles),
+            )
         elif plan == "units":
-            ut, mt, slots = plan_units(seq_lens_cpu, cu_q_cpu, num_kv_heads, num_sms, chunk_tiles, bool(per_request), inc)
+            ut, mt, slots = plan_units(
+                seq_lens_cpu,
+                cu_q_cpu,
+                num_kv_heads,
+                num_sms,
+                chunk_tiles,
+                bool(per_request),
+                inc,
+            )
             ct = torch.empty(0, dtype=torch.int32)
         else:
             raise ValueError(f"plan {plan!r} not units / sk")
@@ -203,8 +282,10 @@ def _workspace(device, slots):
     key = _stream_key(device)
     ws = _WS_CACHE.get(key)
     if ws is None or ws[0].numel() < rows * HEAD_DIM:
-        ws = (torch.empty(rows * HEAD_DIM, dtype=torch.float32, device=device),
-              torch.empty(rows * 2, dtype=torch.float32, device=device))
+        ws = (
+            torch.empty(rows * HEAD_DIM, dtype=torch.float32, device=device),
+            torch.empty(rows * 2, dtype=torch.float32, device=device),
+        )
         _WS_CACHE[key] = ws
     return ws
 
@@ -256,15 +337,39 @@ def prefill_attn(
         seq_lens_cpu = seq_lens.tolist()
     if cu_seqlens_q_cpu is None:
         cu_seqlens_q_cpu = cu_seqlens_q.tolist()
-    units, munits, slots, cta_units = _plan(seq_lens_cpu, cu_seqlens_q_cpu, k_cache.shape[1], q.device, chunk_tiles,
-                                            per_request, include, plan, sk_min_tiles)
+    units, munits, slots, cta_units = _plan(
+        seq_lens_cpu,
+        cu_seqlens_q_cpu,
+        k_cache.shape[1],
+        q.device,
+        chunk_tiles,
+        per_request,
+        include,
+        plan,
+        sk_min_tiles,
+    )
     if include is not None and units.shape[0] == 0:
         return out
     ws_o, ws_ml = _workspace(q.device, slots)
     pp = POLY_PAIRS if poly_pairs is None else int(poly_pairs)
-    _module(bool(use_pdl), pp).prefill_attn(units, cta_units, munits, ws_o, ws_ml, q, k_cache, v_cache, page_table,
-                                            seq_lens, cu_seqlens_q, out, int(max_q_len), float(bmm1_scale),
-                                            float(bmm2_scale), trace.data_ptr() if trace is not None else 0)
+    _module(bool(use_pdl), pp).prefill_attn(
+        units,
+        cta_units,
+        munits,
+        ws_o,
+        ws_ml,
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        cu_seqlens_q,
+        out,
+        int(max_q_len),
+        float(bmm1_scale),
+        float(bmm2_scale),
+        trace.data_ptr() if trace is not None else 0,
+    )
     return out
 
 
@@ -275,5 +380,17 @@ def preload(device, use_pdl: bool = False, poly_pairs: int | None = None) -> Non
     table = torch.zeros(1, 1, dtype=torch.int32, device=device)
     lens = torch.ones(1, dtype=torch.int32, device=device)
     cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    prefill_attn(q, cache, cache, table, lens, cu, 1, 0.125, 1.0, use_pdl=use_pdl, poly_pairs=poly_pairs)
+    prefill_attn(
+        q,
+        cache,
+        cache,
+        table,
+        lens,
+        cu,
+        1,
+        0.125,
+        1.0,
+        use_pdl=use_pdl,
+        poly_pairs=poly_pairs,
+    )
     torch.cuda.current_stream(device).synchronize()

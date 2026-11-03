@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Host-side plan of the own extend-attention op: the engage window and the balanced work split.
 
 Pure functions of a request's lengths, the head layout and the device's SM count (a runtime query by the caller); no
@@ -57,7 +59,9 @@ def decline_reason(call: ExtendCall, num_q_heads: int, num_sms: int) -> str | No
     return None
 
 
-def split(new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_tiles: int = MIN_TILES):
+def split(
+    new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_tiles: int = MIN_TILES
+):
     """Balanced split (plan_sk), vectorized: returns (units [n, 8] int32 array, cta_offsets list, merges [m, 8] int32 array,
     slots). The tables are exactly split_reference's (tests/test_extend_attn_b_plan.py checks equality on a sweep)."""
     import numpy as np
@@ -69,7 +73,9 @@ def split(new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_tiles: int
             continue
         nt = -(-q_len // TOKENS_PER_BLOCK)
         tok0 = np.arange(nt, dtype=np.int64) * TOKENS_PER_BLOCK
-        per_tok = (prefix + np.minimum(tok0 + TOKENS_PER_BLOCK, q_len) + PAGE - 1) // PAGE
+        per_tok = (
+            prefix + np.minimum(tok0 + TOKENS_PER_BLOCK, q_len) + PAGE - 1
+        ) // PAGE
         tiles = np.tile(per_tok, num_kv_heads)  # blocks in (kv head, first token) order
         heads = np.repeat(np.arange(num_kv_heads, dtype=np.int64), nt)
         toks = np.tile(tok0, num_kv_heads)
@@ -92,16 +98,39 @@ def split(new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_tiles: int
         base = slot + np.cumsum(mcount) - mcount
         sl = np.where(cut[blk], base[blk] + pn, -1)
         z = np.zeros_like(kk)
-        parts.append((kk, np.stack([np.full_like(kk, r), heads[blk], toks[blk], a, e, sl, z, z], 1)))
+        parts.append(
+            (
+                kk,
+                np.stack(
+                    [np.full_like(kk, r), heads[blk], toks[blk], a, e, sl, z, z], 1
+                ),
+            )
+        )
         if cut.any():
             mz = np.zeros(int(cut.sum()), dtype=np.int64)
-            mparts.append(np.stack([np.full_like(mz, r), heads[cut], toks[cut], base[cut], npc[cut], mz, mz, mz], 1))
+            mparts.append(
+                np.stack(
+                    [
+                        np.full_like(mz, r),
+                        heads[cut],
+                        toks[cut],
+                        base[cut],
+                        npc[cut],
+                        mz,
+                        mz,
+                        mz,
+                    ],
+                    1,
+                )
+            )
         slot += int(mcount.sum())
     if not parts:
         return np.zeros((0, 8), np.int32), [], np.zeros((0, 8), np.int32), 0
     kk = np.concatenate([p[0] for p in parts])
     rows = np.concatenate([p[1] for p in parts])
-    order = np.argsort(kk, kind="stable")  # block-major; request / block / piece order kept inside each block
+    order = np.argsort(
+        kk, kind="stable"
+    )  # block-major; request / block / piece order kept inside each block
     counts = np.bincount(kk, minlength=ncta)
     counts = counts[counts > 0]
     offs = [0] + np.cumsum(counts).tolist()
@@ -109,7 +138,9 @@ def split(new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_tiles: int
     return rows[order].astype(np.int32), offs, merges.astype(np.int32), slot
 
 
-def split_reference(new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_tiles: int = MIN_TILES):
+def split_reference(
+    new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_tiles: int = MIN_TILES
+):
     """Balanced split (plan_sk), the plain Python form: returns (units, cta_offsets, merges, slots) as Python lists.
 
     units rows: [request, kv head, first query token, tile begin, tile end, slot (-1: writes the output)];
@@ -123,7 +154,14 @@ def split_reference(new_lens, prefix_lens, num_kv_heads: int, num_sms: int, min_
         blocks = []
         for h in range(num_kv_heads):
             for tok0 in range(0, q_len, TOKENS_PER_BLOCK):
-                blocks.append((h, tok0, (prefix + min(tok0 + TOKENS_PER_BLOCK, q_len) + PAGE - 1) // PAGE))
+                blocks.append(
+                    (
+                        h,
+                        tok0,
+                        (prefix + min(tok0 + TOKENS_PER_BLOCK, q_len) + PAGE - 1)
+                        // PAGE,
+                    )
+                )
         total = sum(b[2] for b in blocks)
         nblk = min(len(per_cta), max(1, total // max(1, min_tiles)))
         bounds = [(i * total) // nblk for i in range(nblk + 1)]

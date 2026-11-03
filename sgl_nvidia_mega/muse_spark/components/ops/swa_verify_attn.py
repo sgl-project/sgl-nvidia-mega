@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Sliding-window FP8 paged attention for speculative verify (8 query tokens per request), JIT CUDA.
 
 See ``csrc/swa_verify_attn.cuh`` for the arithmetic and the work split. The op covers the shape class of the
@@ -77,8 +79,9 @@ def qk_arith() -> str | None:
         from triton import knobs
 
         lang = knobs.language
-        fusion = bool(getattr(lang, "default_fp_fusion", True)) and not bool(getattr(lang, "force_disable_fp_fusion",
-                                                                                        False))
+        fusion = bool(getattr(lang, "default_fp_fusion", True)) and not bool(
+            getattr(lang, "force_disable_fp_fusion", False)
+        )
         return QK_ARITH.get((str(triton.__version__), fusion))
     except Exception:  # noqa: BLE001
         return None
@@ -103,16 +106,30 @@ def qk_class(num_tokens: int, num_q_heads: int, num_kv_heads: int) -> int | None
 
 
 @functools.lru_cache(maxsize=None)
-def _module(kchunk: int, ksplit: int, krg: int, kc: int, use_pdl: bool, prefetch: bool, norm_gate: bool, qk: int = 0,
-            rope: bool = False, unfused: bool = False):
+def _module(
+    kchunk: int,
+    ksplit: int,
+    krg: int,
+    kc: int,
+    use_pdl: bool,
+    prefetch: bool,
+    norm_gate: bool,
+    qk: int = 0,
+    rope: bool = False,
+    unfused: bool = False,
+):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
-    args = make_cpp_args(kchunk, ksplit, krg, kc, use_pdl, prefetch, norm_gate, qk, rope, unfused)
+    args = make_cpp_args(
+        kchunk, ksplit, krg, kc, use_pdl, prefetch, norm_gate, qk, rope, unfused
+    )
     return load_jit(
         "muse_vr_swa_verify_attn",
         *args,
         cuda_files=[str(_CSRC)],
-        cuda_wrappers=[("swa_verify_attn", f"muse_vr::SwaVerifyAttnKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("swa_verify_attn", f"muse_vr::SwaVerifyAttnKernel<{args}>::run")
+        ],
     )
 
 
@@ -124,12 +141,29 @@ def pdl_for(num_requests: int, qk: int = 0) -> bool:
     return _use_pdl() and num_requests not in no_pdl
 
 
-def module_key(num_requests: int, window_left: int, norm_gate: bool = False, use_pdl: bool | None = None,
-               prefetch: bool = False, qk: int = 0, rope: bool = False) -> tuple:
+def module_key(
+    num_requests: int,
+    window_left: int,
+    norm_gate: bool = False,
+    use_pdl: bool | None = None,
+    prefetch: bool = False,
+    qk: int = 0,
+    rope: bool = False,
+) -> tuple:
     c, k, r = cfg(num_requests)
     pdl = pdl_for(num_requests, qk) if use_pdl is None else use_pdl
-    return (c, k, r, cluster_size(int(window_left), c), pdl, bool(prefetch), bool(norm_gate), int(qk),
-            bool(rope) if qk else False, qk_unfused(qk))
+    return (
+        c,
+        k,
+        r,
+        cluster_size(int(window_left), c),
+        pdl,
+        bool(prefetch),
+        bool(norm_gate),
+        int(qk),
+        bool(rope) if qk else False,
+        qk_unfused(qk),
+    )
 
 
 def is_loaded(key: tuple) -> bool:
@@ -137,31 +171,76 @@ def is_loaded(key: tuple) -> bool:
     return key in _loaded
 
 
-def preload(window_left: int, max_requests: int, num_q_heads: int, num_kv_heads: int, device,
-            norm_gate: bool = False, fuse_qk: bool = False, rope: bool = False) -> None:
+def preload(
+    window_left: int,
+    max_requests: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    device,
+    norm_gate: bool = False,
+    fuse_qk: bool = False,
+    rope: bool = False,
+) -> None:
     """Build, load and launch once (on zeros) the kernels every request count up to ``max_requests`` uses, so that
     no build, module load or function attribute call happens inside a CUDA-graph capture."""
     keys = set()
     for n in range(1, max_requests + 1):
-        qk = qk_class(n * TOKENS_PER_REQUEST, num_q_heads, num_kv_heads) if fuse_qk else 0
+        qk = (
+            qk_class(n * TOKENS_PER_REQUEST, num_q_heads, num_kv_heads)
+            if fuse_qk
+            else 0
+        )
         keys.add(module_key(n, window_left, norm_gate, qk=qk or 0, rope=rope))
     if keys <= _loaded:
         return
     page = 64
-    q = torch.zeros(TOKENS_PER_REQUEST, num_q_heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
-    pool = torch.zeros(2 * page, num_kv_heads * HEAD_DIM, dtype=torch.float8_e4m3fn, device=device)
+    q = torch.zeros(
+        TOKENS_PER_REQUEST,
+        num_q_heads,
+        HEAD_DIM,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    pool = torch.zeros(
+        2 * page, num_kv_heads * HEAD_DIM, dtype=torch.float8_e4m3fn, device=device
+    )
     table = torch.zeros(1, 2, dtype=torch.int32, device=device)
     lens = torch.full((1,), TOKENS_PER_REQUEST, dtype=torch.int32, device=device)
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
-    gate = torch.zeros(TOKENS_PER_REQUEST, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device)
-    qkv = torch.zeros(TOKENS_PER_REQUEST, (2 * num_q_heads + 2 * num_kv_heads) * HEAD_DIM, dtype=torch.bfloat16,
-                      device=device)
+    gate = torch.zeros(
+        TOKENS_PER_REQUEST, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    qkv = torch.zeros(
+        TOKENS_PER_REQUEST,
+        (2 * num_q_heads + 2 * num_kv_heads) * HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     pos = torch.zeros(TOKENS_PER_REQUEST, dtype=torch.int64, device=device)
     cos_sin = torch.zeros(1, HEAD_DIM, dtype=torch.float32, device=device)
-    loc = torch.zeros(TOKENS_PER_REQUEST, dtype=torch.int64, device=device)  # 0: no store
+    loc = torch.zeros(
+        TOKENS_PER_REQUEST, dtype=torch.int64, device=device
+    )  # 0: no store
     for key in keys - _loaded:
-        _module(*key).swa_verify_attn(q, pool, pool, table, lens, out, int(window_left), page, 1.0, 1.0, gate, 1e-6,
-                                      qkv, pos, cos_sin, loc, 1e-6)
+        _module(*key).swa_verify_attn(
+            q,
+            pool,
+            pool,
+            table,
+            lens,
+            out,
+            int(window_left),
+            page,
+            1.0,
+            1.0,
+            gate,
+            1e-6,
+            qkv,
+            pos,
+            cos_sin,
+            loc,
+            1e-6,
+        )
         _loaded.add(key)
     torch.cuda.current_stream(device).synchronize()
 
@@ -176,12 +255,20 @@ def _use_pdl() -> bool:
     return bool(is_arch_support_pdl())
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, window_left: int) -> bool:
-    if not (head_dim == HEAD_DIM and num_kv_heads * Q_PER_KV == num_q_heads and window_left >= 0):
+def supported(
+    num_q_heads: int, num_kv_heads: int, head_dim: int, window_left: int
+) -> bool:
+    if not (
+        head_dim == HEAD_DIM
+        and num_kv_heads * Q_PER_KV == num_q_heads
+        and window_left >= 0
+    ):
         return False
     # at least 2 blocks per cluster: the kernel exchanges partial results with st.async, which the PTX ISA defines
     # only for clusters of more than one block
-    return all(2 <= cluster_size(window_left, c[0]) <= MAX_CLUSTER for _, c in _POLICY) and (
+    return all(
+        2 <= cluster_size(window_left, c[0]) <= MAX_CLUSTER for _, c in _POLICY
+    ) and (
         not os.environ.get("MUSE_VR_SWA_VERIFY_ATTN_CFG")
         or 2 <= cluster_size(window_left, cfg(1)[0]) <= MAX_CLUSTER
     )
@@ -250,9 +337,22 @@ def swa_verify_attn(
     _loaded.add(key)
     dummy = out.view(out.shape[0], -1)
     mod.swa_verify_attn(
-        q if q is not None else out, k_pool, v_pool, page_table, seq_lens, out, int(window_left), int(page_size),
-        float(bmm1_scale), float(bmm2_scale), gate if gate is not None else dummy, float(norm_eps),
-        qkv if qkv is not None else dummy, positions if positions is not None else seq_lens,
-        cos_sin if cos_sin is not None else dummy, cache_loc if cache_loc is not None else seq_lens, float(qk_eps),
+        q if q is not None else out,
+        k_pool,
+        v_pool,
+        page_table,
+        seq_lens,
+        out,
+        int(window_left),
+        int(page_size),
+        float(bmm1_scale),
+        float(bmm2_scale),
+        gate if gate is not None else dummy,
+        float(norm_eps),
+        qkv if qkv is not None else dummy,
+        positions if positions is not None else seq_lens,
+        cos_sin if cos_sin is not None else dummy,
+        cache_loc if cache_loc is not None else seq_lens,
+        float(qk_eps),
     )
     return out

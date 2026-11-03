@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MoE-LD-W BF16 (``csrc/moe_ldwb.cuh``): routed BF16 experts of one expert-parallel rank for 1..512 token rows in one launch
 of one CTA per SM, streaming each active local expert's weights once per pass of routed rows (development build, not wired
 into any component).
@@ -43,8 +45,12 @@ def _flashinfer_include_paths() -> list[str]:
     import flashinfer
 
     data = Path(flashinfer.__file__).resolve().parent / "data"
-    paths = [data / "csrc" / "nv_internal", data / "csrc" / "nv_internal" / "include", data / "include",
-             data / "cutlass" / "include"]
+    paths = [
+        data / "csrc" / "nv_internal",
+        data / "csrc" / "nv_internal" / "include",
+        data / "include",
+        data / "cutlass" / "include",
+    ]
     return [str(p) for p in paths if p.exists()]
 
 
@@ -62,9 +68,19 @@ def _module(extra: tuple = ()):
         "muse_vr_moe_ldwb",
         *[re.sub(r"[^A-Za-z0-9_]", "_", e) for e in extra],
         cuda_files=[str(_CUH)],
-        cuda_wrappers=[("run", "muse_vr_ldwb::MuseVrLdwb::run"), ("preload", "muse_vr_ldwb::MuseVrLdwb::preload")],
+        cuda_wrappers=[
+            ("run", "muse_vr_ldwb::MuseVrLdwb::run"),
+            ("preload", "muse_vr_ldwb::MuseVrLdwb::preload"),
+        ],
         extra_include_paths=[str(_CSRC)] + _flashinfer_include_paths(),
-        extra_cuda_cflags=["-O3", "-use_fast_math", "-DENABLE_BF16", "-lineinfo", f"-DMUSE_VR_LDW_ABI={abi}", *extra],
+        extra_cuda_cflags=[
+            "-O3",
+            "-use_fast_math",
+            "-DENABLE_BF16",
+            "-lineinfo",
+            f"-DMUSE_VR_LDW_ABI={abi}",
+            *extra,
+        ],
     )
 
 
@@ -85,7 +101,9 @@ def place_relay(w: torch.Tensor) -> torch.Tensor:
         raise ValueError("place_relay needs a contiguous CUDA [P, 64, R, 64] stack")
     p = w.shape[0]
     chunk = w.numel() * w.element_size() // (2 * p)
-    raw = alloc_pattern(w.device, chunk, [(e & 1) ^ h for e in range(p) for h in (0, 1)])
+    raw = alloc_pattern(
+        w.device, chunk, [(e & 1) ^ h for e in range(p) for h in (0, 1)]
+    )
     out = raw.view(w.dtype).view(w.shape)
     out.copy_(w)
     return out
@@ -105,11 +123,19 @@ class Scratch:
         z = dict(device=device)
         passes = MAX_POOL + MAX_SLOTS // pass_rows
         self.pass_rows = pass_rows
-        relay_slots = passes * 96 if relay else 0  # one per (pass, FC1 / FC2 tile); rows of pass_rows fp32 columns
-        self.relay = torch.empty(relay_slots * 128 * pass_rows, dtype=torch.float32, **z) if relay else None
+        relay_slots = (
+            passes * 96 if relay else 0
+        )  # one per (pass, FC1 / FC2 tile); rows of pass_rows fp32 columns
+        self.relay = (
+            torch.empty(relay_slots * 128 * pass_rows, dtype=torch.float32, **z)
+            if relay
+            else None
+        )
         self.hs_perm = torch.zeros(MAX_SLOTS, ROW_BYTES, dtype=torch.uint8, **z)
         self.act = torch.zeros(MAX_SLOTS * ACT_WORDS, dtype=torch.int64, **z)
-        self.cnt = torch.zeros(2 * (2 * passes + 32 + relay_slots), dtype=torch.int32, **z)
+        self.cnt = torch.zeros(
+            2 * (2 * passes + 32 + relay_slots), dtype=torch.int32, **z
+        )
         self.ctl = torch.zeros(32, dtype=torch.int32, **z)
         self.err = torch.zeros(1, dtype=torch.int32, **z)
 
@@ -117,8 +143,19 @@ class Scratch:
         return int(self.err.item())
 
 
-def moe_ldwb(packed, hs, w13, w2, local_offset: int, scratch: Scratch, flags: int | None = None, dbg: int = 0,
-             pdl: bool = False, extra: tuple = (), stamps=None):
+def moe_ldwb(
+    packed,
+    hs,
+    w13,
+    w2,
+    local_offset: int,
+    scratch: Scratch,
+    flags: int | None = None,
+    dbg: int = 0,
+    pdl: bool = False,
+    extra: tuple = (),
+    stamps=None,
+):
     """``w13`` [P, 64, 8192, 64] / ``w2`` [P, 64, 4096, 64] BF16 (the stock block-major-K expert stacks), ``hs`` [M, 4096] BF16."""
     from ..moe_ld_ops import domain_slots
 
@@ -128,15 +165,39 @@ def moe_ldwb(packed, hs, w13, w2, local_offset: int, scratch: Scratch, flags: in
     if not 1 <= m <= MAX_TOKENS:
         raise ValueError(f"num_tokens {m} outside 1..{MAX_TOKENS}")
     if scratch.pass_rows != pass_rows_of(tuple(extra)):
-        raise ValueError(f"scratch for {scratch.pass_rows}-row passes, build with {pass_rows_of(tuple(extra))}-row passes")
+        raise ValueError(
+            f"scratch for {scratch.pass_rows}-row passes, build with {pass_rows_of(tuple(extra))}-row passes"
+        )
     dev = packed.device
-    table, n0, n1 = domain_slots(dev.index if dev.index is not None else torch.cuda.current_device())
+    table, n0, n1 = domain_slots(
+        dev.index if dev.index is not None else torch.cuda.current_device()
+    )
     out = torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device=dev)
     ew = torch.empty(m, TOP_K, dtype=torch.bfloat16, device=dev)
     e2p = torch.empty(m * TOP_K, dtype=torch.int32, device=dev)
     s = scratch
-    args = [packed, hs, w13, w2, table, out, ew.view(torch.int16), e2p, s.hs_perm, s.act, s.cnt, s.ctl, s.err, stamps,
-            int(local_offset), n0, n1, int(flags), int(dbg), int(bool(pdl))]
+    args = [
+        packed,
+        hs,
+        w13,
+        w2,
+        table,
+        out,
+        ew.view(torch.int16),
+        e2p,
+        s.hs_perm,
+        s.act,
+        s.cnt,
+        s.ctl,
+        s.err,
+        stamps,
+        int(local_offset),
+        n0,
+        n1,
+        int(flags),
+        int(dbg),
+        int(bool(pdl)),
+    ]
     if relay_of(tuple(extra)):
         if s.relay is None:
             raise ValueError("relay build needs Scratch(relay=True)")

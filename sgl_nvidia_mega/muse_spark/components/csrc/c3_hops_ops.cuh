@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Launch wrappers for the hop roles of c3_hops.cuh: the owner-row reduce-scatter as one persistent launch (every CTA first
 // pushes its share of this rank's rows to their owners, then folds the owned rows it serves), plain or source-masked.
 // Default off: used only through ops/c3_hops.py, which callers select with a default-off knob.

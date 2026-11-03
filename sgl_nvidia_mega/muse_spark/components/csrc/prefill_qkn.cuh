@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Prefill QK path in one pass: per-head RMS norm of the q and k heads of a QKV projection output, RoPE, q -> e4m3,
  * and the e4m3 K / V cache store, with the arithmetic of SGLang's fused QK-norm Triton kernel followed by its fused FP8

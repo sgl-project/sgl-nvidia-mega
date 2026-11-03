@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paged FP8 sliding-window verify attention for mid / large batches: SWA-T, JIT CUDA (``csrc/swa_t_verify_attn.cuh``).
 
 One thread-block cluster of kC CTAs per request: CTA c takes chunk c of the request's window tiles and runs
@@ -75,15 +77,40 @@ def _module(pairs: int, kc: int, gate: int, use_pdl: bool, pf: int):
 
     tpr = 2 if pairs == 1 else 1
     g = _gk(gate)
-    args = make_cpp_args(pairs, STAGES, use_pdl, 0, pf, 0, tpr, False, True, False, False, False, 0, DIET, g != 0, False, kc,
-                         16 if g == 2 else 8)
-    wrappers = [("swa_t", f"muse_vr::SwaTKernel<{args}>::run"),
-                ("swa_t_max_clusters", f"muse_vr::SwaTKernel<{args}>::max_clusters")]
+    args = make_cpp_args(
+        pairs,
+        STAGES,
+        use_pdl,
+        0,
+        pf,
+        0,
+        tpr,
+        False,
+        True,
+        False,
+        False,
+        False,
+        0,
+        DIET,
+        g != 0,
+        False,
+        kc,
+        16 if g == 2 else 8,
+    )
+    wrappers = [
+        ("swa_t", f"muse_vr::SwaTKernel<{args}>::run"),
+        ("swa_t_max_clusters", f"muse_vr::SwaTKernel<{args}>::max_clusters"),
+    ]
     if (pf >> 16) & 3:
         wrappers.append(("swa_t_qk", f"muse_vr::SwaTKernel<{args}>::run_qk"))
     extra = [f"-DSWAT_MAX_POLLS={SAN_POLLS}u"] if SAN_POLLS > 0 else []
-    return load_jit("muse_vr_swa_t" + (f"_san{SAN_POLLS}" if SAN_POLLS > 0 else ""), *args, cuda_files=[str(_CSRC)],
-                    cuda_wrappers=wrappers, extra_cuda_cflags=extra or None)
+    return load_jit(
+        "muse_vr_swa_t" + (f"_san{SAN_POLLS}" if SAN_POLLS > 0 else ""),
+        *args,
+        cuda_files=[str(_CSRC)],
+        cuda_wrappers=wrappers,
+        extra_cuda_cflags=extra or None,
+    )
 
 
 def qk_class(num_tokens: int, num_q_heads: int, num_kv_heads: int) -> int | None:
@@ -103,8 +130,11 @@ def qk_class(num_tokens: int, num_q_heads: int, num_kv_heads: int) -> int | None
 def _probe_module():
     from sglang.kernels.jit.utils import load_jit
 
-    return load_jit("muse_vr_swa_t_exp2_probe", cuda_files=[str(_CSRC)],
-                    cuda_wrappers=[("exp2_probe", "muse_vr::SwaTExp2Probe::run")])
+    return load_jit(
+        "muse_vr_swa_t_exp2_probe",
+        cuda_files=[str(_CSRC)],
+        cuda_wrappers=[("exp2_probe", "muse_vr::SwaTExp2Probe::run")],
+    )
 
 
 def exp2_probe(y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -115,11 +145,17 @@ def exp2_probe(y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return hw, poly
 
 
-def supported(num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int) -> bool:
+def supported(
+    num_q_heads: int, num_kv_heads: int, head_dim: int, page_size: int
+) -> bool:
     """2 KV heads per rank (one cluster per request), or 4 (one cluster per request and KV-head pair: grid z = pair; the
     same 2-head kernel, each cluster reads its pair's 128-byte half of the pool rows)."""
-    return (head_dim == HEAD_DIM and num_kv_heads in (2, 4) and num_q_heads == Q_PER_KV * num_kv_heads
-            and page_size == PAGE)
+    return (
+        head_dim == HEAD_DIM
+        and num_kv_heads in (2, 4)
+        and num_q_heads == Q_PER_KV * num_kv_heads
+        and page_size == PAGE
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -133,7 +169,9 @@ def _max_clusters(pairs: int, kc: int, device_index: int) -> int:
 
 
 def _kc_override(reqs: int, kv_heads: int = 2):
-    raw = os.environ.get("MUSE_VR_SWA_T_KC" if kv_heads == 2 else "MUSE_VR_SWA_T_KC_KV4", "").strip()
+    raw = os.environ.get(
+        "MUSE_VR_SWA_T_KC" if kv_heads == 2 else "MUSE_VR_SWA_T_KC_KV4", ""
+    ).strip()
     if not raw:
         return None
     table = dict(tuple(int(x) for x in e.split(":")) for e in raw.split(",") if e)
@@ -144,7 +182,9 @@ _kc_cache: dict = {}  # (clusters, gate, use_pdl, device index, pf) -> kC (0: no
 _loaded: set = set()  # (kc, gate, use_pdl, pf) modules built
 
 
-def kc_for(reqs: int, device, gate: bool = True, use_pdl: bool = True, kv_heads: int = 2) -> int:
+def kc_for(
+    reqs: int, device, gate: bool = True, use_pdl: bool = True, kv_heads: int = 2
+) -> int:
     """kC for `reqs` requests: MUSE_VR_SWA_T_KC's entry (2 KV heads; MUSE_VR_SWA_T_KC_KV4 at 4), else the largest kC in
     [2, KC_MAX] whose reqs x (kv_heads / 2) clusters are all resident at once (one wave); 0 when even kC = 2 does not fit
     (the caller runs another path)."""
@@ -156,13 +196,17 @@ def kc_for(reqs: int, device, gate: bool = True, use_pdl: bool = True, kv_heads:
     clusters = reqs * (kv_heads // 2)
     key = (clusters, bool(gate), bool(use_pdl), idx, pf)
     if key not in _kc_cache:
-        _kc_cache[key] = next((k for k in range(KC_MAX, 1, -1) if _max_clusters(1, k, idx) >= clusters), 0)
+        _kc_cache[key] = next(
+            (k for k in range(KC_MAX, 1, -1) if _max_clusters(1, k, idx) >= clusters), 0
+        )
     return _kc_cache[key]
 
 
 def _kc_known(reqs: int, device, gate: bool, use_pdl: bool, kv_heads: int) -> int:
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    return _kc_override(reqs, kv_heads) or _kc_cache.get((reqs * (kv_heads // 2), bool(gate), bool(use_pdl), idx, _pf()), 0)
+    return _kc_override(reqs, kv_heads) or _kc_cache.get(
+        (reqs * (kv_heads // 2), bool(gate), bool(use_pdl), idx, _pf()), 0
+    )
 
 
 def is_loaded(reqs: int, device, gate: bool, use_pdl: bool, kv_heads: int = 2) -> bool:
@@ -179,7 +223,9 @@ def qk_arith() -> str | None:
         from triton import knobs
 
         lang = knobs.language
-        fusion = bool(getattr(lang, "default_fp_fusion", True)) and not bool(getattr(lang, "force_disable_fp_fusion", False))
+        fusion = bool(getattr(lang, "default_fp_fusion", True)) and not bool(
+            getattr(lang, "force_disable_fp_fusion", False)
+        )
         return QK_ARITH.get((str(triton.__version__), fusion))
     except Exception:  # noqa: BLE001
         return None
@@ -193,14 +239,23 @@ def _pf_qk(reqs: int, kv_heads: int = 2) -> int:
     return _pf() | PF_QK[e] | (PF_QK_UNFUSED if arith == "unfused" else 0)
 
 
-def is_loaded_qk(reqs: int, device, gate: bool, use_pdl: bool, kv_heads: int = 2) -> bool:
+def is_loaded_qk(
+    reqs: int, device, gate: bool, use_pdl: bool, kv_heads: int = 2
+) -> bool:
     kc = _kc_known(reqs, device, gate, use_pdl, kv_heads)
     pf = _pf_qk(reqs, kv_heads)
     return bool(kc) and bool(pf) and (kc, _gk(gate), bool(use_pdl), pf) in _loaded
 
 
-def preload(max_reqs: int, device, gate: bool = True, use_pdl: bool = True, min_reqs: int = 1, qk: bool = False,
-            kv_heads: int = 2) -> None:
+def preload(
+    max_reqs: int,
+    device,
+    gate: bool = True,
+    use_pdl: bool = True,
+    min_reqs: int = 1,
+    qk: bool = False,
+    kv_heads: int = 2,
+) -> None:
     """Pick kC and build the module for every request count in [min_reqs, max_reqs] (before graph capture); qk: also the
     QK-prologue module of each count's column class."""
     for r in range(max(1, min_reqs), max_reqs + 1):
@@ -218,12 +273,19 @@ _workspace: dict = {}
 
 
 def _ws(device):
-    key = (device.type, device.index if device.index is not None else torch.cuda.current_device())
+    key = (
+        device.type,
+        device.index if device.index is not None else torch.cuda.current_device(),
+    )
     ws = _workspace.get(key)
     if ws is None:
         # the kernel keeps its records in shared memory; the workspace only satisfies the launcher's argument checks
-        ws = (torch.zeros(2 * 4 * ROWS * REC_FLOATS, dtype=torch.float32, device=device),  # up to 4 KV heads per rank
-              torch.zeros(MAX_REQUESTS, dtype=torch.int32, device=device))
+        ws = (
+            torch.zeros(
+                2 * 4 * ROWS * REC_FLOATS, dtype=torch.float32, device=device
+            ),  # up to 4 KV heads per rank
+            torch.zeros(MAX_REQUESTS, dtype=torch.int32, device=device),
+        )
         _workspace[key] = ws
     return ws
 
@@ -271,8 +333,29 @@ def swa_t_verify_attn(
     mod = _module(1, kc, gk, bool(use_pdl), pf)
     _loaded.add((kc, gk, bool(use_pdl), pf))
     off = counters[:1]
-    mod.swa_t(q, k_pool, v_pool, page_table, seq_lens, out, ws, counters, 1, float(bmm1_scale), float(bmm2_scale),
-              counters, counters, 0, 0, 0, 0, 0, int(window_left), gate if gate is not None else off, float(norm_eps))
+    mod.swa_t(
+        q,
+        k_pool,
+        v_pool,
+        page_table,
+        seq_lens,
+        out,
+        ws,
+        counters,
+        1,
+        float(bmm1_scale),
+        float(bmm2_scale),
+        counters,
+        counters,
+        0,
+        0,
+        0,
+        0,
+        0,
+        int(window_left),
+        gate if gate is not None else off,
+        float(norm_eps),
+    )
     return out
 
 
@@ -320,7 +403,23 @@ def swa_t_verify_attn_qk(
     mod = _module(1, kc, gk, bool(use_pdl), pf)
     _loaded.add((kc, gk, bool(use_pdl), pf))
     off = counters[:1]
-    mod.swa_t_qk(qkv, k_pool, v_pool, page_table, seq_lens, out, ws, counters, positions, cos_sin, cache_loc,
-                 float(bmm1_scale), float(bmm2_scale), int(window_left), gate if gate is not None else off, float(norm_eps),
-                 float(qk_eps))
+    mod.swa_t_qk(
+        qkv,
+        k_pool,
+        v_pool,
+        page_table,
+        seq_lens,
+        out,
+        ws,
+        counters,
+        positions,
+        cos_sin,
+        cache_loc,
+        float(bmm1_scale),
+        float(bmm2_scale),
+        int(window_left),
+        gate if gate is not None else off,
+        float(norm_eps),
+        float(qk_eps),
+    )
     return out

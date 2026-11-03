@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 /**
  * \brief Paged FP8 (e4m3) attention for speculative verify with tensor-core MMA (tcgen05): 8 query tokens per
  * request, 8 query heads per KV head, head_dim 64, page size 128. The key range of a request (all keys for full

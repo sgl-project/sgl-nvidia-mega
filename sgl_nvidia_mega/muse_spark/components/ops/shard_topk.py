@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Row-wise top-16 of a bf16 matrix, sorted by value (descending), equal values by ascending column (JIT CUDA).
 
 See ``csrc/shard_topk.cuh``.
@@ -29,14 +31,24 @@ def module(pdl: bool):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
     args = make_cpp_args(pdl)
-    return load_jit("muse_vr_shard_topk", *args, cuda_files=[str(_CSRC)],
-                    cuda_wrappers=[("run", f"muse_vr::shard_topk::ShardTopK<{args}>::run")])
+    return load_jit(
+        "muse_vr_shard_topk",
+        *args,
+        cuda_files=[str(_CSRC)],
+        cuda_wrappers=[("run", f"muse_vr::shard_topk::ShardTopK<{args}>::run")],
+    )
 
 
 def supported(x: torch.Tensor) -> bool:
     return (
-        x.is_cuda and x.dim() == 2 and x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 8 == 0
-        and x.data_ptr() % 16 == 0 and K <= x.shape[1] and -(-x.shape[1] // CHUNK) <= MAX_CHUNKS
+        x.is_cuda
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.stride(1) == 1
+        and x.stride(0) % 8 == 0
+        and x.data_ptr() % 16 == 0
+        and K <= x.shape[1]
+        and -(-x.shape[1] // CHUNK) <= MAX_CHUNKS
     )
 
 

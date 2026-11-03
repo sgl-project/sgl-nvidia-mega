@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Component ``draft_boundary`` (env ``MUSE_VR_DRAFT_BOUNDARY=1``, default off).
 
 Each DFlash draft decoder layer ends both of its sublayers the same way: the row-parallel projection (attention
@@ -70,15 +72,36 @@ BLOCK = 8
 # dispatch, the RMSNorm module, the custom all-reduce (plane, protocol, kernel), the convolution's compiled source and
 # the draft QK-norm + RoPE kernel.
 PINS = {
-    "sglang/srt/models/dflash.py": ("59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff", "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b"),
+    "sglang/srt/models/dflash.py": (
+        "59ae9eab87fd3416828604018c36ad6a57be07c4ff6d17f699bb9c0be8c719ff",
+        "b7b541368cbbb072a679d08ba5bf0f952f4a43f02b6c078562b2ea7a9ddfd01b",
+    ),
     "sglang/srt/layers/linear.py": "3ce31df0a8aab09ed8afa0ada8c0ce30ca207a748c02c3073d7f53648b9b7c3c",
-    "sglang/srt/distributed/parallel_state.py": ("49f4ecb8627b469d1e6972ba6eba0c54412ea5eec756da587b3ad375f607a5c7", "b6c0cd98a81e884c7c4677bd783b3b0cb4eb1438c93540a520296595e8a2ff2d"),
-    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": ("277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001", "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5"),
-    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": ("ec14bbf6b02c481daad053dce6246d684a957cc66aa58a464a15ef117a094258", "693fc6e5b73478bab41a6ea93c1636b180c0e2ddb733794d80f370efa9427c9a"),
+    "sglang/srt/distributed/parallel_state.py": (
+        "49f4ecb8627b469d1e6972ba6eba0c54412ea5eec756da587b3ad375f607a5c7",
+        "b6c0cd98a81e884c7c4677bd783b3b0cb4eb1438c93540a520296595e8a2ff2d",
+    ),
+    "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "277da88e2837e585f3ebdf4122906d29ea7a96cc30b981f7a028f6f63b6cf001",
+        "f7b23a55019734be7b2f1958e20cc1f78a31251a035f2d75885911aa4a46e6b5",
+    ),
+    "sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh": (
+        "ec14bbf6b02c481daad053dce6246d684a957cc66aa58a464a15ef117a094258",
+        "693fc6e5b73478bab41a6ea93c1636b180c0e2ddb733794d80f370efa9427c9a",
+    ),
     "sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh": "30d5c75e86e86da7ce99cd6eab85212fdbc71f83a8e3c715c4e9f2c6c1d8986f",
-    "sglang/srt/layers/layernorm.py": ("98072d836e0c77312058521ee1015c80177b2c370da7408fd066eec61015ff21", "253ff80cef7def9af6caa4b4d700c1aaa7d133cf7c26f50da7d855a6a2ea0c21"),
-    "sglang/srt/layers/moe/utils.py": ("dd4bc85f40ee72622631b8dee52ed8a6368bf4dc257a4a78228901d283a63dd0", "a0c0cc2eaa112e3b3e79db07814735f99c099ab9d80c6fd5cfa10f8890d26ce6"),
-    "sglang/srt/speculative/dflash_utils.py": ("6e0423578bade4a8c58b921430df678840c6fa2de6ea411fe58eb77c98d5a820", "35e885f930e95ed82a1f47a0dfa2dab583225d170c6cabe54f6c7bb4e3abbf79"),
+    "sglang/srt/layers/layernorm.py": (
+        "98072d836e0c77312058521ee1015c80177b2c370da7408fd066eec61015ff21",
+        "253ff80cef7def9af6caa4b4d700c1aaa7d133cf7c26f50da7d855a6a2ea0c21",
+    ),
+    "sglang/srt/layers/moe/utils.py": (
+        "dd4bc85f40ee72622631b8dee52ed8a6368bf4dc257a4a78228901d283a63dd0",
+        "a0c0cc2eaa112e3b3e79db07814735f99c099ab9d80c6fd5cfa10f8890d26ce6",
+    ),
+    "sglang/srt/speculative/dflash_utils.py": (
+        "6e0423578bade4a8c58b921430df678840c6fa2de6ea411fe58eb77c98d5a820",
+        "35e885f930e95ed82a1f47a0dfa2dab583225d170c6cabe54f6c7bb4e3abbf79",
+    ),
 }
 
 _state: dict = {"loaded": set()}
@@ -132,7 +155,11 @@ def _reduce_group(linear):
     from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
     from sglang.srt.runtime_context import get_parallel
 
-    if linear.use_decode_attn_tp or should_skip_mlp_all_reduce() or not linear.reduce_results:
+    if (
+        linear.use_decode_attn_tp
+        or should_skip_mlp_all_reduce()
+        or not linear.reduce_results
+    ):
         return None
     if linear.use_dp_attention_reduce:
         return get_parallel().attn_tp_group
@@ -145,7 +172,9 @@ def _reduce_group(linear):
 
 def _model_eligible(model, hidden: torch.Tensor):
     """(reason, context) for one draft forward."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import CustomAllReduceV2
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
     from sglang.srt.runtime_context import get_forward
 
     from .ar_attn_boundary import _stock_ar_is_one_shot_push
@@ -161,7 +190,11 @@ def _model_eligible(model, hidden: torch.Tensor):
     if get_forward().sp_active:
         return "sequence parallel", None
     layers = list(model.layers)
-    norms = [ly.input_layernorm for ly in layers] + [ly.post_attention_layernorm for ly in layers] + [model.norm]
+    norms = (
+        [ly.input_layernorm for ly in layers]
+        + [ly.post_attention_layernorm for ly in layers]
+        + [model.norm]
+    )
     if not all(_plain_residual_norm(n) for n in norms):
         return "norm configuration", None
     group = None
@@ -169,7 +202,12 @@ def _model_eligible(model, hidden: torch.Tensor):
         if ly.attention_conv is None or ly.mlp_conv is None:
             return "no block convolution", None
         for conv in (ly.attention_conv, ly.mlp_conv):
-            if conv.taps != 2 or conv.group_size != 16 or conv.block_size != BLOCK or conv.base_kernel.dtype != torch.bfloat16:
+            if (
+                conv.taps != 2
+                or conv.group_size != 16
+                or conv.block_size != BLOCK
+                or conv.base_kernel.dtype != torch.bfloat16
+            ):
                 return "convolution shape", None
         for lin in (ly.self_attn.o_proj, ly.mlp.down_proj):
             g = _reduce_group(lin)
@@ -177,13 +215,20 @@ def _model_eligible(model, hidden: torch.Tensor):
                 return "reduce configuration", None
             group = g
     comm = getattr(group, "ca_comm", None)
-    if group.world_size not in (2, 4, 8) or not isinstance(comm, CustomAllReduceV2) or comm.disabled:
+    if (
+        group.world_size not in (2, 4, 8)
+        or not isinstance(comm, CustomAllReduceV2)
+        or comm.disabled
+    ):
         return "no custom all-reduce", None
     probe = torch.empty((m, hdim), dtype=torch.bfloat16, device=hidden.device)
     if not _stock_ar_is_one_shot_push(group, probe):
         return "stock all-reduce not one-shot push", None
     cluster = op.cluster_for(m)
-    if m * hdim * 2 > int(comm.max_push_size) or int(comm.config.num_push_blocks) < cluster:
+    if (
+        m * hdim * 2 > int(comm.max_push_size)
+        or int(comm.config.num_push_blocks) < cluster
+    ):
         return "rows above push plane capacity", None
     key = (hdim, group.world_size, op.use_pdl(), cluster, hidden.device.index)
     if torch.cuda.is_current_stream_capturing():
@@ -198,7 +243,12 @@ def _model_eligible(model, hidden: torch.Tensor):
 def _coef_view(kern: torch.Tensor):
     """(base tensor, element offset, row stride) of the output-side coefficient view ``prepare`` returns."""
     base = kern._base if kern._base is not None else kern
-    if not base.is_contiguous() or kern.dim() != 3 or kern.stride(2) != 1 or kern.stride(1) != kern.shape[2]:
+    if (
+        not base.is_contiguous()
+        or kern.dim() != 3
+        or kern.stride(2) != 1
+        or kern.stride(1) != kern.shape[2]
+    ):
         return None
     return base, kern.storage_offset() - base.storage_offset(), kern.stride(0)
 
@@ -208,7 +258,17 @@ def _boundary(comm, partial, coef, conv, residual, norm):
     from .ops import draft_ar_norm as op
 
     base, off, stride = coef
-    return op.run(comm, partial, base, off, stride, conv.base_kernel[1], residual, norm.weight, norm.variance_epsilon)
+    return op.run(
+        comm,
+        partial,
+        base,
+        off,
+        stride,
+        conv.base_kernel[1],
+        residual,
+        norm.weight,
+        norm.variance_epsilon,
+    )
 
 
 def _prepare(conv, h, use_gemv):
@@ -216,7 +276,9 @@ def _prepare(conv, h, use_gemv):
     if use_gemv:
         from .ops import draft_gemv
 
-        h_conv, coef = draft_gemv.conv_in(h, conv.kernel_projection.weight, conv.base_kernel[0])
+        h_conv, coef = draft_gemv.conv_in(
+            h, conv.kernel_projection.weight, conv.base_kernel[0]
+        )
         groups = coef.shape[1] // 4
         return h_conv, (coef, 2 * groups, 4 * groups)
     h_conv, kern = conv.prepare(h)
@@ -231,18 +293,30 @@ def _prepare(conv, h, use_gemv):
 
 
 def _gemv_eligible(model, m: int) -> bool:
-    if not bed.flag("draft_gemv") or m > bed.env_int("MUSE_VR_DRAFT_GEMV_MAX_M", 16) or m % BLOCK:
+    if (
+        not bed.flag("draft_gemv")
+        or m > bed.env_int("MUSE_VR_DRAFT_GEMV_MAX_M", 16)
+        or m % BLOCK
+    ):
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
     for ly in model.layers:
         for conv in (ly.attention_conv, ly.mlp_conv):
             kp = conv.kernel_projection
-            if type(kp) is not torch.nn.Linear or kp.bias is not None or kp.weight.dtype != torch.bfloat16:
+            if (
+                type(kp) is not torch.nn.Linear
+                or kp.bias is not None
+                or kp.weight.dtype != torch.bfloat16
+            ):
                 return False
         gu = ly.mlp.gate_up_proj
-        if not isinstance(gu.quant_method, UnquantizedLinearMethod) or gu.bias is not None or (
-                gu.weight.dtype != torch.bfloat16) or not gu.weight.is_contiguous():
+        if (
+            not isinstance(gu.quant_method, UnquantizedLinearMethod)
+            or gu.bias is not None
+            or (gu.weight.dtype != torch.bfloat16)
+            or not gu.weight.is_contiguous()
+        ):
             return False
     return True
 
@@ -258,7 +332,13 @@ def _gemv_ready(m: int, device) -> bool:
         return False
     t = draft_gemv.token_tile(m)
     for epi, boxes in ((draft_gemv.EPI_CONV, 4), (draft_gemv.EPI_SWIGLU, 2)):
-        draft_gemv.module(t, draft_gemv.Tactic.parse(draft_gemv.DEFAULTS[epi]), boxes, epi, draft_gemv.use_pdl())
+        draft_gemv.module(
+            t,
+            draft_gemv.Tactic.parse(draft_gemv.DEFAULTS[epi]),
+            boxes,
+            epi,
+            draft_gemv.use_pdl(),
+        )
     _state["loaded"].add(key)
     return True
 
@@ -273,14 +353,25 @@ def _qk_eligible(model, flag_name: str = "draft_qk") -> bool:
         return False
     for ly in model.layers:
         a = ly.self_attn
-        if type(a) is not d.DFlashAttention or not a.use_table_qk_norm_rope or a.v_scale is not None or (
-                a.attention_sink_bias is not None):
+        if (
+            type(a) is not d.DFlashAttention
+            or not a.use_table_qk_norm_rope
+            or a.v_scale is not None
+            or (a.attention_sink_bias is not None)
+        ):
             return False
         qp = a.qkv_proj
-        if not isinstance(qp.quant_method, UnquantizedLinearMethod) or qp.weight.dtype != torch.bfloat16:
+        if (
+            not isinstance(qp.quant_method, UnquantizedLinearMethod)
+            or qp.weight.dtype != torch.bfloat16
+        ):
             return False
         for w in (a.q_norm.weight, a.k_norm.weight):
-            if w.dtype != torch.bfloat16 or not w.is_contiguous() or w.numel() != a.head_dim:
+            if (
+                w.dtype != torch.bfloat16
+                or not w.is_contiguous()
+                or w.numel() != a.head_dim
+            ):
                 return False
     return True
 
@@ -302,8 +393,17 @@ def _attention_qk(attn, positions, hidden_states, forward_batch):
     from .ops.draft_qk import qk_norm_rope_qout
 
     qkv, _ = attn.qkv_proj(hidden_states)
-    q = qk_norm_rope_qout(qkv, positions, attn.q_norm.weight, attn.k_norm.weight, attn.rotary_emb.cos_sin_cache,
-                          attn.num_heads, attn.num_kv_heads, attn.head_dim, attn.q_norm.variance_epsilon)
+    q = qk_norm_rope_qout(
+        qkv,
+        positions,
+        attn.q_norm.weight,
+        attn.k_norm.weight,
+        attn.rotary_emb.cos_sin_cache,
+        attn.num_heads,
+        attn.num_kv_heads,
+        attn.head_dim,
+        attn.q_norm.variance_epsilon,
+    )
     _, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
     out = attn.attn(q.view(q.shape[0], attn.q_size), k, v, forward_batch)
     out, _ = attn.o_proj(out, skip_all_reduce=True)
@@ -316,8 +416,17 @@ def _attention_qk_full(attn, positions, hidden_states, forward_batch):
     from .ops.draft_qk import qk_norm_rope_qout
 
     qkv, _ = attn.qkv_proj(hidden_states)
-    q = qk_norm_rope_qout(qkv, positions, attn.q_norm.weight, attn.k_norm.weight, attn.rotary_emb.cos_sin_cache,
-                          attn.num_heads, attn.num_kv_heads, attn.head_dim, attn.q_norm.variance_epsilon)
+    q = qk_norm_rope_qout(
+        qkv,
+        positions,
+        attn.q_norm.weight,
+        attn.k_norm.weight,
+        attn.rotary_emb.cos_sin_cache,
+        attn.num_heads,
+        attn.num_kv_heads,
+        attn.head_dim,
+        attn.q_norm.variance_epsilon,
+    )
     _, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
     out = attn.attn(q.view(q.shape[0], attn.q_size), k, v, forward_batch)
     out = attn.apply_attention_output(out, hidden_states)
@@ -345,7 +454,9 @@ def _qk_wide_layers(model):
             del a.forward
 
 
-def _fused_forward(model, positions, hidden, forward_batch, comm, use_gemv, use_qk=False):
+def _fused_forward(
+    model, positions, hidden, forward_batch, comm, use_gemv, use_qk=False
+):
     """DFlashDraftModel.forward (pinned revision) with the layer boundaries fused."""
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
@@ -358,8 +469,19 @@ def _fused_forward(model, positions, hidden, forward_batch, comm, use_gemv, use_
             partial = _attention_qk(layer.self_attn, positions, h_conv, forward_batch)
         else:
             with _deferred_reduce(layer.self_attn.o_proj):
-                partial = layer.self_attn(positions=positions, hidden_states=h_conv, forward_batch=forward_batch)
-        h = _boundary(comm, partial, coef, layer.attention_conv, residual, layer.post_attention_layernorm)
+                partial = layer.self_attn(
+                    positions=positions,
+                    hidden_states=h_conv,
+                    forward_batch=forward_batch,
+                )
+        h = _boundary(
+            comm,
+            partial,
+            coef,
+            layer.attention_conv,
+            residual,
+            layer.post_attention_layernorm,
+        )
         h_conv, coef = _prepare(layer.mlp_conv, h, use_gemv)
         if use_gemv:
             from .ops import draft_gemv
@@ -374,7 +496,14 @@ def _fused_forward(model, positions, hidden, forward_batch, comm, use_gemv, use_
     return LogitsProcessorOutput(next_token_logits=None, hidden_states=h)
 
 
-_ARGS = ("input_ids", "positions", "forward_batch", "input_embeds", "get_embedding", "pp_proxy_tensors")
+_ARGS = (
+    "input_ids",
+    "positions",
+    "forward_batch",
+    "input_embeds",
+    "get_embedding",
+    "pp_proxy_tensors",
+)
 
 
 def draft_forward(original, model, *args, **kwargs):
@@ -402,9 +531,20 @@ def draft_forward(original, model, *args, **kwargs):
     m = hidden.shape[0]
     use_gemv = _gemv_eligible(model, m) and _gemv_ready(m, hidden.device)
     use_qk = _qk_eligible(model) and _qk_ready(hidden.device)
-    bed.count(NAME, f"fused:rows={m}:tp={comm.world_size}:gemv={int(use_gemv)}:qk={int(use_qk)}")
+    bed.count(
+        NAME,
+        f"fused:rows={m}:tp={comm.world_size}:gemv={int(use_gemv)}:qk={int(use_qk)}",
+    )
     with torch.no_grad():
-        return _fused_forward(model, bound["positions"], hidden, bound["forward_batch"], comm, use_gemv, use_qk)
+        return _fused_forward(
+            model,
+            bound["positions"],
+            hidden,
+            bound["forward_batch"],
+            comm,
+            use_gemv,
+            use_qk,
+        )
 
 
 def register() -> bool:

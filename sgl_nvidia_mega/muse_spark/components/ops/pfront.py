@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Sequence-parallel MoE front (JIT CUDA): the pre-expert RMSNorm of [T, 4096] bf16 rows and the per-token NVFP4
 quantization of the normalized rows in one kernel, bitwise to the stock pair (torch RMSNorm -> bf16 -> FlashInfer
 per-token NVFP4, linear scale layout, fast-math scale path). See ``csrc/pfront.cuh`` and ``tests/test_pfront.py``.
@@ -18,7 +20,11 @@ HIDDEN = 4096
 def _module():
     from sglang.kernels.jit.utils import load_jit
 
-    return load_jit("muse_vr_pfront", cuda_files=[str(_CSRC)], cuda_wrappers=[("pfront", "muse_vr::PFront::run")])
+    return load_jit(
+        "muse_vr_pfront",
+        cuda_files=[str(_CSRC)],
+        cuda_wrappers=[("pfront", "muse_vr::PFront::run")],
+    )
 
 
 def pfront(x: torch.Tensor, weight: torch.Tensor, eps: float, global_scale_inv: float):

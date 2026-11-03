@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Cross-rank hop device API, version 2 (header only). Arena and host helpers: ../ops/lb_hop.py; test kernels:
 // lb_hop_ops.cuh.
 //

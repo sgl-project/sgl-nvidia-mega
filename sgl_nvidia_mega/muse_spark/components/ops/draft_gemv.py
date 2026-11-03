@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Weight-streaming BF16 GEMV for the DFlash draft layers, with fused epilogues (``csrc/draft_gemv.cuh``).
 
 ``conv_in(x, w, base0, tactic)``: the block convolution's coefficient projection (``w`` [4 G, H]) with the input-side
@@ -36,7 +38,7 @@ class Tactic:
         return f"r{self.rows}k{self.step_k}s{self.stages}w{self.warps}c{self.cluster}"
 
     @staticmethod
-    def parse(s: str) -> "Tactic":
+    def parse(s: str) -> Tactic:
         m = re.fullmatch(r"r(\d+)k(\d+)s(\d+)w(\d+)c(\d+)", s)
         if not m:
             raise ValueError(f"bad tactic {s!r}")
@@ -75,7 +77,9 @@ def use_pdl() -> bool:
 def module(tok_tile: int, t: Tactic, boxes: int, epi: int, pdl: bool):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
-    args = make_cpp_args(tok_tile, t.rows, t.step_k, t.stages, t.warps, t.cluster, boxes, epi, pdl)
+    args = make_cpp_args(
+        tok_tile, t.rows, t.step_k, t.stages, t.warps, t.cluster, boxes, epi, pdl
+    )
     name = {EPI_PLAIN: "run", EPI_CONV: "run_conv", EPI_SWIGLU: "run_swiglu"}[epi]
     return load_jit(
         "muse_vr_draft_gemv",
@@ -98,7 +102,9 @@ def conv_in(x, w, base0, tactic=None, conv_out=None, coef_out=None, pdl=None):
         conv_out = torch.empty((m, h), dtype=x.dtype, device=x.device)
     if coef_out is None:
         coef_out = torch.empty((m, w.shape[0]), dtype=x.dtype, device=x.device)
-    module(token_tile(m), t, 4, EPI_CONV, use_pdl() if pdl is None else pdl).run_conv(x, w, base0, conv_out, coef_out)
+    module(token_tile(m), t, 4, EPI_CONV, use_pdl() if pdl is None else pdl).run_conv(
+        x, w, base0, conv_out, coef_out
+    )
     return conv_out, coef_out
 
 
@@ -107,7 +113,9 @@ def swiglu(x, w, tactic=None, out=None, pdl=None):
     m = x.shape[0]
     if out is None:
         out = torch.empty((m, w.shape[0] // 2), dtype=x.dtype, device=x.device)
-    module(token_tile(m), t, 2, EPI_SWIGLU, use_pdl() if pdl is None else pdl).run_swiglu(x, w, out)
+    module(
+        token_tile(m), t, 2, EPI_SWIGLU, use_pdl() if pdl is None else pdl
+    ).run_swiglu(x, w, out)
     return out
 
 
@@ -116,5 +124,7 @@ def plain(x, w, tactic=None, out=None, pdl=None):
     m = x.shape[0]
     if out is None:
         out = torch.empty((m, w.shape[0]), dtype=x.dtype, device=x.device)
-    module(token_tile(m), t, 1, EPI_PLAIN, use_pdl() if pdl is None else pdl).run(x, w, out)
+    module(token_tile(m), t, 1, EPI_PLAIN, use_pdl() if pdl is None else pdl).run(
+        x, w, out
+    )
     return out

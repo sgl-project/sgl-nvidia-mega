@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Row kernels of the routed-expert path: per-token NVFP4 quantization of the expert-sorted rows (the input of the second
 // expert GEMM), and the copy of the call's NVFP4 activations into sorted-row order (the input of the first expert GEMM).
 //
