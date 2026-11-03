@@ -1,4 +1,6 @@
 // Copied from SGLang (Apache-2.0, see ../LICENSE.sglang): python/sglang/kernels/jit/include/sgl_kernel/warp.cuh
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 // at commit a55ab7d5ae1bba59ac351e55026fe7f7644ecc5f.
 // Modified by NVIDIA: the f32 redux.sync max/min asm statements are marked volatile so the compiler cannot
 // move the warp-collective into a divergent branch (same change as upstream SGLang PR #44137).
