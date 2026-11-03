@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 # Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see include/LICENSE.sglang.
 # MHATokenToKVPoolNVFP4Host follows MHATokenToKVPoolMXFP8Host (python/sglang/srt/mem_cache/pool_host/mha_mxfp8.py at
 # the pinned revision).

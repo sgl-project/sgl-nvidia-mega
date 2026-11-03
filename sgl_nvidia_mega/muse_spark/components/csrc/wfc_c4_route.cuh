@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 // Sources: SGLang python/sglang/kernels/jit/csrc/muse_spark/routing.cuh (routing_kernel) and
 // python/sglang/kernels/jit/csrc/muse_spark/norm_fp4_quant.cuh (muse_spark_norm_fp4_quant_kernel); the helpers they use are

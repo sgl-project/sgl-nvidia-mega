@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 // Source: SGLang python/sglang/kernels/jit/csrc/muse_spark/norm_residual.cuh (the one-CTA-per-row path) at revision 306ccf6,
 // through the owner-row norm role owner_norm_row (wfc_c4_norm.cuh).

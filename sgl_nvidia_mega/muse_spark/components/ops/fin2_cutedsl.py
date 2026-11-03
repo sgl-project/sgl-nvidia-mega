@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 # Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 # Source: python/sglang/kernels/ops/communication/muse_spark_moe_finalize_all_reduce_cutedsl.py at revision 306ccf6.
 # Modified by NVIDIA: the one-shot push exchange of the fused finalize is replaced by a two-shot exchange through a

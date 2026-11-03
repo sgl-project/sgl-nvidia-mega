@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 # Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see include/LICENSE.sglang.
 # build_hybrid_swa_kv_pool follows KVCacheConfigurator._build_hybrid_swa_kv_pool (python/sglang/srt/mem_cache/
 # kv_cache_configurator.py at the pinned revision).

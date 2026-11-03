@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Portions Copyright 2023-2024 SGLang Team (Apache-2.0)
 // Derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0; see ../include/LICENSE.sglang.
 // Sources: SGLang python/sglang/kernels/jit/csrc/distributed/nvlink_comm.cuh (nvlink_pull_kernel and the pull half of
 // NVLinkComm) and python/sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh (McBarrier) at revision
