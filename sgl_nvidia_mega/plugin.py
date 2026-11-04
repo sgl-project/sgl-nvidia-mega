@@ -23,6 +23,10 @@ SPECS = (
     # The MTP draft offers EAGLE draft-loop and draft-extend entries.
     ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
+    # GLM-5.3 and GLM-5.2: the MTP target verify step
+    ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm5_3.spec:SPEC"),
+    # the NextN draft (ModelConfig names a GLM draft's architecture this way)
+    ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
