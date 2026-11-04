@@ -229,11 +229,28 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "engram_history",
         "engram_host_table",
     }
+    # Startup agreement is a host preparation API, not a borrowed runtime-view
+    # callable to replace with data. Keep its exact signature covered separately.
+    preparation = {"megakernel_agree"}
     for path in READERS:
         names = {n.split("(", 1)[0] for n in _declared(path).get(BINDING, ())}
-        untolerated = names - callables - data
+        untolerated = names - callables - data - preparation
         untolerated = {n for n in untolerated if not n.startswith("get_")}
         assert not untolerated, f"{_id(path)}: {sorted(untolerated)}"
+
+
+def test_native_preparation_agreement_signature():
+    binding = _tree(_files(BINDING)[0])
+    agree = next(
+        node
+        for node in binding.body
+        if isinstance(node, ast.FunctionDef) and node.name == "megakernel_agree"
+    )
+    assert [arg.arg for arg in agree.args.args] == ["value"]
+    assert [arg.arg for arg in agree.args.kwonlyargs] == ["what", "group"]
+    assert agree.args.kw_defaults[0] is None
+    assert ast.literal_eval(agree.args.kw_defaults[1]) is None
+    assert agree.args.vararg is None and agree.args.kwarg is None
 
 
 def _mirrors(path: Path) -> dict:

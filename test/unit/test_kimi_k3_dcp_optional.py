@@ -3,7 +3,7 @@
 """Dormant DCP import/activation boundaries, not GPU qualification."""
 
 import builtins
-import importlib.util
+import importlib
 from unittest.mock import patch
 
 import pytest
@@ -27,7 +27,11 @@ CASES = (
 @pytest.mark.parametrize("module,name,constructor", CASES)
 def test_native_optional_boundary(module, name, constructor):
     """Use the real installed framework, without creating substitute modules."""
-    if importlib.util.find_spec(name) is None:
+    try:
+        native = importlib.import_module(name)
+    except ModuleNotFoundError as error:
+        if error.name != name:
+            raise
         # Reject before inspecting resources or preparing any device state.
         with pytest.raises(
             RuntimeError, match="requires the SGLang DCP binding extension"
@@ -36,7 +40,6 @@ def test_native_optional_boundary(module, name, constructor):
         assert isinstance(caught.value.__cause__, ModuleNotFoundError)
         assert caught.value.__cause__.name == name
     else:
-        native = __import__(name, fromlist=["*"])
         declared = next(iter(module.SGLANG_OPTIONAL_READS.values()))
         assert module._native_types() == tuple(
             getattr(native, value) for value in declared

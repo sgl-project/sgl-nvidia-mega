@@ -70,9 +70,10 @@ def _execute(guard, *, new_error=None, old_error=None, missing_symbol=False):
 
 
 class TestKimiK3ImportCompatibility(unittest.TestCase):
-    def test_all_four_guards_prefer_new_types_when_both_paths_exist(self):
+    def test_all_five_guards_prefer_new_types_when_both_paths_exist(self):
         guards = _guards()
-        self.assertEqual(len(guards), 4)  # spec, its annotation, pool and step
+        # Spec, its annotation, capture-width agreement, pool and step.
+        self.assertEqual(len(guards), 5)
         for filename, guard in guards:
             with self.subTest(file=filename, module=guard.body[0].module):
                 run, namespace, new, _, calls = _execute(guard)
