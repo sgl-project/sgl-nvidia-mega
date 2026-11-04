@@ -15,7 +15,7 @@ import torch
 from .dcp_execution import _kda_type, _pool_tensor
 from .dcp_resources import DcpResources, PreparedDcpMla, _identity, _native_context
 
-SGLANG_READS = {
+SGLANG_OPTIONAL_READS = {
     "srt/kernel_plugins/nvidia/_dcp_verify_binding.py": (
         "_DcpVerifyBinding",
         "_DcpVerifyBucket",
@@ -25,11 +25,19 @@ SGLANG_READS = {
 
 
 def _native_types():
-    from sglang.srt.kernel_plugins.nvidia._dcp_verify_binding import (
-        _DcpVerifyBinding,
-        _DcpVerifyBucket,
-        _DcpVerifyStepView,
-    )
+    try:
+        from sglang.srt.kernel_plugins.nvidia._dcp_verify_binding import (
+            _DcpVerifyBinding,
+            _DcpVerifyBucket,
+            _DcpVerifyStepView,
+        )
+    except ModuleNotFoundError as error:
+        if error.name != "sglang.srt.kernel_plugins.nvidia._dcp_verify_binding":
+            raise
+        raise RuntimeError(
+            "Kimi DCP verification requires the SGLang DCP binding extension; "
+            "ordinary DCP-off execution remains available"
+        ) from error
 
     return _DcpVerifyBinding, _DcpVerifyBucket, _DcpVerifyStepView
 

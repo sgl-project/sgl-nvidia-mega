@@ -11,6 +11,9 @@ A module whose stock step mirrors an SGLang function lists it in ``SGLANG_MIRROR
 with the digest of its code, so a changed branch fails here too. A file that moved
 between SGLang versions is named newest first, ``"new.py|old.py"``; the first one
 present is checked. A read name such as "replication|layout" accepts either field.
+An explicitly guarded opt-in extension uses ``SGLANG_OPTIONAL_READS``: its
+file may be absent, but all declared names must match when it is installed.
+The feature's tests must cover rejection when its extension is unavailable.
 The checks are static (AST and tokens): no package module is
 imported. Run them against every supported SGLang and nightly against main.
 """
@@ -72,11 +75,11 @@ def _provided(path: Path) -> frozenset:
     return frozenset(names)
 
 
-def _declared(path: Path) -> dict:
-    """The module's ``SGLANG_READS``, or {} without one."""
+def _declared(path: Path, kind: str = "SGLANG_READS") -> dict:
+    """The module's named source contract, or {} without one."""
     for node in _tree(path).body:
         if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "SGLANG_READS" for t in node.targets
+            isinstance(t, ast.Name) and t.id == kind for t in node.targets
         ):
             return ast.literal_eval(node.value)
     return {}
@@ -93,7 +96,9 @@ def _sglang_imports(path: Path) -> set:
 
 
 READERS = [
-    p for p in sorted(PACKAGE.rglob("*.py")) if _declared(p) or _sglang_imports(p)
+    p
+    for p in sorted(PACKAGE.rglob("*.py"))
+    if _declared(p) or _declared(p, "SGLANG_OPTIONAL_READS") or _sglang_imports(p)
 ]
 
 
@@ -103,7 +108,8 @@ def _id(path: Path) -> str:
 
 @pytest.mark.parametrize("path", READERS, ids=_id)
 def test_every_sglang_import_is_declared(path):
-    declared = {n for names in _declared(path).values() for n in names}
+    contracts = _declared(path) | _declared(path, "SGLANG_OPTIONAL_READS")
+    declared = {n for names in contracts.values() for n in names}
     undeclared = _sglang_imports(path) - declared
     assert not undeclared, f"{_id(path)}: declare {sorted(undeclared)} in SGLANG_READS"
 
@@ -111,8 +117,15 @@ def test_every_sglang_import_is_declared(path):
 @pytest.mark.parametrize("path", READERS, ids=_id)
 def test_sglang_provides_what_the_plugin_reads(path):
     missing = []
-    for pattern, names in _declared(path).items():
+    required = _declared(path)
+    optional = _declared(path, "SGLANG_OPTIONAL_READS")
+    assert not required.keys() & optional.keys(), (
+        "contract cannot be both required and optional"
+    )
+    for pattern, names in (required | optional).items():
         files = _files(pattern)
+        if not files and pattern in optional:
+            continue
         assert files, f"{_id(path)}: no file matches {pattern}"
         provided = frozenset().union(*map(_provided, files))
         missing += [

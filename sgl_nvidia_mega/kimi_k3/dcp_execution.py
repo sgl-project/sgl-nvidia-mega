@@ -13,7 +13,7 @@ import torch
 
 from .dcp_resources import DcpResources, PreparedDcpMla, _identity, _native_context
 
-SGLANG_READS = {
+SGLANG_OPTIONAL_READS = {
     "srt/kernel_plugins/nvidia/_dcp_binding.py": (
         "_DcpHybridBinding",
         "_DcpHybridBucket",
@@ -24,11 +24,19 @@ SGLANG_READS = {
 
 def _native_types():
     # Only this explicit private path requires the private framework successor.
-    from sglang.srt.kernel_plugins.nvidia._dcp_binding import (
-        _DcpHybridBinding,
-        _DcpHybridBucket,
-        _DcpHybridStepView,
-    )
+    try:
+        from sglang.srt.kernel_plugins.nvidia._dcp_binding import (
+            _DcpHybridBinding,
+            _DcpHybridBucket,
+            _DcpHybridStepView,
+        )
+    except ModuleNotFoundError as error:
+        if error.name != "sglang.srt.kernel_plugins.nvidia._dcp_binding":
+            raise
+        raise RuntimeError(
+            "Kimi DCP decode requires the SGLang DCP binding extension; "
+            "ordinary DCP-off execution remains available"
+        ) from error
 
     return _DcpHybridBinding, _DcpHybridBucket, _DcpHybridStepView
 
