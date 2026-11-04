@@ -33,7 +33,7 @@ matched its frozen stock-path reference score. This is bounded functional and
 quality evidence; it does not claim performance, unlisted configurations, production
 readiness, or publication readiness.
 
-Separate matched real-weight functional checks cover ordinary decode and
+Earlier matched real-weight functional checks covered ordinary decode and
 five-draft/q6 DSpark at context length 262144, with DCP off and stock draft
 execution. Inputs span 32768, 131072, 240000 and 255872 tokens, plus a
 262000-input/128-output deployment-edge request. Long B1 and mixed-B2 requests,
@@ -43,6 +43,21 @@ Long-input output tokens matched stock; short controls can differ within the
 numerical bounds. This is not global bitwise equivalence, an AgentX benchmark,
 long-context task-quality validation or a performance claim. Other fixed draft
 lengths have component coverage, not equivalent long-context serving evidence.
+
+These results belong to the revisions tested, not automatically to every later
+composition. The combined default-OFF ordinary-decode check has passed; its
+matched q6 comparison remains pending. Wider ordinary-row numerical comparisons
+retain unresolved failures, including at the already-admitted width 64. Those
+failures are not waived by component tests or by the default-OFF additional-width
+API. The current composition is not a blanket numerical or performance PASS.
+
+Optional prefetch, embedding and selected-width preparation have bounded
+correctness evidence and remain dormant. Alternate MLA and DCP resources and
+execution interfaces are included for explicit integration, not selected by the
+registered default. Their remaining full-model checks are separate gates. The
+DCP adapters require additional framework interfaces; stock-framework import
+compatibility and explicit unsupported-activation rejection do not qualify DCP
+GPU execution. No DCP feature admission is added to the registered spec.
 
 ### What a covered DeepSeek-V4.1-Flash step runs
 
