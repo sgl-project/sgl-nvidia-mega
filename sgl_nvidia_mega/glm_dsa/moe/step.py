@@ -4,13 +4,18 @@
 
 from __future__ import annotations
 
+import types
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 from sgl_nvidia_mega.glm_dsa.attention.step import StepContext
+from sgl_nvidia_mega.glm_dsa.eligibility import HIDDEN
+
+if TYPE_CHECKING:
+    from sgl_nvidia_mega.glm_dsa.moe import MoeGlue
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -18,6 +23,10 @@ SGLANG_READS = {
     "srt/models/deepseek_v2.py": ("DeepseekV2MoE",),
     "srt/runtime_context.py": ("get_forward",),
 }
+
+EXPERTS = 256
+TOP_K = 8
+INTER = 256  # routed and shared intermediate size per rank (TP 8)
 
 # The engine's row groups: at most 4 groups of at most 4 rows (one group: g1, two: g2,
 # three or four: the four-group engine)
@@ -58,8 +67,7 @@ class MlpSteps:
             return mlp(x, step.forward_batch, None)
 
 
-# The steps of each group, in call order (describe, rank agreement, logs).
-
+@dataclass
 class MoeRecords:
     """The engine's per-expert outputs of one MoE layer, for a hop that finalizes them
     inside its all-reduce (row stride ``rows``): ``pq`` [4, rows, 8, 6144] fp32 (the four

@@ -29,11 +29,8 @@ import torch.distributed as dist
 
 from sglang.srt.distributed import tensor_model_parallel_all_gather
 from sglang.srt.distributed.parallel_state import get_tp_group
-from sgl_nvidia_mega.glm_dsa import (
-    draft_attention,
-    eligibility,
-    runtime,
-)
+from sgl_nvidia_mega.glm_dsa import draft_attention, eligibility
+from sgl_nvidia_mega.glm_dsa.runtime import executor
 from sgl_nvidia_mega.glm_dsa.eligibility import HIDDEN, TP_SIZE
 from sgl_nvidia_mega.glm_dsa.runtime.compile import compile_cached, cu_stream
 
@@ -159,9 +156,9 @@ class FusedDraft:
             from sgl_nvidia_mega.glm_dsa.kernels.cute.hop.transport import ErrorRecord
 
             self.error_record = ErrorRecord(dev)
-            if runtime.TARGET is not None:
+            if executor.TARGET is not None:
                 # the target's reporter logs the draft top-1's record too
-                runtime.TARGET.errors.add(self.failure)
+                executor.TARGET.errors.add(self.failure)
         for name, rows in (("decode", TOP1_DECODE_ROWS), ("extend", TOP1_EXTEND_ROWS)):
             spec = specs[f"distributed_argmax_{rows}"]
             mailbox = _symm_mailbox(spec[0].mailbox_words(self.world), tp, dev)
@@ -190,12 +187,12 @@ class FusedDraft:
             family.compile(self.eh_rows)
         except ValueError as e:
             family, why = None, str(e)
-        whys = runtime.tp_gather([] if why is None else [why])
+        whys = executor.tp_gather([] if why is None else [why])
         if any(whys):
             if self.rank == 0:
                 logger.warning(
                     "GLM-DSA fused draft attention stays stock on every rank: %s",
-                    runtime.per_rank(whys),
+                    executor.per_rank(whys),
                 )
             return
         self._attn_family = family
@@ -353,7 +350,7 @@ class FusedDraft:
         mode = "decode" if forward_batch.forward_mode.is_decode() else "extend"
         agreed = self._attn_agreed.get((mode, rows))
         if agreed is None:
-            gathered = runtime.tp_gather(
+            gathered = executor.tp_gather(
                 list(family.step_reasons(self._nextn, forward_batch))
             )
             agreed = self._attn_agreed[(mode, rows)] = not any(gathered)
@@ -368,7 +365,7 @@ class FusedDraft:
                     "GLM-DSA fused draft attention stays stock: draft %s graph, %d rows: %s",
                     mode,
                     rows,
-                    runtime.per_rank(gathered),
+                    executor.per_rank(gathered),
                 )
         return family.for_rows(rows) if agreed else None
 
@@ -517,7 +514,7 @@ def _compile(kernel, constexprs, args):
 def _target_hop_family():
     """The prepared target's hop family when its fused hops are served on every
     rank, else None."""
-    rt = runtime.TARGET
+    rt = executor.TARGET
     family = rt.families.get("hops") if rt is not None else None
     return family if getattr(family, "kernels", None) is not None else None
 

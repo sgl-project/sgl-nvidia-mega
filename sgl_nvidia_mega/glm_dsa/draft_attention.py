@@ -29,7 +29,7 @@ from typing import List, Optional
 
 import torch
 
-from sgl_nvidia_mega.glm_dsa.attention import (
+from sgl_nvidia_mega.glm_dsa.attention.fused import (
     AttentionGlue,
     FusedAttention,
     kernel_rows,

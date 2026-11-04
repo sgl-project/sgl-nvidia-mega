@@ -31,6 +31,8 @@ SGLANG_READS = {
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
 class StepContext:
     """Per-forward state shared by the step groups of one verify forward."""
 
