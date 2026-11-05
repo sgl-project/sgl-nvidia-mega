@@ -58,8 +58,8 @@ def serves_this_step() -> bool:
     return get_is_capture_mode() or eager_steps_allowed()
 
 
-# Every value below is the one the accepted rows ran with (P61 / P58 / P52,
-# c80 / c96 / c112). A setup that differs is refused rather than served by
+# Every value below is the one the accepted rows ran with (P108 at c96, and
+# P106 / P102 / P100 / P52 before it at c112 / c96 / c80). A setup that differs is refused rather than served by
 # kernels that were never measured on it.
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_107"}),
