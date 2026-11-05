@@ -45,19 +45,27 @@ long-context task-quality validation or a performance claim. Other fixed draft
 lengths have component coverage, not equivalent long-context serving evidence.
 
 These results belong to the revisions tested, not automatically to every later
-composition. The combined default-OFF ordinary-decode check has passed; its
-matched q6 comparison remains pending. Wider ordinary-row numerical comparisons
-retain unresolved failures, including at the already-admitted width 64. Those
-failures are not waived by component tests or by the default-OFF additional-width
-API. The current composition is not a blanket numerical or performance PASS.
+composition. Combined default-OFF ordinary-decode and fixed-q6 checks passed
+within the recorded scopes, including near-cap requests, mixed lengths, reuse
+and graph replay. A separate registered-default width-64 control matched the
+published and private implementations exactly for all 64 sequences and 4,096
+selected-token log probabilities. That control does not establish native-stock
+accuracy or resolve the five numerical failures in the broader configured-width
+experiment. Those failures, including at the already-admitted width 64, are not
+waived by component tests or the default-OFF additional-width API. These are
+bounded results, not a blanket numerical or performance PASS.
 
 Optional prefetch, embedding and selected-width preparation have bounded
-correctness evidence and remain dormant. Alternate MLA and DCP resources and
-execution interfaces are included for explicit integration, not selected by the
-registered default. Their remaining full-model checks are separate gates. The
-DCP adapters require additional framework interfaces; stock-framework import
-compatibility and explicit unsupported-activation rejection do not qualify DCP
-GPU execution. No DCP feature admission is added to the registered spec.
+correctness evidence and remain dormant. The TokenSpeed MLA alternative has
+matched ordinary-decode and fixed-q6 evidence at TP8, DCP off and context length
+8192; TRTLLM remains the default. DCP resources and execution interfaces are
+included for explicit integration, with matched ordinary-decode and fixed-q6
+evidence at TP8 and context length 8192, including native acceptance, state
+commit, hidden-state handoff and graph replay. The DCP adapters require additional
+framework interfaces; stock-framework imports and explicit unsupported-activation
+rejection are separate CPU contracts, not GPU qualification. No DCP feature
+admission is added to the registered spec, and no DCP long-context, optional
+combined-ON, default activation or performance claim follows from these checks.
 
 ### What a covered DeepSeek-V4.1-Flash step runs
 
