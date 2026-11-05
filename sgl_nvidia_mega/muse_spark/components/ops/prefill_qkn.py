@@ -6,7 +6,9 @@
 counts where that kernel reduces 8 columns per thread (one warp per token; graph-capture safe: no host sync, no
 dynamic cache locations). ``prefill_qkn``: the same plus q in e4m3 and the e4m3 K / V cache store, bitwise to the
 Triton launch followed by SGLang's fused FP8 q / KV-cache store with unit scales. See ``csrc/prefill_qkn.cuh`` and
-``tests/test_prefill_qkn.py``.
+``tests/test_prefill_qkn.py``. ``qk_norm_q8``: ``qk_norm`` with q written as e4m3, byte for byte
+``qk_norm(...)[0].to(torch.float8_e4m3fn)`` (k unchanged); its own module (``csrc/prefill_qkn_q8.cuh``,
+``tests/test_prefill_qkn_q8.py``).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from pathlib import Path
 import torch
 
 _CSRC = Path(__file__).resolve().parent.parent / "csrc" / "prefill_qkn.cuh"
+_CSRC_Q8 = Path(__file__).resolve().parent.parent / "csrc" / "prefill_qkn_q8.cuh"
 
 HEAD_DIM = 64
 MAX_HEADS = 64  # q + k + v head rows per token
@@ -78,6 +81,59 @@ def qk_norm(
         float(eps),
     )
     return q, k
+
+
+@functools.lru_cache(maxsize=None)
+def _norm_q8_module(rope: bool, unfused: bool = False):
+    from sglang.kernels.jit.utils import load_jit, make_cpp_args
+
+    args = make_cpp_args(rope)
+    return load_jit(
+        "muse_vr_prefill_qk_norm_q8" + ("_qku" if unfused else ""),
+        *args,
+        cuda_files=[str(_CSRC_Q8)],
+        cuda_wrappers=[
+            ("qk_norm_q8", f"muse_vr::PrefillQkNormQ8<{args}>::run"),
+            ("e4m3_of_bf16", "muse_vr::E4m3OfBf16::run"),
+        ],
+        extra_cuda_cflags=["-DMUSE_VR_QK_UNFUSED=1"] if unfused else None,
+    )
+
+
+def qk_norm_q8(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor | None,
+    num_q_heads: int,
+    num_kv_heads: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(q, k): e4m3 ``[T, Hq * 64]`` (the bytes of ``qk_norm``'s bf16 q converted with ``.to(torch.float8_e4m3fn)``) and
+    bf16 ``[T, Hkv * 64]`` (``qk_norm``'s k). Same inputs and requirements as ``qk_norm``."""
+    t = qkv.shape[0]
+    q = torch.empty(
+        t, num_q_heads * HEAD_DIM, dtype=torch.float8_e4m3fn, device=qkv.device
+    )
+    k = torch.empty(t, num_kv_heads * HEAD_DIM, dtype=torch.bfloat16, device=qkv.device)
+    rope = cos_sin is not None
+    _norm_q8_module(rope, _unfused()).qk_norm_q8(
+        qkv,
+        positions,
+        cos_sin if rope else positions,
+        q,
+        k,
+        int(num_q_heads),
+        int(num_kv_heads),
+        float(eps),
+    )
+    return q, k
+
+
+def e4m3_of_bf16(x: torch.Tensor) -> torch.Tensor:
+    """``qk_norm_q8``'s e4m3 conversion alone, element-wise: uint8 bytes of a 1-D contiguous bf16 tensor (tests)."""
+    out = torch.empty(x.shape[0], dtype=torch.uint8, device=x.device)
+    _norm_q8_module(False, _unfused()).e4m3_of_bf16(x, out)
+    return out
 
 
 @functools.lru_cache(maxsize=None)

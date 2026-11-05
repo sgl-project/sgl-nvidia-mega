@@ -313,6 +313,88 @@
 #if MUSE_VR_LDW_THEAD && (MUSE_VR_LDW_LANDED || MUSE_VR_LDW_BALB || MUSE_VR_LDW_GATHER)
 #error "MUSE_VR_LDW_THEAD: served ring builds only (MUSE_VR_LDW_GATHER=0)"
 #endif
+// Served builds without head copies (development, default 0): MUSE_VR_LDW_EARLY_COPY = 1 starts the copy phase before the work
+// list. Warp 0 publishes the expert bases, the pass bases and the counter parity right after its expert loop by arriving on a named
+// barrier (MUSE_VR_LDW_ECG_BAR, 32 arrivals + 256 waiters); warps 4-11 arrive at the pass barrier instead of waiting there, wait on
+// that barrier, compute their slot positions (warps 8-11) or zero the other parity's counters (warps 4-7) as before, arrive at the
+// end-of-prologue barrier 3, meet at MUSE_VR_LDW_EC_BAR (256 threads), run the unchanged copy phase, then wait at the list barrier
+// (MUSE_VR_LDW_LIST_BAR) that warps 0-3 arrive at after barrier 3. The same bytes go to the same addresses with the same single
+// release per CTA; every access stays after griddepcontrol.wait, and every new edge is a CTA barrier. Not with the forms whose
+// prologue or copy phase differs (landed, board, finalize, start order, head copies, tensor-copy head, early slot table, rows-ready
+// flags, expert-output hop push): each is refused below.
+#ifndef MUSE_VR_LDW_EARLY_COPY
+#define MUSE_VR_LDW_EARLY_COPY 0
+#endif
+#if MUSE_VR_LDW_EARLY_COPY
+#if MUSE_VR_LDW_LANDED
+#error "MUSE_VR_LDW_EARLY_COPY: not with the landed build (MUSE_VR_LDW_LANDED)"
+#endif
+#if MUSE_VR_LDW_BALB
+#error "MUSE_VR_LDW_EARLY_COPY: not with the board build (MUSE_VR_LDW_BALB)"
+#endif
+#if MUSE_VR_LDW_EPI
+#error "MUSE_VR_LDW_EARLY_COPY: not with the finalize build (MUSE_VR_LDW_EPI)"
+#endif
+#if defined(MUSE_VR_LDW_START) || MUSE_VR_LDW_HEAD_GO || MUSE_VR_LDW_HEAD_PRIO
+#error "MUSE_VR_LDW_EARLY_COPY: not with the start-order forms (MUSE_VR_LDW_START / HEAD_GO / HEAD_PRIO)"
+#endif
+#if MUSE_VR_LDW_THEAD
+#error "MUSE_VR_LDW_EARLY_COPY: not with the tensor-copy head (MUSE_VR_LDW_THEAD)"
+#endif
+#if MUSE_VR_LDW_EARLY_SLOTTAB
+#error "MUSE_VR_LDW_EARLY_COPY: not with the early slot table (MUSE_VR_LDW_EARLY_SLOTTAB)"
+#endif
+#if MUSE_VR_LDW_ROWS_READY
+#error "MUSE_VR_LDW_EARLY_COPY: not with the rows-ready flags (MUSE_VR_LDW_ROWS_READY)"
+#endif
+#if MUSE_VR_LDW_HB0_PUSH
+#error "MUSE_VR_LDW_EARLY_COPY: not with the expert-output hop push (MUSE_VR_LDW_HB0_PUSH)"
+#endif
+#if MUSE_VR_LDW_HEADS
+#error "MUSE_VR_LDW_EARLY_COPY: builds without head copies only (MUSE_VR_LDW_GATHER=0)"
+#endif
+#endif
+// early copy: the hand-off barrier (warp 0 arrives, warps 4-11 wait) and the copy warps' barrier; settable like HEAD_BAR
+#ifndef MUSE_VR_LDW_ECG_BAR
+#define MUSE_VR_LDW_ECG_BAR 14
+#endif
+#ifndef MUSE_VR_LDW_EC_BAR
+#define MUSE_VR_LDW_EC_BAR 15
+#endif
+// Tests only (early-copy builds; default 0). MUSE_VR_LDW_TEST_EC_COUNT = 1: every participant of the two early-copy barriers
+// also counts itself in shared memory and thread 0 checks the counts at the end (error bit kErrEcCount on a mismatch).
+// MUSE_VR_LDW_TEST_EC_TWIN = 1: the hand-off barrier is dropped (no arrival, no wait); 2: the copy warps' barrier is dropped
+// (the two racecheck controls; in its place the dropping warps wait MUSE_VR_LDW_TEST_EC_WAIT_CYCLES clock cycles, default 0, so
+// the reads usually find the values though nothing orders them). With the hand-off dropped (TWIN = 1), every value warps 4-11
+// take from warp 0's publication (expert bases, pass bases, counter parity, and the positions and pass indices computed with
+// them) is clamped into its valid range, so the launch completes (its rows may be wrong) and racecheck can report the unordered
+// accesses. MUSE_VR_LDW_TEST_EC_PLANT = 1: warps 8-11 arrive at barrier 3
+// BEFORE their slot positions (the last reads of the prologue scratch on the copy's path) and then wait
+// MUSE_VR_LDW_TEST_EC_WAIT_CYCLES clock cycles (default 200000), so the producer's copy into the last ring stage lands under
+// those reads (the ordering control; outputs are expected to differ). MUSE_VR_LDW_TEST_EC_PLANT = 2: the hand-off barrier is
+// dropped on both sides and warp 0 waits MUSE_VR_LDW_TEST_EC_WAIT_CYCLES clock cycles before it writes its publication, while
+// warps 4-11 proceed without waiting (the hand-off control; no clamps; outputs are expected to differ or the launch to fault).
+#ifndef MUSE_VR_LDW_TEST_EC_COUNT
+#define MUSE_VR_LDW_TEST_EC_COUNT 0
+#endif
+#ifndef MUSE_VR_LDW_TEST_EC_TWIN
+#define MUSE_VR_LDW_TEST_EC_TWIN 0
+#endif
+#ifndef MUSE_VR_LDW_TEST_EC_PLANT
+#define MUSE_VR_LDW_TEST_EC_PLANT 0
+#endif
+#ifndef MUSE_VR_LDW_TEST_EC_WAIT_CYCLES
+#define MUSE_VR_LDW_TEST_EC_WAIT_CYCLES (MUSE_VR_LDW_TEST_EC_PLANT ? 200000 : 0)
+#endif
+#if (MUSE_VR_LDW_TEST_EC_COUNT || MUSE_VR_LDW_TEST_EC_TWIN || MUSE_VR_LDW_TEST_EC_PLANT) && !MUSE_VR_LDW_EARLY_COPY
+#error "MUSE_VR_LDW_TEST_EC_*: early-copy builds only"
+#endif
+#if MUSE_VR_LDW_TEST_EC_TWIN < 0 || MUSE_VR_LDW_TEST_EC_TWIN > 2 || (MUSE_VR_LDW_TEST_EC_TWIN && MUSE_VR_LDW_TEST_EC_PLANT)
+#error "MUSE_VR_LDW_TEST_EC_TWIN: 0, 1 or 2, one control per build"
+#endif
+#if MUSE_VR_LDW_TEST_EC_PLANT < 0 || MUSE_VR_LDW_TEST_EC_PLANT > 2
+#error "MUSE_VR_LDW_TEST_EC_PLANT: 0, 1 or 2, one control per build"
+#endif
 
 // Every build variant (compile flags) gets its own symbol names (the ops layer sets MUSE_VR_LDW_ABI per variant), so
 // variants loaded in one process never share a kernel or a launch-configuration static.
@@ -449,6 +531,37 @@ __host__ __device__ constexpr bool hs2_pad_bound() {
   return true;
 }
 static_assert(hs2_pad_bound(), "hs2 padding bound (kHs2Rows)");
+#if MUSE_VR_LDW_EARLY_COPY
+// early copy: barrier ids and thread counts. Every named barrier of an early-copy build (the forms refused above use none
+// beyond these): 3 (end of prologue), 5 (end), 6 (prologue steps), 7 (copy phase), the list barrier, the hand-off barrier and
+// the copy warps' barrier; all distinct and below the 16 logical barriers of a CTA (PTX ISA barrier{.cta}: ids 0..15). The two
+// new ids also avoid 0 (the CTA-wide barrier), the head-loader and hop-push barriers of the refused forms, and 11 / 12 (kept
+// free for other development forms of this kernel).
+constexpr int kEcgBar = MUSE_VR_LDW_ECG_BAR, kEcBar = MUSE_VR_LDW_EC_BAR;
+constexpr int kEcgThreads = 32 + 8 * 32;  // warp 0 arrives, warps 4-11 wait
+constexpr int kEcThreads = 8 * 32;        // warps 4-11
+constexpr int kNamedBarIds = 16;
+__host__ __device__ constexpr bool ec_bar_ids_ok() {
+  const int live[] = {3, 5, 6, 7, MUSE_VR_LDW_LIST_BAR, kEcgBar, kEcBar};
+  const int n = int(sizeof(live) / sizeof(live[0]));
+  for (int i = 0; i < n; ++i) {
+    if (live[i] < 0 || live[i] >= kNamedBarIds) return false;
+    for (int j = i + 1; j < n; ++j)
+      if (live[i] == live[j]) return false;
+  }
+  const int kept[] = {0, MUSE_VR_LDW_HEAD_BAR, MUSE_VR_LDW_HB0_BAR, 11, 12};
+  for (int k = 0; k < int(sizeof(kept) / sizeof(kept[0])); ++k)
+    if (kEcgBar == kept[k] || kEcBar == kept[k]) return false;
+  return true;
+}
+static_assert(ec_bar_ids_ok(), "early copy: barrier ids must be distinct among the live named barriers and below 16");
+static_assert(kThreads == 12 * 32, "early copy: warps 0-3 (work list, producer, MMA, control) and 4-11 (copy)");
+static_assert(kEcgThreads == 288 && kEcThreads == 256, "early copy: hand-off = 32 arrivals + 256 waiters; copy barrier = 256");
+static_assert(kEcgThreads % 32 == 0 && kEcThreads % 32 == 0, "named barrier thread counts are multiples of the warp size");
+#if MUSE_VR_LDW_TEST_EC_COUNT
+constexpr int kErrEcCount = 512;  // tests only: a participant count of an early-copy barrier differs from its declared count
+#endif
+#endif
 
 
 // ---------------------------------------------------------------- PTX helpers
@@ -550,6 +663,16 @@ __device__ __forceinline__ void named_bar_arrive(uint32_t id, uint32_t n) {
 __device__ __forceinline__ void grid_dep_wait() {
   asm volatile("griddepcontrol.wait;" ::: "memory");
 }
+#if MUSE_VR_LDW_TEST_EC_TWIN || MUSE_VR_LDW_TEST_EC_PLANT
+__device__ __forceinline__ void ec_test_wait() {  // tests only (early-copy controls): about that many clock cycles
+  const long long c0 = clock64();
+  while (clock64() - c0 < (long long)(MUSE_VR_LDW_TEST_EC_WAIT_CYCLES)) __nanosleep(1000);
+}
+#endif
+#if MUSE_VR_LDW_TEST_EC_TWIN == 1
+// tests only (hand-off dropped): a value taken from warp 0's publication, clamped into [0, hi]
+__device__ __forceinline__ int ec_twin_clamp(int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); }
+#endif
 __device__ __forceinline__ uint64_t policy_evict_first() {
   uint64_t pol;
   asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
@@ -971,6 +1094,9 @@ struct Smem {
   int32_t head_n;                       // leading FC1 items whose token rows are copied by row index (0: none)
   uint32_t items[kMaxItems];
   int32_t n_items, n_fc1, n_pass, n_my, set;
+#if MUSE_VR_LDW_TEST_EC_COUNT
+  uint32_t ec_dbg[2];  // tests only: [0] hand-off barrier (arrivals << 16 | waiters), [1] copy warps' barrier (waiters)
+#endif
   uint32_t fc1_stored[4];  // per FC1 epilogue warp: tiles whose activation words it stored (red.release / ld.acquire, cta)
 #if MUSE_VR_LDW_HB0_PUSH
   uint32_t fc2_stored[4];  // per FC2 epilogue warp: FC2 items whose output rows it stored (red.release / ld.acquire, cta)
@@ -995,6 +1121,15 @@ struct Scratch {
   uint32_t total[kMaxPool];
 };
 static_assert(sizeof(Scratch) <= kStageBytes, "prologue scratch fits one ring stage");
+#if MUSE_VR_LDW_EARLY_COPY
+// early copy: warps 4-11 arrive at barrier 3 (after which the producer's first copies may overwrite the scratch in the last ring
+// stage) before they run the copy phase; the copy reads only these shared fields, all of them outside the ring stages
+constexpr size_t kRingEnd = offsetof(Smem, st) + sizeof(Smem::st);
+static_assert(offsetof(Smem, base) >= kRingEnd && offsetof(Smem, qbase) >= kRingEnd && offsetof(Smem, my_slot) >= kRingEnd &&
+                  offsetof(Smem, my_pos) >= kRingEnd && offsetof(Smem, my_exp) >= kRingEnd && offsetof(Smem, n_my) >= kRingEnd &&
+                  offsetof(Smem, set) >= kRingEnd,
+              "early copy: the copy phase's shared operands are outside the ring stages (the prologue scratch)");
+#endif
 #if MUSE_VR_LDW_HEAD_GO
 // the head loaders may store into the token region of the last ring stage while other warps still read the scratch in it
 // (they no longer wait for the end-of-prologue barrier): the scratch must end before that region
@@ -1665,7 +1800,12 @@ __device__ __noinline__ void copy_rows(Smem& s, const Params& p, int wt) {  // o
     if (lane < 16) {
       // image words of K chunks g = 4 lane .. 4 lane + 3 (one per 64-wide chunk)
       const int e = s.my_exp[j];
+#if MUSE_VR_LDW_TEST_EC_TWIN == 1  // tests only: the expert's bases may be unwritten here (clamped)
+      const int r = ec_twin_clamp(pos - s.base[e], kMaxSlots - 1);
+      const int q = ec_twin_clamp(s.qbase[e] + r / kPassRows, kMaxPasses - 1), i = r % kPassRows;
+#else
       const int r = pos - s.base[e], q = s.qbase[e] + r / kPassRows, i = r % kPassRows;
+#endif
       uint8_t* img = p.img1 + size_t(q) * kImgBytes + size_t(4 * lane) * 512 + size_t(16 * (i & 31) + 4 * (i >> 5));
       *reinterpret_cast<uint32_t*>(img) = f.x;
       *reinterpret_cast<uint32_t*>(img + 512) = f.y;
@@ -1676,7 +1816,11 @@ __device__ __noinline__ void copy_rows(Smem& s, const Params& p, int wt) {  // o
   if (wt == 0) LDW_STAMP(p, kStCopyRows);
 #if MUSE_VR_LDW_SPLIT_REL
   named_bar_sync(7, kW);  // every worker's row and image stores, before the rows-ready release on their behalf
+#if MUSE_VR_LDW_TEST_EC_TWIN == 1  // tests only: the counter parity may be unwritten here (masked)
+  if (wt == 0) asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.cnt + (s.set & 1) * kCntSet + kRowsReady) : "memory");
+#else
   if (wt == 0) asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.cnt + s.set * kCntSet + kRowsReady) : "memory");
+#endif
 #endif
   if (tail) {
     const int pos = s.my_pos[wt];
@@ -1704,7 +1848,11 @@ __device__ __noinline__ void copy_rows(Smem& s, const Params& p, int wt) {  // o
   if (wt == 0) LDW_STAMP(p, kStCopyBar);
   if (wt == 0) {
     // SPLIT_REL: the metadata count (the rows-ready count was raised above)
+#if MUSE_VR_LDW_TEST_EC_TWIN == 1  // tests only: the counter parity may be unwritten here (masked)
+    asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.cnt + (s.set & 1) * kCntSet + kMetaReady) : "memory");
+#else
     asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.cnt + s.set * kCntSet + kMetaReady) : "memory");
+#endif
     LDW_STAMP(p, kStCopy);
 #if MUSE_VR_LDW_EARLY_SLOTTAB
     // the slot table (this CTA's share of e2p / expert_weights, ordered here by the named barrier) before the trigger
@@ -1759,7 +1907,12 @@ __device__ __noinline__ void copy_rows_v(uint32_t sb, int wt, const uint8_t* hs,
     if (lane < 16) {
       // image words of K chunks g = 4 lane .. 4 lane + 3 (one per 64-wide chunk)
       const int e = lds_s16(a_exp + 2u * uint32_t(j));
+#if MUSE_VR_LDW_TEST_EC_TWIN == 1  // tests only: the expert's bases may be unwritten here (clamped)
+      const int r = ec_twin_clamp(pos - lds_s16(a_base + 2u * uint32_t(e)), kMaxSlots - 1);
+      const int q = ec_twin_clamp(lds_s16(a_qbase + 2u * uint32_t(e)) + r / kPassRows, kMaxPasses - 1);
+#else
       const int r = pos - lds_s16(a_base + 2u * uint32_t(e)), q = lds_s16(a_qbase + 2u * uint32_t(e)) + r / kPassRows;
+#endif
       const int i = r % kPassRows;
       uint8_t* img = img1 + size_t(q) * kImgBytes + size_t(4 * lane) * 512 + size_t(16 * (i & 31) + 4 * (i >> 5));
       *reinterpret_cast<uint32_t*>(img) = f.x;
@@ -2143,7 +2296,7 @@ __device__ MUSE_VR_LDW_ROLE void role_epilogue(Smem& s, const Params& p) {
 #if !MUSE_VR_LDW_HEAD_GO  // HEAD_GO: the kernel body ran it before the list barrier
   landed_head(s, p, threadIdx.x - 4 * 32);
 #endif
-#else
+#elif !MUSE_VR_LDW_EARLY_COPY  // EARLY_COPY: the kernel body ran the copy phase before the list barrier
   LDW_COPY_ROWS(s, p, cset, threadIdx.x - 4 * 32);
 #endif
   if (p.dbg & 128) return;
@@ -2496,7 +2649,7 @@ __device__ MUSE_VR_LDW_ROLE void role_builder(Smem& s, const Params& p) {
   unsigned* const cset = p.cnt + s.set * kCntSet;
 #if MUSE_VR_LDW_LANDED
   landed_copy_rows(s, p, threadIdx.x - 8 * 32);
-#else
+#elif !MUSE_VR_LDW_EARLY_COPY  // EARLY_COPY: the kernel body ran the copy phase before the list barrier
   LDW_COPY_ROWS(s, p, cset, threadIdx.x - 4 * 32);
 #endif
   if (p.dbg & 128) return;
@@ -3110,7 +3263,32 @@ __device__ MUSE_VR_LDW_ROLE void prologue(Smem& s, const Params& p) {
   }
   named_bar_sync(6, kThreads);
   if (tid == 0) LDW_STAMP(p, kStPfx);
+#if MUSE_VR_LDW_EARLY_COPY
+  // early copy, warps 4-11: their share of the pass barrier below (only warps 0-3 wait there), then the hand-off barrier, after
+  // which warp 0's expert bases, pass bases and counter parity are visible (the slots' experts and the prefix counts read below
+  // are ordered by the barrier just passed). No exit before either operation: every thread of every CTA issues both once.
+  if (warp >= 4) {
+    named_bar_arrive(6, kThreads);
+#if MUSE_VR_LDW_TEST_EC_TWIN != 1 && MUSE_VR_LDW_TEST_EC_PLANT != 2
+#if MUSE_VR_LDW_TEST_EC_COUNT
+    atomicAdd(&s.ec_dbg[0], 1u);
+#endif
+    named_bar_sync(kEcgBar, kEcgThreads);
+#elif MUSE_VR_LDW_TEST_EC_TWIN == 1
+    ec_test_wait();  // tests only: the hand-off dropped (racecheck control)
+#endif  // PLANT == 2 (tests only): the hand-off dropped and no wait (the hand-off control)
+#if MUSE_VR_LDW_TEST_EC_PLANT == 1
+    if (warp >= 8) {  // tests only: the ordering control (barrier 3 before the scratch reads of the positions below)
+      named_bar_arrive(3, kThreads);
+      ec_test_wait();
+    }
+#endif
+  }
+#endif
   if (warp == 0) {  // expert bases and passes (ascending expert order), pass tables
+#if MUSE_VR_LDW_TEST_EC_PLANT == 2
+    ec_test_wait();  // tests only: the publication below is delayed (the hand-off control; nothing waits for it)
+#endif
     int rows = 0, q = 0;
 #pragma unroll 1
     for (int c = 0; c < kMaxPool; c += 32) {
@@ -3146,6 +3324,23 @@ __device__ MUSE_VR_LDW_ROLE void prologue(Smem& s, const Params& p) {
       q += __shfl_sync(0xffffffffu, inclq, 31);
     }
     __syncwarp();  // every lane's q_rows stores before lane 0 reads them
+#if MUSE_VR_LDW_EARLY_COPY
+    // early copy: the counter parity (moved here from the lane-0 block below), then the hand-off. Each lane's arrival orders its
+    // own base / qbase stores (lane 0: also start_base / set) before the waiters' reads: when a barrier completes, the prior memory
+    // accesses of its participants are performed relative to all of them (PTX ISA barrier{.cta}). Unconditional: the expert loop
+    // above has a fixed trip count and no exit, so warp 0 of every CTA (with or without rows or items) arrives exactly once.
+    if (lane == 0) {
+      s.start_base = ticket - ticket % gridDim.x;
+      s.set = int((s.start_base / gridDim.x) & 1u);
+    }
+    __syncwarp();
+#if MUSE_VR_LDW_TEST_EC_TWIN != 1 && MUSE_VR_LDW_TEST_EC_PLANT != 2
+#if MUSE_VR_LDW_TEST_EC_COUNT
+    atomicAdd(&s.ec_dbg[0], 1u << 16);
+#endif
+    named_bar_arrive(kEcgBar, kEcgThreads);
+#endif
+#endif
     if (lane == 0) {
 #if !MUSE_VR_LDW_PRO_COMPACT  // compact form: warp 2 builds q_row2 in the next phase (no reader before barrier 3)
       int acc = 0;
@@ -3162,8 +3357,10 @@ __device__ MUSE_VR_LDW_ROLE void prologue(Smem& s, const Params& p) {
       s.bal_rows_p = rows;
 #endif
       s.head_n = 0;
+#if !MUSE_VR_LDW_EARLY_COPY  // early copy: set above, before the hand-off
       s.start_base = ticket - ticket % gridDim.x;
       s.set = int((s.start_base / gridDim.x) & 1u);
+#endif
 #if MUSE_VR_LDW_ROWS_READY
       s.rr_epoch = rr_old / gridDim.x + 1ull;
 #endif
@@ -3176,7 +3373,11 @@ __device__ MUSE_VR_LDW_ROLE void prologue(Smem& s, const Params& p) {
 #endif
     }
   }
+#if MUSE_VR_LDW_EARLY_COPY
+  if (warp < 4) named_bar_sync(6, kThreads);  // the pass barrier (warps 4-11 arrived at it before the hand-off)
+#else
   named_bar_sync(6, kThreads);
+#endif
   if (tid == 0) LDW_STAMP(p, kStPass);
   if (warp == 0) {  // this CTA's work list: one round-robin over the domain list FC1(all passes) then FC2(all passes)
     unsigned slot = 0;
@@ -3344,6 +3545,8 @@ __device__ MUSE_VR_LDW_ROLE void prologue(Smem& s, const Params& p) {
           s.my_cand[j] = int8_t(s.cand[e]);
         }
         pos = s.cand[e] ? -1 : int(s.base[e]) + rank;  // a candidate's position comes with the board
+#elif MUSE_VR_LDW_TEST_EC_TWIN == 1  // tests only: the expert's base may be unwritten here (clamped to a routed slot)
+        pos = ec_twin_clamp(int(s.base[e]) + int(x.ccnt[sl / kChunkSlots][e]) + before, nslot - 1);
 #else
         pos = int(s.base[e]) + int(x.ccnt[sl / kChunkSlots][e]) + before;
 #endif
@@ -3388,7 +3591,11 @@ __device__ MUSE_VR_LDW_ROLE void prologue(Smem& s, const Params& p) {
     }
 #endif
   } else if (warp >= 4) {  // the other launch parity's counters: zero this CTA's share for the next launch
+#if MUSE_VR_LDW_TEST_EC_TWIN == 1  // tests only: the counter parity may be unwritten here (masked)
+    unsigned* const other = p.cnt + (1 - (s.set & 1)) * kCntSet;
+#else
     unsigned* const other = p.cnt + (1 - s.set) * kCntSet;
+#endif
     for (int i = int(blockIdx.x) + int(gridDim.x) * (tid - 4 * 32); i < kCntSet; i += int(gridDim.x) * 128)
       muse_vr_ldq::st_relaxed_gpu(other + i, 0u);
 #if MUSE_VR_LDW_EPI
@@ -3454,6 +3661,10 @@ __global__ void __launch_bounds__(kThreads, 1) ldw_kernel(const __grid_constant_
 #if MUSE_VR_LDW_HB0_PUSH
       for (int i = 0; i < 4; ++i) s.fc2_stored[i] = 0u;
 #endif
+#if MUSE_VR_LDW_TEST_EC_COUNT
+      s.ec_dbg[0] = 0u;  // tests only; ordered before every count by barrier 6 below
+      s.ec_dbg[1] = 0u;
+#endif
 #endif
       fence_barrier_init();
       prefetch_tensormap(&maps.m13);
@@ -3480,6 +3691,39 @@ __global__ void __launch_bounds__(kThreads, 1) ldw_kernel(const __grid_constant_
   } else {
     named_bar_sync(3, kThreads);  // work list, pass tables, positions, counter parity for these roles
     named_bar_arrive(MUSE_VR_LDW_LIST_BAR, kThreads);
+  }
+  if (tid == 0) LDW_STAMP(p, kStPro);
+#elif MUSE_VR_LDW_EARLY_COPY
+  // early copy (HEAD_GO's split of barrier 3): warps 0-3 wait at barrier 3 for the work list (warp 0), the FC2 pass rows (warp 2
+  // with the compact prologue) and warps 4-11's arrivals, then arrive at the list barrier. Warps 4-11 arrive at barrier 3 only
+  // here, after their last read of the prologue scratch (the slot positions); the producer's first copies into the last ring
+  // stage, which holds the scratch, follow barrier 3. They then meet at the copy warps' barrier (positions of warps 8-11 for all
+  // eight copy warps), run the copy phase (no scratch read: its operands are outside the ring stages, asserted at Smem), and
+  // wait at the list barrier before their roles read the work list. The other parity's counters were zeroed by warps 4-7 above,
+  // so those stores precede, in program order, the copy's barrier 7 and its release of this parity's count.
+  if (warp < 4) {
+    named_bar_sync(3, kThreads);  // work list, pass tables, positions, counter parity for these roles
+    named_bar_arrive(MUSE_VR_LDW_LIST_BAR, kThreads);
+  } else {
+#if MUSE_VR_LDW_TEST_EC_PLANT == 1
+    if (warp < 8) named_bar_arrive(3, kThreads);  // tests only: warps 8-11 arrived before their positions (prologue)
+#else
+    named_bar_arrive(3, kThreads);
+#endif
+#if MUSE_VR_LDW_TEST_EC_TWIN != 2
+#if MUSE_VR_LDW_TEST_EC_COUNT
+    atomicAdd(&s.ec_dbg[1], 1u);
+#endif
+    named_bar_sync(kEcBar, kEcThreads);
+#else
+    ec_test_wait();  // tests only: the copy warps' barrier dropped (racecheck control)
+#endif
+#if MUSE_VR_LDW_TEST_EC_TWIN == 1  // tests only: the counter parity may be unwritten here (masked)
+    LDW_COPY_ROWS(s, p, p.cnt + (s.set & 1) * kCntSet, tid - 4 * 32);
+#else
+    LDW_COPY_ROWS(s, p, p.cnt + s.set * kCntSet, tid - 4 * 32);
+#endif
+    named_bar_sync(MUSE_VR_LDW_LIST_BAR, kThreads);  // work list, pass tables for the epilogue and builder roles
   }
   if (tid == 0) LDW_STAMP(p, kStPro);
 #else
@@ -3509,6 +3753,10 @@ __global__ void __launch_bounds__(kThreads, 1) ldw_kernel(const __grid_constant_
     role_builder(s, p);
   }
   named_bar_sync(5, kThreads);
+#if MUSE_VR_LDW_TEST_EC_COUNT
+  // tests only: every participant counted itself before its operation on the two early-copy barriers (ordered by barrier 5)
+  if (tid == 0 && (s.ec_dbg[0] != ((32u << 16) | 256u) || s.ec_dbg[1] != uint32_t(kEcThreads))) atomicOr(p.err, kErrEcCount);
+#endif
   if (tid == 0) {
     LDW_STAMP(p, kStEnd);
 #ifdef MUSE_VR_LDW_STAMPS

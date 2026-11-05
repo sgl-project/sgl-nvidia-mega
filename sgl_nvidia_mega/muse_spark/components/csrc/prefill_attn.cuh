@@ -43,6 +43,9 @@
  * accumulated by the P V issuer as P(t) x ones (a second MMA, N = 16, B = a constant e4m3 1.0 tile in shared memory)
  * into tensor-memory columns next to O, rescaled with O, so L = sum of the e4m3 P values that multiply V. One P buffer
  * (the softmax threads wait for the MMAs of tile t - 1 before writing P(t)). Same numerics class as the half exp mode.
+ * Option kOptTcSum32 (kernel template argument kOpt, default off): the same tensor-core row sum with the default fp32
+ * exponentials (p = ex2.approx.ftz.f32, P = e4m3(p) as above); L = the sum of the e4m3 P values instead of the fp32 sum of
+ * the unquantized p, so O / L is the weighted mean of V with exactly the weights the P V MMA used.
  * Split units: out = bf16((sum_i w_i O_i) * (bmm2_scale / sum_i w_i L_i)), w_i = exp2(m_i - max_i m_i).
  *
  * Block: 16 warps in four warpgroups (registers rebalanced with setmaxnreg: the softmax warpgroups grow, the others
@@ -65,6 +68,11 @@
  *      when some row's maximum grew; the group arrives at the P barrier of buffer t % 2.
  *   4. The P V issuer issues P(t) V(t), commits to the buffer's mbarrier and to the stage's release mbarrier (one
  *      arrival per query tile).
+ * Option kOptDirectS (kernel template argument kOpt, default off): in step 1 each softmax warp waits on the scores MMA's
+ * completion mbarrier itself (no group meeting); the P-buffer condition (P V of tile t - 2 completed) is waited for by
+ * the softmax threads right before step 3's P store. Option kOptHintWait: the load and issuing warps wait with a
+ * suspend-time hint instead of re-polling. Option kOptWarpS: step 1 keeps the issuer's relay but meets each softmax warp
+ * at its own named barrier (no group meeting). None of these options changes any arithmetic or its order.
  * Ordering of tensor-memory accesses across threads: tcgen05.wait, tcgen05.fence::before_thread_sync, barrier or
  * mbarrier arrive; the waiting thread issues tcgen05.fence::after_thread_sync before its tensor-memory access or MMA.
  * The P V MMAs of a query tile accumulate into O from one thread (tcgen05 pipeline order). Every issuer waits for the
@@ -218,6 +226,28 @@ __device__ __forceinline__ void mbar_wait_sleep(uint32_t bar, uint32_t parity) {
   while (!mbar_try(bar, parity)) {
     if (++polls == kMaxPolls) [[unlikely]] wait_bound_exceeded();
     __nanosleep(kSleepNs);
+  }
+}
+// The same with a suspend-time hint (PTX ISA, mbarrier.try_wait timeHint): a waiting thread may stay suspended inside the
+// instruction until the phase completes or the hint elapses, instead of re-polling (option kOptHintWait).
+__device__ __forceinline__ bool mbar_try_hint(uint32_t bar, uint32_t parity, uint32_t hint_ns) {
+  uint32_t done;
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2, %3;\n"
+      "selp.u32 %0, 1, 0, p;\n"
+      "}\n"
+      : "=r"(done)
+      : "r"(bar), "r"(parity), "r"(hint_ns)
+      : "memory");
+  return done != 0;
+}
+template <uint32_t kHintNs>
+__device__ __forceinline__ void mbar_wait_hint(uint32_t bar, uint32_t parity) {
+  uint32_t polls = 0;
+  while (!mbar_try_hint(bar, parity, kHintNs)) {
+    if (++polls == kMaxPolls) [[unlikely]] wait_bound_exceeded();
   }
 }
 // named barriers (PTX barrier.cta): producers arrive, the consumer syncs
@@ -426,12 +456,47 @@ __device__ __forceinline__ float2 h2_to_f2(uint32_t a) {
 constexpr int kHalfExp = 16;
 constexpr int kHalfExpTc = 17;  // half exp, no row sum on the softmax threads: the P V issuer adds P x ones on the tensor core
 
+// Kernel options (kOpt bits, default 0 = the original form). Synchronization only (no arithmetic change):
+//   kOptDirectS: each softmax warp waits on the scores MMA's completion mbarrier itself, instead of a group-wide named
+//     barrier that the scores issuer arrives at after waiting on that mbarrier; the P-buffer-free condition (the P V MMA
+//     of tile t - 2 completed) is then checked by the softmax threads right before they write P(t).
+//   kOptHintWait: the load warp and the issuing warps wait with mbarrier.try_wait plus a suspend-time hint instead of
+//     re-polling (the load warp's try-and-sleep loop).
+// Arithmetic (a different normalization sum, judged against a float64 reference):
+//   kOptTcSum32: fp32 exp2 as in the default mode, and the row sum L taken by the tensor core as P x ones (the sum of the
+//     e4m3 P values that multiply V, fp32 accumulation) instead of the fp32 sum of the unquantized p; the tensor-core
+//     row-sum form of the half exp mode (one P buffer per query tile), with fp32 exponentials.
+constexpr int kOptDirectS = 1;
+constexpr int kOptHintWait = 2;
+constexpr int kOptTcSum32 = 4;
+// Synchronization only (no arithmetic change), exclusive with kOptDirectS:
+//   kOptWarpS: the scores issuer's relay (it waits on the scores MMA's completion and on the P buffer as in the default form)
+//     arrives at one named barrier per softmax warp (the warp's 32 threads + the issuer's 32) instead of one barrier of the
+//     whole group, so each softmax warp waits only for the relay, not for the group's other warps.
+constexpr int kOptWarpS = 8;
+constexpr uint32_t kWaitHintNs = 8192;  // tunable
+
 // ---------------------------------------------------------------------------------------------- main kernel
 // exp2, row sum and e4m3 packing of the 128 keys of a tile: pk[i] = keys 4 i .. 4 i + 3 (lowest key in the lowest
 // byte), acc[pair % 4] += the fp32 pairs; pairs with (pair % 8) < kPolyPairs use the polynomial
-template <int kPolyPairs>
+template <int kPolyPairs, bool kNoSum = false>
 __device__ __forceinline__ void exp_tile(const float* x, float2 c2, float2 nb2, uint32_t* pk, float2* acc) {
-  if constexpr (kPolyPairs == kHalfExpTc) {
+  if constexpr (kNoSum) {
+    // fp32 exp2 and e4m3 packing only (kOptTcSum32: the row sum comes from the tensor core)
+    static_assert(kPolyPairs == 0, "the tensor-core row sum with fp32 exp uses the hardware exp2 only");
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      float2 pr[2];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int pair = 2 * i + h;
+        const float2 y = fma2(make_float2(x[2 * pair], x[2 * pair + 1]), c2, nb2);
+        pr[h] = make_float2(fast_exp2(y.x), fast_exp2(y.y));
+      }
+      pk[i] = e4m3x2(pr[0].x, pr[0].y) | (e4m3x2(pr[1].x, pr[1].y) << 16);
+    }
+    return;
+  } else if constexpr (kPolyPairs == kHalfExpTc) {
 #pragma unroll
     for (int i = 0; i < 32; ++i) {
       uint32_t w[2];
@@ -484,10 +549,18 @@ __device__ __forceinline__ void exp_tile(const float* x, float2 c2, float2 nb2, 
 }
 
 // kPolyPairs: polynomial exp2 for this many of every 8 key pairs (the rest on ex2.approx.ftz.f32)
-template <bool kUsePDL, bool kTrace, int kPolyPairs>
+// kOpt: synchronization option bits (kOptDirectS, kOptHintWait; 0 = the original form)
+template <bool kUsePDL, bool kTrace, int kPolyPairs, int kOpt = 0>
 __global__ void __launch_bounds__(kThreads, 1)
     prefill_attn_kernel(const Params p, const __grid_constant__ CUtensorMap k_map,
                         const __grid_constant__ CUtensorMap v_map) {
+  static_assert((kOpt & ~(kOptDirectS | kOptHintWait | kOptTcSum32 | kOptWarpS)) == 0, "unknown option bits");
+  static_assert((kOpt & kOptDirectS) == 0 || (kOpt & kOptWarpS) == 0, "kOptDirectS and kOptWarpS are exclusive");
+  constexpr bool kWarpS = (kOpt & kOptWarpS) != 0;
+  static_assert((kOpt & kOptTcSum32) == 0 || kPolyPairs == 0, "kOptTcSum32 goes with the hardware fp32 exp2 only");
+  constexpr bool kTcSum32 = (kOpt & kOptTcSum32) != 0;
+  constexpr bool kDirectS = (kOpt & kOptDirectS) != 0;
+  constexpr bool kHintWait = (kOpt & kOptHintWait) != 0;
   extern __shared__ uint8_t smem_raw[];
   uint8_t* const sm = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t{1023});
   uint64_t* const bars = reinterpret_cast<uint64_t*>(sm + kSmBar);
@@ -505,6 +578,12 @@ __global__ void __launch_bounds__(kThreads, 1)
   const auto sfree_id = [](int b) { return static_cast<uint32_t>(1 + 4 * b); };
   const auto pfull_id = [](int b, int j) { return static_cast<uint32_t>(2 + 4 * b + j); };
   const auto sready_id = [](int b) { return static_cast<uint32_t>(4 + 4 * b); };
+  // kOptWarpS: one S-ready barrier per softmax warp (query tile b, warp wq of its group): ids 4 and 8 (the group barriers'
+  // ids, unused in this form) and 9-14; 64 threads each (the softmax warp + the scores issuer)
+  const auto sready_w_id = [](int b, int wq) {
+    return static_cast<uint32_t>(wq == 0 ? 4 + 4 * b : 8 + 3 * b + wq);
+  };
+  constexpr uint32_t kWarpPairThreads = 64;
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   // work unit: key tiles [tile0, tile0 + ntiles) of the 32 query tokens tok0 .. tok0 + 31 of request req, KV head kvh.
@@ -522,7 +601,7 @@ __global__ void __launch_bounds__(kThreads, 1)
   };
   const auto unit_at = [&](int u) { return p.units + 8 * static_cast<int64_t>(u); };
 
-  constexpr bool kTcSum = kPolyPairs == kHalfExpTc;
+  constexpr bool kTcSum = kPolyPairs == kHalfExpTc || kTcSum32;
   // Invariant: no global-memory access of any kind before this wait (the launch may overlap the predecessor's tail).
   if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
 
@@ -585,7 +664,13 @@ __global__ void __launch_bounds__(kThreads, 1)
           const int page = __shfl_sync(0xffffffffu, cur_page, i);
           if (lane == 0) {
             const int s = t & (kStages - 1);
-            if (t >= kStages) mbar_wait_sleep<256>(empty_bar(s), ((t / kStages) - 1) & 1);
+            if (t >= kStages) {
+              if constexpr (kHintWait) {
+                mbar_wait_hint<kWaitHintNs>(empty_bar(s), ((t / kStages) - 1) & 1);
+              } else {
+                mbar_wait_sleep<256>(empty_bar(s), ((t / kStages) - 1) & 1);
+              }
+            }
             mbar_expect_tx(full_bar(s), 2 * kKvBytes);
             tma_load_4d(smem_u32(sm + kSmK + s * kKvBytes), &k_map, 0, 0, kvh, page, full_bar(s));
             tma_load_4d(smem_u32(sm + kSmV + s * kKvBytes), &v_map, 0, 0, kvh, page, full_bar(s));
@@ -618,7 +703,13 @@ __global__ void __launch_bounds__(kThreads, 1)
       const uint32_t st = static_cast<uint32_t>(t) & (kStages - 1);
       if (!is_pv) {
         // S(t): K(t) landed (waited for before parking at the barrier); the group has read S(t - 1) / written Q
-        if (lane == 0) mbar_wait(full_bar(st), (t / kStages) & 1);
+        if (lane == 0) {
+          if constexpr (kHintWait) {
+            mbar_wait_hint<kWaitHintNs>(full_bar(st), (t / kStages) & 1);
+          } else {
+            mbar_wait(full_bar(st), (t / kStages) & 1);
+          }
+        }
         __syncwarp();
         named_sync(sfree_id(b), kGroupThreads);
         if (lane == 0) {
@@ -626,14 +717,25 @@ __global__ void __launch_bounds__(kThreads, 1)
           tc_fence_after();
           mma_ss(tb + kColS, dq, dk0 + st * (kKvBytes >> 4), id_qk, 0);
           mma_commit(s_full_bar(b));
-          // relay: S(t) complete and the P V MMA of tile t - 2 (P buffer t % 2) complete
-          mbar_wait(s_full_bar(b), t & 1);
-          if (t >= 2) mbar_wait(pv_done_bar(b, t & 1), ((t >> 1) - 1) & 1);
-          tc_fence_before();
+          if constexpr (!kDirectS) {
+            // relay: S(t) complete and the P V MMA of tile t - 2 (P buffer t % 2) complete
+            mbar_wait(s_full_bar(b), t & 1);
+            if (t >= 2) mbar_wait(pv_done_bar(b, t & 1), ((t >> 1) - 1) & 1);
+            tc_fence_before();
+          }
           PFA_TRACE(t, 9 + 4 * b);
         }
         __syncwarp();
-        named_arrive(sready_id(b), kGroupThreads);
+        // kDirectS: the softmax threads wait on s_full themselves (S(t + 1) cannot be issued, and s_full cannot complete
+        // again, before every softmax thread of the group has read S(t) and arrived at sfree)
+        if constexpr (kWarpS) {
+          // one relay arrival per softmax warp (barrier ids are per warp; each completes once per tile: the next arrival
+          // follows S(t + 1), which needs every warp's sfree arrival after its sync for tile t)
+#pragma unroll
+          for (int w = 0; w < 4; ++w) named_arrive(sready_w_id(b, w), kWarpPairThreads);
+        } else if constexpr (!kDirectS) {
+          named_arrive(sready_id(b), kGroupThreads);
+        }
       } else {
         // O += P(t) V(t) once the group has written P(t) (and rescaled O)
         const int j = t & 1;
@@ -685,7 +787,8 @@ __global__ void __launch_bounds__(kThreads, 1)
     {
       // Q row (64 e4m3) -> shared memory, K-major in the 64-byte swizzle (16-byte chunk j of row r at chunk
       // j ^ ((r >> 1) & 3)). For a later unit of the block, the scores MMAs of the earlier unit (async-proxy reads of
-      // Q) have completed: the group has read their results after the issuer's mbarrier wait and the barrier relay.
+      // Q) have completed: the group has read their results after the issuer's mbarrier wait and the barrier relay
+      // (kDirectS: after each thread's own wait on that mbarrier).
       // The proxy fence orders those reads before the generic writes below (PTX ISA, memory consistency model: proxy
       // fences); the second one orders the writes before the next scores MMA reads them.
       if (u > u0) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -710,8 +813,14 @@ __global__ void __launch_bounds__(kThreads, 1)
     for (int lt = 0; lt < ntiles; ++lt) {
       const int t = g0 + lt;  // block-wide tile index: P buffer t % 2 and the mbarrier phases
       const int j = t & 1;
-      // S(t) is in tensor memory and P buffer j is free
-      named_sync(sready_id(b), kGroupThreads);
+      // S(t) is in tensor memory and P buffer j is free (kDirectS: S(t) only; the P buffer is checked before the P store)
+      if constexpr (kDirectS) {
+        mbar_wait(s_full_bar(b), t & 1);
+      } else if constexpr (kWarpS) {
+        named_sync(sready_w_id(b, wq), kWarpPairThreads);  // this warp and the relay only
+      } else {
+        named_sync(sready_id(b), kGroupThreads);
+      }
       if (lane == 0) PFA_TRACE(t, 32 + 4 * b + wq);
       tc_fence_after();
       float x[128];
@@ -738,7 +847,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       const float nb = kLog2PScale - mnew;
       uint32_t pk[32];
       float2 acc[4] = {make_float2(0.f, 0.f), make_float2(0.f, 0.f), make_float2(0.f, 0.f), make_float2(0.f, 0.f)};
-      exp_tile<kPolyPairs>(x, make_float2(c, c), make_float2(nb, nb), pk, acc);
+      exp_tile<kPolyPairs, kTcSum32>(x, make_float2(c, c), make_float2(nb, nb), pk, acc);
       const float f = rescale ? fast_exp2(m - mnew) : 1.0f;
       if constexpr (kTcSum) {
         // one P buffer: the P V and row-sum MMAs of tile t - 1 must have finished before P(t) overwrites it (and
@@ -782,6 +891,13 @@ __global__ void __launch_bounds__(kThreads, 1)
         }
         l = fmaf(l, f, lt);
         m = mnew;
+        if constexpr (kDirectS) {
+          // P buffer j is free: the P V MMA of tile t - 2 (its last reader) has completed
+          if (t >= 2) {
+            mbar_wait(pv_done_bar(b, j), ((t >> 1) - 1) & 1);
+            tc_fence_after();
+          }
+        }
         tmem_st16u(tl + kColP + 32 * j, pk);
         tmem_st16u(tl + kColP + 32 * j + 16, pk + 16);
       }

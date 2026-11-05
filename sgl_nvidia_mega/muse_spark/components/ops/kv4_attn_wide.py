@@ -52,16 +52,18 @@ DQ_WARPS = int(os.environ.get("MUSE_VR_KV4_ATTN_WIDE_DQ_WARPS", "4"))
 # (20-warp blocks);
 # 64 = (with 4) the table dequantization's high selector as a high-word multiply; 128 = (with 4) the table entry address
 # by an integer multiply-add; 256 = (probabilities in tensor memory, no 32) the previous tile's output combine before the
-# store of the probabilities
+# store of the probabilities; 512 = every output column of a tile loaded before one wait in the combine; 1024 = the load
+# warp's page-list loads issued eight per lane before their stores
 SKEL = int(os.environ.get("MUSE_VR_KV4_ATTN_WIDE_SKEL", "0"))
 
 
-def _skel_for(hkv: int) -> int:
+def _skel_for(hkv: int, skel: int | None = None, dq: int | None = None) -> int:
     """The skeleton options a build at ``hkv`` KV heads takes: option 32 only with option 4 at 4 KV heads, one softmax
     thread per row, probabilities in tensor memory and 4 dequantization warps (other builds drop it)."""
-    s = SKEL
+    s = SKEL if skel is None else int(skel)
+    dqm = DQ_MODE if dq is None else int(dq)
     if not (
-        hkv == 4 and TPR == 1 and (s & 4) and DQ_WARPS == 4 and not (DQ_MODE >> 17) & 1
+        hkv == 4 and TPR == 1 and (s & 4) and DQ_WARPS == 4 and not (dqm >> 17) & 1
     ):
         s &= ~32
     return s
@@ -169,6 +171,8 @@ def kv4_attn_wide(
     blocks: int | None = None,
     f8_stages: int | None = None,
     raw_stages: int | None = None,
+    skel: int | None = None,
+    dq_mode: int | None = None,
 ) -> torch.Tensor:
     """Full attention of 8 consecutive query tokens per request over a paged native-NVFP4 KV pool.
 
@@ -180,6 +184,8 @@ def kv4_attn_wide(
     :param page_table: ``[>= R, pages]`` int32, inner dimension contiguous.
     :param seq_lens: ``[R]`` int32, KV length per request including the 8 query tokens.
     :param blocks: thread blocks (default: the SM count; ``MUSE_VR_KV4_ATTN_WIDE_BLOCKS`` overrides).
+    :param skel: / ``dq_mode``: per-call overrides of ``MUSE_VR_KV4_ATTN_WIDE_SKEL`` / ``MUSE_VR_KV4_ATTN_WIDE_DQ_MODE``
+        (benchmarks compare builds in one process; a nonzero development mode gives wrong outputs).
     """
     kp = k_pool.view(torch.uint8).reshape(k_pool.shape[0], -1)
     vp = v_pool.view(torch.uint8).reshape(v_pool.shape[0], -1)
@@ -195,8 +201,8 @@ def kv4_attn_wide(
         raw_stages or RAW_STAGES,
         bool(use_pdl),
         TPR if hkv == 4 else 2,
-        DQ_MODE,
-        _skel_for(hkv),
+        DQ_MODE if dq_mode is None else int(dq_mode),
+        _skel_for(hkv, skel, dq_mode),
     ).kv4_attn_wide(
         q,
         kp,

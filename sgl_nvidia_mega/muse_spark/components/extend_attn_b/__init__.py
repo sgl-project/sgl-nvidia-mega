@@ -58,6 +58,10 @@ def stats() -> dict:
     out = dict(_state["stats"])
     for dev, cap in _state["cap_slots"].items():
         out[f"scratch_mb@{dev}"] = round(cap * 256 * (64 * 4 + 8) / 2**20, 1)
+    for dev, k in _state["kernels"].items():
+        out[f"pfa_opt@{dev}"] = getattr(
+            k, "opt", 0
+        )  # the attention kernel's synchronization option (launch.OPT_ENV)
     return out
 
 

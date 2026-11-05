@@ -21,6 +21,14 @@ K/V scales stay in bmm1 / bmm2 as on the stock path; q is the same E4M3 q; the o
 for (BF16 with ``prefill_bf16_out``). The FP8-KV kernel over this workspace differs from the E2M1-KV kernel in a small
 fraction of output elements, by one bf16 ulp (kernel-internal arithmetic: the differences remain when the dequantized
 values are exactly representable); against an fp64 reference both have the same error.
+
+In-place output (``MUSE_VR_NVFP4_PREFILL_DQ_INPLACE=1``, default off): inside SGLang's eager attention region of the
+prefill graphs the layer's output rows are ``forward_batch._attn_output``; the region copies the backend's result into
+them unless the result already lives there (it compares data pointers). With this knob the workspace call writes its BF16
+output directly into those rows instead of the fresh tensor the BF16-output wrapper allocates, so the result is that
+buffer and the copy is skipped. Same kernels, same inputs, same output bytes; only the output address changes. A call
+whose destination does not fit (no buffer, another dtype, size or device, a non-contiguous buffer, a non-BF16 output)
+keeps the fresh tensor. Counted as ``inplace`` / ``inplace:skip:<reason>``.
 """
 
 from __future__ import annotations
@@ -44,10 +52,23 @@ TARGET_INIT = (
 _ACTIVE: contextvars.ContextVar = contextvars.ContextVar(
     "muse_vr_prefill_dq", default=None
 )
+# In-place mode only: (destination or None,) for the engaged forward_extend call; None when the mode is off.
+_DEST: contextvars.ContextVar = contextvars.ContextVar(
+    "muse_vr_prefill_dq_dest", default=None
+)
 
 
 def requested() -> bool:
     return os.environ.get("MUSE_VR_NVFP4_PREFILL_DQ", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def inplace_requested() -> bool:
+    return os.environ.get("MUSE_VR_NVFP4_PREFILL_DQ_INPLACE", "0").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -188,9 +209,16 @@ def _forward_extend_around(
         bed.count(NAME, "stock_capacity" if total is not None else "stock_no_host_lens")
         return original(self, q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
     token = _ACTIVE.set((ws, total, max_pages, forward_batch.batch_size))
+    dest = (
+        _DEST.set((getattr(forward_batch, "_attn_output", None),))
+        if inplace_requested()
+        else None
+    )
     try:
         return original(self, q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
     finally:
+        if dest is not None:
+            _DEST.reset(dest)
         _ACTIVE.reset(token)
 
 
@@ -263,6 +291,43 @@ def _call_ok(kwargs: dict, batch: int) -> bool:
     )
 
 
+def _to_dest(kwargs: dict, dest) -> None:
+    """In-place mode: point the workspace call's BF16 output at ``dest`` (the layer's output rows, see the module
+    docstring), else leave the call as it is (counted with the reason).
+
+    Inside an engaged ``forward_extend`` call the backend's native-NVFP4 context call passes its E4M3 staging buffer as
+    ``out``; a BF16 ``out`` with the query's shape here is the tensor the BF16-output wrapper allocated for that call. The
+    context functions below return ``out``, so the call's result becomes a view of ``dest``."""
+    import torch
+
+    query, out = kwargs.get("query"), kwargs.get("out")
+    if dest is None:
+        why = "no_dest"
+    elif not (
+        isinstance(query, torch.Tensor)
+        and isinstance(out, torch.Tensor)
+        and out.dtype == torch.bfloat16
+        and out.shape == query.shape
+        and out.is_contiguous()
+    ):
+        why = "out"
+    elif not (
+        isinstance(dest, torch.Tensor)
+        and dest.is_cuda
+        and dest.dtype == torch.bfloat16
+        and dest.is_contiguous()
+        and dest.device == query.device
+    ):
+        why = "dest"
+    elif dest.numel() != query.numel():
+        why = "numel"
+    else:
+        kwargs["out"] = dest.view(out.shape)
+        bed.count(NAME, "inplace")
+        return
+    bed.count(NAME, "inplace:skip:" + why)
+
+
 def wrap_context(context_fn):
     """Wrap FlashInfer's ``trtllm_batch_context_with_kv_cache``: inside an engaged ``forward_extend`` call (see the
     module docstring), a keyword call over the NVFP4 pool goes through the FP8 workspace; every other call is unchanged."""
@@ -286,6 +351,9 @@ def wrap_context(context_fn):
         from .ops import nvfp4_prefill_dq as op
 
         bed.count(NAME, "dq")
+        box = _DEST.get()
+        if box is not None:
+            _to_dest(kwargs, box[0])
         return op.context_over_workspace(
             context_fn, ws, total, max_pages, kwargs, use_pdl=_use_pdl()
         )

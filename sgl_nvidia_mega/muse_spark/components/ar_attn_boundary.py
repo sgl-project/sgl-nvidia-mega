@@ -32,6 +32,14 @@ instead of the cap (``MUSE_VR_AR_ATTN_BOUNDARY_MAX_M`` is then not used), so a s
 smaller or larger one does not; with ``MUSE_VR_AR2_BOUNDARY=1`` a call whose row count is not in the set takes the two-shot form
 inside its own range. Unset = the cap rule above, unchanged.
 
+``MUSE_VR_AR_K47=1`` (default off): calls with ``MUSE_VR_AR_K47_MIN_M`` (default 80) <= rows <= ``MUSE_VR_AR_K47_MAX_M``
+(default 1024) that take neither the one-shot form above nor the two-shot form of ``MUSE_VR_AR2_BOUNDARY``'s range run SGLang
+pull request 47174's fused push all-reduce + boundary kernel (``vendor/sglang_pr47174``: 1-shot or 2-shot push by its own
+rule; the 2-shot gives each rank a column slice of every row, reduces it in rank order and gathers the sums) where the stock
+all-reduce dispatch resolves to the custom all-reduce (any algorithm) and that op's own support check passes. Its outputs
+are those of the push all-reduce + the boundary kernel at the same launch shape (bitwise to the stock pair at the launch
+shapes it uses in this range).
+
 ``MUSE_VR_AR_ATTN_BOUNDARY_SHADOW=1`` (debug, eager calls only) also runs the stock pair (all-reduce, then the
 boundary) on the same inputs after every fused call and tallies bitwise equality of all outputs with
 ``bed.shadow_result``. Every rank takes the same decision, so the extra all-reduce is issued on all of them or none.
@@ -57,6 +65,11 @@ ENV_AR2_MAX_M = "MUSE_VR_AR2_BOUNDARY_MAX_M"
 DEFAULT_AR2_MAX_M = 512
 ENV_AR2_MIN_M = "MUSE_VR_AR2_BOUNDARY_MIN_M"
 ENV_ROWS = "MUSE_VR_AR_ATTN_BOUNDARY_ROWS"
+ENV_K47 = "MUSE_VR_AR_K47"
+ENV_K47_MIN_M = "MUSE_VR_AR_K47_MIN_M"
+ENV_K47_MAX_M = "MUSE_VR_AR_K47_MAX_M"
+DEFAULT_K47_MIN_M = 80
+DEFAULT_K47_MAX_M = 1024
 _state = {"shadow": False}
 TARGET = "sglang.srt.models.muse_spark.MuseSpark1xDecoderLayer.forward"
 
@@ -143,6 +156,50 @@ def _ar2_max_m() -> int:
         return int(os.environ.get(ENV_AR2_MAX_M, str(DEFAULT_AR2_MAX_M)))
     except ValueError:
         return DEFAULT_AR2_MAX_M
+
+
+def _k47_enabled() -> bool:
+    return os.environ.get(ENV_K47, "0") == "1"
+
+
+def _k47_min_m() -> int:
+    try:
+        return int(os.environ.get(ENV_K47_MIN_M, str(DEFAULT_K47_MIN_M)))
+    except ValueError:
+        return DEFAULT_K47_MIN_M
+
+
+def _k47_max_m() -> int:
+    try:
+        return int(os.environ.get(ENV_K47_MAX_M, str(DEFAULT_K47_MAX_M)))
+    except ValueError:
+        return DEFAULT_K47_MAX_M
+
+
+def _ar2_row(m: int) -> bool:
+    """The call takes the two-shot form's range (MUSE_VR_AR2_BOUNDARY): not a one-shot row and within MIN_M..MAX_M."""
+    return _ar2_enabled() and not _one_shot_row(m) and _ar2_min_m() <= m <= _ar2_max_m()
+
+
+def _k47_row(m: int) -> bool:
+    """The call takes pull request 47174's form: neither a one-shot nor a two-shot row, within its MIN_M..MAX_M."""
+    return (
+        _k47_enabled()
+        and not _one_shot_row(m)
+        and not _ar2_row(m)
+        and _k47_min_m() <= m <= _k47_max_m()
+    )
+
+
+def row_form(m: int) -> str:
+    """'one' / 'two' / 'k47' / 'stock': the form the row count selects (before the per-call dispatch checks)."""
+    if _one_shot_row(m):
+        return "one"
+    if _ar2_row(m):
+        return "two"
+    if _k47_row(m):
+        return "k47"
+    return "stock"
 
 
 def pins_match() -> tuple[bool, str]:
@@ -237,14 +294,7 @@ def _layer_eligible(layer, attn_input: torch.Tensor, forward_batch) -> str | Non
     if not (mode.is_decode() or mode.is_target_verify()):
         return "not decode/verify"
     m = attn_input.shape[0]
-    if m == 0 or not (
-        _one_shot_row(m)
-        or (
-            _ar2_enabled()
-            and _ar2_min_m() <= m <= _ar2_max_m()
-            and (_rows() is not None or m > _max_m())
-        )
-    ):
+    if m == 0 or row_form(m) == "stock":
         return "row count outside range"
     o_proj = layer.self_attn.o_proj
     if (
@@ -314,7 +364,27 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
     group = get_parallel().attn_tp_group
     comm = group.ca_comm
     m_rows = partial.shape[0]
-    if not _one_shot_row(m_rows) and m_rows >= _ar2_min_m():
+    form = row_form(m_rows)
+    k47 = None
+    if form == "k47":
+        from .vendor.sglang_pr47174 import muse_spark_all_reduce_norm_residual as k47_op
+
+        k47 = (
+            k47_op
+            if (
+                _stock_ar_is_custom(group, partial)
+                and layer.operator_dtype == torch.bfloat16
+                and k47_op.all_reduce_norm_residual_supported(
+                    comm, m_rows, partial.shape[1]
+                )
+                and boundary._triton_supported(
+                    stream, partial, layer.operator_dtype, router_dtype, None
+                )
+                and partial.is_contiguous()
+            )
+            else None
+        )
+    if form == "two":
         from .ar2_norm_residual import ar2_norm_residual
         from .ar2_norm_residual import supported as supported2
 
@@ -328,7 +398,27 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
         )
     else:
         two_shot = False
-    if two_shot:
+    if k47 is not None:
+        ffn_input, stream_out, router_input = k47.all_reduce_norm_residual(
+            comm,
+            partial,
+            stream,
+            **boundary.jit_kernel_kwargs(layer.operator_dtype),
+            want_router=router_dtype is not None,
+        )
+        bed.count(NAME, f"k47:M={m_rows}:tp={comm.world_size}")
+        if _state["shadow"] and not torch.cuda.is_current_stream_capturing():
+            _shadow_compare(
+                group,
+                boundary,
+                layer,
+                partial,
+                stream,
+                router_dtype,
+                (ffn_input, stream_out, router_input),
+            )
+        stream = stream_out
+    elif two_shot:
         boundary._ensure_cached_weights(layer.operator_dtype)
         ffn_input, stream_out, router_input = ar2_norm_residual(
             comm,
@@ -360,7 +450,7 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
             )
         stream = stream_out
     elif (
-        _one_shot_row(m_rows)
+        form == "one"
         and _stock_ar_is_one_shot_push(group, partial)
         and supported(comm, partial.shape[0], partial.shape[1])
         and boundary._triton_supported(
@@ -455,5 +545,8 @@ def register() -> bool:
         ar2=_ar2_enabled(),
         ar2_min_m=_ar2_min_m(),
         ar2_max_m=_ar2_max_m(),
+        k47=_k47_enabled(),
+        k47_min_m=_k47_min_m(),
+        k47_max_m=_k47_max_m(),
     )
     return True

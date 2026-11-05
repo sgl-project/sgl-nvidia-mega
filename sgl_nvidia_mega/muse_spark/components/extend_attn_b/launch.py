@@ -5,6 +5,11 @@ csrc/prefill_attn.cuh (its __CUDACC_RTC__ branch has no host headers), the CUDA 
 
 Imports torch and cuda.bindings only. Cubins are cached on disk by the digest of source, options and NVRTC version.
 Every build refuses under CUDA-graph capture (prepare() builds everything before serving).
+
+Kernel option (``MUSE_VR_XATTN_B_PFA_OPT``, default 0 = the original kernel): the attention kernel's kOpt template bits
+(csrc/prefill_attn.cuh): 1 = kOptDirectS, 2 = kOptHintWait and 8 = kOptWarpS (exclusive with 1) change only how the
+kernel's warps wait for each other; 4 = kOptTcSum32 takes the softmax row sum on the tensor core (the sum of the e4m3 P
+values, a different normalization sum, judged against a float64 reference). Any other value refuses the build loudly.
 """
 
 from __future__ import annotations
@@ -25,6 +30,32 @@ HEAD_DIM, PAGE = 64, 128
 SMEM_BYTES = 2 * 8 * PAGE * 64 + 2 * 128 * 64 + 1024 + 256 + 1024
 KERNEL = "muse_vr::pfa::prefill_attn_kernel<true, false, 0>"  # PDL entry wait on, no trace, fp32 exp only
 MERGE = "muse_vr::pfa::prefill_attn_merge"
+OPT_ENV = "MUSE_VR_XATTN_B_PFA_OPT"
+OPTS = tuple(v for v in range(16) if not (v & 1 and v & 8))
+
+
+def opt_from_env() -> int:
+    raw = os.environ.get(OPT_ENV, "0").strip() or "0"
+    try:
+        opt = int(raw)
+    except ValueError:
+        opt = -1
+    if opt not in OPTS:
+        raise ValueError(f"{OPT_ENV}={raw!r}: expected one of {OPTS}")
+    return opt
+
+
+def kernel_expr(opt: int) -> str:
+    """The attention kernel's name expression for kernel option ``opt`` (0 = KERNEL, the original instantiation)."""
+    if opt not in OPTS:
+        raise ValueError(f"kernel option {opt!r}: expected one of {OPTS}")
+    return (
+        KERNEL
+        if opt == 0
+        else f"muse_vr::pfa::prefill_attn_kernel<true, false, 0, {opt}>"
+    )
+
+
 # The engine JIT's device flags for the same source (-std=c++20, nvcc's float defaults); stated explicitly so the two builds
 # make the same rounding choices (division, flush-to-zero, contraction).
 OPTIONS = (
@@ -70,12 +101,14 @@ def _cache_dir() -> Path:
     return Path(os.path.expanduser(root)) / "muse_vr_extend_attn_b"
 
 
-def compile_cubin(arch: str) -> tuple[bytes, dict]:
-    """NVRTC build of the attention kernel and the merge kernel for ``arch``; returns (cubin, lowered names)."""
+def compile_cubin(arch: str, opt: int = 0) -> tuple[bytes, dict]:
+    """NVRTC build of the attention kernel (kernel option ``opt``) and the merge kernel for ``arch``; returns (cubin,
+    lowered names keyed by the name expressions)."""
     from cuda.bindings import nvrtc
 
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("extend_attn_b: build inside CUDA-graph capture")
+    kexpr = kernel_expr(opt)
     source = SOURCE.read_text()
     options = [
         f"--gpu-architecture={arch}",
@@ -84,19 +117,19 @@ def compile_cubin(arch: str) -> tuple[bytes, dict]:
     ]
     (major, minor) = _check(nvrtc.nvrtcVersion(), "nvrtcVersion")
     key = hashlib.sha256(
-        "\0".join([source, *options, KERNEL, MERGE, f"{major}.{minor}"]).encode()
+        "\0".join([source, *options, kexpr, MERGE, f"{major}.{minor}"]).encode()
     ).hexdigest()[:24]
     cubin_path = _cache_dir() / f"pfa-{key}.cubin"
     names_path = cubin_path.with_suffix(".names")
     if cubin_path.is_file() and names_path.is_file():
         k, m = names_path.read_text().split("\n")[:2]
-        return cubin_path.read_bytes(), {KERNEL: k, MERGE: m}
+        return cubin_path.read_bytes(), {kexpr: k, MERGE: m}
     prog = _check(
         nvrtc.nvrtcCreateProgram(source.encode(), b"prefill_attn.cu", 0, [], []),
         "nvrtcCreateProgram",
     )
     try:
-        for expr in (KERNEL, MERGE):
+        for expr in (kexpr, MERGE):
             _check(
                 nvrtc.nvrtcAddNameExpression(prog, expr.encode()),
                 "nvrtcAddNameExpression",
@@ -111,7 +144,7 @@ def compile_cubin(arch: str) -> tuple[bytes, dict]:
                 "extend_attn_b: NVRTC failed: " + log.decode(errors="replace")[-4000:]
             )
         lowered = {}
-        for expr in (KERNEL, MERGE):
+        for expr in (kexpr, MERGE):
             name = _check(
                 nvrtc.nvrtcGetLoweredName(prog, expr.encode()), "nvrtcGetLoweredName"
             )
@@ -126,7 +159,7 @@ def compile_cubin(arch: str) -> tuple[bytes, dict]:
     tmp.write_bytes(cubin)
     tmp.replace(cubin_path)
     tmpn = names_path.with_suffix(f".{os.getpid()}.ntmp")
-    tmpn.write_text(lowered[KERNEL] + "\n" + lowered[MERGE] + "\n")
+    tmpn.write_text(lowered[kexpr] + "\n" + lowered[MERGE] + "\n")
     tmpn.replace(names_path)
     return cubin, lowered
 
@@ -156,15 +189,18 @@ class Params(ctypes.Structure):
 class Kernels:
     """Loaded functions of one device (built once by prepare())."""
 
-    def __init__(self, device_index: int):
+    def __init__(self, device_index: int, opt: int | None = None):
         cu = _drv()
+        self.opt = opt_from_env() if opt is None else int(opt)
         major, minor = torch.cuda.get_device_capability(device_index)
-        cubin, names = compile_cubin(f"sm_{major}{minor}a")
+        cubin, names = compile_cubin(f"sm_{major}{minor}a", self.opt)
         with torch.cuda.device(device_index):
             torch.zeros(1, device=f"cuda:{device_index}")  # primary context current
             self.module = _check(cu.cuModuleLoadData(cubin), "cuModuleLoadData")
             self.attn = _check(
-                cu.cuModuleGetFunction(self.module, names[KERNEL].encode()),
+                cu.cuModuleGetFunction(
+                    self.module, names[kernel_expr(self.opt)].encode()
+                ),
                 "get attention kernel",
             )
             self.merge = _check(
@@ -276,8 +312,10 @@ def launch(
     k_map=None,
     v_map=None,
     stream=None,
+    pdl: bool = True,
 ) -> None:
-    """One attention launch (grid = blocks of cta_units) and, when there are split pieces, the merge launch."""
+    """One attention launch (grid = blocks of cta_units) and, when there are split pieces, the merge launch.
+    ``pdl``: the attention launch's programmatic-serialization attribute (tests switch it off)."""
     p = Params(
         units.data_ptr(),
         cta_units.data_ptr(),
@@ -300,7 +338,7 @@ def launch(
     s = torch.cuda.current_stream().cuda_stream if stream is None else stream
     blocks = cta_units.shape[0] - 1
     _launch(
-        k.attn, (blocks, 1, 1), (THREADS, 1, 1), SMEM_BYTES, [p, km, vm], s, pdl=True
+        k.attn, (blocks, 1, 1), (THREADS, 1, 1), SMEM_BYTES, [p, km, vm], s, pdl=pdl
     )
     if munits.shape[0] > 0:
         args = [

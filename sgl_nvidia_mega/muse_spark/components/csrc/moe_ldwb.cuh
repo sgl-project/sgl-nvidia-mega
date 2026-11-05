@@ -47,6 +47,11 @@
 #ifndef MUSE_VR_LDW_TRAP
 #define MUSE_VR_LDW_TRAP 1
 #endif
+// Tests only: 1 = the start ticket and the slot claim are issued BEFORE griddepcontrol.wait (the earlier placement; the
+// negative control of tests/test_moe_ldwb_order.py). Default 0: both are issued right after the wait (prologue).
+#ifndef MUSE_VR_LDW_TEST_PREWAIT_CLAIM
+#define MUSE_VR_LDW_TEST_PREWAIT_CLAIM 0
+#endif
 #ifndef MUSE_VR_LDW_MAX_POLLS
 #define MUSE_VR_LDW_MAX_POLLS (1u << 24)
 #endif
@@ -1039,23 +1044,43 @@ __device__ MUSE_VR_LDW_ROLE void prologue(Smem& s, const Params& p) {
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   Scratch& x = *reinterpret_cast<Scratch*>(&s.st[kStages - 1][0]);
   const int nslot = p.m * kTopK;
-  // start ticket (residency, counter parity): issued now, its value first needed at the parity step below
+  // Start ticket (residency, counter parity) and slot claim: both are atomic RMWs on control words that the previous
+  // launch of this call site updates (its last CTA clears the claim bitmap in finish()). They are issued right AFTER
+  // griddepcontrol.wait: under programmatic dependent launch the wait is the documented edge that orders them after the
+  // completion of every prerequisite grid (PTX ISA, griddepcontrol), so the previous launch's clear is ordered before
+  // this launch's claim. Issued before the routed-ids loads below, so their latency still overlaps those loads and the
+  // ccnt zeroing (= moe_ldw.cuh's placement, a84afeb4). -DMUSE_VR_LDW_TEST_PREWAIT_CLAIM=1 (tests only: the negative
+  // control of tests/test_moe_ldwb_order.py) keeps the earlier pre-wait placement.
   unsigned ticket = 0;
-  if (tid == 0) ticket = atomicInc(p.ticket, gridDim.x * kStartCycle - 1u);
 #if !MUSE_VR_SLOT_UNSAFE && MUSE_VR_SLOT_EPOCH
   // launch-counter claim (slot_claim.cuh): issued by thread 0 after its routed-ids loads below (an RMW issued at
   // launch delays those loads), settled when the work list needs it
   unsigned ep_smid = 0, ep_old = 0, ep_hint = 0;
 #endif
 #if !MUSE_VR_SLOT_UNSAFE && !MUSE_VR_SLOT_EPOCH
-  // slot claim (slot_claim.cuh): the SM's slot is the hint; issued now, settled when the work list needs it
   unsigned claim_hint = 0, claim_old = 0;
+#endif
+#if MUSE_VR_LDW_TEST_PREWAIT_CLAIM
+  if (tid == 0) ticket = atomicInc(p.ticket, gridDim.x * kStartCycle - 1u);
+#if !MUSE_VR_SLOT_UNSAFE && !MUSE_VR_SLOT_EPOCH
   if (tid == 0) {
     claim_hint = unsigned(reinterpret_cast<const uint8_t*>(p.sm_domain)[muse_vr_slot::read_smid()]);
     claim_old = muse_vr_slot::try_hint(p.ticket + kClaimWord, claim_hint, p.n_dom0, p.n_dom1);
   }
 #endif
+#endif
   grid_dep_wait();  // ids and token rows come from predecessors
+#if !MUSE_VR_LDW_TEST_PREWAIT_CLAIM
+  // start ticket: its value is first needed at the parity step below
+  if (tid == 0) ticket = atomicInc(p.ticket, gridDim.x * kStartCycle - 1u);
+#if !MUSE_VR_SLOT_UNSAFE && !MUSE_VR_SLOT_EPOCH
+  // slot claim (slot_claim.cuh): the SM's slot is the hint; settled when the work list needs it
+  if (tid == 0) {
+    claim_hint = unsigned(reinterpret_cast<const uint8_t*>(p.sm_domain)[muse_vr_slot::read_smid()]);
+    claim_old = muse_vr_slot::try_hint(p.ticket + kClaimWord, claim_hint, p.n_dom0, p.n_dom1);
+  }
+#endif
+#endif
   for (int i = tid; i < kNumChunks * kMaxPool; i += kThreads) (&x.ccnt[0][0])[i] = 0u;
   named_bar_sync(6, kThreads);
   {

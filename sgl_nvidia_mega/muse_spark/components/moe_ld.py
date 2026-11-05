@@ -42,6 +42,13 @@ the same rows; its own per-device scratch). The RING48 range takes precedence wh
 ``MUSE_VR_MOE_LDW_MAX_M`` (default 512; 1024 allowed) raises MoE-LD-W's row ceiling: at 1024 every MoE-LD-W build is the wide build
 (``ops.moe_ldw.WIDE``) with scratch for 1024 rows (about twice the memory), so calls of up to 1024 rows engage (the same rows,
 bitwise); RING48 then also runs up to that ceiling unless ``MUSE_VR_MOE_LDW_RING48_MAX_M`` lowers it.
+``MUSE_VR_MOE_LD_PLACE_AT_CREATE=1`` (default off) creates the expert weights (gate_up_proj, down_proj) directly in the placement
+layout (``ld_layout.alloc_rows_split``: split_rows_copy's chunks and domain order) inside the stock create_weights. The checkpoint
+loader and the stock process_weights_after_loading write them in place, so the placed bytes are the ones the load-time copy would
+place, and the load-time step finds them placed (``ld_layout.is_placed``) and skips its copy, swap and empty_cache. With expandable
+segments, the copy's freed regions leave partly-live allocator pages per layer that empty_cache cannot unmap; this avoids them
+(tests/test_moe_ld_place_create.py). ``MUSE_VR_MOE_LD_WFP=1`` (default off; diagnostics) folds every prepared layer's expert
+weights and block scales into a per-rank digest (engagement record ``moe_ld_wfp``) for whole-tensor compares between runs.
 ``MUSE_VR_MOE_LD_MAX_M`` (default 16) bounds the rows MoE-LD takes; 0 leaves calls of up to 16 rows on FlashInfer, so only
 MoE-LD-W engages.
 
@@ -200,8 +207,9 @@ def _sp_active() -> bool:
         return True
 
 
-def _layer_reason(layer) -> str:
-    """Empty when this expert layer can use the kernel, else why not."""
+def _layer_reason(layer, quant_config=None) -> str:
+    """Empty when this expert layer can use the kernel, else why not (quant_config: the one to judge by when the layer has
+    none attached yet, i.e. at create_weights time)."""
     from .moe_ld_ops import HIDDEN, INTER, MAX_POOL
 
     if getattr(layer, "use_marlin", False) or getattr(layer, "use_megamoe", False):
@@ -223,11 +231,128 @@ def _layer_reason(layer) -> str:
         return f"down_proj shape {tuple(w2.shape)}"
     if w13.shape[0] > MAX_POOL or w2.shape[0] != w13.shape[0]:
         return f"{w13.shape[0]} expert slots"
-    if not bool(
-        getattr(getattr(layer, "quant_config", None), "use_per_token_activation", False)
-    ):
+    qc = getattr(layer, "quant_config", None)
+    if qc is None:
+        qc = quant_config
+    if not bool(getattr(qc, "use_per_token_activation", False)):
         return "per-token activation scaling is off"
     return ""
+
+
+_PC: dict = {
+    "on": None,
+    "tensors": 0,
+    "skipped": None,
+}  # MUSE_VR_MOE_LD_PLACE_AT_CREATE
+_WFP: dict = {"on": None, "tensors": 0, "h": None}  # MUSE_VR_MOE_LD_WFP (diagnostics)
+
+
+def _pc_on() -> bool:
+    """MUSE_VR_MOE_LD_PLACE_AT_CREATE=1 (read once)."""
+    if _PC["on"] is None:
+        _PC["on"] = bed.env_int("MUSE_VR_MOE_LD_PLACE_AT_CREATE", 0) == 1
+    return _PC["on"]
+
+
+def _place_at_create(method, layer) -> None:
+    """Back gate_up_proj / down_proj by the placement layout from the start (MUSE_VR_MOE_LD_PLACE_AT_CREATE). The checkpoint
+    loader and the stock process_weights_after_loading write these parameters in place (copy_ into the same storage), so
+    the placed storage ends up holding exactly the bytes split_rows_copy would have copied there; _prepare_layer then finds
+    them placed and skips its copy, swap and empty_cache. The PyTorch storage created by the stock create_weights is never
+    written and goes back to the cache at once. Any failure leaves the stock storage (the load-time copy then places it)."""
+    import torch
+
+    from . import ld_layout
+
+    why = _layer_reason(layer, getattr(method, "quant_config", None))
+    if why:
+        _PC["skipped"] = why
+        return
+    dev = layer.gate_up_proj.device
+    if dev.type != "cuda" or ld_layout.domain_count(dev) != 2:
+        _PC["skipped"] = f"device {dev}: not two locality domains"
+        return
+    with torch.no_grad():
+        for name in ("gate_up_proj", "down_proj"):
+            p = getattr(layer, name)
+            if ld_layout.is_placed(p.data):
+                continue
+            p.data = ld_layout.alloc_rows_split(p.device, p.shape, p.dtype, 2)
+            _PC["tensors"] += 1
+    bed.report(
+        "moe_ld_place_at_create",
+        True,
+        tensors=_PC["tensors"],
+        skipped=_PC["skipped"] or "-",
+    )
+
+
+def _wfp_on() -> bool:
+    """MUSE_VR_MOE_LD_WFP=1 (read once)."""
+    if _WFP["on"] is None:
+        _WFP["on"] = bed.env_int("MUSE_VR_MOE_LD_WFP", 0) == 1
+    return _WFP["on"]
+
+
+def _wfp_tensor(t, slice_bytes: int = 32 * 2**20) -> list:
+    """Order-sensitive fingerprint of a contiguous tensor's bytes, on its device, in slices (small temporaries): per slice the
+    sums of the low / high 32-bit words of every 8-byte word and two position-weighted 16-bit sums (no int64 overflow), then the
+    tail bytes; a whole-tensor compare between two runs at the cost of one read."""
+    import torch
+
+    b = t.detach().contiguous().view(torch.uint8).view(-1)
+    n8 = b.numel() // 8 * 8
+    out: list = [int(b.numel())]
+    w = None
+    for o in range(0, n8, slice_bytes):
+        x = b[o : min(o + slice_bytes, n8)].view(torch.int64)
+        if w is None or w.numel() < x.numel():
+            w = torch.arange(x.numel(), device=x.device, dtype=torch.int64) % 65521 + 1
+        ww = w[: x.numel()]
+        out.append(
+            torch.stack(
+                (
+                    (x & 0xFFFFFFFF).sum(),
+                    ((x >> 32) & 0xFFFFFFFF).sum(),
+                    ((x & 0xFFFF) * ww).sum(),
+                    (((x >> 16) & 0xFFFF) * ww).sum(),
+                )
+            )
+        )
+    vals = (
+        [out[0]] + [v for r in torch.stack(out[1:]).tolist() for v in r]
+        if len(out) > 1
+        else [out[0]]
+    )
+    vals += b[n8:].tolist()
+    return vals
+
+
+def _wfp_add(layer, dev) -> None:
+    """MUSE_VR_MOE_LD_WFP: fold the layer's expert weights + their block scales into the rank's running digest (load order)."""
+    import hashlib
+
+    if _WFP["h"] is None:
+        _WFP["h"] = hashlib.sha256()
+    for name in (
+        "gate_up_proj",
+        "down_proj",
+        "gate_up_proj_weight_scale",
+        "down_proj_weight_scale",
+    ):
+        t = getattr(layer, name, None)
+        if t is None:
+            continue
+        _WFP["h"].update(f"{name}:{tuple(t.shape)}:{t.dtype}:".encode())
+        _WFP["h"].update(repr(_wfp_tensor(t)).encode())
+        _WFP["tensors"] += 1
+    bed.report(
+        "moe_ld_wfp",
+        True,
+        device=str(dev),
+        tensors=_WFP["tensors"],
+        digest=_WFP["h"].hexdigest(),
+    )
 
 
 def _prepare_layer(layer) -> None:
@@ -251,10 +376,17 @@ def _prepare_layer(layer) -> None:
         with torch.no_grad():
             for name in ("gate_up_proj", "down_proj"):
                 p = getattr(layer, name)
+                if ld_layout.is_placed(
+                    p.data
+                ):  # MUSE_VR_MOE_LD_PLACE_AT_CREATE: already in the placement layout
+                    continue
                 placed = ld_layout.split_rows_copy(p.data, 2)
                 p.data = placed
                 del placed
                 torch.cuda.empty_cache()  # the replaced storage goes back before the next layer's placement
+    if _wfp_on():
+        with torch.no_grad():
+            _wfp_add(layer, dev)
     if not _state["prepared"]:
         # once per process, at load time (outside any graph capture): the SM -> locality-domain table (probe kernels
         # and a synchronization) and the kernel builds for both row configurations
@@ -774,6 +906,27 @@ def register() -> bool:
     q.MuseSparkNvFp4FusedMoEMethod.process_weights_after_loading = (
         process_weights_after_loading
     )
+    if _pc_on():  # MUSE_VR_MOE_LD_PLACE_AT_CREATE: the expert weights are created in the placement layout
+        orig_create = q.MuseSparkNvFp4FusedMoEMethod.create_weights
+
+        def create_weights(self, layer, *a, **kw):
+            out = orig_create(self, layer, *a, **kw)
+            try:
+                _place_at_create(self, layer)
+            except Exception as e:  # noqa: BLE001 - the stock storage stays; the load-time copy places it
+                _PC["skipped"] = f"place at create failed: {type(e).__name__}: {e}"
+                bed.report(
+                    "moe_ld_place_at_create",
+                    _PC["tensors"] > 0,
+                    tensors=_PC["tensors"],
+                    skipped=_PC["skipped"],
+                )
+            return out
+
+        q.MuseSparkNvFp4FusedMoEMethod.create_weights = create_weights
+        logger.warning(
+            "muse_vr_plugin: moe_ld expert weights are created in the placement layout (MUSE_VR_MOE_LD_PLACE_AT_CREATE=1)"
+        )
     fp4.MuseSpark1xFp4Experts.forward = experts_forward
     _state["engaged"] = True
     logger.warning("muse_vr_plugin: moe_ld hooks installed")

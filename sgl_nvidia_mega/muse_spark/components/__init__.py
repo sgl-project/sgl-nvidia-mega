@@ -43,7 +43,8 @@ _state: dict = {"engaged": None, "warp_fixed_upstream": False}
 
 # Order matters; see the module docstring.
 COMPONENTS = (
-    "nvfp4_kv",  # first: kv_draftwin's sizing hook wraps its per-token bytes
+    "ctx_kv_counter",  # before nvfp4_kv: its context-function chain wraps the function this one installs (innermost)
+    "nvfp4_kv",  # first after ctx_kv_counter: kv_draftwin's sizing hook wraps its per-token bytes
     "ar_attn_boundary",
     "pull_bounded",
     "verify_logits_gather",
@@ -62,8 +63,10 @@ COMPONENTS = (
     "moe_ld",  # before moe_tail: wraps the experts' forward and the routed-MoE call
     "bf16_ldw",  # BF16-expert layers: wraps their weight preparation, TRT-LLM forward and the routed BF16 MoE call
     "moe_tail",
+    "proj_publish",  # after moe_ld / moe_tail: rebinds the model module's pooler / unpooler call names and prepare_input
     "unorm_boundary",  # wraps FusedPostNormResidualPreNorm.forward_jit (the boundary kernel call itself)
     "fin2",
+    "fin_2shot",  # after fin2 (exclusive with it): wraps the finalize op, MuseSpark1xMoE._forward_tp and its workspace setter
     "hb0_rr",  # after fin2: both wrap the finalize op; this one takes only the call right behind its expert kernel
     "mid_rs",  # after ar_attn_boundary, final_norm, input_norm and moe_ld: wraps their layer / model hooks
     "moe_tactic",
@@ -72,14 +75,20 @@ COMPONENTS = (
     "prefill_moe_tactic",
     "prefill_moe_x",  # before sp_fp4_dispatch: that hook adds the per-token scales and calls this one
     "sp_gate",
+    "o_rowshard",  # wraps the SP o_proj / QKV entry points and the model load (moves the o_proj slices at load)
+    "fp8_prefill",  # after o_rowshard (its QKV path calls o_rowshard's join) and gemm_lt (its dispatch hook is outermost)
     "sp_combine_inplace",
     "pfin",  # wraps the finalize op's CuTe-DSL call (sp_combine_inplace only picks its destination)
+    "rs_samem",  # after fp8_prefill: wraps its qkv all-gather (the fence it records) and SGLang's GEMM + reduce-scatter
     "small_extend_attn",
     "xattn_b",  # own extend-attention op; refuses to engage next to extend_attn / small_extend_attn / prefill_attn
     "sp_fp4_dispatch",
+    "car_table",
     "prefill_attn",
     "prefill_qkn",
     "kv_draftwin",
+    "draft_topk",
+    "draft_head_lt",
     "verify_topk_sample",  # last: its hooks wrap the other components' hooks
 )
 

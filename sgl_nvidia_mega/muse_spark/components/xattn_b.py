@@ -10,7 +10,10 @@ stand-in runs the previous (stock) function. The op's kernels are built and run 
 model is loaded (``extend_attn_b.prepare``), never inside a served forward.
 
 Opt in with ``MUSE_VR_XATTN_B=1``. Refused at boot when ``extend_attn``, ``small_extend_attn`` or ``prefill_attn`` is
-also enabled (they route the same calls). Engagement is guarded by the sha256 pins of the backend and FlashInfer files.
+also enabled (they route the same calls). ``MUSE_VR_XATTN_B_PFA_OPT`` (default 0) selects the attention kernel's
+option (extend_attn_b.launch: bits 1 / 2 / 8 synchronization only, bit 4 the tensor-core row sum); a value outside
+launch's list refuses the component at boot, and a nonzero value is recorded as ``pfa_opt`` in the engagement record. Engagement is
+guarded by the sha256 pins of the backend and FlashInfer files.
 
 NVFP4 KV pool (``nvfp4_kv``): the op reads E4M3 pages only, so over an NVFP4 pool it serves the context calls that
 ``nvfp4_kv``'s ``prefill_dq`` part makes over its FP8 workspace, and nothing else. ``nvfp4_kv`` builds that chain itself
@@ -31,6 +34,16 @@ served inputs. With ``MUSE_VR_XATTN_B_DUMP_BINCAP`` = n > 0 the cap and the stri
 the bin of its largest new-token count, its smallest cached prefix and its request count (DUMP_BINS edges), and each bin
 saves its 1st, (1 + EVERY)-th, ... eligible call up to n files (DUMP_MAX still bounds the total). The copies to host
 synchronize the stream: never use it in a timed run.
+
+Load-time charge. ``prepare`` builds the op's kernels and grows its split scratch to the cap right after the target's
+weights load, i.e. before SGLang sizes the KV pool, so the pool is smaller by that much. ``MUSE_VR_XATTN_B_DEFER_PREPARE=1``
+(default 0) moves the same ``prepare`` call: the load hook only records the device (count ``prepare_deferred``) and a BEFORE
+hook on ``ModelRunner.init_cuda_graphs`` (the target runner only; after the KV pool is sized, before any graph capture) runs
+it. Until then the op declines every call as ``not_prepared`` (stock path; no allocation). A ``prepare`` that fails there is
+loud and leaves the op off on that device (warning, count ``prepare_failed``, report ``xattn_b_defer`` engaged=False; the
+device is left unprepared, so every call runs stock). ``MUSE_VR_XATTN_B_PREP_REQUESTS`` (1..4, default 4 = ``prepare``'s
+default) trims the scratch cap (``prepare(max_requests=...)``); a call that needs more slots than the cap declines as
+``scratch`` and runs stock. Other values of either knob refuse the component at boot.
 """
 
 from __future__ import annotations
@@ -45,6 +58,9 @@ logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "xattn_b"
 CONFLICTS = ("extend_attn", "small_extend_attn", "prefill_attn")
+PFA_OPTS = tuple(
+    str(v) for v in range(16) if not (v & 1 and v & 8)
+)  # = extend_attn_b.launch.OPTS
 _state: dict = {
     "engaged": None,
     "prev_ctx": None,
@@ -58,7 +74,12 @@ _state: dict = {
     "route": False,
     "compose": False,
     "composed": False,
+    "defer": False,
+    "prep_requests": 4,
+    "pending": {},
+    "hook_ran": False,
 }
+T_GRAPHS = "sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs"
 _call: contextvars.ContextVar = contextvars.ContextVar(
     "muse_vr_xattn_b_call", default=None
 )
@@ -387,13 +408,21 @@ def _wrap_load_model(fn):
             hq = mc.num_attention_heads // tp
             hkv = max(1, mc.get_num_kv_heads(tp))
             if hq == 8 * hkv:
-                xb.prepare(
-                    torch.cuda.current_device(),
-                    max_new_tokens=plan.T_HI,
-                    num_kv_heads=hkv,
-                    num_q_heads=hq,
-                )
-                bed.count(NAME, "prepared")
+                dix = torch.cuda.current_device()
+                if (
+                    _state["defer"] and not _state["hook_ran"]
+                ):  # MUSE_VR_XATTN_B_DEFER_PREPARE=1: after the KV pool
+                    _state["pending"][dix] = (hkv, hq)
+                    bed.count(NAME, "prepare_deferred")
+                else:
+                    xb.prepare(
+                        dix,
+                        max_requests=_state["prep_requests"],
+                        max_new_tokens=plan.T_HI,
+                        num_kv_heads=hkv,
+                        num_q_heads=hq,
+                    )
+                    bed.count(NAME, "prepared")
             else:
                 bed.count(NAME, "prepare_skipped:head_layout")
         except Exception as e:  # noqa: BLE001 - without prepare the op declines every call ("not_prepared")
@@ -408,6 +437,67 @@ def _wrap_load_model(fn):
 
     load_model.__wrapped_by_xattn_b__ = True
     return load_model
+
+
+def _is_target_runner(runner) -> bool:
+    """Whether a ModelRunner serves the target MuseSpark1xModel (not the draft model; the mid_rs form)."""
+    m = getattr(runner, "model", None)
+    for path in (("model", "language_model"), ("language_model",), ("model",)):
+        x = m
+        for p in path:
+            x = getattr(x, p, None)
+        if x is not None and type(x).__name__ == "MuseSpark1xModel":
+            return True
+    return False
+
+
+def _before_graphs(runner, *a, **kw):
+    """ModelRunner.init_cuda_graphs (BEFORE), MUSE_VR_XATTN_B_DEFER_PREPARE=1 only: the deferred ``prepare`` of every device
+    the load hook recorded, for the target runner, after SGLang sized the KV pool and before any capture (``prepare``
+    refuses under capture). A failure is loud and leaves that device unprepared (the op declines, stock path)."""
+    if not _is_target_runner(runner):
+        return None
+    _state["hook_ran"] = True
+    if not _state["pending"]:
+        return None
+    from . import extend_attn_b as xb
+    from .extend_attn_b import plan
+
+    done, failed = [], []
+    for dix, (hkv, hq) in sorted(_state["pending"].items()):
+        try:
+            xb.prepare(
+                dix,
+                max_requests=_state["prep_requests"],
+                max_new_tokens=plan.T_HI,
+                num_kv_heads=hkv,
+                num_q_heads=hq,
+            )
+            bed.count(NAME, "prepared")
+            done.append(dix)
+        except Exception as e:  # noqa: BLE001 - loud step-aside: the device stays unprepared, every call runs stock
+            for k in ("kernels", "ws", "cap_slots"):
+                xb._state[k].pop(dix, None)
+            bed.count(NAME, "prepare_failed")
+            failed.append(f"{dix}:{type(e).__name__}: {e}")
+            logger.warning(
+                "muse_vr_plugin: %s deferred prepare FAILED on device %d (%s: %s); the op stays off there "
+                "(stock path)",
+                NAME,
+                dix,
+                type(e).__name__,
+                e,
+            )
+    _state["pending"].clear()
+    bed.report(
+        "xattn_b_defer",
+        not failed,
+        devices=",".join(str(d) for d in done),
+        failed="; ".join(failed) or None,
+        when="before init_cuda_graphs",
+        prep_requests=_state["prep_requests"],
+    )
+    return None
 
 
 def install() -> None:
@@ -480,6 +570,30 @@ def engage() -> bool:
         )
     _state["mode"] = mode
     _state["route"] = os.environ.get("MUSE_VR_XATTN_B_ROUTE", "0") == "1"
+    defer = os.environ.get("MUSE_VR_XATTN_B_DEFER_PREPARE", "0").strip()
+    preq = os.environ.get("MUSE_VR_XATTN_B_PREP_REQUESTS", "4").strip()
+    if defer not in ("0", "1") or preq not in ("1", "2", "3", "4"):
+        bed.report(
+            NAME,
+            False,
+            reason=f"MUSE_VR_XATTN_B_DEFER_PREPARE {defer!r} not 0 / 1 or MUSE_VR_XATTN_B_PREP_REQUESTS "
+            f"{preq!r} not 1..4",
+        )
+        _state["engaged"] = False
+        return False
+    _state["defer"], _state["prep_requests"] = defer == "1", int(preq)
+    # the attention kernel's option (extend_attn_b.launch.OPT_ENV; launch validates it again at build). Checked here
+    # without importing the op, so a refused value is reported before anything is installed.
+    raw_opt = os.environ.get("MUSE_VR_XATTN_B_PFA_OPT", "0").strip() or "0"
+    if raw_opt not in PFA_OPTS:
+        bed.report(
+            NAME,
+            False,
+            reason=f"MUSE_VR_XATTN_B_PFA_OPT {raw_opt!r} not one of {', '.join(PFA_OPTS)}",
+        )
+        _state["engaged"] = False
+        return False
+    pfa_opt = int(raw_opt)
     from .small_extend_attn import _pins_ok
 
     ok, why = _pins_ok()
@@ -487,13 +601,39 @@ def engage() -> bool:
         bed.report(NAME, False, reason=f"pin mismatch: {why}")
         _state["engaged"] = False
         return False
+    if _state[
+        "defer"
+    ]:  # registered before install(): a registration failure refuses with nothing patched
+        try:
+            from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+            HookRegistry.register(T_GRAPHS, _before_graphs, HookType.BEFORE)
+        except Exception as e:  # noqa: BLE001
+            bed.report(
+                NAME,
+                False,
+                reason=f"deferred-prepare hook registration failed: {type(e).__name__}: {e}",
+            )
+            _state["engaged"] = False
+            return False
+        logger.warning(
+            "muse_vr_plugin: %s prepare deferred to after the KV pool (MUSE_VR_XATTN_B_DEFER_PREPARE=1)",
+            NAME,
+        )
     try:
         install()
     except Exception as e:  # noqa: BLE001
         bed.report(NAME, False, reason=f"install failed: {type(e).__name__}: {e}")
         _state["engaged"] = False
         return False
-    bed.report(NAME, True, composed=bool(_state["compose"]))
+    extra = {}  # the default record is unchanged (keys only when a knob is set)
+    if _state["defer"]:
+        extra["defer_prepare"] = True
+    if _state["prep_requests"] != 4:
+        extra["prep_requests"] = _state["prep_requests"]
+    if pfa_opt:
+        extra["pfa_opt"] = pfa_opt
+    bed.report(NAME, True, composed=bool(_state["compose"]), **extra)
     _state["engaged"] = True
     return True
 

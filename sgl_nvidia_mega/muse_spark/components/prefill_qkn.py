@@ -19,10 +19,13 @@ other call runs SGLang's method unchanged; step-asides are counted per reason an
 Engagement needs the sha256 of the SGLang sources whose behaviour the hook mirrors to match the pinned revision, and
 the Triton version whose code generation the arithmetic reproduces. Opt in with ``MUSE_VR_PREFILL_QKN=1``.
 Counters: ``own:rope`` / ``own:norope`` (with ``capture`` / ``eager``) and ``stock:<reason>`` (with ``>=2^k`` progress keys).
+q8 mode (``MUSE_VR_PREFILL_QKN_Q8=1``, default off; see ``Q8_PINS``): ``own:q8:rope`` / ``own:q8:norope`` and
+``q8:stock:<reason>``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 
@@ -58,7 +61,9 @@ PINS = {
 # hook passes the raw q / k / v and a spec keyword to the attention layer; SGLang's eager attention path narrows the
 # call to the real tokens and forwards keywords to the backend, where ``_extend_hook`` consumes the spec. Every call
 # the backend's fused FP8 path would not take falls back to the norm-only kernel followed by the stock call, so the
-# backend never receives an un-normalized q.
+# backend never receives an un-normalized q. On a mixed NVFP4 / FP8 hybrid pool (``nvfp4_kv_mixed``) the decision and the
+# fused store of a sliding-window layer run under the FP8-KV view that component applies to that layer's backend call, so its
+# FP8 sub-pool is written exactly as an FP8 pool is; full-attention (NVFP4) layers keep the stock store.
 TARGET_EXTEND = (
     "sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend.forward_extend"
 )
@@ -82,6 +87,24 @@ STORE_PINS = {
 }
 _store_state = {"engaged": False}
 
+# q8 mode (``MUSE_VR_PREFILL_QKN_Q8=1``, on top of ``MUSE_VR_PREFILL_QKN=1``): where the norm-only form runs and the
+# attention call goes to SGLang's TRT-LLM MHA backend on its native-NVFP4 prefill path (which converts q with
+# ``q.to(torch.float8_e4m3fn)``, an elementwise kernel), the norm kernel writes q as e4m3 directly
+# (``ops.prefill_qkn.qk_norm_q8``: the bytes of that conversion of the bf16 q) and the attention layer receives it; the
+# backend's conversion then returns it unchanged. k and v are the same tensors as before. Not for FP8 layers of a mixed
+# NVFP4 / FP8 pool (their backend call takes the FP8 path), context parallelism, or other forward modes; those calls
+# keep the bf16 q (counted ``q8:stock:<reason>``). Engagement needs the pins of the SGLang sources whose behaviour it
+# relies on (the backend's q conversion, the eager attention region's output dtype following v).
+Q8_PINS = {
+    rel: STORE_PINS[rel]
+    for rel in (
+        "sglang/srt/layers/attention/trtllm_mha_backend.py",
+        "sglang/srt/layers/attention/graph_utils.py",
+        "sglang/srt/layers/attention/base_attn_backend.py",
+    )
+}
+_q8_state = {"engaged": False}
+
 _logged: set = set()
 
 
@@ -96,6 +119,15 @@ def enabled() -> bool:
 
 def store_enabled() -> bool:
     return os.environ.get("MUSE_VR_PREFILL_QKN_STORE", "0").strip() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def q8_enabled() -> bool:
+    return os.environ.get("MUSE_VR_PREFILL_QKN_Q8", "0").strip() in (
         "1",
         "true",
         "yes",
@@ -121,6 +153,25 @@ class _StoreSpec:
         self.rows = rows
 
 
+def _store_view(backend, layer):
+    """The backend attributes the stock call of ``layer`` runs with: for a layer whose KV lives in the FP8 sliding-window
+    sub-pool of a mixed NVFP4 / FP8 hybrid pool (``nvfp4_kv_mixed``), the FP8-KV view that ``nvfp4_kv_mixed`` applies
+    around ``forward_extend``; otherwise the backend as it is. The store decision and the fused store run under it, so an
+    FP8 sub-pool layer is judged and written exactly as on an FP8 pool."""
+    from . import nvfp4_kv_mixed as mixed
+
+    sub = (
+        mixed._fp8_sub_pool_of(
+            getattr(backend, "token_to_kv_pool", None), layer.layer_id
+        )
+        if mixed.requested()
+        else None
+    )
+    return (
+        mixed._fp8_view(backend, sub) if sub is not None else contextlib.nullcontext()
+    )
+
+
 def _store_reason(backend, layer, forward_batch, save_kv_cache) -> str | None:
     """Reason the backend call must keep its own FP8 store, or None (the backend's fused FP8 q + KV path would run
     with unit KV scales: the case the fused kernel reproduces)."""
@@ -142,6 +193,39 @@ def _store_reason(backend, layer, forward_batch, save_kv_cache) -> str | None:
     if getattr(forward_batch.forward_mode, "name", "") != "EXTEND":
         return "not plain extend"
     return None
+
+
+def _q8_reason(backend, layer, forward_batch) -> str | None:
+    """Reason the attention call must receive the bf16 q (q8 mode), or None: the backend's extend call converts q with
+    ``q.to(torch.float8_e4m3fn)`` on its native-NVFP4 path (not the fused FP8 q / KV path)."""
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnBackend,
+        is_cp_active,
+    )
+
+    from . import nvfp4_kv_mixed as mixed
+
+    if backend is None or type(backend) is not TRTLLMHAAttnBackend:
+        return "backend"
+    if getattr(forward_batch.forward_mode, "name", "") != "EXTEND":
+        return "not plain extend"
+    if is_cp_active(forward_batch):
+        return "context parallel"
+    if mixed.requested() and mixed.layer_is_fp8(backend, layer):
+        return "fp8 layer"
+    if (
+        backend.data_type == torch.float8_e4m3fn
+        or not backend._forward_extend_uses_native_fp4(forward_batch)
+    ):
+        return "not native fp4"
+    return None
+
+
+def _q8_stock(reason: str) -> None:
+    _tally(f"q8:stock:{reason}")
+    if "q8:" + reason not in _logged:
+        _logged.add("q8:" + reason)
+        logger.warning("muse_vr_plugin: %s q8 steps aside (%s); bf16 q", NAME, reason)
 
 
 def _qkv_rows(q: torch.Tensor, n: int) -> torch.Tensor:
@@ -251,11 +335,11 @@ def _prefill_path(attn, positions, qkv, forward_batch, cos_sin):
     if _store_state["engaged"] and qkv.stride(1) == 1:
         backend = _backend()
         rows_ref = _rows_ref(qkv)
-        if (
-            backend is not None
-            and rows_ref is not None
-            and _store_reason(backend, layer, forward_batch, True) is None
-        ):
+        ok = False
+        if backend is not None and rows_ref is not None:
+            with _store_view(backend, layer):
+                ok = _store_reason(backend, layer, forward_batch, True) is None
+        if ok:
             spec = _StoreSpec(
                 cos_sin, layer.tp_q_head_num, layer.tp_k_head_num, eps, rows_ref
             )
@@ -266,6 +350,19 @@ def _prefill_path(attn, positions, qkv, forward_batch, cos_sin):
                 q_raw, k_raw, v, forward_batch, save_kv_cache=True, **{STORE_KW: spec}
             )
             return attn._fused_o_norm_gate(output, o_gate)
+    if _q8_state["engaged"]:
+        try:
+            q8_reason = _q8_reason(_backend(), layer, forward_batch)
+        except Exception as e:  # noqa: BLE001 - this call keeps the bf16 q
+            q8_reason = f"error {type(e).__name__}"
+        if q8_reason is None:
+            q8, k = op.qk_norm_q8(
+                qkv, positions, cos_sin, layer.tp_q_head_num, layer.tp_k_head_num, eps
+            )
+            _tally(("own:q8:rope" if cos_sin is not None else "own:q8:norope") + mode)
+            output = attn.attn(q8, k, v, forward_batch, save_kv_cache=True)
+            return attn._fused_o_norm_gate(output, o_gate)
+        _q8_stock(q8_reason)
     q, k = op.qk_norm(
         qkv, positions, cos_sin, layer.tp_q_head_num, layer.tp_k_head_num, eps
     )
@@ -331,29 +428,31 @@ def _extend_hook(original, *args, **kwargs):
         _tally("store:rebuilt_rows")
         rows = torch.cat([q.reshape(n, -1), k.reshape(n, -1), v.reshape(n, -1)], dim=1)
     positions = forward_batch.positions[:n]
-    reason = _store_reason(backend, layer, forward_batch, save_kv_cache)
+    with _store_view(backend, layer):
+        reason = _store_reason(backend, layer, forward_batch, save_kv_cache)
+        if reason is None:
+            cache_loc = backend._get_layer_cache_loc(layer, forward_batch)
+            k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            kv_dim = spec.num_kv_heads * op.HEAD_DIM
+            q8 = torch.empty(
+                (n, spec.num_q_heads * op.HEAD_DIM),
+                dtype=torch.float8_e4m3fn,
+                device=q.device,
+            )
+            op.prefill_qkn(
+                rows,
+                positions,
+                spec.cos_sin,
+                k_cache.view(-1, kv_dim),
+                v_cache.view(-1, kv_dim),
+                cache_loc,
+                q8,
+                spec.num_q_heads,
+                spec.num_kv_heads,
+                spec.eps,
+            )
+            _tally("store:fused")
     if reason is None:
-        cache_loc = backend._get_layer_cache_loc(layer, forward_batch)
-        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        kv_dim = spec.num_kv_heads * op.HEAD_DIM
-        q8 = torch.empty(
-            (n, spec.num_q_heads * op.HEAD_DIM),
-            dtype=torch.float8_e4m3fn,
-            device=q.device,
-        )
-        op.prefill_qkn(
-            rows,
-            positions,
-            spec.cos_sin,
-            k_cache.view(-1, kv_dim),
-            v_cache.view(-1, kv_dim),
-            cache_loc,
-            q8,
-            spec.num_q_heads,
-            spec.num_kv_heads,
-            spec.eps,
-        )
-        _tally("store:fused")
         return original(
             backend, q8, None, None, layer, forward_batch, save_kv_cache=False, **kwargs
         )
@@ -423,6 +522,16 @@ def register() -> bool:
                 "muse_vr_plugin: %s store mode not engaged (pin mismatch); norm-only",
                 NAME,
             )
+    q8 = None
+    if q8_enabled():
+        if all(bed.pinned(rel, sha) for rel, sha in Q8_PINS.items()):
+            _q8_state["engaged"] = True
+            mode += "+q8"
+        else:
+            q8 = "q8 pins mismatch: bf16 q"
+            logger.warning(
+                "muse_vr_plugin: %s q8 mode not engaged (pin mismatch); bf16 q", NAME
+            )
     bed.report(
         NAME,
         True,
@@ -430,5 +539,6 @@ def register() -> bool:
         arith=qk_arith(),
         mode=mode,
         **({"store": store} if store else {}),
+        **({"q8": q8} if q8 else {}),
     )
     return True

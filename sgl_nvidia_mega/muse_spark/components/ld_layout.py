@@ -123,6 +123,18 @@ def pointer_domain(ptr: int) -> int:
     return int(v)
 
 
+PLACE_COUNTS = {
+    "allocs": 0,
+    "mapped": 0,
+}  # cuMemCreate calls / mapped bytes made by _Mapping (diagnostics; MUSE_VR_MOE_LD_PLACEDIAG reads them)
+PLACED: dict[
+    int, int
+] = {}  # base address -> size of every live _Mapping (is_placed reads it)
+LAYOUT: dict[
+    int, tuple
+] = {}  # base address -> (chunk bytes, domain order) of every live _Mapping (units compare layouts)
+
+
 class _Mapping:
     """A mapped VA range; exposes ``__cuda_array_interface__`` so PyTorch tensors keep it alive."""
 
@@ -164,10 +176,16 @@ class _Mapping:
             "version": 3,
             "strides": None,
         }
+        PLACE_COUNTS["allocs"] += len(domains)
+        PLACE_COUNTS["mapped"] += self.size
+        PLACED[self.va] = self.size
+        LAYOUT[self.va] = (int(chunk), tuple(int(d) for d in domains))
 
     def _free(self):
         if not self.va:
             return
+        PLACED.pop(self.va, None)
+        LAYOUT.pop(self.va, None)
         try:
             cu = _cu()
             if self._mapped:
@@ -187,21 +205,42 @@ def alloc_pattern(device, chunk_bytes: int, domains: list[int]) -> torch.Tensor:
     return torch.as_tensor(m, device=torch.device("cuda", ordinal))
 
 
+def alloc_rows_split(device, shape, dtype, parts: int = 2) -> torch.Tensor:
+    """Uninitialized contiguous [E, R, ...] tensor in split_rows_copy's layout: rows [p*R/parts, (p+1)*R/parts) of every
+    block e on domain p (the same chunks, the same domain order)."""
+    shape = tuple(int(x) for x in shape)
+    if len(shape) < 2:
+        raise ValueError("alloc_rows_split needs at least 2 dimensions")
+    e, r = shape[0], shape[1]
+    if r % parts:
+        raise ValueError(f"rows {r} not divisible by {parts}")
+    nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
+    chunk = nbytes // (e * parts)
+    raw = alloc_pattern(device, chunk, [p for _ in range(e) for p in range(parts)])
+    return raw.view(dtype).view(shape)
+
+
 def split_rows_copy(src: torch.Tensor, parts: int = 2) -> torch.Tensor:
     """Copy of a contiguous [E, R, ...] tensor; rows [p*R/parts, (p+1)*R/parts) of every block e on domain p."""
     if not src.is_cuda or not src.is_contiguous() or src.dim() < 2:
         raise ValueError(
             "split_rows_copy needs a contiguous CUDA tensor with at least 2 dimensions"
         )
-    e, r = src.shape[0], src.shape[1]
-    if r % parts:
-        raise ValueError(f"rows {r} not divisible by {parts}")
-    nbytes = src.numel() * src.element_size()
-    chunk = nbytes // (e * parts)
-    raw = alloc_pattern(src.device, chunk, [p for _ in range(e) for p in range(parts)])
-    out = raw.view(src.dtype).view(src.shape)
+    out = alloc_rows_split(src.device, src.shape, src.dtype, parts)
     out.copy_(src)
     return out
+
+
+def is_placed(t: torch.Tensor) -> bool:
+    """True when t is a whole live placement mapping (alloc_rows_split / split_rows_copy output, not a view of part of one)."""
+    try:
+        return (
+            t.is_cuda
+            and t.is_contiguous()
+            and PLACED.get(int(t.data_ptr())) == t.numel() * t.element_size()
+        )
+    except Exception:  # noqa: BLE001 - a tensor without storage is not placed
+        return False
 
 
 @lru_cache(maxsize=None)

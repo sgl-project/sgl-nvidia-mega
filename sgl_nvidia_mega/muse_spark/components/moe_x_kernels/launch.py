@@ -64,6 +64,7 @@ DEFAULT_GEMM2 = Tactic(256, 256, "cpasync", two_cta=True)
 
 _lock = threading.Lock()
 _cache: dict = {}
+_rows_kernels: dict = {}  # compile key -> GroupedGemmRowsKernel object (trace-time records for the unit)
 
 
 def _max_active_clusters(cluster_size: int = 1) -> int:
@@ -136,6 +137,111 @@ def _gemm2_ptrs(addrs=None):
     ]
 
 
+def _gemm2_sched_ptrs(addrs=None):
+    """``_gemm2_ptrs`` plus the claimed schedules' control block and per-SM locality-domain table."""
+    import cutlass
+
+    a = addrs or [0x100000] * 18
+    return _gemm2_ptrs(a[:16]) + [
+        _ptr(cutlass.Int32, a[16], 16),  # schedule control block
+        _ptr(cutlass.Int32, a[17]),  # locality domain per SM
+    ]
+
+
+SCHEDS = ("static", "dyn", "local")
+
+
+def tmem_bar_unaligned() -> bool:
+    """The rows kernels' tensor-memory handshake uses the non-aligned named-barrier form (default; one shared barrier
+    instruction for the MMA warp and the epilogue warps). ``MUSE_VR_MOE_X_TMEM_BAR_UNALIGNED=0`` selects the library's
+    aligned form, which reaches one aligned barrier from two different instructions. No value changes either way."""
+    return os.environ.get("MUSE_VR_MOE_X_TMEM_BAR_UNALIGNED", "1").strip() != "0"
+
+
+def sched_mode() -> str:
+    """Work-unit schedule of the rows kernels (``MUSE_VR_MOE_X_SCHED``): "static" (default; the persistent static
+    schedule), "dyn" (units claimed from one counter) or "local" (one queue per half of the weight rows, claimed by
+    the clusters of the matching locality domain first); see ``GroupedGemmRowsKernel``."""
+    m = os.environ.get("MUSE_VR_MOE_X_SCHED", "static").strip().lower()
+    return m if m in SCHEDS else "static"
+
+
+def sm_domains(device) -> torch.Tensor | None:
+    """int32 [multiprocessor count]: locality domain of each SM, or None when the device has fewer than two domains.
+    Built once per device (probe kernels and a synchronization: call outside CUDA graph capture)."""
+    dev = torch.device(device)
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    key = ("sm_domains", idx)
+    if key in _cache:
+        return _cache[key]
+    from .. import ld_layout
+
+    tab = None
+    if ld_layout.domain_count(idx) >= 2:
+        tab = (
+            ld_layout.sm_domain_table(idx)
+            .to(device=torch.device("cuda", idx), dtype=torch.int32)
+            .contiguous()
+        )
+    _cache[key] = tab
+    return tab
+
+
+MBOX_N_TILES = (
+    64  # the mailbox word's N field holds N tiles 0..63 (see grouped_gemm_rows)
+)
+
+
+def effective_sched(
+    t1: Tactic, t2: Tactic, device=None, n1: int | None = None, n2: int | None = None
+) -> str:
+    """The schedule a call runs with: the configured one where it applies (rows form of the first GEMM, a non-fused
+    quantizer form, no N clusters, at most MBOX_N_TILES N tiles per GEMM), "local" -> "dyn" without two locality
+    domains (or before the domain table is built) or when a GEMM has an odd N tile count (its queues split the N tiles
+    in halves), else "static". n1 / n2 = the GEMMs' weight rows (gate/up rows, down rows); None = the served shapes."""
+    mode = sched_mode()
+    if mode == "static":
+        return mode
+    if (
+        not gemm1_rows_mode()
+        or quant_form(t1) == "fused"
+        or t1.cluster_n != 1
+        or t2.cluster_n != 1
+    ):
+        return "static"
+    tiles = [n // t.tile_n for n, t in ((n1, t1), (n2, t2)) if n is not None]
+    if any(n % t.tile_n for n, t in ((n1, t1), (n2, t2)) if n is not None) or any(
+        x > MBOX_N_TILES for x in tiles
+    ):
+        return "static"
+    if mode == "local" and any(x % 2 for x in tiles):
+        mode = "dyn"
+    if mode == "local":
+        dev = (
+            torch.device(device)
+            if device is not None
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        if (
+            "sm_domains",
+            idx,
+        ) not in _cache and not torch.cuda.is_current_stream_capturing():
+            sm_domains(
+                idx
+            )  # first eager call (warm-up) builds the table; never inside a capture
+        if _cache.get(("sm_domains", idx)) is None:
+            return "dyn"
+    return mode
+
+
+def sched_words(t: Tactic) -> int:
+    """int32 words of one GEMM's schedule control block (head + one mailbox ring per cluster)."""
+    from .grouped_gemm_rows import MBOX_RING, SCHED_HEAD_WORDS
+
+    return SCHED_HEAD_WORDS + MBOX_RING * _max_active_clusters(t.cluster_size)
+
+
 def compile_gemm1(
     tactic: Tactic, *, use_pdl: bool = False, vectorized_f32: bool = True
 ):
@@ -181,20 +287,15 @@ def compile_gemm1(
         return fn
 
 
-def compile_gemm2(
+def rows_key(
     tactic: Tactic,
     swiglu: bool = False,
     row_amax: bool = False,
     fuse_quant: bool = False,
-):
-    """Compiled rows kernel: the second GEMM, or (``swiglu``) the first GEMM over sorted-row activations (with
-    ``row_amax``: also reducing each row's largest |output| for the row-block quantizer)."""
-    import cutlass.cute as cute
-
-    from .arch import device_arch
-    from .bounded_wait import bounded_waits
-    from .grouped_gemm_rows import GroupedGemmRowsKernel
-
+    sched: str = "static",
+) -> tuple:
+    """Compile-cache key of a rows kernel: every option that selects a different build (the one key used by
+    ``compile_gemm2`` to store a build and by ``compiled`` to find it)."""
     key = (
         (
             ("gemm1_rows_fq" if fuse_quant else "gemm1_rows_amax")
@@ -206,9 +307,40 @@ def compile_gemm2(
         tactic,
     )
     # output stores: per-row bulk copies (default; measured faster) or tensor-memory-access tile stores
-    tma_store = os.environ.get("MUSE_VR_MOE_X_TMA_STORE", "0") == "1"
-    if tma_store:
+    if os.environ.get("MUSE_VR_MOE_X_TMA_STORE", "0") == "1":
         key = key + ("tma_store",)
+    twin = (
+        sched != "static" and os.environ.get("MUSE_VR_MOE_X_SCHED_TWIN", "0") == "1"
+    )  # test only (must-fail twin)
+    if sched != "static":
+        key = key + ("sched", sched) + (("twin",) if twin else ())
+    if tmem_bar_unaligned() and not fuse_quant:
+        key = key + ("tmem_bar_unaligned",)
+    return key
+
+
+def compile_gemm2(
+    tactic: Tactic,
+    swiglu: bool = False,
+    row_amax: bool = False,
+    fuse_quant: bool = False,
+    sched: str = "static",
+):
+    """Compiled rows kernel: the second GEMM, or (``swiglu``) the first GEMM over sorted-row activations (with
+    ``row_amax``: also reducing each row's largest |output| for the row-block quantizer); ``sched`` = the work-unit
+    schedule (``sched_mode``)."""
+    import cutlass.cute as cute
+
+    from .arch import device_arch
+    from .bounded_wait import bounded_waits
+    from .grouped_gemm_rows import GroupedGemmRowsKernel
+
+    key = rows_key(
+        tactic, swiglu=swiglu, row_amax=row_amax, fuse_quant=fuse_quant, sched=sched
+    )
+    tma_store = "tma_store" in key
+    twin = "twin" in key
+    tmem_bar = "tmem_bar_unaligned" in key
     with _lock:
         hit = _cache.get(key)
         if hit is not None:
@@ -224,11 +356,13 @@ def compile_gemm2(
             row_amax=row_amax,
             fuse_quant=fuse_quant,
             tma_store=tma_store,
+            **({"sched": sched, "sched_twin": twin} if sched != "static" else {}),
+            **({"tmem_bar_unaligned": True} if tmem_bar else {}),
         )
         with bounded_waits():
             fn = cute.compile(
-                kern.wrapper,
-                *_gemm2_ptrs(),
+                kern.wrapper if sched == "static" else kern.wrapper_sched,
+                *(_gemm2_ptrs() if sched == "static" else _gemm2_sched_ptrs()),
                 tactic.tile_m * 8,  # m (runtime)
                 256,  # n (runtime)
                 256,  # k (runtime)
@@ -239,7 +373,14 @@ def compile_gemm2(
                 stream=_stream(),
             )
         _cache[key] = fn
+        _rows_kernels[key] = kern
         return fn
+
+
+def compiled_rows_kernels() -> list:
+    """The rows kernel objects compiled in this process (for unit checks of their trace-time records)."""
+    with _lock:
+        return list(_rows_kernels.values())
 
 
 def gemm1_rows_mode() -> bool:
@@ -267,27 +408,38 @@ def row_block_quant(t1: Tactic = None) -> bool:
     return quant_form(t1 or DEFAULT_GEMM1) in ("fused", "blocks")
 
 
+def missing_builds(t1: Tactic, t2: Tactic) -> list:
+    """The compile-cache keys (and the row-kernel module) a call with these tactics needs and this process has not
+    built; empty when ``compiled``. The keys are the ones ``build`` / the first eager call store (``rows_key``)."""
+    form = quant_form(t1)
+    sched = effective_sched(t1, t2)
+    if gemm1_rows_mode():
+        g1 = rows_key(
+            t1,
+            swiglu=True,
+            row_amax=form in ("fused", "blocks"),
+            fuse_quant=form == "fused",
+            sched=sched,
+        )
+    else:
+        g1 = ("gemm1", t1, False, True)
+    g2 = rows_key(t2, sched=sched)
+    miss = [k for k in (g1, g2) if k not in _cache]
+    if (own_quantizer_applies() or gemm1_rows_mode()) and "quant_module" not in _cache:
+        miss.append("quant_module")
+    return miss
+
+
 def compiled(t1: Tactic, t2: Tactic) -> bool:
     """Kernels for these tactics (and the row-kernel module, if used) are built in this process."""
-    form = quant_form(t1)
-    g1 = (
-        (
-            {"fused": "gemm1_rows_fq", "blocks": "gemm1_rows_amax"}.get(
-                form, "gemm1_rows"
-            ),
-            t1,
-        )
-        if gemm1_rows_mode()
-        else ("gemm1", t1, False, True)
-    )
-    ok = g1 in _cache and ("gemm2", t2) in _cache
-    return ok and (
-        not (own_quantizer_applies() or gemm1_rows_mode()) or "quant_module" in _cache
-    )
+    return not missing_builds(t1, t2)
 
 
 def build(t1: Tactic, t2: Tactic) -> None:
     """Compile / load everything one call needs (outside CUDA graph capture)."""
+    if sched_mode() == "local" and torch.cuda.is_available():
+        sm_domains(torch.cuda.current_device())
+    sched = effective_sched(t1, t2) if torch.cuda.is_available() else "static"
     if gemm1_rows_mode():
         form = quant_form(t1)
         compile_gemm2(
@@ -295,10 +447,11 @@ def build(t1: Tactic, t2: Tactic) -> None:
             swiglu=True,
             row_amax=form in ("fused", "blocks"),
             fuse_quant=form == "fused",
+            sched=sched,
         )
     else:
         compile_gemm1(t1)
-    compile_gemm2(t2)
+    compile_gemm2(t2, sched=sched)
     if own_quantizer_applies() or gemm1_rows_mode():
         _quant_module()
 
@@ -361,17 +514,22 @@ def run_gemm2(
     alpha_up=None,
     row_amax=None,
     fused=None,
+    sched: str = "static",
+    sched_ctl=None,
+    sm_dom=None,
 ):
     """out[r, :] = alpha[e] * row_scale[r] * (A[r] @ W2[e]^T) for every valid sorted row r; with ``alpha_up`` the first
     GEMM's SwiGLU form (out has half the weight's rows as columns), with ``row_amax`` (SwiGLU form, zeroed int32 [rows])
     also each row's largest |output| as FP32 bits; with ``fused`` = (payload, swizzled scales, per-row scales, ctl)
-    also the per-token NVFP4 form of the output where the epilogue can (see the kernel)."""
+    also the per-token NVFP4 form of the output where the epilogue can (see the kernel). A claimed ``sched`` needs
+    ``sched_ctl`` (int32 [sched_words(tactic)], zero at the launch) and, for "local", ``sm_dom`` (``sm_domains``)."""
     swiglu = alpha_up is not None
     fn = compile_gemm2(
         tactic,
         swiglu=swiglu,
         row_amax=row_amax is not None,
         fuse_quant=fused is not None,
+        sched=sched,
     )
     num_experts, n, k_half = w2.shape
     fq = (
@@ -394,7 +552,33 @@ def run_gemm2(
         tile_limit.data_ptr(),
         num_tiles.data_ptr(),
     ]
-    fn(*_gemm2_ptrs(addrs), out.shape[0], n, k_half * 2, num_experts, stream=_stream())
+    if sched == "static":
+        fn(
+            *_gemm2_ptrs(addrs),
+            out.shape[0],
+            n,
+            k_half * 2,
+            num_experts,
+            stream=_stream(),
+        )
+        return
+    if sched_ctl is None or (sched == "local" and sm_dom is None):
+        raise ValueError(
+            f"schedule {sched!r} needs its control block"
+            + (" and the SM domain table" if sched == "local" else "")
+        )
+    addrs += [
+        sched_ctl.data_ptr(),
+        (sm_dom if sm_dom is not None else sched_ctl).data_ptr(),
+    ]
+    fn(
+        *_gemm2_sched_ptrs(addrs),
+        out.shape[0],
+        n,
+        k_half * 2,
+        num_experts,
+        stream=_stream(),
+    )
 
 
 def permute_rows(
@@ -649,6 +833,27 @@ def routed_experts(
         ctl = torch.empty(
             (rows // 128 * (1 + inter_size // 128) + 1,), dtype=torch.int32, device=dev
         )
+    # claimed schedules: one control block per GEMM, zeroed by the row copy below (its ctl words; stream order)
+    sched = effective_sched(t1, t2, dev, n1=n1, n2=w2.shape[1])
+    if (
+        sched != "static" and rows // t1.tile_m >= 0x3FFF
+    ):  # the mailbox word's M field (14 bits)
+        raise ValueError(
+            f"{rows} sorted rows exceed the claimed schedules' M tile field"
+        )
+    _cache["last_sched"] = sched
+    sched_kw1, sched_kw2, zero_words = {}, {}, ctl
+    if sched != "static":
+        w1 = sched_words(t1)
+        sbuf = torch.empty((w1 + sched_words(t2),), dtype=torch.int32, device=dev)
+        sdom = sm_domains(dev) if sched == "local" else None
+        sched_kw1 = {"sched": sched, "sched_ctl": sbuf[:w1], "sm_dom": sdom}
+        sched_kw2 = {"sched": sched, "sched_ctl": sbuf[w1:], "sm_dom": sdom}
+        zero_words = sbuf
+        if (
+            os.environ.get("MUSE_VR_MOE_X_KEEP_CTL") == "1"
+        ):  # inspection of the claim records (tests)
+            _cache["last_sched_ctl"] = (sbuf, w1)
     if gemm1_rows_mode():
         a1 = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=dev)
         a1_sf = torch.empty((rows, hidden // SF_VEC), dtype=torch.uint8, device=dev)
@@ -665,7 +870,7 @@ def routed_experts(
             a1_sf,
             a1_scale,
             row_amax,
-            ctl,
+            zero_words,
         )
         a1_sf_mma = convert_sf_to_mma_layout(
             a1_sf, m=rows, k=hidden, num_groups=1, sf_vec_size=SF_VEC
@@ -685,6 +890,7 @@ def routed_experts(
             alpha_up=g1_up,
             row_amax=row_amax,
             fused=(a2, a2_sf, a2_scale, ctl) if ctl is not None else None,
+            **sched_kw1,
         )
     else:
         run_gemm1(
@@ -745,5 +951,6 @@ def routed_experts(
         num_tiles,
         out,
         t2,
+        **sched_kw2,
     )
     return out, e2p_flat

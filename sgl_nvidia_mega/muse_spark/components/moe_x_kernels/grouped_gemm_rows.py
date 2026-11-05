@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 
@@ -81,6 +82,7 @@ from cutlass.utils.gemm.sm100 import (
 )
 
 from .arch import arch_helpers
+from .bounded_wait import TEST_WAIT_SCALE, scaled_bound
 
 # ============================================================================
 # Inline utility functions
@@ -654,6 +656,135 @@ def blk_wait_all(loc=None, ip=None):
     )
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Claimed work units (``sched`` "dyn" / "local", see GroupedGemmRowsKernel). Each helper is executed by all 32 lanes
+# of the scheduler warp; lane 0 does the memory operation and the value is broadcast to the warp.
+# ----------------------------------------------------------------------------------------------------------------------
+
+# Mailbox word: [tag : 12 | m tile : 14 | n tile : 6]; tag = (sequence number + 1) mod 4096 in slot sequence % MBOX_RING.
+# A slot is first waited for with a tag in 1..MBOX_RING (a zeroed slot never matches) and afterwards holds the tag of
+# the sequence MBOX_RING earlier (never equal). The first CTA of a pair is at most a few units ahead of the second
+# (it can only run ahead of the units its own MMA has consumed by the tile-info and accumulator stages, and that MMA
+# needs the second CTA's operand loads of the same unit), far below MBOX_RING. The m / n fields of DONE are all ones.
+MBOX_RING = 16
+MBOX_DONE = 0xFFFFF
+# Words before the first mailbox in a control block: [0] / [1] claim counters of queues 0 / 1; [2 + d] units that
+# clusters of domain d took from their own queue, [4 + d] units they took from the other queue (record only).
+SCHED_HEAD_WORDS = 32
+# Bound of one mailbox wait (polls), then trap (x the test-only wait scale of bounded_wait).
+MBOX_MAX_POLLS = scaled_bound(1 << 22, TEST_WAIT_SCALE)
+
+
+@dsl_user_op
+def claim_unit(addr, loc=None, ip=None):
+    """Lane 0: atom.add.relaxed.gpu of 1 on the u32 counter at addr; the previous value to every lane."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .pred p;\n\t.reg .u32 l, v;\n\tmov.u32 v, 0;\n\tmov.u32 l, %laneid;\n\tsetp.eq.u32 p, l, 0;\n\t"
+            "@p atom.relaxed.gpu.global.add.u32 v, [$1], 1;\n\t"
+            "shfl.sync.idx.b32 $0, v, 0, 31, 0xffffffff;\n\t}",
+            "=r,l",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def sm_domain(table_addr, loc=None, ip=None):
+    """Locality domain of the SM this thread runs on: table[%smid] (u32 entries)."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int64(table_addr).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .u32 s;\n\t.reg .u64 a;\n\tmov.u32 s, %smid;\n\tmul.wide.u32 a, s, 4;\n\tadd.u64 a, a, $1;\n\t"
+            "ld.global.u32 $0, [a];\n\t}",
+            "=r,l",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def lane0_red_add(addr, v, loc=None, ip=None):
+    """Lane 0: red.add.relaxed.gpu of v to the u32 at addr."""
+    _asm(
+        None,
+        [
+            cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(v).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p;\n\t.reg .u32 l;\n\tmov.u32 l, %laneid;\n\tsetp.eq.u32 p, l, 0;\n\t"
+        "@p red.relaxed.gpu.global.add.u32 [$0], $1;\n\t}",
+        "l,r",
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def named_barrier_sync_unaligned(barrier_id, num_threads, loc=None, ip=None):
+    """barrier.sync without .aligned: a named barrier whose participating warps reach it from different instructions."""
+    _asm(
+        None,
+        [
+            cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(num_threads).ir_value(loc=loc, ip=ip),
+        ],
+        "barrier.sync $0, $1;",
+        "r,r",
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def mbox_post(addr, word, loc=None, ip=None):
+    """Lane 0: st.release.gpu of one mailbox word (the word carries all of its data)."""
+    _asm(
+        None,
+        [
+            cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(word).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p;\n\t.reg .u32 l;\n\tmov.u32 l, %laneid;\n\tsetp.eq.u32 p, l, 0;\n\t"
+        "@p st.release.gpu.global.u32 [$0], $1;\n\t}",
+        "l,r",
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def mbox_wait(addr, tag, loc=None, ip=None):
+    """Poll the mailbox word at addr (lane 0, ld.acquire.gpu; broadcast) until its tag field equals tag; the word to
+    every lane. At most MBOX_MAX_POLLS polls, then trap."""
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [
+                cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(tag).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .pred p, q;\n\t.reg .u32 l, v, t, n;\n\tmov.u32 n, 0;\n\tmov.u32 v, 0;\n\t"
+            "mov.u32 l, %laneid;\n\tsetp.eq.u32 q, l, 0;\n\t"
+            "MBOX_POLL:\n\t"
+            "@q ld.acquire.gpu.global.u32 v, [$1];\n\t"
+            "shfl.sync.idx.b32 v, v, 0, 31, 0xffffffff;\n\t"
+            "shr.u32 t, v, 20;\n\tsetp.eq.u32 p, t, $2;\n\t@p bra MBOX_DONE;\n\t"
+            "nanosleep.u32 64;\n\tadd.u32 n, n, 1;\n\t"
+            f"setp.lt.u32 p, n, {MBOX_MAX_POLLS};\n\t@p bra MBOX_POLL;\n\ttrap;\n\t"
+            "MBOX_DONE:\n\tmov.u32 $0, v;\n\t}",
+            "=r,l,r",
+            loc,
+            ip,
+        )
+    )
+
+
 class S2TCopyBundle(NamedTuple):
     """Bundle of tiled copy and partitioned tensors for smem-to-tmem copies."""
 
@@ -674,7 +805,20 @@ class GroupedGemmRowsKernel:
     :param cluster_shape_mn: Cluster dimensions (M, N)
     :param arch: target architecture string (from the device's compute capability at run time)
     :param raster_along_m: If True, raster tiles along M dimension first
+    :param sched: how clusters get their work units (one unit = one MMA tile of 256 or 128 rows x tile N):
+        "static" (default): the persistent static schedule (cluster c takes units c, c + clusters, ...);
+        "dyn": every cluster claims its next unit from one counter (one atomic add per unit), in the static order
+        (M tile major, N tile minor), so a cluster that starts late or runs slowly takes fewer units;
+        "local": two such queues, queue d holding the units whose N tile lies in the d-th half of the weight rows
+        (the halves an expert-weight placement may back on locality domain d); a cluster claims from the queue of
+        the domain of the SM it runs on (a per-SM table) and, once that queue is empty, from the other one.
+        Every unit is computed exactly as in the static schedule (same tile, same K order, same epilogue), so the
+        outputs are bitwise identical for every schedule. With the pair-of-CTAs MMA the first CTA of the pair claims
+        and hands each unit to the second CTA through a mailbox word in global memory (tagged with the sequence
+        number). Only the "blocks" / "rows" quantizer forms (not fuse_quant) and clusters along M only.
     """
+
+    SCHEDS = ("static", "dyn", "local")
 
     def __init__(
         self,
@@ -688,6 +832,9 @@ class GroupedGemmRowsKernel:
         row_amax: bool = False,
         fuse_quant: bool = False,
         tma_store: bool = True,
+        sched: str = "static",
+        sched_twin: bool = False,
+        tmem_bar_unaligned: bool = False,
     ):
         if row_amax and not swiglu:
             raise ValueError("row_amax needs the SwiGLU epilogue")
@@ -697,6 +844,26 @@ class GroupedGemmRowsKernel:
             raise ValueError(
                 "fuse_quant needs row_amax and the pair-of-CTAs MMA with tile M 256"
             )
+        if sched not in self.SCHEDS:
+            raise ValueError(f"sched must be one of {self.SCHEDS}")
+        if sched != "static" and (
+            fuse_quant or raster_along_m or cluster_shape_mn[1] != 1
+        ):
+            raise ValueError(
+                "claimed schedules need fuse_quant off, N rastering and clusters along M only"
+            )
+        if sched_twin and sched == "static":
+            raise ValueError("sched_twin needs a claimed schedule")
+        self.sched = sched
+        # test only: units of N tile 0 use the next expert's weights (a schedule test must detect it)
+        self.sched_twin = sched_twin
+        # The library's tensor-memory handshake has the MMA warp and the epilogue warps reach the same named barrier from
+        # two different instructions in its aligned form. With this set the handshake runs at ONE shared site for those
+        # five warps, through one non-aligned named-barrier instruction. No value changes.
+        if tmem_bar_unaligned and fuse_quant:
+            raise ValueError("tmem_bar_unaligned is not available with fuse_quant")
+        self.tmem_bar_unaligned = tmem_bar_unaligned
+        self.tmem_cols_trace: dict = {}  # trace-time record: site ("alloc" / "free") -> column counts passed
         self.swiglu = swiglu
         self.row_amax_out = row_amax
         self.fuse_quant = fuse_quant
@@ -1056,6 +1223,12 @@ class GroupedGemmRowsKernel:
         )
         self.copy_size = self.out_tile_n * (self.c_dtype.width // 8)
 
+    def _tmem_cols(self, site: str, ncols: int) -> int:
+        """Records (at trace time) the column count a tensor-memory allocate or free site passes and returns it
+        unchanged; the unit checks that the free passes the allocated count."""
+        self.tmem_cols_trace.setdefault(site, []).append(int(ncols))
+        return ncols
+
     def _is_interleaved_utccp(self) -> bool:
         """Enable interleaving tcgen05.cp for Bkeep-Breuse case for 4xFP4 kernel."""
         return (
@@ -1177,6 +1350,8 @@ class GroupedGemmRowsKernel:
         q_scale: cute.Tensor,
         q_ctl: cute.Tensor,
         c_out: cute.Tensor,
+        sched_ctl: Optional[cute.Tensor] = None,
+        sm_dom: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with finalize fusion.
 
@@ -1192,6 +1367,9 @@ class GroupedGemmRowsKernel:
         :param max_active_clusters: Maximum number of active clusters
         :param stream: CUDA stream
         :param row_scale: operand-A scale per permuted row, shape (permuted_m,)
+        :param sched_ctl: claimed schedules: control block (int32, zeroed before the launch: SCHED_HEAD_WORDS + MBOX_RING
+            words per cluster)
+        :param sm_dom: claimed schedule "local": locality domain per SM (int32, multiprocessor count entries)
         """
         # Setup static attributes
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -1503,6 +1681,8 @@ class GroupedGemmRowsKernel:
             self.c_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
+            sched_ctl,
+            sm_dom,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1553,6 +1733,8 @@ class GroupedGemmRowsKernel:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
+        sched_ctl: Optional[cute.Tensor],
+        sm_dom: Optional[cute.Tensor],
     ):
         """GPU device kernel for contiguous grouped GEMM with finalize fusion."""
         warp_idx = cute.arch.warp_idx()
@@ -1775,6 +1957,17 @@ class GroupedGemmRowsKernel:
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
+        if cutlass.const_expr(self.tmem_bar_unaligned):
+            # One shared handshake site for the MMA warp and the epilogue warps: the allocator warp allocates, then all
+            # five warps meet at ONE non-aligned named barrier instruction (the role blocks below skip their own).
+            if warp_idx <= self.mma_warp_id:
+                if warp_idx < self.mma_warp_id:
+                    tmem.allocate(self._tmem_cols("alloc", self.num_tmem_alloc_cols))
+                named_barrier_sync_unaligned(
+                    self.tmem_alloc_barrier.barrier_id,
+                    self.tmem_alloc_barrier.num_threads,
+                )
+
         #
         # Specialized Scheduler warp
         #
@@ -1793,7 +1986,120 @@ class GroupedGemmRowsKernel:
 
             num_valid_tiles = num_non_exiting_tiles[0]
 
-            if cutlass.const_expr(self.raster_along_m):
+            if cutlass.const_expr(self.sched != "static"):
+                # Claimed units (class docstring). Unit = (M tile, N tile). "local": queue q holds the N tiles of the
+                # q-th half of the weight rows; "dyn": one queue (q = 0) over all N tiles. Claim index k of queue q is
+                # unit (k // n_queue, q * n_queue + k % n_queue): M tile major, as in the static order.
+                pair = cute.size(tiled_mma.thr_id.shape)
+                n_tiles = cutlass.Int32(
+                    cute.size(c, mode=[1]) // self.cta_tile_shape_mnk[1]
+                )  # (n is Int64 at the wrapper)
+                n_queue = n_tiles
+                if cutlass.const_expr(self.sched == "local"):
+                    n_queue = n_tiles // 2
+                ctl_base = gaddr(sched_ctl)
+                mbox = ctl_base + cutlass.Int64(SCHED_HEAD_WORDS + bidz * MBOX_RING) * 4
+                seq = cutlass.Int32(0)
+                running = cutlass.Boolean(1)
+                if is_leader_cta:
+                    own = cutlass.Int32(0)
+                    if cutlass.const_expr(self.sched == "local"):
+                        own = sm_domain(gaddr(sm_dom)) & 1
+                    cur = own
+                    n_own = cutlass.Int32(0)
+                    while running:
+                        k = claim_unit(ctl_base + cutlass.Int64(cur) * 4)
+                        m_tile = k // n_queue
+                        if m_tile < num_valid_tiles:
+                            n_tile = cur * n_queue + k % n_queue
+                            # the second CTA of the pair gets the unit before this CTA's own pipeline slot is free
+                            # (it never waits on this CTA's pipeline, so the pair cannot deadlock here)
+                            if cutlass.const_expr(pair == 2):
+                                mbox_post(
+                                    mbox + cutlass.Int64(seq % MBOX_RING) * 4,
+                                    (((seq + 1) & 0xFFF) << 20)
+                                    | (m_tile << 6)
+                                    | n_tile,
+                                )
+                            seq = seq + 1
+                            if cur == own:
+                                n_own = n_own + 1
+                            expert_idx = tile_idx_to_group_idx[m_tile]
+                            if cutlass.const_expr(self.sched_twin):
+                                if n_tile == 0:
+                                    expert_idx = expert_idx ^ 1
+                            mn_limit = tile_idx_to_mn_limit[m_tile]
+                            tile_info_pipeline.producer_acquire(
+                                tile_info_producer_state
+                            )
+                            with cute.arch.elect_one():
+                                sInfo[(0, tile_info_producer_state.index)] = (
+                                    m_tile * pair + mma_tile_coord_v
+                                )
+                                sInfo[(1, tile_info_producer_state.index)] = n_tile
+                                sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                                sInfo[(3, tile_info_producer_state.index)] = (
+                                    cutlass.Int32(1)
+                                )
+                                sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            cute.arch.fence_proxy("async.shared", space="cta")
+
+                            self.sched_sync_barrier.arrive_and_wait()
+                            tile_info_pipeline.producer_commit(tile_info_producer_state)
+                            tile_info_producer_state.advance()
+                        else:
+                            if cutlass.const_expr(self.sched == "local"):
+                                if cur == own:
+                                    cur = 1 - own
+                                else:
+                                    running = cutlass.Boolean(0)
+                            else:
+                                running = cutlass.Boolean(0)
+                    if cutlass.const_expr(pair == 2):
+                        mbox_post(
+                            mbox + cutlass.Int64(seq % MBOX_RING) * 4,
+                            (((seq + 1) & 0xFFF) << 20) | MBOX_DONE,
+                        )
+                    # record: units this cluster took from its own / the other queue
+                    lane0_red_add(ctl_base + cutlass.Int64(2 + own) * 4, n_own)
+                    lane0_red_add(ctl_base + cutlass.Int64(4 + own) * 4, seq - n_own)
+                else:
+                    # second CTA of the pair: the units in the first CTA's claim order
+                    while running:
+                        word = mbox_wait(
+                            mbox + cutlass.Int64(seq % MBOX_RING) * 4, (seq + 1) & 0xFFF
+                        )
+                        code = word & 0xFFFFF
+                        if code == MBOX_DONE:
+                            running = cutlass.Boolean(0)
+                        else:
+                            m_tile = code >> 6
+                            n_tile = code & 0x3F
+                            seq = seq + 1
+                            expert_idx = tile_idx_to_group_idx[m_tile]
+                            if cutlass.const_expr(self.sched_twin):
+                                if n_tile == 0:
+                                    expert_idx = expert_idx ^ 1
+                            mn_limit = tile_idx_to_mn_limit[m_tile]
+                            tile_info_pipeline.producer_acquire(
+                                tile_info_producer_state
+                            )
+                            with cute.arch.elect_one():
+                                sInfo[(0, tile_info_producer_state.index)] = (
+                                    m_tile * pair + mma_tile_coord_v
+                                )
+                                sInfo[(1, tile_info_producer_state.index)] = n_tile
+                                sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                                sInfo[(3, tile_info_producer_state.index)] = (
+                                    cutlass.Int32(1)
+                                )
+                                sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            cute.arch.fence_proxy("async.shared", space="cta")
+
+                            self.sched_sync_barrier.arrive_and_wait()
+                            tile_info_pipeline.producer_commit(tile_info_producer_state)
+                            tile_info_producer_state.advance()
+            elif cutlass.const_expr(self.raster_along_m):
                 while work_tile.is_valid_tile:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(
@@ -1978,7 +2284,8 @@ class GroupedGemmRowsKernel:
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
-            tmem.wait_for_alloc()
+            if cutlass.const_expr(not self.tmem_bar_unaligned):
+                tmem.wait_for_alloc()
 
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
@@ -2194,8 +2501,9 @@ class GroupedGemmRowsKernel:
         # Specialized epilogue warps with finalize fusion
         #
         if warp_idx < self.mma_warp_id:
-            tmem.allocate(self.num_tmem_alloc_cols)
-            tmem.wait_for_alloc()
+            if cutlass.const_expr(not self.tmem_bar_unaligned):
+                tmem.allocate(self.num_tmem_alloc_cols)
+                tmem.wait_for_alloc()
 
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
@@ -2553,7 +2861,12 @@ class GroupedGemmRowsKernel:
             # Dealloc tensor memory
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
-            tmem.free(acc_tmem_ptr)
+            if cutlass.const_expr(self.tmem_bar_unaligned):
+                tmem.free(
+                    acc_tmem_ptr, self._tmem_cols("free", self.num_tmem_alloc_cols)
+                )  # allocated in the shared block
+            else:
+                tmem.free(acc_tmem_ptr)
 
     QFIFO = 8  # tiles queued for the conversion warps (tunable)
     QSTEPS = 16  # two-row steps whose loads a conversion warp issues together (tunable)
@@ -3045,6 +3358,110 @@ class GroupedGemmRowsKernel:
             q_scale=q_scale,
             q_ctl=q_ctl,
             c_out=c_out,
+        )
+
+    @cute.jit
+    def wrapper_sched(
+        self,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
+        row_scale_ptr: cute.Pointer,
+        alpha_up_ptr: cute.Pointer,
+        row_amax_ptr: cute.Pointer,
+        q_out_ptr: cute.Pointer,
+        q_sf_ptr: cute.Pointer,
+        q_scale_ptr: cute.Pointer,
+        q_ctl_ptr: cute.Pointer,
+        tile_idx_to_group_idx_ptr: cute.Pointer,
+        tile_idx_to_mn_limit_ptr: cute.Pointer,
+        num_non_exiting_tiles_ptr: cute.Pointer,
+        sched_ctl_ptr: cute.Pointer,
+        sm_dom_ptr: cute.Pointer,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
+        tile_size: cutlass.Constexpr,
+        scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """``wrapper`` for the claimed schedules: the same tensors plus the schedule's control block and the per-SM
+        locality-domain table (only their base addresses are used)."""
+        scale_k = k // scaling_vector_size
+        num_tiles = m // tile_size
+        a = cute.make_tensor(
+            a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2))
+        )
+        b = cute.make_tensor(
+            b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
+        )
+        a_sf = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, m // 128, 4, scale_k // 4, 1), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+        b_sf = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+            ),
+        )
+        c_row = n // 2 if self.swiglu else n
+        c = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_layout((m, n, 1), stride=(c_row, 1, m * c_row)),
+        )
+        alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        row_scale = cute.make_tensor(row_scale_ptr, layout=cute.make_layout((m,)))
+        alpha_up = cute.make_tensor(alpha_up_ptr, layout=cute.make_layout((l,)))
+        row_amax = cute.make_tensor(row_amax_ptr, layout=cute.make_layout((m,)))
+        q_out = cute.make_tensor(q_out_ptr, layout=cute.make_layout((m,)))
+        q_sf = cute.make_tensor(q_sf_ptr, layout=cute.make_layout((m,)))
+        q_scale = cute.make_tensor(q_scale_ptr, layout=cute.make_layout((m,)))
+        q_ctl = cute.make_tensor(q_ctl_ptr, layout=cute.make_layout((m,)))
+        c_out = cute.make_tensor(
+            c_ptr, layout=cute.make_layout((m, c_row, 1), stride=(c_row, 1, m * c_row))
+        )
+        tile_idx_to_group_idx = cute.make_tensor(
+            tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
+        )
+        tile_idx_to_mn_limit = cute.make_tensor(
+            tile_idx_to_mn_limit_ptr, layout=cute.make_layout((num_tiles,))
+        )
+        num_non_exiting_tiles = cute.make_tensor(
+            num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
+        )
+        sched_ctl = cute.make_tensor(sched_ctl_ptr, layout=cute.make_layout((1,)))
+        sm_dom = cute.make_tensor(sm_dom_ptr, layout=cute.make_layout((1,)))
+
+        return self(
+            a,
+            b,
+            c,
+            a_sf,
+            b_sf,
+            tile_idx_to_group_idx,
+            num_non_exiting_tiles,
+            tile_idx_to_mn_limit,
+            alpha,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+            row_scale=row_scale,
+            alpha_up=alpha_up,
+            row_amax=row_amax,
+            q_out=q_out,
+            q_sf=q_sf,
+            q_scale=q_scale,
+            q_ctl=q_ctl,
+            c_out=c_out,
+            sched_ctl=sched_ctl,
+            sm_dom=sm_dom,
         )
 
     @staticmethod

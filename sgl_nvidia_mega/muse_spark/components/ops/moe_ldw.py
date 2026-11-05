@@ -129,6 +129,9 @@ def _module(extra: tuple = ()):
     extra = tuple(extra) + rows_ready_flags(
         extra
     )  # rows-ready flags (MUSE_VR_W_ROWS_READY=1, with the early slot table)
+    extra = tuple(extra) + early_copy_flags(
+        extra
+    )  # copy phase before the work list (MUSE_VR_MOE_LDW_EARLY_COPY=1); last
     _RR_BUILDS[_key] = ROWS_READY[0] in extra
     # one symbol namespace per build variant (two variants may be loaded in one process)
     abi = "v" + hashlib.sha256(" ".join(extra).encode()).hexdigest()[:12]
@@ -359,6 +362,64 @@ def rows_ready_flags(extra: tuple = ()) -> tuple[str, ...]:
         return ()
     bed.report("moe_ldw_rows_ready", True, env=f"{ROWS_READY_ENV}=1")
     return ROWS_READY
+
+
+EARLY_COPY_ENV = "MUSE_VR_MOE_LDW_EARLY_COPY"
+EARLY_COPY = ("-DMUSE_VR_LDW_EARLY_COPY=1",)
+# defines of the builds the early copy does not cover (the kernel refuses each with #error); a define set to 0 does not count
+_EARLY_COPY_REFUSED = {
+    "-DMUSE_VR_LDW_LANDED": "landed build",
+    "-DMUSE_VR_LDW_BALB": "board build",
+    "-DMUSE_VR_LDW_EPI": "finalize build",
+    "-DMUSE_VR_LDW_START": "start-order build",
+    "-DMUSE_VR_LDW_HEAD_GO": "start-order build",
+    "-DMUSE_VR_LDW_HEAD_PRIO": "start-order build",
+    "-DMUSE_VR_LDW_THEAD": "tensor-copy head",
+    "-DMUSE_VR_LDW_EARLY_SLOTTAB": "early slot table",
+    "-DMUSE_VR_LDW_ROWS_READY": "rows-ready flags",
+    "-DMUSE_VR_LDW_HB0_PUSH": "expert-output hop push",
+}
+_early_copy_recorded: list = []
+_early_copy_aside: set = set()
+
+
+def early_copy_flags(extra: tuple = ()) -> tuple[str, ...]:
+    """The copy phase started before the work list (-DMUSE_VR_LDW_EARLY_COPY=1: warp 0 hands the expert bases and the counter
+    parity to the copy warps by a named barrier right after its expert loop; the copy warps run the unchanged copy phase while
+    warp 0 builds the work list) on the builds without head copies (-DMUSE_VR_LDW_GATHER=0: the RING48 / RING4 builds and the
+    no-head build), with MUSE_VR_MOE_LDW_EARLY_COPY=1 (default off). Every other build steps aside (logged once per reason):
+    the head build, and the landed / board / finalize / start-order / tensor-copy head / early slot table / rows-ready /
+    hop-push builds. Applied after every other build flag. Routed rows and the copy phase's bytes are bitwise the same
+    (tests/test_moe_ldw_early_copy.py, tests/test_moe_ldw.py)."""
+    if os.environ.get(EARLY_COPY_ENV, "0").strip() != "1":
+        return ()
+    if any(e.startswith("-DMUSE_VR_LDW_EARLY_COPY") for e in extra):
+        return ()
+    reason = None
+    for e in extra:
+        name, _, value = e.partition("=")
+        if name in _EARLY_COPY_REFUSED and value.strip() != "0":
+            reason = _EARLY_COPY_REFUSED[name]
+            break
+    if reason is None and "-DMUSE_VR_LDW_GATHER=0" not in tuple(extra):
+        reason = "head build (head copies)"
+    from .. import bed
+
+    if reason is not None:
+        if reason not in _early_copy_aside:
+            _early_copy_aside.add(reason)
+            tag = re.sub(r"[^a-z0-9]+", "_", reason).strip("_")
+            bed.report(
+                f"moe_ldw_early_copy_aside_{tag}",
+                False,
+                env=f"{EARLY_COPY_ENV}=1",
+                reason=f"{reason}: step aside",
+            )
+        return ()
+    if not _early_copy_recorded:
+        _early_copy_recorded.append(True)
+        bed.report("moe_ldw_early_copy", True, env=f"{EARLY_COPY_ENV}=1")
+    return EARLY_COPY
 
 
 def rows_ready_words(pass_rows: int, max_tokens: int = MAX_TOKENS) -> int:

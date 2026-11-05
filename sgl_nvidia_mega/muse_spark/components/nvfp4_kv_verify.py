@@ -154,6 +154,8 @@ def _init_after(original, self, model_runner, *args, **kwargs):
                 min_requests=_wide_min(hkv),
                 max_requests=_WIDE_MAX,
                 pdl=pdl,
+                skel=kw._skel_for(hkv),
+                dq_warps=kw.DQ_WARPS,
             )
     except Exception as e:  # noqa: BLE001 - the stock path stays in place
         self._muse_vr_nvfp4_verify = False

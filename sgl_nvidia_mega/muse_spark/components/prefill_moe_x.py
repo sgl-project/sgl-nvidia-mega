@@ -40,6 +40,11 @@ Opt in with ``MUSE_VR_PREFILL_MOE_X=1``. The device-specific MMA builder module 
 configurations: ``MUSE_VR_PREFILL_MOE_X_TACTIC`` = ``<tile_m>,<tile_n1>,<a_path>,<tile_n2>[,2cta]`` (tunable; default
 from ``moe_x_kernels.launch``). Register this component before any component that wraps the same FlashInfer entry point and
 adds per-token scales, so that it receives the completed call.
+
+Work-unit schedule of both expert GEMMs: ``MUSE_VR_MOE_X_SCHED`` = ``static`` (default) | ``dyn`` (units claimed from a
+counter) | ``local`` (units claimed per locality domain, for expert weights whose row halves are placed on the two domains,
+as the ``moe_ld`` load hook places them); outputs are bitwise identical for every schedule (see
+``moe_x_kernels.grouped_gemm_rows.GroupedGemmRowsKernel``). Calls with a claimed schedule are counted as ``sched:<mode>``.
 """
 
 from __future__ import annotations
@@ -338,6 +343,13 @@ def _eligible(kw: dict) -> str:
         from .moe_x_kernels import launch as L
 
         if not L.compiled(*tactics()):
+            if not _state.get("not_built_warned"):
+                _state["not_built_warned"] = True
+                logger.warning(
+                    "muse_vr_plugin: %s steps aside in CUDA-graph capture: kernels not built in this process: %s",
+                    NAME,
+                    L.missing_builds(*tactics()),
+                )
             return "not_built_in_capture"
     return ""
 
@@ -415,6 +427,27 @@ def _routed_moe(*args, **kwargs):
         NAME,
         f"x:{'capture' if torch.cuda.is_current_stream_capturing() else 'eager'}:tokens<={bucket}",
     )
+    from .moe_x_kernels import launch as L
+
+    # guard: a call that just ran (and so built its kernels) must find them in the capture-time check, or every captured
+    # call would step aside ("not_built_in_capture"); named once, loudly
+    if not torch.cuda.is_current_stream_capturing() and not _state.get(
+        "built_check_done"
+    ):
+        _state["built_check_done"] = True
+        miss = L.missing_builds(*tactics())
+        if miss:
+            bed.count(NAME, "guard:built_but_not_found")
+            logger.error(
+                "muse_vr_plugin: %s ran eagerly but its capture-time build check misses %s: captured calls would "
+                "take the stock path",
+                NAME,
+                miss,
+            )
+
+    sched = L._cache.get("last_sched", "static")
+    if sched != "static":
+        bed.count(NAME, f"sched:{sched}")
     return res
 
 
@@ -456,12 +489,24 @@ def engage() -> bool:
         return False
     install()
     t1, t2 = tactics()
+    from .moe_x_kernels import launch as L
+
+    sched = L.sched_mode()
+    # the non-aligned handshake covers the rows kernels except the fused-quantizer form; the gather first GEMM is a
+    # different kernel
+    g1_rows = L.gemm1_rows_mode() and L.quant_form(t1) != "fused"
     bed.report(
         NAME,
         True,
         min_tokens=min_tokens(),
         gemm1=f"{t1.tile_m}x{t1.tile_n}/{t1.a_path}",
         gemm2=f"{t2.tile_m}x{t2.tile_n}",
+        **({"sched": sched} if sched != "static" else {}),
+        **(
+            {"tmem_bar": "unaligned" if g1_rows else "unaligned-gemm2"}
+            if L.tmem_bar_unaligned()
+            else {}
+        ),
     )
     _state["engaged"] = True
     return True

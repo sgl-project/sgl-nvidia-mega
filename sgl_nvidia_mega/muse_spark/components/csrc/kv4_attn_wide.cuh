@@ -374,6 +374,65 @@ __device__ __forceinline__ void mma_f8_ts_e(uint32_t d, uint32_t a_tmem, uint64_
       "r"(a_tmem), "l"(b), "r"(idesc), "r"(accumulate)
       : "memory");
 }
+// Block-scaled form (PTX ISA tcgen05.mma .kind::mxf8f6f4 .block_scale): A from tensor memory, B in shared memory, the
+// UE8M0 scale factors of A and B in tensor memory (one per 32 values of K per row of A / column of B).
+__device__ __forceinline__ void mma_bs_ts_e(uint32_t d, uint32_t a_tmem, uint64_t b, uint32_t idesc, uint32_t sfa,
+                                            uint32_t sfb, uint32_t accumulate) {
+  asm volatile(
+      "{\n"
+      ".reg .pred e, p;\n"
+      "elect.sync _|e, 0xffffffff;\n"
+      "setp.ne.b32 p, %6, 0;\n"
+      "@e tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%4], [%5], p;\n"
+      "}\n" ::"r"(d),
+      "r"(a_tmem), "l"(b), "r"(idesc), "r"(sfa), "r"(sfb), "r"(accumulate)
+      : "memory");
+}
+// The same with two scale factors per row of A / column of B (scale_vec::2X: dense K = 64, one per 32 values of K; the
+// scale-factor IDs select a 16-bit half of the scale-factor words).
+__device__ __forceinline__ void mma_bs2_ts_e(uint32_t d, uint32_t a_tmem, uint64_t b, uint32_t idesc, uint32_t sfa,
+                                             uint32_t sfb, uint32_t accumulate) {
+  asm volatile(
+      "{\n"
+      ".reg .pred e, p;\n"
+      "elect.sync _|e, 0xffffffff;\n"
+      "setp.ne.b32 p, %6, 0;\n"
+      "@e tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::2X [%0], [%1], %2, %3, [%4], [%5], p;\n"
+      "}\n" ::"r"(d),
+      "r"(a_tmem), "l"(b), "r"(idesc), "r"(sfa), "r"(sfb), "r"(accumulate)
+      : "memory");
+}
+// Block-scaled FP4 form (PTX ISA tcgen05.mma .kind::mxf4nvf4 .block_scale .block16): A (packed E2M1) from tensor memory,
+// B (packed E2M1, K-major) in shared memory, their UE4M3 scale factors (one per 16 values of K) in tensor memory.
+__device__ __forceinline__ void mma_nvf4_ts_e(uint32_t d, uint32_t a_tmem, uint64_t b, uint32_t idesc, uint32_t sfa,
+                                              uint32_t sfb, uint32_t accumulate) {
+  asm volatile(
+      "{\n"
+      ".reg .pred e, p;\n"
+      "elect.sync _|e, 0xffffffff;\n"
+      "setp.ne.b32 p, %6, 0;\n"
+      "@e tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 [%0], [%1], %2, %3, [%4], [%5], p;\n"
+      "}\n" ::"r"(d),
+      "r"(a_tmem), "l"(b), "r"(idesc), "r"(sfa), "r"(sfb), "r"(accumulate)
+      : "memory");
+}
+__device__ __forceinline__ void tmem_st2(uint32_t taddr, uint32_t w0, uint32_t w1) {
+  asm volatile("tcgen05.st.sync.aligned.32x32b.x2.b32 [%0], {%1,%2};\n" ::"r"(taddr), "r"(w0), "r"(w1) : "memory");
+}
+__device__ __forceinline__ void tmem_st8(uint32_t taddr, const uint32_t (&w)[8]) {
+  asm volatile("tcgen05.st.sync.aligned.32x32b.x8.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};\n" ::"r"(taddr), "r"(w[0]),
+               "r"(w[1]), "r"(w[2]), "r"(w[3]), "r"(w[4]), "r"(w[5]), "r"(w[6]), "r"(w[7])
+               : "memory");
+}
+// one / four consecutive 32-bit columns of this thread's tensor-memory lane
+__device__ __forceinline__ void tmem_st1(uint32_t taddr, uint32_t w) {
+  asm volatile("tcgen05.st.sync.aligned.32x32b.x1.b32 [%0], {%1};\n" ::"r"(taddr), "r"(w) : "memory");
+}
+__device__ __forceinline__ void tmem_st4(uint32_t taddr, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) {
+  asm volatile("tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1,%2,%3,%4};\n" ::"r"(taddr), "r"(w0), "r"(w1), "r"(w2),
+               "r"(w3)
+               : "memory");
+}
 // 16 consecutive 32-bit columns of this thread's tensor-memory lane
 __device__ __forceinline__ void tmem_st16(uint32_t taddr, const uint32_t (&w)[16]) {
   asm volatile(
@@ -406,6 +465,19 @@ __device__ __forceinline__ void mma_commit_e(uint32_t bar) {
 }
 __device__ __forceinline__ void mma_commit(uint32_t bar) {
   asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n" ::"r"(bar) : "memory");
+}
+// one / 16 consecutive 32-bit columns of this thread's tensor-memory lane
+__device__ __forceinline__ uint32_t tmem_ld1(uint32_t taddr) {
+  uint32_t r;
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];\n" : "=r"(r) : "r"(taddr));
+  return r;
+}
+__device__ __forceinline__ void tmem_ld16(uint32_t taddr, uint32_t (&r)[16]) {
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\n"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]), "=r"(r[8]),
+        "=r"(r[9]), "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]), "=r"(r[14]), "=r"(r[15])
+      : "r"(taddr));
 }
 // 32 consecutive fp32 columns of this thread's tensor-memory lane
 __device__ __forceinline__ void tmem_ld32(uint32_t taddr, float (&v)[32]) {
@@ -450,9 +522,89 @@ __device__ __forceinline__ uint64_t sdesc(uint32_t saddr, uint32_t sbo, uint32_t
 }
 constexpr uint32_t kSw128 = 2, kSw64 = 4;
 // Instruction descriptor, kind::f8f6f4, e4m3 x e4m3 -> fp32 (PTX ISA, tcgen05 instruction descriptor).
-constexpr uint32_t idesc_f8(int m, int n, int b_mn_major) {
+// k64: the descriptor's K-dimension bit (dense K = 64 instead of 32; PTX ISA 9.4, instruction descriptor for
+// .kind::f8f6f4, on the targets that list it).
+constexpr uint32_t idesc_f8(int m, int n, int b_mn_major, bool k64 = false) {
   return (1u << 4) | (static_cast<uint32_t>(b_mn_major) << 16) | (static_cast<uint32_t>(n >> 3) << 17) |
-         (static_cast<uint32_t>(m >> 4) << 24);
+         (static_cast<uint32_t>(m >> 4) << 24) | (k64 ? (1u << 29) : 0u);
+}
+// Instruction descriptor, kind::mxf8f6f4 block-scaled, e4m3 x e4m3 -> fp32, UE8M0 scales, scale factor A in the 128-lane
+// layout, dense K = 32; a_sf_id selects the byte of the scale-factor A word (PTX ISA 9.4, instruction descriptor for
+// .kind::mxf8f6f4), B's scale-factor ID 0. k64: dense K = 64 (the K-dimension bit; scale_vec::2X, a_sf_id 0 or 2
+// selects the 16-bit half).
+constexpr uint32_t idesc_bs_f8(int m, int n, int b_mn_major, int a_sf_id = 0, bool k64 = false) {
+  return (static_cast<uint32_t>(b_mn_major) << 16) | (static_cast<uint32_t>(n >> 3) << 17) | (1u << 23) | (1u << 26) |
+         (static_cast<uint32_t>(m >> 7) << 27) | (static_cast<uint32_t>(a_sf_id & 3) << 29) | (k64 ? (1u << 31) : 0u);
+}
+// Instruction descriptor, kind::mxf4nvf4 block16: E2M1 x E2M1 -> fp32, UE4M3 scales, dense K = 64, both K-major,
+// scale factor A in the 128-lane layout, sparsity-version field 1 (PTX ISA 9.4: required value on this target),
+// scale-factor IDs 0.
+constexpr uint32_t idesc_nvf4(int m, int n) {
+  return (1u << 7) | (1u << 10) | (1u << 12) | (static_cast<uint32_t>(n >> 3) << 17) | (1u << 26) |
+         (static_cast<uint32_t>(m >> 7) << 27);
+}
+// Shared-memory matrix descriptor with an explicit leading byte offset (no-swizzle K-major layouts: the offset between
+// the two 16-byte columns of the 8-row core matrix pair; PTX ISA tcgen05 matrix descriptors).
+__device__ __forceinline__ uint64_t sdesc_lbo(uint32_t saddr, uint32_t lbo, uint32_t sbo, uint32_t layout) {
+  return static_cast<uint64_t>((saddr >> 4) & 0x3FFF) | (static_cast<uint64_t>((lbo >> 4) & 0x3FFF) << 16) |
+         (static_cast<uint64_t>((sbo >> 4) & 0x3FFF) << 32) | (static_cast<uint64_t>(1) << 46) |
+         (static_cast<uint64_t>(layout & 7) << 61);
+}
+
+// Narrow-format conversions (PTX ISA cvt): an f16x2 word to two floats (low half first); four e4m3 bytes (byte 0 first)
+// to floats; a float to its e4m3 byte (round to nearest even, satfinite); eight floats to eight E2M1 nibbles (value 0 in
+// bits 0-3; round to nearest even, satfinite) and the nibbles back to floats (exact).
+__device__ __forceinline__ float2 h2_to_f2(uint32_t h) {
+  float a, b;
+  asm("{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, %2;\ncvt.f32.f16 %0, lo;\ncvt.f32.f16 %1, hi;\n}\n" : "=f"(a), "=f"(b) : "r"(h));
+  return make_float2(a, b);
+}
+__device__ __forceinline__ void e4m3x4_to_f(uint32_t w, float* o) {
+  uint32_t h0, h1;
+  asm("{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, %2;\ncvt.rn.f16x2.e4m3x2 %0, lo;\ncvt.rn.f16x2.e4m3x2 %1, hi;\n}\n"
+      : "=r"(h0), "=r"(h1)
+      : "r"(w));
+  const float2 a = h2_to_f2(h0), b = h2_to_f2(h1);
+  o[0] = a.x;
+  o[1] = a.y;
+  o[2] = b.x;
+  o[3] = b.y;
+}
+__device__ __forceinline__ uint32_t f_to_e4m3(float x) {
+  uint16_t h;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(h) : "f"(0.0f), "f"(x));
+  return h & 0xFFu;
+}
+__device__ __forceinline__ float e4m3_to_f(uint32_t b) {
+  float o[4];
+  e4m3x4_to_f(b & 0xFFu, o);
+  return o[0];
+}
+__device__ __forceinline__ uint32_t f8_to_e2m1x8(const float* v) {
+  uint32_t w;
+  asm("{\n.reg .b8 b0, b1, b2, b3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n"
+      "mov.b32 %0, {b0, b1, b2, b3};\n}\n"
+      : "=r"(w)
+      : "f"(v[0]), "f"(v[1]), "f"(v[2]), "f"(v[3]), "f"(v[4]), "f"(v[5]), "f"(v[6]), "f"(v[7]));
+  return w;
+}
+__device__ __forceinline__ void e2m1x8_to_f(uint32_t w, float* o) {
+  uint32_t h0, h1, h2, h3;
+  asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %4;\n"
+      "cvt.rn.f16x2.e2m1x2 %0, b0;\ncvt.rn.f16x2.e2m1x2 %1, b1;\ncvt.rn.f16x2.e2m1x2 %2, b2;\ncvt.rn.f16x2.e2m1x2 %3, b3;\n}\n"
+      : "=r"(h0), "=r"(h1), "=r"(h2), "=r"(h3)
+      : "r"(w));
+  const uint32_t h[4] = {h0, h1, h2, h3};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 f = h2_to_f2(h[i]);
+    o[2 * i] = f.x;
+    o[2 * i + 1] = f.y;
+  }
 }
 
 __device__ __forceinline__ float fast_exp2(float x) {
@@ -505,6 +657,22 @@ __device__ __forceinline__ float max3(float a, float b, float c) {
   float d;
   asm("max.f32 %0, %1, %2, %3;\n" : "=f"(d) : "f"(a), "f"(b), "f"(c));
   return d;
+}
+// 2^y of a pair in half precision (PTX ISA ex2.approx.f16x2): y rounded to f16x2 (value 0 in the low half), the f16x2
+// result; and four such values (two f16x2 words, value 0 in the low half of the first) as four e4m3 bytes (key order).
+__device__ __forceinline__ uint32_t exp2_f16x2(float2 y) {
+  uint32_t h, r;
+  asm("cvt.rn.f16x2.f32 %0, %1, %2;\n" : "=r"(h) : "f"(y.y), "f"(y.x));
+  asm("ex2.approx.f16x2 %0, %1;\n" : "=r"(r) : "r"(h));
+  return r;
+}
+__device__ __forceinline__ uint32_t e4m3x4_from_f16x2(uint32_t h01, uint32_t h23) {
+  uint32_t w;
+  asm("{\n.reg .b16 lo, hi;\ncvt.rn.satfinite.e4m3x2.f16x2 lo, %1;\ncvt.rn.satfinite.e4m3x2.f16x2 hi, %2;\n"
+      "mov.b32 %0, {lo, hi};\n}\n"
+      : "=r"(w)
+      : "r"(h01), "r"(h23));
+  return w;
 }
 __device__ __forceinline__ uint32_t e4m3x4(float a, float b, float c, float d) {
   uint16_t lo, hi;
@@ -689,7 +857,9 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
   using L = Layout<kPairs, kF8, kRaw, kTpr, (((kDq >> 17) & 1) || kPairs != 2) ? 1 : 0>;
   constexpr int kHeads = L::kHeads, kTileKeys = L::kTileKeys, kSmWarps = L::kSmWarps, kKpt = L::kKpt;
   // the softmax below is full_attn_wide's code verbatim, in its served instantiation (no probe mode, no polynomial)
-  constexpr int kMode = 0, kPoly = 0;
+  // skeleton bits 18-20: kPoly of every 8 keys take 2^x from the FMA pipes (exp2_poly2, full_attn_wide's option; 0 =
+  // the default code)
+  constexpr int kMode = 0, kPoly = (kSkel >> 18) & 7;
   // skeleton options (kSkel, each bit keeps every output bit unchanged): bit 0 - the tile maximum of an interior tile from
   // the score loads (tcgen05.ld .red .max); bit 1 - e4m3 probability packing joined in one statement; bit 2 (4 or 8
   // dequantization warps) - register split kWg2RegsR / kDqRegsR, a tile's shared-memory loads issued before its stores,
@@ -706,6 +876,10 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
   constexpr bool kMadAddr = (kSkel & 128) != 0;
   // bit 8 (P in tensor memory, no rescale warpgroup): combine(g - 1) before the store of P(g)
   constexpr bool kEarlyComb = (kSkel & 256) != 0 && ((kDq >> 17) & 1) == 0 && kPairs == 2 && (kSkel & 32) == 0;
+  // bit 9: every output column of a tile loaded before one wait in the combine (full_attn_wide's option 4); bit 10: the
+  // load warp's page-list loads issued eight per lane before their stores (full_attn_wide's option 8); same outputs
+  constexpr bool kOneWaitO = (kSkel & 512) != 0;
+  constexpr bool kPageFill = (kSkel & 1024) != 0;
   // suspend hint (ns) of the waits of the load / MMA / dequantization warps (development tunable, kDq bits 8-15 x 64)
   constexpr uint32_t kAuxHint = ((static_cast<uint32_t>(kDq) >> 8) & 0xFFu) * 64u;
   constexpr uint32_t kLoadHint = (kSkel & 16) != 0 ? 256u : kAuxHint;
@@ -720,6 +894,60 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
   constexpr bool kCr = (kSkel & 32) != 0;
   static_assert(!kCr || (kDqR && kDqWarps == 4 && kPTmem && kTpr == 1 && kPairs == 2),
                 "option bit 5 needs bit 2, 4 dequantization warps, 4 KV heads, P in TMEM");
+  // option 4096 (4 KV heads, one softmax thread per row, P in tensor memory): the output accumulates in tensor memory
+  // across a piece's tiles. QK is unchanged; PV runs block-scaled (kind::mxf8f6f4, UE8M0) at M = 128 over the 128 lanes
+  // of a KV-head pair as the scores lie (the two heads interleaved by 16 lanes): each K step covers 32 keys of one head,
+  // and the rows of the other head take scale factor 2^-127 for it (their products vanish below the FP32 accumulator's
+  // resolution). Each row's probabilities of a tile are e4m3(448 * 2^(s * scale_log2 - kt)), kt = ceil(tile maximum), and
+  // its scale factor 2^(kt - m) (m = the row's reference, an integer) puts them on the accumulator's scale; no per-tile
+  // output combine. A tile maximum more than 64 above m re-references the row (accumulator and row sum scaled by a power
+  // of two). Option 8192 (with 4096): the row sum is accumulated by the same MMAs (a constant 1.0 B block), i.e. the sum
+  // of the probabilities as applied.
+  constexpr bool kPvAcc = (kSkel & 4096) != 0;
+  constexpr bool kLmma = kPvAcc && (kSkel & 8192) != 0;
+  // option 32768 (with 4096): the probabilities in their own tensor-memory columns instead of over the scores, so the QK of
+  // tile g + 2 waits only for the softmax's score loads (not for PV(g)); the softmax waits for PV(g - 2) before it rewrites
+  // P buffer g & 1. Columns with option 4096: S 0-255, O 256-383; without 32768: SFA 384-387, SFB 392-395, row sums 400-431;
+  // with it: P 384-447 (32 bb + 16 c), SFA 448-451, SFB 452-455, row sums 456-487.
+  constexpr bool kPsep = kPvAcc && (kSkel & 32768) != 0;
+  // option 131072 (with 4096): the re-reference block rescales the accumulator 16 columns at a time (same products and
+  // outputs), so the block keeps few registers live across the per-tile softmax path (tunable; bench/bench_kv4_attn.py)
+  constexpr bool kSlimRef = kPvAcc && (kSkel & 131072) != 0;
+  // option 2097152: the first piece's Q requested before the page list (see the load warp); same outputs
+  constexpr bool kEarlyQ = (kSkel & 2097152) != 0;
+  // option 4194304 (with 4096 + 8192, P in tensor memory): the probabilities' 2^y in half precision (see the softmax); a
+  // numerics change (measured against float64 by the unit)
+  constexpr bool kF16Exp = (kSkel & 4194304) != 0;
+  // option 8388608 (with 16384): the Q terms' E2M1 codes by the conversion instruction on r x the rounded reciprocal of the
+  // block scale (a numerics change at exact midpoints only; measured against float64 by the unit)
+  constexpr bool kFastQ = (kSkel & 8388608) != 0;
+  static_assert(!kF16Exp || (kLmma && kPTmem && kKpt == 64 && kPoly == 0), "option 4194304 needs 4096 + 8192");
+  constexpr uint32_t kColSfa = kPsep ? 448u : 384u, kColSfb = kPsep ? 452u : 392u, kColL = kPsep ? 456u : 400u;
+  const auto p_col = [](uint32_t bb_, uint32_t c_) -> uint32_t { return kPsep ? 384u + 32u * bb_ + 16u * c_ : 128u * bb_ + 64u * c_; };
+  static_assert(!kPvAcc || (kPairs == 2 && kTpr == 1 && kPTmem && !kCr && !kEarlyComb),
+                "option 4096 needs 4 KV heads, one softmax thread per row, P in tensor memory, no option 32 / 256");
+  // option 65536: K = 64 per MMA (the instruction descriptor's K-dimension bit): one QK MMA per head and tile instead of
+  // two, one PV MMA per 64 keys instead of two (option 4096: scale_vec::2X, the row's two scale factors in the 16-bit
+  // half of its word that the scale-factor ID selects)
+  constexpr bool kK64 = (kSkel & 65536) != 0;
+  constexpr int kKStep = kK64 ? 64 : 32;  // K (e4m3 values) per MMA
+  // option 16384 (with 4096, without 32768): QK block-scaled on the packed NVFP4 K (kind::mxf4nvf4, block 16, UE4M3
+  // scales), no K dequantization. Q is kQTerms NVFP4 terms of the row's e4m3 query (each term quantizes the remaining
+  // residual: block 16, scale = e4m3(amax / 6), E2M1 round-to-nearest-even, satfinite), relative to a per-row power of two
+  // (folded into the row's score scale) that puts the row maximum at most 6 x 448; written by the softmax threads at
+  // each piece's start (A operand in tensor memory, columns kColQa + 16 c + 8 t, each lane its own row). The MMAs run at
+  // M = 128 over a pair's 128 lanes as they lie: the MMA of head 2c + hh takes the scale factors whose other-head rows
+  // are 0, so those rows add exactly 0 (scale-factor A columns kColSfaQ + 4 c + 2 t + hh). The K scale words go from the
+  // raw stage to tensor memory (the B scale factors, columns kColSfbK + 8 stage + 2 head, every lane quarter) by the
+  // dequantization warps; the K data is read by the MMAs from the raw stage (128-byte swizzle), which the QK commit
+  // releases with the dequantization threads.
+  constexpr bool kD4b = (kSkel & 16384) != 0;
+  constexpr int kQTerms = 2;
+  constexpr uint32_t kColQa = 432u, kColSfaQ = kColQa + 16u * kPairs * kQTerms / 2, kColSfbK = kColSfaQ + 8u;
+  static_assert(!kD4b || (kPvAcc && !kPsep && kPairs == 2 && kTpr == 1 && !kDqR),
+                "option 16384 needs option 4096, not 32768 / 4");
+  static_assert(!kD4b || kColQa >= kColL + 32u, "option 16384: tensor-memory columns after the row sums");
+  static_assert(!kD4b || kColSfbK + 8u * kF8 <= kTmemCols, "option 16384: tensor-memory columns");
   extern __shared__ uint8_t smem_raw[];
   // 1024-byte aligned base by pointer arithmetic on the shared array (keeps the shared address space visible to the
   // compiler: st.shared / ld.shared instead of generic accesses)
@@ -751,7 +979,9 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
   const auto o_free_bar = [&](int b) { return cr_bar(4 + b); };
   const auto cr_done_bar = [&]() { return cr_bar(6); };
   const auto acc_free_bar = [&]() { return cr_bar(7); };
-  static_assert(8 * (L::kNumBars + 1 + 8) <= 512, "barrier region (option bit 5)");
+  // option 16384: the piece's Q terms are in tensor memory (one elected lane per softmax warp)
+  const auto qt_full_bar = [&]() { return cr_bar(8); };
+  static_assert(8 * (L::kNumBars + 1 + 9) <= 512, "barrier region (option bits 5, 16384)");
   float2* const arat = reinterpret_cast<float2*>(sm + L::kSmRed);  // [2][heads * 64 rows] (ar, at)
   static_assert(!kCr || 2 * kHeads * kRows * 8 <= 3 * kHeads * kRows * 2 * 4, "(ar, at) buffers fit the exchange area");
   int32_t* const pre = reinterpret_cast<int32_t*>(sm + L::kSmPre);  // pre[r] = tiles of requests < r; pre[R] = W
@@ -789,7 +1019,8 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
 #pragma unroll
     for (int s = 0; s < kRaw; ++s) {
       mbar_init(raw_full_bar(s), 1);            // the load thread's expect_tx arrival + the copies' bytes
-      mbar_init(raw_empty_bar(s), kDqThreads);  // every dequantization thread arrives after its reads + proxy fence
+      // (option 16384: + the QK commit, the MMAs read the packed K from the raw stage)
+      mbar_init(raw_empty_bar(s), kDqThreads + (kD4b ? 1 : 0));  // every dequantization thread arrives after its reads + proxy fence
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -810,6 +1041,9 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
       mbar_init(cr_done_bar(), 4);
       mbar_init(acc_free_bar(), kSmWarps);
     }
+    // option 4096: acc_free = the softmax warps loaded a piece's accumulator (the next piece's first PV may overwrite it)
+    if constexpr (kPvAcc) mbar_init(acc_free_bar(), kSmWarps);
+    if constexpr (kD4b) mbar_init(qt_full_bar(), kSmWarps);
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
   }
   if (warp == 0) {
@@ -820,6 +1054,14 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
   }
   // Dequantization table (constants only, so it is built before the dependency wait); read after the barrier below.
   if (tid < 256) sts64(smem_u32(sm + L::kSmLut + 8 * tid), lut_entry(static_cast<uint32_t>(tid)));
+  if constexpr (kLmma) {
+    // option 8192: 4 KB of e4m3 1.0 (0x38) in the exchange area (unused at one softmax thread per row without option 32;
+    // the descriptor's whole span lies inside): the B operand of the row-sum MMAs; generic stores read by the MMAs (async
+    // proxy): each writing thread fences, and the block barrier below orders them before the PV warp's first MMA
+    static_assert(3 * kHeads * kRows * 2 * 4 >= 4096, "exchange area holds the 1.0 block");
+    if (tid < 256) sts128(smem_u32(sm + L::kSmRed + 16 * tid), make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u));
+    fence_proxy_async();
+  }
   if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
   // Prefix tile counts (warp 9): pre[r] for r = 0..R.
   if (warp == kSmWarps + 1) {
@@ -1071,13 +1313,41 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
       // ------------------------------------------------------------------ loads
       // page numbers of the range -> shared memory (all lanes, all loads in flight together)
       constexpr int kTilesPerPage = 128 / kTileKeys;
+      // option 2097152: the first piece's Q rows are requested before the page list is gathered (they need no page), so
+      // they land while the page list loads (the option-16384 Q-term build of the first piece then overlaps it)
+      if (kEarlyQ && lane == 0) {
+        asm volatile("fence.proxy.async.global;\n" ::: "memory");
+        mbar_expect_tx(q_full_bar(0), kHeads * kRows * 64);
+#pragma unroll
+        for (int h = 0; h < kHeads; ++h)
+          tma_load_3d(smem_u32(sm + L::kSmQ + h * kRows * 64), &q_map, 0, h * kQPerKv, r_first * kTokens, q_full_bar(0));
+      }
       {
         int r = r_first, base = 0;
         for (int t = T0; t < T1 && base < kMaxPages;) {
           const int lo = t - pre[r], hi = min(T1, pre[r + 1]) - pre[r];
           const int pg0 = lo / kTilesPerPage, pg1 = (hi - 1) / kTilesPerPage + 1;
           const int32_t* const pt = p.page_table + static_cast<int64_t>(r) * p.page_table_stride;
-          for (int i = lane; i < pg1 - pg0 && base + i < kMaxPages; i += 32) pages[base + i] = pt[pg0 + i];
+          if constexpr (kPageFill) {
+            // option bit 10: eight page loads per lane issued before any store (one load per iteration keeps only one
+            // load in flight per lane); same entries
+            const int n = min(pg1 - pg0, kMaxPages - base);
+            for (int i0 = 0; i0 < n; i0 += 256) {
+              int v[8];
+#pragma unroll
+              for (int k = 0; k < 8; ++k) {
+                const int i = i0 + lane + 32 * k;
+                v[k] = i < n ? pt[pg0 + i] : 0;
+              }
+#pragma unroll
+              for (int k = 0; k < 8; ++k) {
+                const int i = i0 + lane + 32 * k;
+                if (i < n) pages[base + i] = v[k];
+              }
+            }
+          } else {
+            for (int i = lane; i < pg1 - pg0 && base + i < kMaxPages; i += 32) pages[base + i] = pt[pg0 + i];
+          }
           base += pg1 - pg0;
           t = pre[r] + hi;
           ++r;
@@ -1093,11 +1363,13 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
           // q rows of request r -> Q buffer k & 1 (free once the QK MMAs of piece k - 2 finished)
           constexpr int kQB = L::kQBufs;
           if (k >= kQB) mbar_wait_hint<kAuxHint>(q_empty_bar(k % kQB), ((k / kQB) - 1) & 1);
+          if (!(kEarlyQ && k == 0)) {  // (option 2097152: piece 0's Q was requested above)
           mbar_expect_tx(q_full_bar(k % kQB), kHeads * kRows * 64);
 #pragma unroll
           for (int h = 0; h < kHeads; ++h)
             tma_load_3d(smem_u32(sm + L::kSmQ + (k % kQB) * L::kQBuf + h * kRows * 64), &q_map, 0, h * kQPerKv,
                         r * kTokens, q_full_bar(k % kQB));
+          }
           const int32_t* const pt = p.page_table + static_cast<int64_t>(r) * p.page_table_stride;
           for (int i = lo; i < hi; ++i, ++g) {
             // tile g -> raw stage g % kRaw (free once the dequantization threads released tile g - kRaw)
@@ -1127,9 +1399,11 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
       {
         // QK issue (whole warp, warp-uniform operands, one elected lane issues). Descriptors: uniform bases plus
         // compile-time offsets (the start-address field is linear; shared-memory offsets stay inside it).
-        constexpr uint32_t id_qk = idesc_f8(64, kTileKeys, 0);
+        constexpr uint32_t id_qk = idesc_f8(64, kTileKeys, 0, kK64);
         const uint64_t dq0 = sdesc(smem_u32(sm + L::kSmQ), 512, kSw64);
         const uint64_t dk0 = sdesc(smem_u32(sm + L::kSmK), 1024, kSw128);
+        constexpr uint32_t id_qk4 = idesc_nvf4(128, kTileKeys);
+        const uint64_t dkr0 = sdesc(smem_u32(sm + L::kSmRaw), 1024, kSw128);
         int r_q = r_first, k_q = 0, end_q = __shfl_sync(0xffffffffu, min(T1, pre[r_first + 1]), 0);
         const int T0u = __shfl_sync(0xffffffffu, T0, 0);
         const auto qk_tile = [&](int gq) {
@@ -1140,15 +1414,36 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
             ++k_q;
             end_q = __shfl_sync(0xffffffffu, min(T1, pre[r_q + 1]), 0);
             mbar_wait_hint<kAuxHint>(q_full_bar(k_q % L::kQBufs), (k_q / L::kQBufs) & 1);
+            // option 16384: and the piece's Q terms (the softmax threads wrote them after the previous piece's last
+            // scores, i.e. after every QK MMA reading the previous terms completed)
+            if constexpr (kD4b) mbar_wait_hint<kAuxHint>(qt_full_bar(), k_q & 1);
             __syncwarp();
             tc_fence_after();
           }
           const int s = gq % kF8, bq = gq & 1;
           if (lane == 0) stamp(10, gq);
-          mbar_wait_hint<kAuxHint>(full_bar(s), (gq / kF8) & 1);
+          mbar_wait_hint<kAuxHint>(full_bar(s), (gq / kF8) & 1);  // option 16384: the tile's K scale factors written
           __syncwarp();
           if (lane == 0) stamp(1, gq);
           tc_fence_after();
+          if constexpr (kD4b) {
+            // M = 128, N = 64 keys, K = 64 dims (one MMA per Q term and head): A = Q term t of the pair's rows, B = head
+            // 2c + hh's packed K rows of raw stage gq % kRaw (32 bytes at byte 32 (2c + hh) of each 128-byte row)
+            const int sr = gq % kRaw;
+            const uint64_t dkr = dkr0 + static_cast<uint64_t>((sr * L::kRawBytes) >> 4);
+#pragma unroll
+            for (int c = 0; c < kPairs; ++c)
+#pragma unroll
+              for (int tq = 0; tq < kQTerms; ++tq)
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh)
+                  mma_nvf4_ts_e(tmem + 128u * bq + 64u * c, tmem + kColQa + 16u * c + 8u * tq,
+                                dkr + static_cast<uint64_t>((64 * c + 32 * hh) >> 4), id_qk4,
+                                tmem + kColSfaQ + 4u * c + 2u * tq + hh, tmem + kColSfbK + 8u * s + 2u * (2 * c + hh),
+                                (tq == 0 && hh == 0) ? 0u : 1u);
+            mma_commit_e(s_full_bar(bq));
+            mma_commit_e(raw_empty_bar(sr));  // the raw stage's K data read
+          } else {
           const uint64_t dq = dq0 + static_cast<uint64_t>(((k_q % L::kQBufs) * L::kQBuf) >> 4);
           const uint64_t dk = dk0 + static_cast<uint64_t>((s * kTileBytes) >> 4);
 #pragma unroll
@@ -1156,21 +1451,24 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
 #pragma unroll
             for (int hh = 0; hh < 2; ++hh)
 #pragma unroll
-              for (int kk = 0; kk < 2; ++kk)
+              for (int kk = 0; kk < 64 / kKStep; ++kk)
                 mma_f8_e(tmem + ((16u * hh) << 16) + 128u * bq + 64u * c,
-                         dq + static_cast<uint64_t>(((2 * c + hh) * kRows * 64 + 32 * kk) >> 4),
-                         dk + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * hh + 32 * kk) >> 4), id_qk, kk);
+                         dq + static_cast<uint64_t>(((2 * c + hh) * kRows * 64 + kKStep * kk) >> 4),
+                         dk + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * hh + kKStep * kk) >> 4), id_qk, kk);
           mma_commit_e(s_full_bar(bq));
+          }
           if (lane == 0) stamp(2, gq);
         };
         mbar_wait_hint<kAuxHint>(q_full_bar(0), 0);
+        if constexpr (kD4b) mbar_wait_hint<kAuxHint>(qt_full_bar(), 0);
         __syncwarp();
         tc_fence_after();
         qk_tile(0);
         if (ntiles > 1) qk_tile(1);
         for (int g = 0; g + 2 < ntiles; ++g) {
           mbar_wait_hint<kAuxHint>(s_free_bar(g & 1), (g >> 1) & 1);
-          if constexpr (kPTmem) mbar_wait_hint<kAuxHint>(o_full_bar(g & 1), (g >> 1) & 1);  // PV(g) read P(g)
+          // PV(g) read P(g) over S buffer g & 1 (option 32768: P has its own columns, no wait)
+          if constexpr (kPTmem && !kPsep) mbar_wait_hint<kAuxHint>(o_full_bar(g & 1), (g >> 1) & 1);
           __syncwarp();
           tc_fence_after();
           qk_tile(g + 2);
@@ -1179,12 +1477,26 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
     } else if (warp == kSmWarps + 2) {
       // ------------------------------------------------------------------ PV issue (warp-uniform, elected lane)
       {
-        constexpr uint32_t id_pv = idesc_f8(64, 64, 1);
+        constexpr uint32_t id_pv = idesc_f8(64, 64, 1, kK64);
         constexpr uint32_t kPSbo = kPairs == 2 ? 512 : 1024, kPSw = kPairs == 2 ? kSw64 : kSw128;
         const uint64_t dp0 = sdesc(smem_u32(sm + L::kSmP), kPSbo, kPSw);
         const uint64_t dv0 = sdesc(smem_u32(sm + L::kSmV), 1024, kSw128);
+        // option 4096: pieces (requests of the block's range) start the accumulator afresh; the next piece's first PV
+        // overwrites it only after the softmax warps loaded the previous piece's (acc_free)
+        int kp_pv = 0, end_pv = __shfl_sync(0xffffffffu, min(T1, pre[r_first + 1]), 0), r_pv = r_first;
+        const int T0p = __shfl_sync(0xffffffffu, T0, 0);
         for (int g = 0; g < ntiles; ++g) {
           const int s = g % kF8, bb = g & 1;
+          bool piece_start = g == 0;
+          if constexpr (kPvAcc) {
+            if (T0p + g >= end_pv) {
+              ++r_pv;
+              ++kp_pv;
+              end_pv = __shfl_sync(0xffffffffu, min(T1, pre[r_pv + 1]), 0);
+              piece_start = true;
+            }
+            if (piece_start && kp_pv > 0) mbar_wait_hint<kAuxHint>(acc_free_bar(), (kp_pv - 1) & 1);
+          }
           if (lane == 0) stamp(11, g);
           mbar_wait_hint<kAuxHint>(p_full_bar(bb), (g >> 1) & 1);
           mbar_wait_hint<kAuxHint>(vfull_bar(s), (g / kF8) & 1);  // the V half of the tile's FP8 stage
@@ -1196,21 +1508,63 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
           const uint64_t dp = dp0 + static_cast<uint64_t>((bb * kHeads * kRows * L::kPRowBytes) >> 4);
           const uint64_t dv = dv0 + static_cast<uint64_t>((s * kTileBytes) >> 4);
           constexpr uint32_t kObuf = kCr ? 0u : 128u;  // output buffer stride (one buffer with option bit 5)
+          // development probe (kDq bit 21, timing only, wrong outputs): no PV MMAs (the commits and hand-offs stay)
+          if constexpr (((kDq >> 21) & 1) != 0) {
+          } else if constexpr (kPvAcc) {
+            // M = 128 over the pair's 128 lanes, block-scaled: K step j covers keys 32 (j & 1) .. + 31 of head
+            // 2c + (j >> 1); A = this tile's P columns 8 (j & 1) .. + 7 of every lane (each lane holds its own head's
+            // P); the row scale factor word (column 384 + 2 bb + c) has byte j = the row's factor when j / 2 is the
+            // row's head, else 2^-127; the constant B scale factor 1 (columns 392 ..). Option 8192: the same A and
+            // scale factors times a constant 1.0 block (N = 16) accumulate the row sums (columns 400 + 16 c ..).
+            const uint64_t d1 = sdesc(smem_u32(sm + L::kSmRed), 128, 0);
+            if constexpr (kK64) {
+              // option 65536: one MMA per head (K = 64 = the tile's keys), scale-factor ID 2 hh = the 16-bit half
+              // whose two bytes carry the row's factor when hh is the row's head (the factor word's bytes 2 hh, 2 hh + 1)
+#pragma unroll
+              for (int c = 0; c < kPairs; ++c)
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                  const uint32_t acc = (piece_start && hh == 0) ? 0u : 1u;
+                  mma_bs2_ts_e(tmem + 256u + 64u * c, tmem + p_col(bb, c),
+                               dv + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * hh) >> 4),
+                               idesc_bs_f8(128, 64, 1, 2 * hh, true), tmem + kColSfa + 2u * bb + c, tmem + kColSfb, acc);
+                  if constexpr (kLmma)
+                    mma_bs2_ts_e(tmem + kColL + 16u * c, tmem + p_col(bb, c), d1, idesc_bs_f8(128, 16, 1, 2 * hh, true),
+                                 tmem + kColSfa + 2u * bb + c, tmem + kColSfb, acc);
+                }
+            } else {
+#pragma unroll
+            for (int c = 0; c < kPairs; ++c)
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                const uint32_t acc = (piece_start && j == 0) ? 0u : 1u;
+                mma_bs_ts_e(tmem + 256u + 64u * c, tmem + p_col(bb, c) + 8u * (j & 1),
+                            dv + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * (j >> 1) + 4096 * (j & 1)) >> 4),
+                            idesc_bs_f8(128, 64, 1, j), tmem + kColSfa + 2u * bb + c, tmem + kColSfb, acc);
+                if constexpr (kLmma)
+                  mma_bs_ts_e(tmem + kColL + 16u * c, tmem + p_col(bb, c) + 8u * (j & 1), d1,
+                              idesc_bs_f8(128, 16, 1, j), tmem + kColSfa + 2u * bb + c, tmem + kColSfb, acc);
+              }
+            }
+          } else {
 #pragma unroll
           for (int c = 0; c < kPairs; ++c)
 #pragma unroll
             for (int hh = 0; hh < 2; ++hh)
 #pragma unroll
-              for (int kk = 0; kk < kTileKeys / 32; ++kk)
+              for (int kk = 0; kk < kTileKeys / kKStep; ++kk)
                 if constexpr (kPTmem)
                   mma_f8_ts_e(tmem + ((16u * hh) << 16) + 256u + kObuf * bb + 64u * c,
-                              tmem + ((16u * hh) << 16) + 128u * bb + 64u * c + (32 * kk / kKpt) * kKpt +
-                                  (32 * kk % kKpt) / 4,
-                              dv + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * hh + 4096 * kk) >> 4), id_pv, kk);
+                              tmem + ((16u * hh) << 16) + 128u * bb + 64u * c + (kKStep * kk / kKpt) * kKpt +
+                                  (kKStep * kk % kKpt) / 4,
+                              dv + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * hh + kKStep * 128 * kk) >> 4), id_pv,
+                              kk);
                 else
                   mma_f8_e(tmem + ((16u * hh) << 16) + 256u + 128u * bb + 64u * c,
-                           dp + static_cast<uint64_t>(((2 * c + hh) * kRows * L::kPRowBytes + 32 * kk) >> 4),
-                           dv + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * hh + 4096 * kk) >> 4), id_pv, kk);
+                           dp + static_cast<uint64_t>(((2 * c + hh) * kRows * L::kPRowBytes + kKStep * kk) >> 4),
+                           dv + static_cast<uint64_t>((c * kTileKeys * 128 + 64 * hh + kKStep * 128 * kk) >> 4), id_pv,
+                           kk);
+          }
           mma_commit_e(o_full_bar(bb));
           if (lane == 0) stamp(7, g);
           // the FP8 stage of tile g (K read by QK(g), V by PV(g)) may take tile g + kF8 once these MMAs finished
@@ -1265,6 +1619,35 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
         const uint8_t* const raw = sm + L::kSmRaw + rs * L::kRawBytes;
 #pragma unroll
         for (int kv = 0; kv < 2; ++kv) {
+          if constexpr (kD4b) {
+            if (kv == 0) {
+              // option 16384: no K dequantization; the tile's K scale words to tensor memory as the QK's B scale
+              // factors (scale_vec::4X: lane i, column j of a head = key 32 j + i's four block scales), in every lane
+              // quarter: warp w covers lane quarter w % 4 for the heads of pair(s) (w - first dequantization warp) / 4 ..
+              const int dw = warp - kDqWarp0;
+              const uint32_t lb = (32u * static_cast<uint32_t>(dw & 3)) << 16;
+              const uint8_t* const ksr = raw + 2 * L::kRawData;
+              // the scale slot was last read by an earlier tile's QK MMAs (their completion observed through the waits
+              // above): order this thread's tensor-memory stores after them (PTX ISA tcgen05 thread-sync rules)
+              tc_fence_after();
+#pragma unroll
+              for (int hp = dw >> 2; hp < kPairs; hp += kDqWarps / 4) {
+                uint32_t w4[4];
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {  // u = 2 hh + j: head 2 hp + hh, keys 32 j + lane
+                  const int r128 = (2 * hp + (u >> 1)) * kSRows + (u & 1);
+                  w4[u] = *reinterpret_cast<const uint32_t*>(ksr + r128 * 128 + ((((lane >> 2) ^ (r128 & 7))) << 4) +
+                                                             4 * (lane & 3));
+                }
+                tmem_st4(tmem + lb + kColSfbK + 8u * fs + 4u * hp, w4[0], w4[1], w4[2], w4[3]);
+              }
+              tmem_wait_st();
+              tc_fence_before();
+              mbar_arrive(full_bar(fs));
+              if (d == 0) stamp(18, g);
+              continue;
+            }
+          }
           const uint8_t* const src = raw + kv * L::kRawData;
           uint8_t* const dst = sm + (kv ? L::kSmV : L::kSmK) + fs * kTileBytes;
           constexpr int kDqm = kDq & 7;  // development: 1 no stores, 2 no work, 3 constant table, 4 no proxy fence,
@@ -1276,7 +1659,11 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
               *reinterpret_cast<uint4*>(dst + doff1[i]) = make_uint4(0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u);
             }
           }
-          if constexpr (kDqm != 2 && kDqm != 5) {
+          // development bit 20 (timing only, wrong outputs): no dequantization work for the K half (V converted as
+          // usual); bounds a kernel whose QK consumes the packed K directly
+          constexpr bool kSkipK = ((kDq >> 20) & 1) != 0;
+          if (kSkipK && kv == 0) {
+          } else if constexpr (kDqm != 2 && kDqm != 5) {
           // scale words of the quad's rows (K: word t = blocks 0..3 of row t; V, four-token interleaved: word b =
           // block b of rows t = 0..3, byte t) -> table byte offsets 8 x scale of blocks 2 half, 2 half + 1 per step
           const uint4 sw = *reinterpret_cast<const uint4*>(raw + 2 * L::kRawData + kv * L::kRawScale + s_off);
@@ -1337,7 +1724,7 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
             mbar_arrive(full_bar(fs));
             if (d == 0) stamp(18, g);
           } else {
-            if (kOneFence) mbar_arrive(full_bar(fs));
+            if (kOneFence && !kD4b) mbar_arrive(full_bar(fs));
             mbar_arrive(vfull_bar(fs));
             mbar_arrive(raw_empty_bar(rs));
             if (d == 0) stamp(19, g);
@@ -1384,6 +1771,11 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
       };
       int g = 0, kp = 0;  // kp: pieces done (option bit 5 accumulator hand-off parity)
       int r = r_first;
+      if constexpr (kPvAcc) {
+        // the constant B scale factor 1.0 (UE8M0 0x7f) in columns 392 .. 395 of every lane, before the first P hand-off
+        // (whose tcgen05.wait::st + fence + arrival orders it before the first PV)
+        if (c == 0) tmem_st4(tmem + lane_base + kColSfb, 0x7f7f7f7fu, 0x7f7f7f7fu, 0x7f7f7f7fu, 0x7f7f7f7fu);
+      }
       for (int t = T0; t < T1; ++r, ++kp) {
         const int lo = t - pre[r], hi = min(T1, pre[r + 1]) - pre[r];
         const int n_r = pre[r + 1] - pre[r];
@@ -1393,21 +1785,126 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
 #pragma unroll
         for (int d = 0; d < kDims / 2; ++d) o2[d] = make_float2(0.0f, 0.0f);
         float m = -INFINITY, l = 0.0f, ar_prev = 0.0f, at_prev = 0.0f;
+        float sl2 = p.scale_log2;  // the row's score scale (log2 units)
+        if constexpr (kD4b) {
+          // option 16384: this row's Q terms for the piece (see kD4b). The row's 64 e4m3 values from the piece's Q buffer
+          // (64-byte swizzle: chunk q of row r at q ^ ((r >> 1) & 3)), once the tensor memory accelerator wrote it.
+          if (tid == 0) stamp(20, kp);
+          mbar_wait_warp(q_full_bar(kp % L::kQBufs), (kp / L::kQBufs) & 1);
+          if (tid == 0) stamp(21, kp);
+          const uint8_t* const qrow = sm + L::kSmQ + (kp % L::kQBufs) * L::kQBuf + (head * kRows + row) * 64;
+          float rq[64];
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            const uint4 w = *reinterpret_cast<const uint4*>(qrow + ((q ^ ((row >> 1) & 3)) << 4));
+            e4m3x4_to_f(w.x, rq + 16 * q);
+            e4m3x4_to_f(w.y, rq + 16 * q + 4);
+            e4m3x4_to_f(w.z, rq + 16 * q + 8);
+            e4m3x4_to_f(w.w, rq + 16 * q + 12);
+          }
+          float amax = 0.0f;
+#pragma unroll
+          for (int j = 0; j < 64; ++j) amax = fmaxf(amax, fabsf(rq[j]));
+          // the row's power of two 2^ge >= amax / (6 x 448), the smallest (amax / 2688 = (an integer < 16) / 21 x 2^k for
+          // e4m3 inputs: never within rounding of a power of two, so the product with the rounded reciprocal decides the
+          // same exponent), folded into the score scale; exponent arithmetic only (amax = 0: 2^0)
+          const float y = amax * (1.0f / 2688.0f);
+          const int ge = y > 0.0f ? ((__float_as_int(y) >> 23) & 0xFF) - 126 : 0;
+          const float ginv = __int_as_float((127 - ge) << 23);
+          sl2 = p.scale_log2 * __int_as_float((127 + ge) << 23);
+#pragma unroll
+          for (int j = 0; j < 64; ++j) rq[j] *= ginv;
+#pragma unroll
+          for (int tq = 0; tq < kQTerms; ++tq) {
+            uint32_t qa[8], sfw = 0u;
+#pragma unroll
+            for (int blk = 0; blk < 4; ++blk) {
+              float bm = 0.0f;
+#pragma unroll
+              for (int k = 0; k < 16; ++k) bm = fmaxf(bm, fabsf(rq[16 * blk + k]));
+              uint32_t sb = f_to_e4m3(bm * (1.0f / 6.0f));
+              float sv = 1.0f;
+              if (sb == 0u) {
+                sb = 0x38u;  // 1.0: a block that is zero after rounding
+              } else {
+                sv = e4m3_to_f(sb);
+              }
+              // E2M1 round-to-nearest-even of r / sv without a division: |r| against the exact midpoints x sv (each
+              // product exact in fp32); a tie goes to the even code (0, 1, 2, 4, 4, 6, 6 at 0.25, 0.75, 1.25, 1.75, 2.5,
+              // 3.5, 5), values beyond 6 sv saturate at 6. The magnitude in units of sv: 0.5 per step up to 2, then 1, 1, 2.
+              const float t0 = 0.25f * sv, t1 = 0.75f * sv, t2 = 1.25f * sv, t3 = 1.75f * sv, t4 = 2.5f * sv,
+                          t5 = 3.5f * sv, t6 = 5.0f * sv;
+              float v[16];
+              if constexpr (kFastQ) {
+                // option 8388608: r x (the rounded reciprocal of sv), the conversion's round-to-nearest-even (it can
+                // differ from the exact rounding of r / sv only within an ulp of a midpoint), then the exact values back
+                const float inv = __frcp_rn(sv);
+#pragma unroll
+                for (int k = 0; k < 16; ++k) v[k] = rq[16 * blk + k] * inv;
+                qa[2 * blk] = f8_to_e2m1x8(v);
+                qa[2 * blk + 1] = f8_to_e2m1x8(v + 8);
+                e2m1x8_to_f(qa[2 * blk], v);
+                e2m1x8_to_f(qa[2 * blk + 1], v + 8);
+#pragma unroll
+                for (int k = 0; k < 16; ++k) rq[16 * blk + k] = fmaf(-v[k], sv, rq[16 * blk + k]);  // the residual
+                sfw |= sb << (8 * blk);
+                continue;
+              }
+#pragma unroll
+              for (int k = 0; k < 16; ++k) {
+                const float r = rq[16 * blk + k], a = fabsf(r);
+                const float mh = (a > t0 ? 0.5f : 0.0f) + (a >= t1 ? 0.5f : 0.0f) + (a > t2 ? 0.5f : 0.0f) +
+                                 (a >= t3 ? 0.5f : 0.0f) + (a > t4 ? 1.0f : 0.0f) + (a >= t5 ? 1.0f : 0.0f) +
+                                 (a > t6 ? 2.0f : 0.0f);
+                v[k] = copysignf(mh, r);                          // on the E2M1 grid: the conversion is exact
+                rq[16 * blk + k] = fmaf(-v[k], sv, r);            // the residual (exact)
+              }
+              qa[2 * blk] = f8_to_e2m1x8(v);
+              qa[2 * blk + 1] = f8_to_e2m1x8(v + 8);
+              sfw |= sb << (8 * blk);
+            }
+            tmem_st8(tmem + lane_base + kColQa + 16u * c + 8u * tq, qa);
+            // scale factors of the MMAs of head 2c and 2c + 1: this row's word in its own head's column, 0 in the other
+            tmem_st2(tmem + lane_base + kColSfaQ + 4u * c + 2u * tq, hh == 0 ? sfw : 0u, hh == 1 ? sfw : 0u);
+          }
+          tmem_wait_st();
+          tc_fence_before();
+          __syncwarp();
+          if (lane == 0) mbar_arrive(qt_full_bar());
+          if (tid == 0) stamp(22, kp);
+        }
         // rescale-and-add of an output tile into o (packed fp32 pairs: the same two roundings as fmaf(o, ar, v * at))
-        const auto combine = [&](int gg) {
+        const auto combine = [&](int gg, bool last = false) {
+          // development probe (kDq bit 19, timing only, wrong outputs): no per-tile combine (no output wait, loads or
+          // arithmetic) except the piece's last tile (its wait keeps the output MMAs complete before the piece ends);
+          // bounds what an accumulate-in-place output would save
+          if constexpr (((kDq >> 19) & 1) != 0) {
+            if (!last) return;
+          }
           const int bp = gg & 1;
           mbar_wait_warp(o_full_bar(bp), (gg >> 1) & 1);
           if (tid == 0) stamp(8, gg);
           tc_fence_after();
           const float2 a2 = make_float2(ar_prev, ar_prev), t2 = make_float2(at_prev, at_prev);
+          if constexpr (kOneWaitO) {
+            // option bit 9: every output column of the tile loaded before one wait; the same operations per element
+            float v[kDims];
 #pragma unroll
-          for (int d0 = 0; d0 < kDims; d0 += 32) {
-            float v[32];
-            tmem_ld32(tmem + lane_base + 256u + 128u * bp + o_col + d0, v);
+            for (int d0 = 0; d0 < kDims; d0 += 32)
+              tmem_ld32(tmem + lane_base + 256u + 128u * bp + o_col + d0, *reinterpret_cast<float(*)[32]>(v + d0));
             tmem_wait_ld();
 #pragma unroll
-            for (int d = 0; d < 16; ++d)
-              o2[d0 / 2 + d] = fma2(o2[d0 / 2 + d], a2, mul2(make_float2(v[2 * d], v[2 * d + 1]), t2));
+            for (int d = 0; d < kDims / 2; ++d) o2[d] = fma2(o2[d], a2, mul2(make_float2(v[2 * d], v[2 * d + 1]), t2));
+          } else {
+#pragma unroll
+            for (int d0 = 0; d0 < kDims; d0 += 32) {
+              float v[32];
+              tmem_ld32(tmem + lane_base + 256u + 128u * bp + o_col + d0, v);
+              tmem_wait_ld();
+#pragma unroll
+              for (int d = 0; d < 16; ++d)
+                o2[d0 / 2 + d] = fma2(o2[d0 / 2 + d], a2, mul2(make_float2(v[2 * d], v[2 * d + 1]), t2));
+            }
           }
           tc_fence_before();
           if (tid == 0) stamp(9, gg);
@@ -1467,18 +1964,89 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
             smax = fmaxf(red[(bb * kRecRows + rec_row) * 2], red[(bb * kRecRows + rec_row) * 2 + 1]);
           }
           // the tile's own maximum: the probabilities of the tile are quantized against it
-          const float mtile = smax == -INFINITY ? -INFINITY : smax * p.scale_log2;
-          const float mu = mtile == -INFINITY ? 0.0f : mtile;
-          const float mnew = fmaxf(m, mtile);
-          const float ar = m == -INFINITY ? 0.0f : fast_exp2(m - mnew);
-          const float at = mtile == -INFINITY ? 0.0f : fast_exp2(mtile - mnew);
+          const float mtile = smax == -INFINITY ? -INFINITY : smax * sl2;
+          // option 4096: the tile's probabilities are quantized against kt = ceil(mtile) (an integer), and its scale
+          // factor 2^(kt - m) (m = the row's reference, an integer) puts them on the accumulator's scale
+          float kt = 0.0f, ft = 0.0f;
+          uint32_t sfa_word = 0u;
+          if constexpr (kPvAcc) {
+            kt = mtile == -INFINITY ? -INFINITY : ceilf(mtile);
+            const bool need = m != -INFINITY && kt != -INFINITY && kt > m + 64.0f;
+            if (m == -INFINITY) m = kt;  // the piece's first tile with a finite maximum (earlier products are zeros)
+            if (__any_sync(0xffffffffu, need)) {
+              // re-reference: the accumulator rows (and row sums) of the rows whose maximum jumped are scaled by
+              // 2^(m - kt) (exact); the other rows of the warp by 1. The output MMAs of tile g - 1 (the last ones
+              // of this piece so far) are complete first; PV(g) starts only after this tile's hand-off below.
+              mbar_wait_warp(o_full_bar((g - 1) & 1), ((g - 1) >> 1) & 1);
+              tc_fence_after();
+              // (a jump beyond 126 binades scales by 2^-126: the earlier terms are below that relative to the new ones)
+              const float f = need ? __int_as_float((127 + max(static_cast<int>(m - kt), -126)) << 23) : 1.0f;
+              if constexpr (kSlimRef) {
+                // option 131072: 16 columns at a time, not unrolled (the same products)
+#pragma unroll 1
+                for (uint32_t d0 = 0; d0 < 64u; d0 += 16u) {
+                  uint32_t ow[16];
+                  tmem_ld16(tmem + lane_base + 256u + 64u * c + d0, ow);
+                  tmem_wait_ld();
+#pragma unroll
+                  for (int d = 0; d < 16; ++d) ow[d] = __float_as_uint(__uint_as_float(ow[d]) * f);
+                  tmem_st16(tmem + lane_base + 256u + 64u * c + d0, ow);
+                }
+                if constexpr (kLmma) {
+                  const float lv0 = __uint_as_float(tmem_ld1(tmem + lane_base + kColL + 16u * c));
+                  tmem_wait_ld();
+                  tmem_st1(tmem + lane_base + kColL + 16u * c, __float_as_uint(lv0 * f));
+                }
+              } else {
+              float ov[64];
+              tmem_ld32(tmem + lane_base + 256u + 64u * c, *reinterpret_cast<float(*)[32]>(ov));
+              tmem_ld32(tmem + lane_base + 256u + 64u * c + 32u, *reinterpret_cast<float(*)[32]>(ov + 32));
+              tmem_wait_ld();
+              uint32_t ow[32];
+#pragma unroll
+              for (int d = 0; d < 32; ++d) ow[d] = __float_as_uint(ov[d] * f);
+              tmem_st32(tmem + lane_base + 256u + 64u * c, ow);
+#pragma unroll
+              for (int d = 0; d < 32; ++d) ow[d] = __float_as_uint(ov[32 + d] * f);
+              tmem_st32(tmem + lane_base + 256u + 64u * c + 32u, ow);
+              }
+              if constexpr (kLmma && !kSlimRef) {
+                // the row-sum accumulator (column 400 + 16 c; the only one of its 16 equal columns read back)
+                float lv[32];
+                tmem_ld32(tmem + lane_base + kColL + 16u * c, lv);
+                tmem_wait_ld();
+                tmem_st1(tmem + lane_base + kColL + 16u * c, __float_as_uint(lv[0] * f));
+              }
+              if (need) {
+                l *= f;
+                m = kt;
+              }
+            }
+            if (kt != -INFINITY) {
+              const int n = max(static_cast<int>(kt - m), -127);  // <= 64
+              ft = n >= -126 ? __int_as_float((127 + n) << 23) : __int_as_float(0x00400000);
+              // bytes 2 hh and 2 hh + 1 (the K steps of this row's head) carry the factor; the other head's K steps 2^-127
+              sfa_word = static_cast<uint32_t>(127 + n) * (hh == 0 ? 0x00000101u : 0x01010000u);
+            }
+          }
+          const float mu = mtile == -INFINITY ? 0.0f : (kPvAcc ? kt : mtile);
+          const float mnew = kPvAcc ? m : fmaxf(m, mtile);
+          const float ar = kPvAcc || m == -INFINITY ? 0.0f : fast_exp2(m - mnew);
+          const float at = kPvAcc || mtile == -INFINITY ? 0.0f : fast_exp2(mtile - mnew);
           // 448 * 2^y as 2^(y + log2 448): probabilities come out pre-scaled for the e4m3 conversion, and the row sums are
           // kept in the same (x 448) units; the output scale divides by them (bmm2_scale / l448)
           const float nmu448 = kLog2PScale - mu;
-          const float2 sc = make_float2(p.scale_log2, p.scale_log2), nmu = make_float2(nmu448, nmu448);
+          const float2 sc = make_float2(sl2, sl2), nmu = make_float2(nmu448, nmu448);
           float2 ls[2] = {make_float2(0.0f, 0.0f), make_float2(0.0f, 0.0f)};
+          // option 4194304 (with 8192: the row sums come from the MMAs): 2^y in half precision, two per instruction, and
+          // the e4m3 probabilities converted from the f16 pairs; y itself in fp32 as above
+          uint32_t hp[kF16Exp ? kKpt / 2 : 1];
+          if constexpr (kF16Exp) {
 #pragma unroll
-          for (int j = 0; j < kKpt && kMode != 2; j += 2) {
+            for (int j = 0; j < kKpt; j += 2) hp[j / 2] = exp2_f16x2(fma2(make_float2(x[j], x[j + 1]), sc, nmu));
+          }
+#pragma unroll
+          for (int j = 0; j < kKpt && kMode != 2 && !kF16Exp; j += 2) {
             const float2 y = fma2(make_float2(x[j], x[j + 1]), sc, nmu);
             // kPoly of every 8 keys take 2^y from the FMA pipes (exp2_poly2), the rest from ex2.approx
             const float2 pj = (j & 7) < kPoly ? exp2_poly2(y) : make_float2(fast_exp2(y.x), fast_exp2(y.y));
@@ -1502,14 +2070,29 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
           // 128-byte swizzle (chunk q of row r at q ^ (r % 8)); buffer bb was last read by the MMAs of tile g - 2.
           if constexpr (kPTmem) {
             uint32_t pw[16];
+            if constexpr (kF16Exp) {
+#pragma unroll
+              for (int j = 0; j < 16; ++j) pw[j] = e4m3x4_from_f16x2(hp[2 * j], hp[2 * j + 1]);
+            } else {
 #pragma unroll
             for (int j = 0; j < 16; ++j) pw[j] = pack4(x[4 * j], x[4 * j + 1], x[4 * j + 2], x[4 * j + 3]);
+            }
             // option bit 8: the previous tile's combine runs here, before this tile's probabilities are stored and PV(g)
             // starts reading them from tensor memory (independent values; the same per-element operations and order)
             if constexpr (kEarlyComb) {
               if (i > lo) combine(g - 1);
             }
-            tmem_st16(tmem + lane_base + 128u * bb + s_col, pw);
+            if constexpr (kPsep) {
+              // option 32768: P buffer bb (own columns) was last read by PV(g - 2): wait for its commit first (it is
+              // the latest commit on that barrier, so the parity cannot alias)
+              if (g >= 2) {
+                mbar_wait_warp(o_full_bar(bb), ((g - 2) >> 1) & 1);
+                tc_fence_after();
+              }
+            }
+            tmem_st16(tmem + lane_base + (kPsep ? p_col(bb, c) : 128u * bb + s_col), pw);
+            // option 4096: the row's scale-factor word of this tile (one byte per PV K step)
+            if constexpr (kPvAcc) tmem_st1(tmem + lane_base + kColSfa + 2u * bb + c, sfa_word);
             tmem_wait_st();
           } else {
           uint8_t* const prow = sm + L::kSmP + (bb * kHeads + head) * kRows * L::kPRowBytes + row * L::kPRowBytes;
@@ -1531,10 +2114,15 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
           __syncwarp();
           if (lane == 0) mbar_arrive(p_full_bar(bb));
           // this thread's half of the row sum (the two halves are added once, at the end of the piece)
-          if constexpr (!kCr && !kEarlyComb) {
+          if constexpr (!kCr && !kEarlyComb && !kPvAcc) {
             if (i > lo) combine(g - 1);
           }
-          l = l * ar + lpart * at;
+          if constexpr (kPvAcc) {
+            // the row sum on the accumulator's scale (ft = 2^(kt - m), exact); option 8192 takes it from the MMAs
+            if constexpr (!kLmma) l = fmaf(lpart, ft, l);
+          } else {
+            l = l * ar + lpart * at;
+          }
           ar_prev = ar;
           at_prev = at;
         }
@@ -1553,8 +2141,32 @@ __global__ void __launch_bounds__(threads_of<kSkel>(), 1)
           tc_fence_before();
           __syncwarp();
           if (lane == 0) mbar_arrive(acc_free_bar());  // the next piece's first rescale may overwrite it
+        } else if constexpr (kPvAcc) {
+          // the piece's accumulator (this lane's row) once the output MMAs of its last tile completed; then the next
+          // piece's first PV may overwrite it (acc_free: one arrival per softmax warp)
+          mbar_wait_warp(o_full_bar((g - 1) & 1), ((g - 1) >> 1) & 1);
+          tc_fence_after();
+#pragma unroll
+          for (int d0 = 0; d0 < kDims; d0 += 32) {
+            float v[32];
+            tmem_ld32(tmem + lane_base + 256u + 64u * c + d0, v);
+            tmem_wait_ld();
+#pragma unroll
+            for (int d = 0; d < 16; ++d) o2[d0 / 2 + d] = make_float2(v[2 * d], v[2 * d + 1]);
+          }
+          if constexpr (kLmma) {
+            // option 8192: the row sum accumulated by the MMAs (x 448 units, on the accumulator's scale) replaces the
+            // register sum of the unquantized probabilities
+            float lv[32];
+            tmem_ld32(tmem + lane_base + kColL + 16u * c, lv);
+            tmem_wait_ld();
+            l = lv[0];
+          }
+          tc_fence_before();
+          __syncwarp();
+          if (lane == 0) mbar_arrive(acc_free_bar());
         } else {
-          combine(g - 1);
+          combine(g - 1, true);
         }
         if constexpr (kTpr == 2) {
           red[(2 * kRecRows + rec_row) * 2 + half] = l;
@@ -1732,15 +2344,17 @@ inline EncodeFn encode_fn() {
   return fn;
 }
 
-// Tensor map over a packed pool [slots, row_bytes] (bytes), box = whole rows x `rows`, no swizzle.
-inline CUtensorMap packed_map(const void* base, int64_t slots, int64_t row_bytes, int rows) {
+// Tensor map over a packed pool [slots, row_bytes] (bytes), box = whole rows x `rows`, no swizzle (sw128: the 128-byte
+// swizzle, rows of 128 bytes, for a K operand read by the MMA directly).
+inline CUtensorMap packed_map(const void* base, int64_t slots, int64_t row_bytes, int rows, bool sw128 = false) {
   CUtensorMap map;
   const cuuint64_t dims[2] = {static_cast<cuuint64_t>(row_bytes), static_cast<cuuint64_t>(slots)};
   const cuuint64_t strides[1] = {static_cast<cuuint64_t>(row_bytes)};
   const cuuint32_t box[2] = {static_cast<cuuint32_t>(row_bytes), static_cast<cuuint32_t>(rows)};
   const cuuint32_t elem[2] = {1, 1};
   const CUresult r = encode_fn()(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), dims, strides, box,
-                                 elem, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                 elem, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                 sw128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
                                  CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   sglang::host::RuntimeCheck(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled (packed pool) failed: ", static_cast<int>(r));
   return map;
@@ -1851,7 +2465,9 @@ struct Kv4AttnWideKernel {
     params.scale_log2 = static_cast<float>(bmm1_scale * M_LOG2E);
     params.out_scale = static_cast<float>(bmm2_scale);  // row sums are kept in x448 units
     const CUtensorMap qm = k4w_host::q_map(q.data_ptr(), m, hq, q.stride(0));
-    const CUtensorMap kdm = k4w_host::packed_map(k_pool.data_ptr(), k_pool.size(0), k_pool.size(1), L::kTileKeys);
+    // option 16384: the packed K rows land in the 128-byte swizzle (the QK MMA reads them directly)
+    const CUtensorMap kdm = k4w_host::packed_map(k_pool.data_ptr(), k_pool.size(0), k_pool.size(1), L::kTileKeys,
+                                                 (kSkel & 16384) != 0);
     const CUtensorMap vdm = k4w_host::packed_map(v_pool.data_ptr(), v_pool.size(0), v_pool.size(1), L::kTileKeys);
     const CUtensorMap ksm = k4w_host::scale_map(k_scales.data_ptr(), k_scales.size(0), hkv, L::kTileKeys);
     const CUtensorMap vsm = k4w_host::scale_map(v_scales.data_ptr(), v_scales.size(0), hkv, L::kTileKeys);
