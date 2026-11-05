@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import ast
 import builtins
-from contextlib import nullcontext
-from dataclasses import dataclass, field
 import hashlib
 import json
+import sys
+import unittest
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from math import prod
 from pathlib import Path
-import sys
-from types import ModuleType, SimpleNamespace as NS
-import unittest
+from types import ModuleType
+from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch

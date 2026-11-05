@@ -53,6 +53,7 @@ def _cuda_fault(error):
 def _query_fixture(device, missing):
     import cutlass
     import cutlass.cute as cute
+
     from sgl_nvidia_mega.kimi_k3.cutedsl.common.host import stream, to_cute
     from sgl_nvidia_mega.kimi_k3.cutedsl.mla.query import MlaQuery
 
@@ -112,6 +113,7 @@ def _query_fixture(device, missing):
 
 def _value_fixture(device, kind, missing):
     import cutlass
+
     from sgl_nvidia_mega.kimi_k3.cutedsl.common.host import layout, stream, to_cute
     from sgl_nvidia_mega.kimi_k3.cutedsl.mla.dcp import compile_value
 

@@ -15,20 +15,21 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
-from sgl_nvidia_mega.kimi_k3 import dcp_verify_execution as d
 from test_kimi_k3_dcp_execution import (
     DEVICE,
     ROOT,
     Binding,
     Dcp,
+)
+from test_kimi_k3_dcp_execution import Fixture as DecodeFixture
+from test_kimi_k3_dcp_execution import (
     Mla,
     Step,
     executor_module,
     tensor,
 )
-from test_kimi_k3_dcp_execution import (
-    Fixture as DecodeFixture,
-)
+
+from sgl_nvidia_mega.kimi_k3 import dcp_verify_execution as d
 
 
 class Kda:
