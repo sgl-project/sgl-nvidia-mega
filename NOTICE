@@ -31,3 +31,32 @@ flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at v0.7.0.post1
 FlashInfer
 Copyright 2025-2026 NVIDIA
 Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+Portions are adapted from SGLang (https://github.com/sgl-project/sglang): the Muse Spark
+kernels and hooks in sgl_nvidia_mega/muse_spark/components/. The CUDA sources in csrc/
+(ar_norm_residual, ar2_norm_residual, b3_norm_mx, c3_fold_norm, draft_ar_norm,
+draft_candidates, moe_tail, proj_publish, norm_fp4_quant_early, pull_gather_bounded, unorm, unorm_cl,
+wfc_c4_norm, wfc_c4_route, wfc_front_roles, wfc_k1s) are derived from SGLang's Muse Spark
+JIT kernels and its NVLink communication header; include/sgl_kernel/warp.cuh is a copy of
+SGLang's warp.cuh with the volatile redux change of SGLang PR #44137; nvfp4_kv_host.py,
+nvfp4_kv_mixed.py, nvfp4_kv_pool.py, nvfp4_kv_resolution.py, nvfp4_kv_scales.py,
+sgl_shims.py, spec_sample_split.py, verify_topk_sample.py,
+ctx_proj_overlap.py, ops/draft_qk.py and ops/fin2_cutedsl.py contain code copied or derived
+from SGLang's Python and Triton sources (Apache License 2.0, Copyright 2023-2024 SGLang
+Team; the license text is kept in components/include/LICENSE.sglang). The directory components/vendor/ holds copies of two SGLang pull requests that are not in the
+SGLang revision this package pins (#47174, fused all-reduce + norm; #46724, fused finalize + two-shot
+push), unchanged or with a "Modified by NVIDIA" header; components/vendor/README.md lists the files
+and commits. SGLang ships no NOTICE
+file. Each adapted file names its origin, revision and the NVIDIA modification in its header.
+
+Portions are adapted from FlashInfer (https://github.com/flashinfer-ai/flashinfer) 0.7.1: the
+NVFP4 KV quantization in csrc/nvfp4_kv_store.cuh (Apache License 2.0, Copyright (c) 2025 by
+FlashInfer team), the vocabulary-split softmax in csrc/softmax_split.cuh (Apache License 2.0,
+Copyright (c) 2024 by FlashInfer team), and the CuTe-DSL grouped-GEMM kernels in
+moe_x_kernels/gather_swiglu_gemm.py and moe_x_kernels/grouped_gemm_rows.py (BSD-3-Clause,
+Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES; the full notice is kept in each file);
+moe_x_kernels/custom_pipeline.py carries the same BSD-3-Clause notice. The TGV BF16 GEMM in opp_tgv_gemm.py is a CuTe-DSL kernel adapted from FlashInfer and SGLang (Apache License
+2.0, Copyright (c) 2026 by FlashInfer team, Copyright 2026 SGLang Team; the full notice is kept in the file). FlashInfer's license
+and NOTICE are kept in components/include/LICENSE.flashinfer and NOTICE.flashinfer; the
+license texts that FlashInfer's NOTICE refers to (CUTLASS, FlashAttention-3, fmt, spdlog) are kept
+unchanged in components/include/licenses/, copied from FlashInfer v0.7.1.
