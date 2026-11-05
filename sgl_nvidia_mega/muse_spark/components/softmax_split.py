@@ -176,12 +176,9 @@ def eligible(logits_2d: torch.Tensor) -> str | None:
     if not _stock_kernel_family(logits_2d.device.index):
         return "device uses another softmax kernel"
     if torch.cuda.is_current_stream_capturing():
-        from . import sampling_graph
-
-        if (
-            not sampling_graph.capturing()
-        ):  # only inside sampling_graph's capture (workspace exists from its warm-up)
-            return "graph capture"
+        # allowed only inside ``sampling_graph``'s capture (workspace from its warm-up); that component is a host-side
+        # runtime one and is not part of this package, so a capture is always refused here
+        return "graph capture"
     return None
 
 

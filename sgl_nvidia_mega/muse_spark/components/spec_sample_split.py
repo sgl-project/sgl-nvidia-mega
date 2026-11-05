@@ -432,10 +432,10 @@ def eligible(
 
 
 def _capture_allowed() -> bool:
-    """Capture is allowed only inside ``sampling_graph``'s capture of the sampling call (scratch then belongs to it)."""
-    from . import sampling_graph
+    """Capture is allowed only inside ``sampling_graph``'s capture of the sampling call (scratch then belongs to it).
 
-    return sampling_graph.capturing()
+    ``sampling_graph`` is a host-side runtime component and is not part of this package, so no capture is allowed here."""
+    return False
 
 
 _compiled: dict = {}

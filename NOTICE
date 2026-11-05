@@ -34,13 +34,13 @@ Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
 
 Portions are adapted from SGLang (https://github.com/sgl-project/sglang): the Muse Spark
 kernels and hooks in sgl_nvidia_mega/muse_spark/components/. The CUDA sources in csrc/
-(ar_norm_residual, ar2_norm_residual, c3_fold_norm, dflash_commit, draft_ar_norm,
+(ar_norm_residual, ar2_norm_residual, c3_fold_norm, draft_ar_norm,
 draft_candidates, moe_tail, norm_fp4_quant_early, pull_gather_bounded, unorm, unorm_cl,
 wfc_c4_norm, wfc_c4_route, wfc_front_roles, wfc_k1s) are derived from SGLang's Muse Spark
 JIT kernels and its NVLink communication header; include/sgl_kernel/warp.cuh is a copy of
 SGLang's warp.cuh with the volatile redux change of SGLang PR #44137; nvfp4_kv_host.py,
 nvfp4_kv_mixed.py, nvfp4_kv_pool.py, nvfp4_kv_resolution.py, nvfp4_kv_scales.py,
-dflash_prefill_async.py, sgl_shims.py, spec_sample_split.py, verify_topk_sample.py,
+sgl_shims.py, spec_sample_split.py, verify_topk_sample.py,
 ctx_proj_overlap.py, ops/draft_qk.py and ops/fin2_cutedsl.py contain code copied or derived
 from SGLang's Python and Triton sources (Apache License 2.0, Copyright 2023-2024 SGLang
 Team; the license text is kept in components/include/LICENSE.sglang). SGLang ships no NOTICE

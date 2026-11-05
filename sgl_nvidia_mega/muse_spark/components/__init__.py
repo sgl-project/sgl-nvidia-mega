@@ -51,11 +51,9 @@ COMPONENTS = (
     "ctx_proj_prefill",  # after ctx_proj_overlap: its projection hook takes only the tensor its SP exit handed out
     "spec_sample_split",
     "softmax_split",
-    "sampling_graph",
     "draft_candidates",
     "draft_boundary",
     "draft_attn",
-    "eager_commit",
     "final_norm",
     "draft_kv_append",
     "input_norm",
@@ -81,12 +79,7 @@ COMPONENTS = (
     "sp_fp4_dispatch",
     "prefill_attn",
     "prefill_qkn",
-    "sb_lite",
     "kv_draftwin",
-    "kv_hostbook",
-    "swa_hostsplit",
-    "kv_accounting",
-    "dflash_prefill_async",
     "verify_topk_sample",  # last: its hooks wrap the other components' hooks
 )
 
@@ -103,7 +96,6 @@ ENTRY: dict[str, str] = {
     "small_extend_attn": "engage",
     "xattn_b": "engage",
     "sp_fp4_dispatch": "engage",
-    "sb_lite": "engage",
 }
 
 _registered: dict[str, bool] | None = None
