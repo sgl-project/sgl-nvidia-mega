@@ -17,12 +17,31 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | DeepSeek-V4.1-Flash | GB300 (SM103); 148-SM B300 (SM103) with `sm148` | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request); on B300, speed was measured at one request only, serving passed a GSM8K canary at client concurrency 12 and 16 with decode CUDA graphs up to batch 16 (DSpark block 5), and larger batches and other block sizes rely on the kernel tests |
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103) | 8 | One-token decode steps of 1–8, 16, 32 and 64 rows |
+| GLM-5 DSA (NVFP4) | GB300 (SM103), Rubin (SM107) | 8 | EAGLE topk-1 target verify steps of whole requests up to 16 rows (batch 1 to 4 at 4 rows a request, 1 to 2 at 6), NextN draft and draft-extend steps of 1 to 16 rows |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
 SGLang's standard path. Qwen3.5 also offers the explicit GDN prefill slot below. Their draft specs provide the DSpark proposal and the
 Qwen3.5 EAGLE entries, respectively. For Kimi K3, the plugin covers the 93-layer
 language model (24 MLA and 69 KDA layers) at the listed widths; every other call
 runs the standard path.
+
+GLM-5 DSA needs `--kv-cache-dtype fp8_e4m3 --page-size 64 --attention-backend dsa --dsa-decode-backend trtllm --moe-runner-backend flashinfer_trtllm --speculative-algorithm EAGLE --speculative-eagle-topk 1 --speculative-num-steps 3 --speculative-num-draft-tokens 4` (or `--speculative-num-steps 5 --speculative-num-draft-tokens 6`) and `SGLANG_ENABLE_EMBED_REPLICATION=1`. Without NVLink multicast (no all-reduce fusion), set `SGLANG_NVIDIA_MEGAKERNEL_GLM_ALLOW_NO_AR_FUSION=1`.
+
+### Speculative step graph (any EAGLE v2 model)
+
+Off by default; each switch installs its SGLang hooks only when set to `1`.
+
+| Switch | Effect |
+| --- | --- |
+| `SGLANG_NVIDIA_MEGAKERNEL_SPEC_STEP_GRAPH` | One CUDA graph per topk-1 decode step (draft, target verify, draft extend and the work between them), batch size 1 to 8 |
+| `SGLANG_SPEC_STEP_GRAPH_FUSED_INPUT_COPY` | The step graph's input copies in one launch |
+| `SGLANG_SPEC_PACKED_VERIFY_BROADCAST` | One TP broadcast of the verify result instead of three |
+| `SGLANG_SPEC_LEAN_SAMPLED_VERIFY` | Chain sampled verify without the expanded temperatures and zero-filled draft probs |
+| `SGLANG_SPEC_CHUNKED_VERIFY_SAMPLING` | With the lean verify: the sampling passes split over vocabulary chunks |
+| `SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL` | The topk-1 draft-extend argmax, probs and DSA seed gather in two launches |
+| `SGLANG_SPEC_FUSED_RELAY` | The relay stash in one scatter, row views for a single request |
+
+Every fusion's outputs are bitwise identical to the path it replaces.
 
 The Kimi K3 adapter is experimental. On the pinned GB300/TP8 configuration
 below, every listed CUDA-graph width and padding boundary passed dummy-weight
