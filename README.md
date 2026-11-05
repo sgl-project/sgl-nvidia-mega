@@ -181,6 +181,11 @@ python -m sglang.launch_server \
 
 ### Kimi K3 optional startup providers
 
+The hybrid runtime and DSpark interfaces are upstream in SGLang through
+[#45406](https://github.com/sgl-project/sglang/pull/45406), merge
+`aa3e34aaebf880d72482cea74dbbfef54da728e2`. API v2 is required. The optional
+interfaces below do not expand the registered hardware, model or width guards.
+
 Native SGLang embedding and no cross-layer weight prefetch remain the defaults.
 For experiments, set either of these plugin-owned switches before launching
 the server with `--enable-nvidia-megakernel`:
@@ -229,6 +234,29 @@ choose the alternative when activating it later.
 CPU selection/forwarding tests do not establish GPU correctness or performance.
 Wider full-model numerical checks retain unresolved failures; this API is
 experimental and default-OFF, not qualification or a fix for those failures.
+
+### Kimi K3 dormant attention and DCP interfaces
+
+These lower-level interfaces retain tested implementations for explicit future
+integration. They are not server switches and do not change `SPEC.build`.
+
+| Capability | Plugin interface | Registered default / integration boundary |
+| --- | --- | --- |
+| Alternate MLA | `providers.build_resources(..., mla_core="tokenspeed")` | `mla_core="trtllm"`; an adapter must select and prepare the alternative before graph capture |
+| DCP8 resources | `providers.build_resources(..., dcp=dcp_resources.DcpBuildOptions())` | `dcp=None`; requires the matching native TP/DCP groups before preparation |
+| DCP ordinary decode | `dcp_execution.PreparedDcpHybrid` | Requires the separate SGLang DCP binding extension and its owned pools/buckets |
+| DCP fixed-q6 verification | `dcp_verify_execution.PreparedDcpVerify` | Requires the separate SGLang DCP verification binding extension, including native acceptance and state commit |
+
+Stock SGLang at the merge above does not contain those DCP extensions. Importing
+the plugin does not require them; attempting the unsupported DCP handoff rejects
+explicitly rather than substituting the ordinary pool layout. Callers own native
+metadata preparation, graph-safe updates and resource lifetimes. The plugin's
+readiness/ownership checks must not be bypassed. These are startup integration
+choices, not live backend or graph toggles.
+
+The bounded attention/DCP results described above do not qualify arbitrary
+combinations with prefetch, embedding, additional widths or long-context DCP.
+Their dormant inclusion does not enable them or imply a performance benefit.
 
 ## Repository Structure
 
