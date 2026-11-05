@@ -989,10 +989,18 @@ def build_resources(
     mla_core: str = "trtllm",
     dcp: DcpBuildOptions | None = None,
 ) -> ResourceSet:
-    """Build TP8 providers; private DCP preparation requires explicit options.
+    """Build TP8 resources before graph capture, without enabling a server mode.
 
-    DCP does not enable a spec or full-model binding. Its resources can only be
-    prepared by the separate private MLA cache handoff.
+    Prefetch and specialized embedding default OFF; do not prepare their optional
+    resources unless requested. Omitted widths use the normal query-mode policy.
+    The default MLA core is TRTLLM. Explicit mla_core="tokenspeed" requires
+    tokenspeed-mla==2.0.2 and prewarming/finalizing its owned workspace; its
+    bounded q1/q6 evidence is at 8K, not arbitrary long contexts.
+
+    DCP requires both mla_core="tokenspeed" and typed DcpBuildOptions, with native
+    TP8/DCP8 groups already established. Supplying dcp alone is rejected. It does
+    not enable a registered spec or full-model binding: separate native framework
+    extensions and PreparedDcpHybrid/PreparedDcpVerify handoffs are required.
     """
 
     if type(enable_prefetch) is not bool:

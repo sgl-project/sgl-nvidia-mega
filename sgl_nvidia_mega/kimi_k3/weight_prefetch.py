@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Prepared, read-only weight prefetch joined before each decode step returns."""
+"""Prepared, read-only weight prefetch joined before each decode step returns.
+
+Dormant unless explicitly requested at build time; OFF prepares no optional
+ranges, kernels, streams or events. Policies count token rows, not requests.
+Short q1/q6 correctness is bounded evidence, not a demonstrated activation benefit
+or long-context/combined-ON qualification. Retained weight owners must outlive
+captured graphs, and every side-stream fork must join before forward returns.
+"""
 
 from __future__ import annotations
 

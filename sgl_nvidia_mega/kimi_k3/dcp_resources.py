@@ -5,6 +5,11 @@
 The native groups exist before pool sizing. Cache preparation is a separate,
 explicit operation after allocation; it does not fabricate a framework binding.
 Borrowed group owners are opaque to the plugin's recursive storage inventory.
+Use build_resources with both mla_core="tokenspeed" and DcpBuildOptions, never
+the default TRTLLM core. Bounded q1/q6 evidence is at 8K with additional native
+framework bindings; these resources do not advertise registered DCP support or
+qualify long-context DCP. Full execution requires PreparedDcpHybrid or
+PreparedDcpVerify, not just cache preparation.
 """
 
 from __future__ import annotations

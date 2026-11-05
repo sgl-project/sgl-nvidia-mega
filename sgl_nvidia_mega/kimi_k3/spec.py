@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103."""
+"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103, TP8 and API v2.
+
+Registered builds use TRTLLM MLA with DCP off. The plugin flag does not enable
+DSpark: explicit fixed speculation selects target verification, leaving draft
+execution and acceptance to SGLang. q6 (five proposals plus an anchor) has bounded
+full-model coverage through 262144 context; other admitted q4-8 modes have
+component coverage, not equivalent serving qualification. Unsupported calls use
+the standard model path; unsupported server configurations reject at startup.
+"""
 
 from __future__ import annotations
 
@@ -307,7 +315,14 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
 
 
 def _startup_options() -> dict[str, bool]:
-    """Read optional providers once, before resource preparation and capture."""
+    """Read default-OFF providers once, before preparation and graph capture.
+
+    SGLANG_KIMI_K3_MEGAKERNEL_PREFETCH and SGLANG_KIMI_K3_MEGAKERNEL_EMBEDDING
+    accept only 0/1; unset means OFF with no optional provider preparation.
+    Every TP rank must use the same settings. Changing them requires rebuilding
+    resources/graphs, not a live toggle. Separate short q1/q6 proofs do not
+    qualify combined-ON behavior or long-context ON execution.
+    """
     options = {}
     for name in ("prefetch", "embedding"):
         key = f"SGLANG_KIMI_K3_MEGAKERNEL_{name.upper()}"
@@ -328,9 +343,9 @@ def _build(
 ) -> _Built:
     """Keep the public dense-range handoff frozen; extended q1 rows are opt-in.
 
-    Only a private caller may explicitly enable configured widths. Merely
-    receiving BuildContext.widths does not mean they are configured graph
-    buckets: the normal framework supplies a dense capacity range.
+    Only an explicit adapter caller may enable configured widths. Merely receiving
+    BuildContext.widths does not mean they are configured graph buckets: the
+    normal framework supplies a dense capacity range.
     """
     if type(configured_widths) is not bool:
         raise ValueError("configured_widths must be a bool")
@@ -372,8 +387,15 @@ def build_with_capture_widths(
     """Opt-in adapter API; registered builds retain their existing width policy.
 
     Call this API on every TP rank with identical settings before preparation.
-    None keeps the default policy. Explicit rows must come from actual capture
-    configuration, never an inferred dense capacity range.
+    None keeps the default policy. A tuple selects baseline plus actual capture
+    token rows, not only those rows or an inferred dense capacity range. Verify
+    rounds to complete requests and excludes incompatible/over-capacity rows.
+    The caller's context is not mutated; startup prefetch/embedding options are
+    still read independently. No registered CLI switch selects this API.
+
+    CPU wiring and bounded subset GPU proofs do not qualify every selectable
+    width. Broader ordinary-width numerical failures remain unresolved; this
+    dormant API neither fixes them nor expands registered width admission.
     """
     try:
         from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree

@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Prepare the local vocabulary gather without changing native TP semantics."""
+"""Prepare the local vocabulary gather without changing native TP semantics.
+
+Default OFF retains native embedding without optional gather/output preparation.
+Explicit opt-in uses supported BF16 vocabulary shards, retaining native fallback
+for other layouts and scattered inputs. It neither replicates weights nor removes
+TP communication. Bounded short q1/q6 checks do not establish a speedup or qualify
+combined optional providers and long-context ON behavior.
+"""
 
 from __future__ import annotations
 

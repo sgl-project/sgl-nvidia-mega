@@ -11,7 +11,12 @@ MAX_CONTEXT = 262144
 def token_widths(
     tokens_per_request: int, *, configured: bool = False
 ) -> tuple[int, ...]:
-    """Keep legacy defaults; explicit q1 capture sizes may use every row to 64."""
+    """Keep legacy defaults; explicit q1 capture sizes may use every row to 64.
+
+    Representable rows are not blanket numerical qualification. Broader ordinary
+    width comparisons retain failures; configured=True is only adapter opt-in.
+    The already-registered width 64 remains admitted, not newly qualified here.
+    """
     if type(tokens_per_request) is not int or tokens_per_request not in (
         1,
         *VERIFY_QUERIES,
