@@ -9,7 +9,6 @@ from unittest.mock import Mock, patch
 import torch
 from test_kimi_k3_dcp_resources import (
     DEVICE,
-    CpuBox,
     FakeCache,
     FakeWorkspace,
     NativeFixture,
@@ -20,49 +19,9 @@ from test_kimi_k3_requested_widths import BuildFixture
 from sgl_nvidia_mega.kimi_k3 import dcp_resources as d
 
 
-class Fixture:
+class Fixture(ResourceFixture):
     def __init__(self, rank=3, widths=(6, 12, 60)):
-        self.native = NativeFixture()
-        self.native.arguments.update(tokens_per_request=6, widths=widths)
-        for group in (self.native.parallel.tp_group, self.native.parallel.dcp_group):
-            group.rank_in_group, group.rank = rank, group.ranks[rank]
-        self.native.parallel.tp_rank = self.native.parallel.dcp_rank = rank
-        self.native.parallel.attn_dcp_rank = rank
-        self.owner = self.native.capture()
-        self.module = NS(
-            DcpBox=CpuBox,
-            local_max=lambda n, size: ((n + size * 64 - 1) // (size * 64)) * 64,
-            stock_decode=Mock(),
-            fill_splits=Mock(return_value=32),
-            _WORKSPACE={},
-        )
-        zeros, ones, full = torch.zeros, torch.ones, torch.full
-        with (
-            patch.object(
-                torch,
-                "zeros",
-                side_effect=lambda *a, **k: zeros(*a, **(k | {"device": "cpu"})),
-            ),
-            patch.object(
-                torch,
-                "ones",
-                side_effect=lambda *a, **k: ones(*a, **(k | {"device": "cpu"})),
-            ),
-            patch.object(
-                torch,
-                "full",
-                side_effect=lambda *a, **k: full(*a, **(k | {"device": "cpu"})),
-            ),
-        ):
-            self.resources = d.DcpResources(
-                self.owner,
-                self.native.options,
-                self.module,
-                widths=widths,
-                max_context=8192,
-                deadline_ns=5_000_000_000,
-                tokens_per_request=6,
-            )
+        super().__init__(q=6, rank=rank, widths=widths)
 
     def core(self, ordinal=0):
         r = self.resources

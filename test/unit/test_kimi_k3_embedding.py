@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import ast
-import builtins
 import contextlib
 import types
 import unittest
@@ -14,9 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from test_kimi_k3_requested_widths import BuildFixture, definitions
+from _kimi_test_utils import execution_resources, inventory_fixture, resource_fields
 
-from sgl_nvidia_mega.kimi_k3 import embedding, weight_prefetch
+from sgl_nvidia_mega.kimi_k3 import embedding
 
 ROOT = Path(embedding.__file__).parent
 
@@ -181,131 +180,8 @@ class TestEmbeddingPolicy(unittest.TestCase):
 
 
 class TestEmbeddingAdmission(unittest.TestCase):
-    def test_provider_defaults_off_and_imports_only_on_opt_in(self):
-
-        original_import = builtins.__import__
-
-        def guarded_import(name, *args, **kwargs):
-            if name in ("embedding", "sgl_nvidia_mega.kimi_k3.embedding"):
-                self.fail("disabled embedding imported its optional adapter")
-            return original_import(name, *args, **kwargs)
-
-        for q, widths in ((1, (2, 8, 64)), (6, (6, 12, 60))):
-            for options in ({}, {"enable_embedding": False}):
-                with self.subTest(q=q, options=options):
-                    fixture = BuildFixture()
-                    with patch.object(
-                        builtins, "__import__", side_effect=guarded_import
-                    ):
-                        result = fixture.build(q, widths, **options)
-                    self.assertIsNone(result.embedding)
-                    self.assertNotIn("embedding.out", result.scratch)
-                    self.assertFalse(
-                        any(
-                            row["kind"] == "embedding"
-                            for row in result.compilation_inventory
-                        )
-                    )
-                    self.assertNotIn(
-                        "common.embedding",
-                        [
-                            call.args[0]
-                            for call in fixture.module._module.call_args_list
-                        ],
-                    )
-
-    def test_invalid_option_fails_before_native_work(self):
-        for value in (None, 0, 1, "false", [], object()):
-            with self.subTest(value=type(value).__name__):
-                fixture = BuildFixture()
-                with self.assertRaisesRegex(
-                    ValueError, "enable_embedding must be a bool"
-                ):
-                    fixture.build(1, enable_embedding=value)
-                fixture.module._module.assert_not_called()
-
-    def test_opt_in_preserves_width_prefetch_and_optional_mla_contracts(self):
-        for q, widths in ((1, (2, 8, 64)), (6, (6, 12, 60))):
-            for prefetch in (False, True):
-                for mla_core in ("trtllm", "tokenspeed"):
-                    for supported in (False, True):
-                        with self.subTest(
-                            q=q, prefetch=prefetch, mla=mla_core, supported=supported
-                        ):
-                            fixture = BuildFixture()
-                            fixture.model.model.embed_tokens = object()
-                            gather, controller = object(), object()
-                            constructor = object()
-                            fixture.modules["common.embedding"] = SimpleNamespace(
-                                PreparedEmbedding=constructor
-                            )
-                            fixture.modules["mla.dcp"] = object()
-                            fixture.module._PreparedTokenSpeedMla = (
-                                lambda core, module: SimpleNamespace(heads=core.heads)
-                            )
-
-                            def prepare(native, *, tp_group, load_prepared):
-                                self.assertIs(native, fixture.model.model.embed_tokens)
-                                if not supported:
-                                    return None
-                                self.assertIs(load_prepared(), constructor)
-                                return gather
-
-                            with (
-                                patch.object(
-                                    embedding, "prepare_embedding", side_effect=prepare
-                                ) as prepare_mock,
-                                patch.object(
-                                    weight_prefetch,
-                                    "PrefetchController",
-                                    return_value=controller,
-                                ),
-                                patch(
-                                    "importlib.metadata.version", return_value="2.0.2"
-                                ),
-                            ):
-                                result = fixture.build(
-                                    q,
-                                    widths,
-                                    enable_embedding=True,
-                                    enable_prefetch=prefetch,
-                                    mla_core=mla_core,
-                                )
-                            prepare_mock.assert_called_once()
-                            self.assertIs(
-                                result.embedding, gather if supported else None
-                            )
-                            self.assertEqual(result.widths, widths)
-                            self.assertIs(
-                                result.prefetch, controller if prefetch else None
-                            )
-                            self.assertEqual(
-                                "embedding.out" in result.scratch, supported
-                            )
-                            self.assertEqual(
-                                sum(
-                                    row["kind"] == "embedding"
-                                    for row in result.compilation_inventory
-                                ),
-                                int(supported),
-                            )
-                            if supported:
-                                self.assertEqual(
-                                    result.scratch["embedding.out"].shape, (64, 7168)
-                                )
-                                self.assertEqual(
-                                    result.scratch["embedding.out"].dtype,
-                                    torch.bfloat16,
-                                )
-
     def test_inventory_excludes_borrowed_weight_and_counts_output_once(self):
         from test_kimi_k3_prefetch import _Tensor
-
-        class Stream:
-            pass
-
-        class Event:
-            pass
 
         class Group:
             def __init__(self):
@@ -314,19 +190,7 @@ class TestEmbeddingAdmission(unittest.TestCase):
             def all_reduce(self, out):
                 return out
 
-        module = definitions(
-            ROOT / "providers.py",
-            ("_owned_resource_inventory",),
-            torch=SimpleNamespace(
-                Tensor=_Tensor, cuda=SimpleNamespace(Stream=Stream, Event=Event)
-            ),
-            _tensor_row=lambda kind, name, value: {
-                "kind": kind,
-                "name": name,
-                "data_ptr": value.data_ptr(),
-            },
-            _resource_kind=lambda name: "provider",
-        )
+        module, _, _ = inventory_fixture(ROOT / "providers.py", _Tensor)
         weight, output = _Tensor(), _Tensor((64, 7168), pointer=8192)
         group = Group()
         core = SimpleNamespace(weight=weight, all_reduce=group.all_reduce)
@@ -335,13 +199,10 @@ class TestEmbeddingAdmission(unittest.TestCase):
             modules=lambda: (), parameters=lambda: (weight,), buffers=lambda: ()
         )
         resources = SimpleNamespace(
-            boxes={},
-            scratch={"embedding.out": output},
-            workspaces={},
-            runtime_handles={},
-            attention={},
-            moe_front_weights={},
-            embedding=SimpleNamespace(core=core, output=output),
+            **resource_fields(
+                scratch={"embedding.out": output},
+                embedding=SimpleNamespace(core=core, output=output),
+            )
         )
         inventory = module._owned_resource_inventory(resources, model)
         self.assertEqual(
@@ -471,35 +332,19 @@ class TestExecutorEmbedding(unittest.TestCase):
                     # Stop at the first layer: test the real executor's input
                     # selection and buffer ownership, not a mock 93-layer model.
                     before.run.side_effect = StopIteration
-                    scratch = {
-                        name: torch.empty_like(x)
-                        for name in (
-                            "embedding.out",
-                            "hidden.0",
-                            "hidden.1",
-                            "hidden.out",
-                            "prefix",
-                            "blocks",
-                            "mla.projected",
-                            "kda.projected",
-                            "attention.local",
-                        )
-                    }
-                    resources = SimpleNamespace(
-                        binding_fingerprint="bound",
+                    resources = execution_resources(
+                        rows,
+                        layers=(0,),
                         tokens_per_request=q,
-                        widths=(rows,),
-                        prefetch=None,
-                        attention={},
-                        aux_capture_layers=(),
-                        scratch=scratch,
-                        model=SimpleNamespace(
-                            model=SimpleNamespace(embed_tokens=native)
-                        ),
-                        embedding=prepared if route != "native" else None,
-                        layers=(SimpleNamespace(layer_idx=0),),
-                        before={0: before},
+                        tensor=lambda shape: torch.empty(shape, dtype=torch.bfloat16),
                     )
+                    resources.scratch["embedding.out"] = torch.empty_like(x)
+                    resources.model = SimpleNamespace(
+                        model=SimpleNamespace(embed_tokens=native)
+                    )
+                    resources.embedding = prepared if route != "native" else None
+                    resources.before[0] = before
+                    scratch = resources.scratch
                     view = SimpleNamespace(
                         mla=SimpleNamespace(write_slots=None, sequence_lengths=None),
                         kda=SimpleNamespace(state_indices=None),

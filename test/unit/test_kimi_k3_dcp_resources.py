@@ -15,6 +15,7 @@ import builtins
 import gc
 import unittest
 import weakref
+from contextlib import ExitStack
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -96,8 +97,13 @@ class CpuBox:
 
 
 class ResourceFixture:
-    def __init__(self):
+    def __init__(self, q=1, rank=3, widths=(1, 8)):
         self.native = NativeFixture()
+        self.native.arguments.update(tokens_per_request=q, widths=widths)
+        for group in (self.native.parallel.tp_group, self.native.parallel.dcp_group):
+            group.rank_in_group, group.rank = rank, group.ranks[rank]
+        self.native.parallel.tp_rank = self.native.parallel.dcp_rank = rank
+        self.native.parallel.attn_dcp_rank = rank
         self.owner = self.native.capture()
         self.module = NS(
             DcpBox=CpuBox,
@@ -106,28 +112,27 @@ class ResourceFixture:
             fill_splits=Mock(return_value=32),
             _WORKSPACE={},
         )
-        zeros, ones = torch.zeros, torch.ones
-        # Make preparation storage real CPU tensors, explicitly substituting
-        # only their allocation device. This is not a native-device execution.
-        with (
-            patch.object(
-                torch,
-                "zeros",
-                side_effect=lambda *a, **k: zeros(*a, **(k | {"device": "cpu"})),
-            ),
-            patch.object(
-                torch,
-                "ones",
-                side_effect=lambda *a, **k: ones(*a, **(k | {"device": "cpu"})),
-            ),
-        ):
+        # Real CPU storage with only the allocation device substituted.
+        with ExitStack() as stack:
+            for name in ("zeros", "ones", "full"):
+                allocate = getattr(torch, name)
+                stack.enter_context(
+                    patch.object(
+                        torch,
+                        name,
+                        side_effect=lambda *a, allocate=allocate, **k: allocate(
+                            *a, **(k | {"device": "cpu"})
+                        ),
+                    )
+                )
             self.resources = d.DcpResources(
                 self.owner,
                 self.native.options,
                 self.module,
-                widths=(1, 8),
+                widths=widths,
                 max_context=8192,
                 deadline_ns=5_000_000_000,
+                tokens_per_request=q,
             )
 
     def core(self, parity=0):

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import gc
 import math
@@ -17,6 +16,12 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from _kimi_test_utils import (
+    definitions,
+    execution_resources,
+    inventory_fixture,
+    resource_fields,
+)
 
 from sgl_nvidia_mega.kimi_k3 import weight_prefetch as prefetch
 from sgl_nvidia_mega.kimi_k3.shape_policy import token_widths
@@ -27,23 +32,7 @@ POINTS = ("oproj_down", "attention_moe", "next_attention")
 
 
 def _definitions(relative, names, namespace):
-    """Execute real host definitions without importing GPU/distributed modules."""
-    path = ROOT / relative
-    tree = ast.parse(path.read_text())
-    selected = [node for node in tree.body if getattr(node, "name", None) in names]
-    if {node.name for node in selected} != set(names):
-        raise AssertionError(f"Missing source definitions: {relative}: {names}")
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            *selected,
-        ],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)  # noqa: S102
-    return namespace
+    return vars(definitions(ROOT / relative, names, **namespace))
 
 
 class _Tensor(torch.Tensor):
@@ -257,30 +246,6 @@ def _host_runtime(test):
         streams=streams,
         event_factory=event_factory,
     )
-
-
-class TestPrefetchAdmission(unittest.TestCase):
-    def test_invalid_option_fails_at_actual_provider_entry_before_preparation(self):
-        modules, widths = Mock(), Mock()
-        namespace = _definitions(
-            "providers.py",
-            {"build_resources"},
-            {"_module": modules, "prepared_widths": widths},
-        )
-        for value in (None, 0, 1, "false", "true", [], object()):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    ValueError, "enable_prefetch must be a bool"
-                ):
-                    namespace["build_resources"](
-                        None,
-                        context_length=8192,
-                        memory_before={},
-                        deadline_ns=1,
-                        enable_prefetch=value,
-                    )
-        modules.assert_not_called()
-        widths.assert_not_called()
 
 
 class TestPrefetchPolicy(unittest.TestCase):
@@ -506,31 +471,8 @@ class TestPrefetchController(unittest.TestCase):
                 )
 
     def test_resource_inventory_counts_shared_table_and_owned_handles_once(self):
-        class Stream:
-            pass
-
-        class Event:
-            pass
-
-        namespace = _definitions(
-            "providers.py",
-            {"_owned_resource_inventory"},
-            {
-                "torch": SimpleNamespace(
-                    Tensor=_Tensor, cuda=SimpleNamespace(Stream=Stream, Event=Event)
-                ),
-                "_tensor_row": lambda kind, name, value: {
-                    "kind": kind,
-                    "name": name,
-                    "data_ptr": value.data_ptr(),
-                },
-                "_handle_row": lambda kind, name, value: {
-                    "kind": kind,
-                    "name": name,
-                    "data_ptr": id(value),
-                },
-                "_resource_kind": lambda name: "prefetch_table",
-            },
+        module, Stream, Event = inventory_fixture(
+            ROOT / "providers.py", _Tensor, kind="prefetch_table"
         )
         weight, table = _Tensor(), _Tensor((2, 2), pointer=8192, dtype=torch.int64)
         ranges = SimpleNamespace(
@@ -548,16 +490,8 @@ class TestPrefetchController(unittest.TestCase):
         model = SimpleNamespace(
             modules=lambda: (), parameters=lambda: (weight,), buffers=lambda: ()
         )
-        resources = SimpleNamespace(
-            boxes={},
-            scratch={},
-            workspaces={},
-            runtime_handles={},
-            attention={},
-            moe_front_weights={},
-            prefetch=controller,
-        )
-        inventory = namespace["_owned_resource_inventory"](resources, model)
+        resources = SimpleNamespace(**resource_fields(prefetch=controller))
+        inventory = module._owned_resource_inventory(resources, model)
         self.assertEqual(
             sorted(row["kind"] for row in inventory),
             ["event", "event", "prefetch_table", "stream"],
@@ -716,69 +650,29 @@ class TestPrefetchHooks(unittest.TestCase):
                         ),
                     },
                 )
-                layers = [SimpleNamespace(layer_idx=index) for index in (0, 1, 92)]
-                attention = {}
-                for index, kind in ((0, "mla"), (1, "kda"), (92, "mla")):
-
-                    def marker(name, layer=index, record=record):
-                        return Mock(
-                            side_effect=lambda *args, **kwargs: record(name, layer)
+                resources = execution_resources(
+                    rows, layers=(0, 1, 92), mla_layers=(0, 92), tokens_per_request=q
+                )
+                for index, prepared in resources.attention.items():
+                    for operation, label in (
+                        (prepared.projection.run, "projection"),
+                        (prepared.core.run, "core"),
+                        (prepared.core.run_verify, "verify"),
+                        (prepared.output.run, "oproj"),
+                    ):
+                        operation.side_effect = (
+                            lambda *a, index=index, label=label, **k: record(
+                                label, index
+                            )
                         )
+                resources.final.run.side_effect = lambda *a, **k: record("final")
+                resources.prefetch = SimpleNamespace(
+                    fork=partial(record, "fork"), join=partial(record, "join")
+                )
 
-                    attention[index] = SimpleNamespace(
-                        kind=kind,
-                        cache=object(),
-                        caches=object(),
-                        intermediates=object(),
-                        projection=SimpleNamespace(run=marker("projection")),
-                        core=SimpleNamespace(
-                            run=marker("core"), run_verify=marker("verify")
-                        ),
-                        output=SimpleNamespace(run=marker("oproj")),
-                    )
-
-                def tensor(rows=rows):
+                def tensor():
                     return torch.empty((rows, 7168))
 
-                resources = SimpleNamespace(
-                    binding_fingerprint="bound",
-                    tokens_per_request=q,
-                    widths=(rows,),
-                    aux_capture_layers=(),
-                    model=SimpleNamespace(),
-                    layers=layers,
-                    attention=attention,
-                    scratch={
-                        name: tensor()
-                        for name in (
-                            "hidden.0",
-                            "hidden.1",
-                            "hidden.out",
-                            "prefix",
-                            "blocks",
-                            "mla.projected",
-                            "kda.projected",
-                            "attention.local",
-                        )
-                    },
-                    before={
-                        layer.layer_idx: SimpleNamespace(run=Mock()) for layer in layers
-                    },
-                    fused_before={},
-                    feed_forward={
-                        layer.layer_idx: SimpleNamespace(run=lambda x, out: out)
-                        for layer in layers
-                    },
-                    final=SimpleNamespace(
-                        run=Mock(
-                            side_effect=lambda *args, record=record: record("final")
-                        )
-                    ),
-                    prefetch=SimpleNamespace(
-                        fork=partial(record, "fork"),
-                        join=partial(record, "join"),
-                    ),
-                )
                 view = SimpleNamespace(
                     mla=SimpleNamespace(
                         write_slots=None, sequence_lengths=None, block_table=None

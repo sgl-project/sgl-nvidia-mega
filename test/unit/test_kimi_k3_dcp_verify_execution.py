@@ -10,7 +10,6 @@ executor definitions under test are the actual private implementation.
 import ast
 import sys
 import unittest
-from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -19,11 +18,9 @@ from test_kimi_k3_dcp_execution import (
     DEVICE,
     ROOT,
     Binding,
-    Dcp,
 )
 from test_kimi_k3_dcp_execution import Fixture as DecodeFixture
 from test_kimi_k3_dcp_execution import (
-    Mla,
     Step,
     executor_module,
     tensor,
@@ -109,27 +106,8 @@ class Fixture(DecodeFixture):
         self.events.append("mla")
         return super().prepare_mla(caches)
 
-    @contextmanager
     def boundaries(self):
-        with ExitStack() as stack:
-            for name, value in (
-                ("_native_types", Mock(return_value=(Binding, Bucket, Step))),
-                (
-                    "_native_context",
-                    Mock(return_value=(lambda: NS(tp_group=self.tp), self.agree)),
-                ),
-                ("DcpResources", Dcp),
-                ("PreparedDcpMla", Mla),
-                ("_kda_type", Mock(return_value=Kda)),
-            ):
-                stack.enter_context(patch.object(d, name, value))
-            stack.enter_context(
-                patch.object(
-                    torch.cuda, "is_current_stream_capturing", return_value=False
-                )
-            )
-            stack.enter_context(patch.object(torch.cuda, "synchronize"))
-            yield
+        return super().boundaries(d, Bucket, Kda)
 
     def prepare(self):
         return d.PreparedDcpVerify(self.resources, self.binding)
@@ -281,113 +259,6 @@ class TestPrivateVerifyReadiness(unittest.TestCase):
 
 
 class TestPrivateVerifyExecutor(unittest.TestCase):
-    def test_shared_q6_body_keeps_all93_order_checkpoint_only_and_native_aux(self):
-        module = executor_module()
-        for private in (False, True):
-            with self.subTest(private=private):
-                events = []
-                attention = {}
-                for layer in range(93):
-                    kind = "mla" if layer % 4 == 0 else "kda"
-                    attention[layer] = NS(
-                        kind=kind,
-                        core=NS(
-                            run=Mock(
-                                side_effect=lambda *a, layer=layer, **k: events.append(
-                                    (layer, "mla")
-                                )
-                            ),
-                            run_verify=Mock(
-                                side_effect=lambda *a, layer=layer, **k: events.append(
-                                    (layer, "verify")
-                                )
-                            ),
-                        ),
-                        projection=NS(run=Mock()),
-                        output=NS(run=Mock()),
-                        cache=object(),
-                        caches=(object(), object()),
-                        intermediates=(object(), object()),
-                    )
-                scratch = {
-                    name: torch.zeros(24, 7168)
-                    for name in (
-                        "prefix",
-                        "blocks",
-                        "hidden.0",
-                        "hidden.1",
-                        "hidden.out",
-                        "mla.projected",
-                        "kda.projected",
-                        "attention.local",
-                    )
-                }
-                resources = NS(
-                    layers=tuple(NS(layer_idx=i) for i in range(93)),
-                    attention=attention,
-                    scratch=scratch,
-                    before={i: NS(run=Mock()) for i in range(93)},
-                    fused_before={},
-                    feed_forward={
-                        i: NS(run=Mock(side_effect=lambda x, out: out))
-                        for i in range(93)
-                    },
-                    final=NS(run=Mock()),
-                )
-                kda = NS(
-                    state_indices=torch.tensor([1, 2, 3, -1], dtype=torch.int32),
-                    verify_scratch_indices=torch.arange(4, dtype=torch.int32),
-                    track_decode_state=Mock(
-                        side_effect=AssertionError("q6 must not track/commit")
-                    ),
-                )
-                aux = {0: object(), 92: object()}
-                table, lengths, slots, totals = (object() for _ in range(4))
-                mla = NS(local_block_table=table) if private else NS(block_table=table)
-                executor = module.KimiK3MegakernelExecutor(resources)
-                result = executor._run_layers(
-                    torch.zeros(24, dtype=torch.int64),
-                    torch.zeros(24, 7168),
-                    kda,
-                    24,
-                    6,
-                    slots,
-                    lengths,
-                    mla,
-                    aux,
-                    **({"totals": totals} if private else {}),
-                )
-                self.assertEqual(result.data_ptr(), scratch["hidden.out"].data_ptr())
-                self.assertEqual(
-                    events, [(i, "mla" if i % 4 == 0 else "verify") for i in range(93)]
-                )
-                for layer, provider in attention.items():
-                    if layer % 4:
-                        provider.core.run.assert_not_called()
-                        call = provider.core.run_verify.call_args.kwargs
-                        self.assertIs(call["slots"], kda.state_indices)
-                        self.assertIs(
-                            call["scratch_indices"], kda.verify_scratch_indices
-                        )
-                        self.assertIs(call["intermediates"], provider.intermediates)
-                        self.assertEqual(
-                            set(call),
-                            {"caches", "slots", "intermediates", "scratch_indices"},
-                        )
-                    else:
-                        provider.core.run_verify.assert_not_called()
-                        call = provider.core.run.call_args.kwargs
-                        self.assertEqual(call["q"], 6)
-                        self.assertIs(call["block_table"], table)
-                        self.assertIs(call["slots"], slots)
-                        self.assertIs(call["lengths"], lengths)
-                        self.assertEqual("totals" in call, private)
-                        if private:
-                            self.assertIs(call["totals"], totals)
-                self.assertIs(resources.before[1].run.call_args.kwargs["aux"], aux[0])
-                self.assertIs(resources.final.run.call_args.kwargs["aux"], aux[92])
-                kda.track_decode_state.assert_not_called()
-
     def test_exact_shapes_cpu_refusal_and_scratch_zero_is_not_padding(self):
         f, module = Fixture(), executor_module()
         view = Bucket(f.binding, 4).view

@@ -4,14 +4,13 @@
 
 from __future__ import annotations
 
-import ast
 import importlib.util
-import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from _kimi_test_utils import execution_resources, resource_fields
 from msgspec.structs import replace
 
 try:
@@ -70,27 +69,9 @@ from sgl_nvidia_mega.kimi_k3.shape_policy import (
 
 
 def _resources(**overrides):
-    values = {
-        "model": SimpleNamespace(),
-        "layers": (),
-        "attention": {},
-        "feed_forward": {},
-        "moe_front_weights": {},
-        "before": {},
-        "final": None,
-        "fused_before": {},
-        "boxes": {},
-        "scratch": {},
-        "workspaces": {},
-        "runtime_handles": {},
-        "payload_modules": {},
-        "compilation_inventory": [],
-        "memory_before": {},
-        "memory_after": {},
-        "deadline_ns": 30_000_000_000,
-        "tokens_per_request": 4,
-    }
-    values.update(overrides)
+    values = (
+        resource_fields(deadline_ns=30_000_000_000, tokens_per_request=4) | overrides
+    )
     return providers.ResourceSet(**values)
 
 
@@ -214,81 +195,6 @@ def test_context_respects_native_model_cap_and_rope_policy_without_override():
             mla_max_seq_len(MAX_CONTEXT, q)
 
 
-def test_prepared_mla_uses_scheduling_hint_and_preserves_default_backend():
-    assert (
-        inspect.signature(providers.build_resources).parameters["mla_core"].default
-        == "trtllm"
-    )
-    public_build = ast.parse(inspect.getsource(spec._build))
-    resource_calls = [
-        node
-        for node in ast.walk(public_build)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "build_resources"
-    ]
-    assert len(resource_calls) == 1
-    assert "mla_core" not in {item.arg for item in resource_calls[0].keywords}
-    tree = ast.parse(inspect.getsource(providers.build_resources))
-    hint = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "max_seq_len"
-            for target in node.targets
-        )
-    )
-    assert (
-        ast.unparse(hint.value) == "mla_max_seq_len(context_length, tokens_per_request)"
-    )
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "PreparedMla"
-    ]
-    assert len(calls) == 1
-    kwargs = {item.arg: ast.unparse(item.value) for item in calls[0].keywords}
-    assert kwargs == {
-        "max_context": "max_seq_len",
-        "core": "mla_core",
-        "dcp": "None if dcp_resources is None else dcp_resources.box",
-        "queries": "(tokens_per_request,)",
-        None: "{} if dcp_resources is None else {'parity': full_ids.index(layer_id) % 2, 'deadline_ns': deadline_ns}",
-    }
-    # Evaluate the actual keyword expressions: DCP-off q1/q6 must still omit
-    # parity/deadline entirely, not just pass harmless-looking defaults.
-    for q in (1, 6):
-        for dcp_resources in (None, SimpleNamespace(box=object())):
-            context = dict(
-                max_seq_len=8192,
-                mla_core="trtllm",
-                tokens_per_request=q,
-                dcp_resources=dcp_resources,
-                full_ids=(0, 4),
-                layer_id=4,
-                deadline_ns=5_000_000_000,
-            )
-            actual = {}
-            for keyword in calls[0].keywords:
-                value = eval(
-                    compile(
-                        ast.Expression(keyword.value), "prepared-mla-kwargs", "eval"
-                    ),
-                    {},
-                    context,
-                )
-                actual.update(value if keyword.arg is None else {keyword.arg: value})
-            expected = dict(max_context=8192, core="trtllm", queries=(q,), dcp=None)
-            if dcp_resources is not None:
-                expected.update(
-                    dcp=dcp_resources.box, parity=1, deadline_ns=5_000_000_000
-                )
-            assert actual == expected
-
-
 def test_kda_verify_policy_uses_requests_and_preserves_decode_policy():
     for q in VERIFY_QUERIES:
         assert providers._kda_policy(q) == {
@@ -392,28 +298,6 @@ def test_prepared_kda_verify_keys_and_checkpoint_capacity(q):
         invalid = prepared.PreparedKda(attention, {bad: (6288, 1)}, False)
         with pytest.raises(ValueError, match="unsupported split-cache"):
             invalid.prepare_verify_caches(caches, checkpoints)
-
-
-def test_shared_front_selects_the_deployment_verify_policy():
-    tree = ast.parse(inspect.getsource(providers.build_resources))
-    constructors = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "SharedFront"
-    ]
-    assert len(constructors) == 1
-    query_width = next(
-        keyword.value for keyword in constructors[0].keywords if keyword.arg == "q"
-    )
-    assert isinstance(query_width, ast.Name) and query_width.id == "tokens_per_request"
-    assert (
-        inspect.signature(providers.build_resources)
-        .parameters["tokens_per_request"]
-        .default
-        == 1
-    )
 
 
 @pytest.mark.parametrize("q", VERIFY_QUERIES)
@@ -752,11 +636,6 @@ class _Consumer:
             aux.fill_(self.tap)
 
 
-class _FeedForward:
-    def run(self, source, out, consume=None):
-        return out if consume is None else consume(out)
-
-
 def _verify_metadata_scratch(device="cpu"):
     return {
         "mla.verify_inactive": torch.ones(16, dtype=torch.bool, device=device),
@@ -877,49 +756,21 @@ def test_verify_mla_metadata_graph_replays_startup_retirement_and_restoration(q)
 def test_executor_preserves_decode_and_never_commits_verify_state(q):
     rows, requests = (8, 8) if q == 1 else (2 * q, 2)
     taps = (0, 1, 7, 92) if q > 1 else ()
-    scratch = {
-        key: torch.zeros(rows, 7168)
-        for key in (
-            "prefix",
-            "blocks",
-            "hidden.0",
-            "hidden.1",
-            "hidden.out",
-            "mla.projected",
-            "kda.projected",
-            "attention.local",
-        )
-    }
+    host = execution_resources(rows, tokens_per_request=q, aux_capture_layers=taps)
+    scratch = host.scratch
     if q > 1:
         scratch.update(_verify_metadata_scratch())
     before = {index: _Consumer(index - 1) for index in range(93)}
     final, mla, kda = _Consumer(92), Mock(), Mock()
     caches, intermediates = (object(), object()), (object(), object())
-    attention = {
-        index: SimpleNamespace(
-            kind="mla" if index == 0 else "kda",
-            projection=Mock(),
-            core=mla if index == 0 else kda,
-            output=Mock(),
-            cache=object() if index == 0 else None,
-            caches=None if index == 0 else caches,
-            intermediates=None if index == 0 else intermediates,
-        )
-        for index in range(93)
-    }
-    resources = _resources(
-        layers=tuple(SimpleNamespace(layer_idx=index) for index in range(93)),
-        attention=attention,
-        scratch=scratch,
-        before=before,
-        final=final,
-        feed_forward={index: _FeedForward() for index in range(93)},
-        fused_before={1: before[2], 7: before[8], 92: final},
-        aux_capture_layers=taps,
-        binding_fingerprint="bound",
-        tokens_per_request=q,
-        widths=(rows,),
-    )
+    for index, prepared in host.attention.items():
+        prepared.core = mla if index == 0 else kda
+        prepared.cache = prepared.cache if index == 0 else None
+        prepared.caches = None if index == 0 else caches
+        prepared.intermediates = None if index == 0 else intermediates
+    host.before, host.final = before, final
+    host.fused_before = {1: before[2], 7: before[8], 92: final}
+    resources = _resources(**vars(host))
     track = Mock(
         side_effect=AssertionError("verify must not commit decode state")
         if q > 1

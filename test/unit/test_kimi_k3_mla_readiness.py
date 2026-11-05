@@ -8,66 +8,21 @@ Native GPU workspace, numerical, stream and graph validation remain separate.
 
 from __future__ import annotations
 
-import ast
-import builtins
-import hashlib
-import json
 import sys
 import unittest
 from contextlib import nullcontext
-from dataclasses import dataclass, field
 from math import prod
 from pathlib import Path
-from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
+from _kimi_test_utils import definitions, resource_fields
 
 ROOT = Path(__file__).resolve().parents[2]
 KIMI = ROOT / "sgl_nvidia_mega/kimi_k3"
 PROVIDERS = KIMI / "providers.py"
 DCP = KIMI / "cutedsl/mla/dcp.py"
-
-
-def definitions(path, names, **values):
-    """Compile selected unmodified definitions; dependency boundaries are fakes."""
-    tree = ast.parse(path.read_text())
-    nodes = [node for node in tree.body if getattr(node, "name", None) in names]
-    if {node.name for node in nodes} != set(names):
-        raise AssertionError(f"Missing actual definitions in {path}: {names}")
-    module = ModuleType("_kimi_mla_readiness_fixture")
-    module.__dict__.update(
-        torch=torch,
-        dataclass=dataclass,
-        field=field,
-        hashlib=hashlib,
-        json=json,
-    )
-    module.__dict__.update(values)
-    # Dataclasses consult their defining module while resolving annotations.
-    with patch.dict(sys.modules, {module.__name__: module}):
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(
-                        body=[
-                            ast.ImportFrom(
-                                module="__future__",
-                                names=[ast.alias(name="annotations")],
-                                level=0,
-                            ),
-                            *nodes,
-                        ],
-                        type_ignores=[],
-                    )
-                ),
-                str(path),
-                "exec",
-            ),
-            module.__dict__,
-        )
-    return module
 
 
 class TestStandaloneSourceContract(unittest.TestCase):
@@ -229,25 +184,11 @@ class OwnershipFixture:
         attention = {i: NS(kind="mla", core=core) for i, core in enumerate(adapters)}
         attention[len(adapters)] = NS(kind="kda", core=kda)
         resources = self.module.ResourceSet(
-            model=NS(),
-            layers=(),
-            attention=attention,
-            feed_forward={},
-            moe_front_weights={},
-            before={},
-            final=None,
-            fused_before={},
-            boxes={},
-            scratch={},
-            workspaces={},
-            runtime_handles={},
-            payload_modules={},
-            compilation_inventory=[],
-            memory_before={},
-            memory_after={},
-            deadline_ns=1,
-            tokens_per_request=self.q,
-            aux_capture_layers=(0,) if self.q > 1 else None,
+            **resource_fields(
+                attention=attention,
+                tokens_per_request=self.q,
+                aux_capture_layers=(0,) if self.q > 1 else None,
+            )
         )
         resources._binding_candidate = lambda hybrid: {"pool": "unchanged"}
         resources.refresh_inventory = Mock(
@@ -450,111 +391,6 @@ class TestAdmission(unittest.TestCase):
                 self.assertEqual(len(actual), len(expected))
                 self.assertTrue(all(a is b for a, b in zip(actual, expected)))
         self.assertIs(wrapped.weights, weights)
-
-    def test_actual_provider_branch_preserves_default_and_wraps_selected_core(self):
-        source = ast.parse(PROVIDERS.read_text())
-        build = next(
-            node
-            for node in source.body
-            if getattr(node, "name", None) == "build_resources"
-        )
-        branch = next(
-            node
-            for node in ast.walk(build)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id == "is_mla"
-        )
-        start = next(
-            index
-            for index, node in enumerate(branch.body)
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Attribute)
-            and node.value.func.attr == "PreparedMla"
-        )
-        actual = ast.Module(body=branch.body[start : start + 2], type_ignores=[])
-        self.assertIsInstance(actual.body[1], ast.If)
-        for q in (1, 6):
-            for selected in ("trtllm", "tokenspeed"):
-                with self.subTest(q=q, selected=selected):
-                    inner, wrapped, dependency = NS(heads=12), object(), object()
-                    constructor, adapter = (
-                        Mock(return_value=inner),
-                        Mock(return_value=wrapped),
-                    )
-                    workspace, counter = object(), object()
-                    prepare = Mock(return_value=(workspace, counter))
-                    load = Mock(return_value=dependency)
-                    proxy, query, origins = object(), object(), {}
-                    native_module = NS(PreparedMla=constructor)
-                    scope = dict(
-                        mla_module=native_module,
-                        proxy=proxy,
-                        batches=(q, 2 * q),
-                        scratch={"mla.query": query},
-                        max_seq_len=262144 + (q if q > 1 else 0),
-                        mla_core=selected,
-                        dcp_resources=None,
-                        tokens_per_request=q,
-                        workspaces={},
-                        device=torch.device("cuda:0"),
-                        origins=origins,
-                        _PreparedTokenSpeedMla=adapter,
-                        _module=load,
-                        _prepare_mla_workspace=prepare,
-                    )
-                    exec(compile(actual, str(PROVIDERS), "exec"), scope)
-                    constructor.assert_called_once_with(
-                        proxy,
-                        {q: 3648, 2 * q: 3648},
-                        query,
-                        max_context=scope["max_seq_len"],
-                        core=selected,
-                        dcp=None,
-                        queries=(q,),
-                    )
-                    if selected == "trtllm":
-                        self.assertIs(scope["core"], inner)
-                        self.assertEqual(
-                            scope["workspaces"],
-                            {
-                                "mla.flashinfer.workspace": workspace,
-                                "mla.flashinfer.counter": counter,
-                            },
-                        )
-                        prepare.assert_called_once_with(
-                            native_module, scope["device"], 12
-                        )
-                        load.assert_not_called()
-                        adapter.assert_not_called()
-                    else:
-                        self.assertIs(scope["core"], wrapped)
-                        self.assertEqual(scope["workspaces"], {})
-                        adapter.assert_called_once_with(inner, dependency)
-                        load.assert_called_once_with("mla.dcp", origins)
-                        prepare.assert_not_called()
-
-    def test_trtllm_does_not_import_or_query_optional_dependency(self):
-        module = definitions(PROVIDERS, ["_validate_mla_core", "build_resources"])
-        real_import = builtins.__import__
-
-        def guarded(name, *args, **kwargs):
-            if name == "importlib.metadata" or name.startswith("tokenspeed"):
-                raise AssertionError("Dormant TokenSpeed dependency was touched")
-            return real_import(name, *args, **kwargs)
-
-        class StopAfterAdmission(Exception):
-            pass
-
-        module.prepared_widths = Mock(side_effect=StopAfterAdmission)
-        with patch("builtins.__import__", side_effect=guarded):
-            module._validate_mla_core("trtllm")
-            with self.assertRaises(StopAfterAdmission):
-                module.build_resources(
-                    object(), context_length=8192, memory_before={}, deadline_ns=1
-                )
-        module.prepared_widths.assert_called_once_with(1, None)
 
     def test_selected_dependency_version_and_invalid_selection_fail_before_build(self):
         from importlib.metadata import PackageNotFoundError

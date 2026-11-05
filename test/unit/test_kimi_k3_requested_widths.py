@@ -9,7 +9,6 @@ replaced. No model weights, optional attention backend or GPU is loaded.
 
 from __future__ import annotations
 
-import ast
 import builtins
 import os
 import sys
@@ -21,24 +20,11 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
+from _kimi_test_utils import definitions, execution_resources
 
-from sgl_nvidia_mega.kimi_k3 import weight_prefetch
+from sgl_nvidia_mega.kimi_k3 import embedding, weight_prefetch
 
 ROOT = Path(__file__).resolve().parents[2] / "sgl_nvidia_mega" / "kimi_k3"
-
-
-def definitions(path, names, **values):
-    tree = ast.parse(path.read_text())
-    body = [node for node in tree.body if getattr(node, "name", None) in names]
-    assert {node.name for node in body} == set(names)
-    body.insert(0, ast.ImportFrom("__future__", [ast.alias("annotations")], 0))
-    module = ModuleType("width_fixture")
-    module.__dict__.update(values)
-    exec(
-        compile(ast.fix_missing_locations(ast.Module(body, [])), str(path), "exec"),
-        module.__dict__,
-    )
-    return module
 
 
 POLICY = definitions(
@@ -245,149 +231,189 @@ class BuildFixture:
 
 
 class TestWidthSelection(unittest.TestCase):
-    def test_optional_mla_preserves_requested_widths_and_prefetch_admission(self):
-        for q, selected in ((1, (2, 8, 64)), (6, (6, 12, 60))):
-            for enabled in (False, True):
-                with self.subTest(q=q, selected=selected, prefetch=enabled):
-                    fixture = BuildFixture()
-                    dependency, controller = object(), object()
-                    fixture.modules["mla.dcp"] = dependency
-                    wrapper = Mock(
+    def test_optional_preparation_matrix(self):
+        # Full feature interactions on representative q1/q6 subsets; defaults,
+        # B1-special and odd-row preparation reuse the same behavioral checks.
+        defaults = [
+            ({}, False),
+            (dict(enable_prefetch=False, enable_embedding=False), False),
+        ]
+        interactions = [
+            (dict(enable_prefetch=p, enable_embedding=True, mla_core=m), supported)
+            for p in (False, True)
+            for m in ("trtllm", "tokenspeed")
+            for supported in (False, True)
+        ]
+        for q, widths in (
+            (1, None),
+            (1, (1, 4, 16)),
+            (1, (2, 8, 64)),
+            (1, (9, 15, 17, 31, 33, 63)),
+            (6, None),
+            (6, (6, 12, 60)),
+        ):
+            cases = defaults + [
+                (dict(enable_prefetch=True, mla_core=m), False)
+                for m in ("trtllm", "tokenspeed")
+            ]
+            if widths in ((2, 8, 64), (6, 12, 60)):
+                cases += interactions
+            for options, supported in cases:
+                with self.subTest(
+                    q=q, widths=widths, options=options, supported=supported
+                ):
+                    f = BuildFixture()
+                    selected = POLICY.prepared_widths(q, widths)
+                    prefetch_on = options.get("enable_prefetch", False)
+                    embedding_on = options.get("enable_embedding", False)
+                    mla = options.get("mla_core", "trtllm")
+                    controller, gather, constructor, dependency = (
+                        object() for _ in range(4)
+                    )
+                    f.model.model.embed_tokens = object()
+                    f.modules["common.embedding"] = NS(PreparedEmbedding=constructor)
+                    f.modules["mla.dcp"] = dependency
+                    wrapper = f.module._PreparedTokenSpeedMla = Mock(
                         side_effect=lambda core, module: NS(heads=core.heads)
                     )
-                    fixture.module._PreparedTokenSpeedMla = wrapper
+                    original_import = builtins.__import__
+
+                    def guarded_import(name, *args, **kwargs):
+                        for enabled, optional in (
+                            (prefetch_on, "weight_prefetch"),
+                            (embedding_on, "embedding"),
+                        ):
+                            if not enabled and name in (
+                                optional,
+                                "sgl_nvidia_mega.kimi_k3." + optional,
+                            ):
+                                self.fail("OFF imported " + optional)
+                        if mla == "trtllm" and (
+                            name == "importlib.metadata"
+                            or name.startswith("tokenspeed")
+                        ):
+                            self.fail("default MLA touched optional dependency")
+                        return original_import(name, *args, **kwargs)
+
+                    def prepare(native, *, tp_group, load_prepared):
+                        self.assertIs(native, f.model.model.embed_tokens)
+                        if supported:
+                            self.assertIs(load_prepared(), constructor)
+                            return gather
+                        return None
+
+                    def resources(**kwargs):
+                        value = NS(**kwargs)
+
+                        def inventory():
+                            self.assertIs(
+                                value.prefetch, controller if prefetch_on else None
+                            )
+                            for layer in value.layers[1:]:
+                                owner = value.feed_forward[layer.layer_idx]
+                                self.assertIs(owner.prefetch, value.prefetch)
+                                self.assertEqual(
+                                    owner.small_batch is not None, 1 in selected
+                                )
+                                if owner.small_batch is not None:
+                                    self.assertIs(
+                                        owner.small_batch.prefetch, value.prefetch
+                                    )
+
+                        value.refresh_inventory = Mock(side_effect=inventory)
+                        return value
+
+                    f.module.ResourceSet = resources
                     with (
-                        patch("importlib.metadata.version", return_value="2.0.2"),
                         patch.object(
                             weight_prefetch,
                             "PrefetchController",
                             return_value=controller,
                         ) as construct,
-                    ):
-                        result = fixture.build(
-                            q, selected, enable_prefetch=enabled, mla_core="tokenspeed"
-                        )
-                    self.assertEqual(result.widths, selected)
-                    self.assertEqual(wrapper.call_count, len(fixture.cores["mla"]))
-                    self.assertGreater(wrapper.call_count, 0)
-                    for call in wrapper.call_args_list:
-                        self.assertIs(call.args[1], dependency)
-                    fixture.module._prepare_mla_workspace.assert_not_called()
-                    for call in fixture.modules[
-                        "mla.prepared"
-                    ].PreparedMla.call_args_list:
-                        self.assertEqual(tuple(call.args[1]), selected)
-                        self.assertEqual(call.kwargs["core"], "tokenspeed")
-                        self.assertEqual(call.kwargs["queries"], (q,))
-                    self.assertIs(result.prefetch, controller if enabled else None)
-                    self.assertEqual(construct.call_count, int(enabled))
-
-    def test_prefetch_opt_in_binds_only_existing_small_batch_owners(self):
-        for q, selected in (
-            (1, None),
-            (1, (1, 4, 16)),
-            (1, (2, 8, 64)),
-            (6, (6, 12, 60)),
-            (6, None),
-        ):
-            with self.subTest(q=q, selected=selected):
-                fixture, controller = BuildFixture(), object()
-                expected = POLICY.prepared_widths(q, selected)
-
-                def resources(**kwargs):
-                    value = NS(**kwargs)
-
-                    def inventory():
-                        # All owners must be bound before inventory is collected.
-                        self.assertIs(value.prefetch, controller)
-                        for layer in value.layers[1:]:
-                            prepared = value.feed_forward[layer.layer_idx]
-                            self.assertIs(prepared.prefetch, controller)
-                            self.assertEqual(
-                                prepared.small_batch is not None, 1 in expected
-                            )
-                            if prepared.small_batch is not None:
-                                self.assertIs(prepared.small_batch.prefetch, controller)
-
-                    value.refresh_inventory = Mock(side_effect=inventory)
-                    return value
-
-                fixture.module.ResourceSet = resources
-                with patch.object(
-                    weight_prefetch, "PrefetchController", return_value=controller
-                ) as construct:
-                    result = fixture.build(q, selected, enable_prefetch=True)
-                construct.assert_called_once_with(
-                    result.attention,
-                    result.layers,
-                    result.moe_front_weights,
-                    device=torch.device("meta"),
-                    batches=expected,
-                )
-                result.refresh_inventory.assert_called_once_with()
-                self.assertEqual(
-                    sum(
-                        call.args[0] == "common.prefetch"
-                        for call in fixture.module._module.call_args_list
-                    ),
-                    1,
-                )
-                self.assertEqual(
-                    sum(
-                        item["kind"] == "weight_prefetch"
-                        for item in result.compilation_inventory
-                    ),
-                    1,
-                )
-
-    def test_width_subsets_do_not_enable_optional_prefetch(self):
-        original_import = builtins.__import__
-
-        def guarded_import(name, *args, **kwargs):
-            if name in ("weight_prefetch", "sgl_nvidia_mega.kimi_k3.weight_prefetch"):
-                self.fail("disabled prefetch imported its optional controller")
-            return original_import(name, *args, **kwargs)
-
-        for q, selected in (
-            (1, None),
-            (1, (1, 4)),
-            (1, (2, 8, 64)),
-            (6, None),
-            (6, (6, 12, 60)),
-        ):
-            for options in ({}, {"enable_prefetch": False}):
-                with self.subTest(q=q, selected=selected, options=options):
-                    fixture = BuildFixture()
-                    with (
+                        patch.object(
+                            embedding, "prepare_embedding", side_effect=prepare
+                        ) as prepare_mock,
+                        patch("importlib.metadata.version", return_value="2.0.2"),
                         patch.object(
                             builtins, "__import__", side_effect=guarded_import
                         ),
-                        patch.object(
-                            weight_prefetch,
-                            "PrefetchController",
-                            side_effect=AssertionError("OFF constructed prefetch"),
-                        ) as construct,
                     ):
-                        result = fixture.build(q, selected, **options)
-                    construct.assert_not_called()
-                    self.assertIsNone(result.prefetch)
-                    for layer in result.layers[1:]:
-                        prepared = result.feed_forward[layer.layer_idx]
-                        self.assertIsNone(prepared.prefetch)
-                        if prepared.small_batch is not None:
-                            self.assertIsNone(prepared.small_batch.prefetch)
-                    self.assertFalse(
-                        any(
-                            call.args[0] == "common.prefetch"
-                            for call in fixture.module._module.call_args_list
+                        result = f.build(q, widths, **options)
+                    result.refresh_inventory.assert_called_once_with()
+                    self.assertEqual(result.widths, selected)
+                    self.assertEqual(construct.call_count, int(prefetch_on))
+                    if prefetch_on:
+                        construct.assert_called_once_with(
+                            result.attention,
+                            result.layers,
+                            result.moe_front_weights,
+                            device=torch.device("meta"),
+                            batches=selected,
                         )
-                    )
-                    self.assertFalse(
-                        any(
-                            item["kind"] == "weight_prefetch"
-                            for item in result.compilation_inventory
+                    self.assertEqual(prepare_mock.call_count, int(embedding_on))
+                    self.assertIs(result.embedding, gather if supported else None)
+                    self.assertEqual("embedding.out" in result.scratch, supported)
+                    if supported:
+                        self.assertEqual(
+                            result.scratch["embedding.out"].shape, (64, 7168)
                         )
-                    )
+                        self.assertEqual(
+                            result.scratch["embedding.out"].dtype, torch.bfloat16
+                        )
+                    loads = [call.args[0] for call in f.module._module.call_args_list]
+                    compiled = [row["kind"] for row in result.compilation_inventory]
+                    for module, kind, enabled in (
+                        ("common.prefetch", "weight_prefetch", prefetch_on),
+                        ("common.embedding", "embedding", supported),
+                    ):
+                        self.assertEqual(loads.count(module), int(enabled))
+                        self.assertEqual(compiled.count(kind), int(enabled))
+                    for call in f.modules["mla.prepared"].PreparedMla.call_args_list:
+                        self.assertEqual(call.args[1], dict.fromkeys(selected, 3648))
+                        self.assertEqual(
+                            call.kwargs,
+                            dict(
+                                max_context=262144 + (q if q > 1 else 0),
+                                core=mla,
+                                dcp=None,
+                                queries=(q,),
+                            ),
+                        )
+                        self.assertIs(call.args[2], result.scratch["mla.query"])
+                    if mla == "tokenspeed":
+                        self.assertEqual(wrapper.call_count, 24)
+                        self.assertTrue(
+                            all(
+                                call.args[1] is dependency
+                                for call in wrapper.call_args_list
+                            )
+                        )
+                        f.module._prepare_mla_workspace.assert_not_called()
+                        self.assertNotIn("mla.flashinfer.workspace", result.workspaces)
+                    else:
+                        wrapper.assert_not_called()
+                        self.assertNotIn("mla.dcp", loads)
+                        f.module._prepare_mla_workspace.assert_called_once_with(
+                            f.modules["mla.prepared"], torch.device("meta"), 12
+                        )
+                        workspace, counter = (
+                            f.module._prepare_mla_workspace.return_value
+                        )
+                        self.assertIs(
+                            result.workspaces["mla.flashinfer.workspace"], workspace
+                        )
+                        self.assertIs(
+                            result.workspaces["mla.flashinfer.counter"], counter
+                        )
+
+    def test_invalid_optional_switches_fail_before_preparation(self):
+        for option in ("enable_prefetch", "enable_embedding"):
+            for value in (None, 0, 1, "false", "true", [], object()):
+                with self.subTest(option=option, value=value):
+                    fixture = BuildFixture()
+                    with self.assertRaisesRegex(ValueError, option + " must be a bool"):
+                        fixture.build(1, **{option: value})
+                    fixture.module._module.assert_not_called()
 
     def test_defaults_and_canonical_subsets(self):
         for q in (1, 4, 5, 6, 7, 8):
@@ -424,17 +450,6 @@ class TestWidthSelection(unittest.TestCase):
             self.assertEqual(
                 {row: all_policies[row] for row in POLICY.DECODE_WIDTHS}, old_policies
             )
-
-    def test_odd_width_build_has_no_unrequested_single_row_helper(self):
-        selected = (9, 15, 17, 31, 33, 63)
-        for prefetch in (False, True):
-            with self.subTest(prefetch=prefetch):
-                fixture = BuildFixture()
-                with patch.object(
-                    weight_prefetch, "PrefetchController", return_value=object()
-                ):
-                    result = fixture.build(1, selected, enable_prefetch=prefetch)
-                self.assertEqual(result.widths, selected)
 
     def test_invalid_subsets_reject_before_native_work(self):
         for q, value in (
@@ -525,6 +540,13 @@ class TestWidthSelection(unittest.TestCase):
                             for call in constructor.call_args_list
                         )
                     )
+                    if name == "SharedFront":
+                        self.assertTrue(
+                            all(
+                                call.kwargs["q"] == q
+                                for call in constructor.call_args_list
+                            )
+                        )
                 chain = fixture.modules["moe.small_batch.chain"].SmallBatchChain
                 self.assertEqual(chain.call_count, 92 if 1 in selected else 0)
                 self.assertEqual(
@@ -803,46 +825,11 @@ class TestConfiguredWidthExecutionContract(unittest.TestCase):
             ),
             aux_hidden_states=None,
         )
-        no_op = NS(run=Mock(side_effect=lambda x, out, *args, **kwargs: out))
+        resources = execution_resources(64, tensor=tensor, widths=prepared)
         projection, mla, kda = Mock(), Mock(), Mock()
-        attention = {
-            index: NS(
-                kind="mla" if index == 0 else "kda",
-                projection=NS(run=projection),
-                core=mla if index == 0 else kda,
-                output=no_op,
-                cache=object() if index == 0 else None,
-                caches=None if index == 0 else (object(), object()),
-            )
-            for index in range(93)
-        }
-        scratch = {
-            name: tensor((64, 7168))
-            for name in (
-                "hidden.0",
-                "hidden.1",
-                "hidden.out",
-                "prefix",
-                "blocks",
-                "mla.projected",
-                "kda.projected",
-                "attention.local",
-            )
-        }
-        resources = NS(
-            binding_fingerprint="bound",
-            tokens_per_request=1,
-            widths=prepared,
-            prefetch=None,
-            aux_capture_layers=None,
-            attention=attention,
-            scratch=scratch,
-            layers=tuple(NS(layer_idx=index) for index in range(93)),
-            before={index: no_op for index in range(93)},
-            fused_before={},
-            feed_forward={index: no_op for index in range(93)},
-            final=no_op,
-        )
+        for index, provider in resources.attention.items():
+            provider.projection.run = projection
+            provider.core = mla if index == 0 else kda
         return resources, ids, embeds, view, projection, mla, kda
 
     def test_new_rows_execute_the_real_python_chain_and_tensor_validation(self):
