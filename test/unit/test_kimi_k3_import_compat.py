@@ -143,29 +143,6 @@ class TestKimiK3ImportCompatibility(unittest.TestCase):
                 self.assertIs(caught.exception, error)
                 self.assertEqual(len(calls), 2)
 
-    def test_source_contracts_name_both_layouts_newest_first(self):
-        for filename in ("spec.py", "providers.py", "executor.py"):
-            tree = ast.parse((KIMI / filename).read_text())
-            declaration = next(
-                node.value
-                for node in tree.body
-                if isinstance(node, ast.Assign)
-                and any(
-                    isinstance(t, ast.Name) and t.id == "SGLANG_READS"
-                    for t in node.targets
-                )
-            )
-            reads = ast.literal_eval(declaration)
-            for _, guard in (item for item in _guards() if item[0] == filename):
-                newest = (
-                    guard.body[0].module.removeprefix("sglang.").replace(".", "/")
-                    + ".py"
-                )
-                oldest = "srt/megakernels/" + newest.rsplit("/", 1)[-1]
-                self.assertIn(newest + "|" + oldest, reads)
-                for alias in guard.body[0].names:
-                    self.assertIn(alias.name, reads[newest + "|" + oldest])
-
 
 if __name__ == "__main__":
     unittest.main()

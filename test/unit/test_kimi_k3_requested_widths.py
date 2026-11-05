@@ -10,6 +10,7 @@ replaced. No model weights, optional attention backend or GPU is loaded.
 from __future__ import annotations
 
 import ast
+import builtins
 import os
 import sys
 import unittest
@@ -283,6 +284,7 @@ class TestWidthSelection(unittest.TestCase):
 
     def test_prefetch_opt_in_binds_only_existing_small_batch_owners(self):
         for q, selected in (
+            (1, None),
             (1, (1, 4, 16)),
             (1, (2, 8, 64)),
             (6, (6, 12, 60)),
@@ -290,11 +292,31 @@ class TestWidthSelection(unittest.TestCase):
         ):
             with self.subTest(q=q, selected=selected):
                 fixture, controller = BuildFixture(), object()
+                expected = POLICY.prepared_widths(q, selected)
+
+                def resources(**kwargs):
+                    value = NS(**kwargs)
+
+                    def inventory():
+                        # All owners must be bound before inventory is collected.
+                        self.assertIs(value.prefetch, controller)
+                        for layer in value.layers[1:]:
+                            prepared = value.feed_forward[layer.layer_idx]
+                            self.assertIs(prepared.prefetch, controller)
+                            self.assertEqual(
+                                prepared.small_batch is not None, 1 in expected
+                            )
+                            if prepared.small_batch is not None:
+                                self.assertIs(prepared.small_batch.prefetch, controller)
+
+                    value.refresh_inventory = Mock(side_effect=inventory)
+                    return value
+
+                fixture.module.ResourceSet = resources
                 with patch.object(
                     weight_prefetch, "PrefetchController", return_value=controller
                 ) as construct:
                     result = fixture.build(q, selected, enable_prefetch=True)
-                expected = POLICY.prepared_widths(q, selected)
                 construct.assert_called_once_with(
                     result.attention,
                     result.layers,
@@ -302,13 +324,7 @@ class TestWidthSelection(unittest.TestCase):
                     device=torch.device("meta"),
                     batches=expected,
                 )
-                self.assertIs(result.prefetch, controller)
-                for layer in result.layers[1:]:
-                    prepared = result.feed_forward[layer.layer_idx]
-                    self.assertIs(prepared.prefetch, controller)
-                    self.assertEqual(prepared.small_batch is not None, 1 in expected)
-                    if prepared.small_batch is not None:
-                        self.assertIs(prepared.small_batch.prefetch, controller)
+                result.refresh_inventory.assert_called_once_with()
                 self.assertEqual(
                     sum(
                         call.args[0] == "common.prefetch"
@@ -325,15 +341,33 @@ class TestWidthSelection(unittest.TestCase):
                 )
 
     def test_width_subsets_do_not_enable_optional_prefetch(self):
-        for q, selected in ((1, (1, 4)), (1, (2, 8, 64)), (6, (6, 12, 60))):
+        original_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name in ("weight_prefetch", "sgl_nvidia_mega.kimi_k3.weight_prefetch"):
+                self.fail("disabled prefetch imported its optional controller")
+            return original_import(name, *args, **kwargs)
+
+        for q, selected in (
+            (1, None),
+            (1, (1, 4)),
+            (1, (2, 8, 64)),
+            (6, None),
+            (6, (6, 12, 60)),
+        ):
             for options in ({}, {"enable_prefetch": False}):
                 with self.subTest(q=q, selected=selected, options=options):
                     fixture = BuildFixture()
-                    with patch.object(
-                        weight_prefetch,
-                        "PrefetchController",
-                        side_effect=AssertionError("OFF constructed prefetch"),
-                    ) as construct:
+                    with (
+                        patch.object(
+                            builtins, "__import__", side_effect=guarded_import
+                        ),
+                        patch.object(
+                            weight_prefetch,
+                            "PrefetchController",
+                            side_effect=AssertionError("OFF constructed prefetch"),
+                        ) as construct,
+                    ):
                         result = fixture.build(q, selected, **options)
                     construct.assert_not_called()
                     self.assertIsNone(result.prefetch)

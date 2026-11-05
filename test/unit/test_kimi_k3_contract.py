@@ -138,6 +138,9 @@ class TestKimiK3Contract(unittest.TestCase):
 
     def test_registration_is_lazy_and_api_mismatch_fails_closed(self):
         # Preserve modules already held by other collected contract tests.
+        parent = importlib.import_module("sgl_nvidia_mega")
+        child = importlib.import_module("sgl_nvidia_mega.kimi_k3")
+        prefetch = importlib.import_module("sgl_nvidia_mega.kimi_k3.weight_prefetch")
         with (
             patch.dict(sys.modules),
             patch.dict(vars(importlib.import_module("sgl_nvidia_mega"))),
@@ -177,11 +180,6 @@ class TestKimiK3Contract(unittest.TestCase):
                     self.assertIn("uses megakernel API version 2", reason)
                     self.assertIn(f"requires version {version}", reason)
 
-    def test_lazy_registration_preserves_loaded_module_identity(self):
-        parent = importlib.import_module("sgl_nvidia_mega")
-        child = importlib.import_module("sgl_nvidia_mega.kimi_k3")
-        prefetch = importlib.import_module("sgl_nvidia_mega.kimi_k3.weight_prefetch")
-        self.test_registration_is_lazy_and_api_mismatch_fails_closed()
         self.assertIs(parent.kimi_k3, child)
         self.assertIs(importlib.import_module(child.__name__), child)
         self.assertIs(importlib.import_module(prefetch.__name__), prefetch)

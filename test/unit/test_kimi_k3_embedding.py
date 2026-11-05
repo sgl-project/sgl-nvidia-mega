@@ -182,31 +182,6 @@ class TestEmbeddingPolicy(unittest.TestCase):
 
 class TestEmbeddingAdmission(unittest.TestCase):
     def test_provider_defaults_off_and_imports_only_on_opt_in(self):
-        tree = ast.parse((ROOT / "providers.py").read_text())
-        build = next(
-            node
-            for node in tree.body
-            if getattr(node, "name", None) == "build_resources"
-        )
-        defaults = dict(
-            zip((arg.arg for arg in build.args.kwonlyargs), build.args.kw_defaults)
-        )
-        self.assertIs(ast.literal_eval(defaults["enable_embedding"]), False)
-        gate = next(
-            node
-            for node in build.body
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id == "enable_embedding"
-        )
-        imports = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module == "embedding"
-        ]
-        self.assertEqual(len(imports), 1)
-        self.assertIn(imports[0], list(ast.walk(gate)))
-        # Registered startup defaults/opt-ins are checked by TestStartupOptions.
 
         original_import = builtins.__import__
 

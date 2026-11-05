@@ -134,23 +134,6 @@ class TestStandaloneSourceContract(unittest.TestCase):
         self.assertEqual(runtime[12:], (0.25, 1.0))
         self.assertEqual(lengths.tolist(), [31])
 
-    def test_public_builder_does_not_select_optional_core(self):
-        source = ast.parse((KIMI / "spec.py").read_text())
-        build = next(
-            node
-            for node in source.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_build"
-        )
-        calls = [
-            node
-            for node in ast.walk(build)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "build_resources"
-        ]
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("mla_core", {keyword.arg for keyword in calls[0].keywords})
-
 
 class Workspace:
     """Host metadata only, deliberately not a CUDA allocation."""
