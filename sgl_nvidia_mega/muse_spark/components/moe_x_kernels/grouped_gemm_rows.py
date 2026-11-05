@@ -111,7 +111,10 @@ def abs_max_f32(acc, x, loc=None, ip=None):
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
-            [cutlass.Float32(acc).ir_value(loc=loc, ip=ip), cutlass.Float32(x).ir_value(loc=loc, ip=ip)],
+            [
+                cutlass.Float32(acc).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(x).ir_value(loc=loc, ip=ip),
+            ],
             "{\n\t.reg .f32 t;\n\tabs.f32 t, $2;\n\tmax.f32 $0, $1, t;\n\t}",
             "=f,f,f",
             has_side_effects=False,
@@ -142,8 +145,15 @@ def red_max_bf16_bits(dst, x, loc=None, ip=None):
 
 def _asm(ret, args, text, cons, loc, ip):
     return llvm.inline_asm(
-        ret, args, text, cons, has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc, ip=ip,
+        ret,
+        args,
+        text,
+        cons,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -156,51 +166,102 @@ def gaddr(t, loc=None, ip=None):
 @dsl_user_op
 def ld_v4(addr, loc=None, ip=None):
     """Four 32-bit words from global memory (16-byte aligned address)."""
-    r = _asm(llvm.StructType.get_literal([T.i32()] * 4), [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
-             "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,l", loc, ip)
-    return [cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip)) for i in range(4)]
+    r = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc,
+        ip,
+    )
+    return [
+        cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip))
+        for i in range(4)
+    ]
 
 
 @dsl_user_op
 def st_v4(addr, a, b, c, d, loc=None, ip=None):
     """Store four 32-bit words to global memory (16-byte aligned address)."""
-    _asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
-         + [cutlass.Int32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
-         "st.global.v4.b32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r", loc, ip)
+    _asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [cutlass.Int32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def st_b32(addr, v, loc=None, ip=None):
     """Store one 32-bit word to global memory."""
-    _asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(v).ir_value(loc=loc, ip=ip)],
-         "st.global.b32 [$0], $1;", "l,r", loc, ip)
+    _asm(
+        None,
+        [
+            cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(v).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.b32 [$0], $1;",
+        "l,r",
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def ld_acquire_u32(addr, loc=None, ip=None):
     """32-bit load with acquire semantics at GPU scope."""
-    return cutlass.Int32(_asm(T.i32(), [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
-                              "ld.acquire.gpu.global.u32 $0, [$1];", "=r,l", loc, ip))
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u32 $0, [$1];",
+            "=r,l",
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def ld_relaxed_u32(addr, loc=None, ip=None):
     """32-bit load, relaxed at GPU scope."""
-    return cutlass.Int32(_asm(T.i32(), [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
-                              "ld.relaxed.gpu.global.u32 $0, [$1];", "=r,l", loc, ip))
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.u32 $0, [$1];",
+            "=r,l",
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def smem_addr(t, loc=None, ip=None):
     """Shared-memory address of a shared tensor's first element as Int32."""
-    return cutlass.Int32(llvm.ptrtoint(T.i32(), t.iterator.to_llvm_ptr(loc=loc, ip=ip), loc=loc, ip=ip))
+    return cutlass.Int32(
+        llvm.ptrtoint(T.i32(), t.iterator.to_llvm_ptr(loc=loc, ip=ip), loc=loc, ip=ip)
+    )
 
 
 @dsl_user_op
 def cp_async_16(saddr, gaddr_, loc=None, ip=None):
     """16-byte asynchronous copy global -> shared (L2 only)."""
-    _asm(None, [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip), cutlass.Int64(gaddr_).ir_value(loc=loc, ip=ip)],
-         "cp.async.cg.shared.global [$0], [$1], 16;", "r,l", loc, ip)
+    _asm(
+        None,
+        [
+            cutlass.Int32(saddr).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gaddr_).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global [$0], [$1], 16;",
+        "r,l",
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
@@ -216,31 +277,66 @@ def cp_async_wait_all(loc=None, ip=None):
 @dsl_user_op
 def lds_v4(saddr, loc=None, ip=None):
     """Four 32-bit words from shared memory (16-byte aligned address)."""
-    r = _asm(llvm.StructType.get_literal([T.i32()] * 4), [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip)],
-             "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,r", loc, ip)
-    return [cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip)) for i in range(4)]
+    r = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        loc,
+        ip,
+    )
+    return [
+        cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip))
+        for i in range(4)
+    ]
 
 
 @dsl_user_op
 def ld_acquire_cta_s32(saddr, loc=None, ip=None):
     """Shared 32-bit load, acquire at CTA scope."""
-    return cutlass.Int32(_asm(T.i32(), [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip)],
-                              "ld.acquire.cta.shared::cta.u32 $0, [$1];", "=r,r", loc, ip))
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.cta.shared::cta.u32 $0, [$1];",
+            "=r,r",
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def st_release_cta_s32(saddr, v, loc=None, ip=None):
     """Shared 32-bit store, release at CTA scope."""
-    _asm(None, [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip), cutlass.Int32(v).ir_value(loc=loc, ip=ip)],
-         "st.release.cta.shared::cta.u32 [$0], $1;", "r,r", loc, ip)
+    _asm(
+        None,
+        [
+            cutlass.Int32(saddr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(v).ir_value(loc=loc, ip=ip),
+        ],
+        "st.release.cta.shared::cta.u32 [$0], $1;",
+        "r,r",
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def ld_cg_v4(addr, loc=None, ip=None):
     """Four 32-bit words from global memory through L2 only (16-byte aligned address)."""
-    r = _asm(llvm.StructType.get_literal([T.i32()] * 4), [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
-             "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,l", loc, ip)
-    return [cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip)) for i in range(4)]
+    r = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc,
+        ip,
+    )
+    return [
+        cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip))
+        for i in range(4)
+    ]
 
 
 @dsl_user_op
@@ -253,28 +349,58 @@ def nanosleep_hint(loc=None, ip=None):
 def blk_wait_older(loc=None, ip=None):
     """Wait until every committed bulk copy of this thread but the most recent group has completed, then order
     those writes for the generic proxy."""
-    _asm(None, [], "cp.async.bulk.wait_group 1;\n\tfence.proxy.async.global;", "", loc, ip)
+    _asm(
+        None,
+        [],
+        "cp.async.bulk.wait_group 1;\n\tfence.proxy.async.global;",
+        "",
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def blk_wait_all_fenced(loc=None, ip=None):
     """Wait until every committed bulk copy of this thread has completed, then order them for the generic proxy."""
-    _asm(None, [], "cp.async.bulk.wait_group 0;\n\tfence.proxy.async.global;", "", loc, ip)
+    _asm(
+        None,
+        [],
+        "cp.async.bulk.wait_group 0;\n\tfence.proxy.async.global;",
+        "",
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def publish_add(addr, loc=None, ip=None):
     """Add 1 to the counter at addr with release semantics at GPU scope."""
-    _asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
-         "red.release.gpu.global.add.u32 [$0], 1;", "l", loc, ip)
+    _asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.add.u32 [$0], 1;",
+        "l",
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def pack_bf16x2(lo, hi, loc=None, ip=None):
     """BF16 pair (round to nearest even) of two FP32 values, lo in the low half."""
-    return cutlass.Int32(_asm(T.i32(), [cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
-                                        cutlass.Float32(hi).ir_value(loc=loc, ip=ip)],
-                              "cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,f,f", loc, ip))
+    return cutlass.Int32(
+        _asm(
+            T.i32(),
+            [
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            loc,
+            ip,
+        )
+    )
 
 
 # 1 / (e4m3 max * e2m1 max) as FP32 bits (the activations' per-token global-scale recipe).
@@ -284,32 +410,72 @@ _PTS_INV = "0f39C30C31"
 @dsl_user_op
 def token_scales(amax_bits, loc=None, ip=None):
     """(per-token scale = row max * inverse global scale, encode scale = its approximate reciprocal or 0)."""
-    r = _asm(llvm.StructType.get_literal([T.f32()] * 2), [cutlass.Int32(amax_bits).ir_value(loc=loc, ip=ip)],
-             "{\n\t.reg .f32 a, p, r;\n\t.reg .pred q;\n\tmov.b32 a, $2;\n\t"
-             f"mul.ftz.f32 p, a, {_PTS_INV};\n\t"
-             "setp.neu.ftz.f32 q, p, 0f00000000;\n\trcp.approx.ftz.f32 r, p;\n\t"
-             "selp.f32 $1, r, 0f00000000, q;\n\tmov.f32 $0, p;\n\t}",
-             "=f,=f,r", loc, ip)
-    return (cutlass.Float32(llvm.extractvalue(T.f32(), r, [0], loc=loc, ip=ip)),
-            cutlass.Float32(llvm.extractvalue(T.f32(), r, [1], loc=loc, ip=ip)))
+    r = _asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [cutlass.Int32(amax_bits).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .f32 a, p, r;\n\t.reg .pred q;\n\tmov.b32 a, $2;\n\t"
+        f"mul.ftz.f32 p, a, {_PTS_INV};\n\t"
+        "setp.neu.ftz.f32 q, p, 0f00000000;\n\trcp.approx.ftz.f32 r, p;\n\t"
+        "selp.f32 $1, r, 0f00000000, q;\n\tmov.f32 $0, p;\n\t}",
+        "=f,=f,r",
+        loc,
+        ip,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(T.f32(), r, [0], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), r, [1], loc=loc, ip=ip)),
+    )
 
 
 def _qblock_text():
-    lines = [".reg .b32 a<8>, m, u, v;", ".reg .f32 fl, fh, vmax, sf, sfd, rc, t, os, z, f0, f1;",
-             ".reg .b16 e8, h0, h1;", ".reg .b32 e16;", ".reg .pred gt, nz;", ".reg .b8 b<8>;"]
+    lines = [
+        ".reg .b32 a<8>, m, u, v;",
+        ".reg .f32 fl, fh, vmax, sf, sfd, rc, t, os, z, f0, f1;",
+        ".reg .b16 e8, h0, h1;",
+        ".reg .b32 e16;",
+        ".reg .pred gt, nz;",
+        ".reg .b8 b<8>;",
+    ]
     lines += [f"and.b32 a{i}, ${3 + i}, 0x7FFF7FFF;" for i in range(8)]
-    lines += ["max.bf16x2 m, a0, a1;"] + [f"max.bf16x2 m, m, a{i};" for i in range(2, 8)]
-    lines += ["shl.b32 u, m, 16;", "mov.b32 fl, u;", "and.b32 v, m, 0xFFFF0000;", "mov.b32 fh, v;",
-              "setp.gt.f32 gt, fl, fh;", "selp.f32 vmax, fl, fh, gt;",
-              "mul.ftz.f32 sf, vmax, 0f3E2AAAAB;", "mul.ftz.f32 sf, sf, $11;", "mov.f32 z, 0f00000000;",
-              "cvt.rn.satfinite.e4m3x2.f32 e8, z, sf;", "cvt.rn.f16x2.e4m3x2 e16, e8;", "mov.b32 {h0, h1}, e16;",
-              "cvt.f32.f16 sfd, h0;", "setp.neu.ftz.f32 nz, vmax, 0f00000000;", "rcp.approx.ftz.f32 rc, $11;",
-              "mul.ftz.f32 t, sfd, rc;", "rcp.approx.ftz.f32 os, t;", "selp.f32 os, os, 0f00000000, nz;"]
+    lines += ["max.bf16x2 m, a0, a1;"] + [
+        f"max.bf16x2 m, m, a{i};" for i in range(2, 8)
+    ]
+    lines += [
+        "shl.b32 u, m, 16;",
+        "mov.b32 fl, u;",
+        "and.b32 v, m, 0xFFFF0000;",
+        "mov.b32 fh, v;",
+        "setp.gt.f32 gt, fl, fh;",
+        "selp.f32 vmax, fl, fh, gt;",
+        "mul.ftz.f32 sf, vmax, 0f3E2AAAAB;",
+        "mul.ftz.f32 sf, sf, $11;",
+        "mov.f32 z, 0f00000000;",
+        "cvt.rn.satfinite.e4m3x2.f32 e8, z, sf;",
+        "cvt.rn.f16x2.e4m3x2 e16, e8;",
+        "mov.b32 {h0, h1}, e16;",
+        "cvt.f32.f16 sfd, h0;",
+        "setp.neu.ftz.f32 nz, vmax, 0f00000000;",
+        "rcp.approx.ftz.f32 rc, $11;",
+        "mul.ftz.f32 t, sfd, rc;",
+        "rcp.approx.ftz.f32 os, t;",
+        "selp.f32 os, os, 0f00000000, nz;",
+    ]
     for i in range(8):
-        lines += [f"shl.b32 u, ${3 + i}, 16;", "mov.b32 f0, u;", f"and.b32 v, ${3 + i}, 0xFFFF0000;", "mov.b32 f1, v;",
-                  "mul.ftz.f32 f0, f0, os;", "mul.ftz.f32 f1, f1, os;", f"cvt.rn.satfinite.e2m1x2.f32 b{i}, f1, f0;"]
-    lines += ["mov.b32 $0, {b0, b1, b2, b3};", "mov.b32 $1, {b4, b5, b6, b7};", "cvt.u32.u16 u, e8;",
-              "and.b32 $2, u, 0xFF;"]
+        lines += [
+            f"shl.b32 u, ${3 + i}, 16;",
+            "mov.b32 f0, u;",
+            f"and.b32 v, ${3 + i}, 0xFFFF0000;",
+            "mov.b32 f1, v;",
+            "mul.ftz.f32 f0, f0, os;",
+            "mul.ftz.f32 f1, f1, os;",
+            f"cvt.rn.satfinite.e2m1x2.f32 b{i}, f1, f0;",
+        ]
+    lines += [
+        "mov.b32 $0, {b0, b1, b2, b3};",
+        "mov.b32 $1, {b4, b5, b6, b7};",
+        "cvt.u32.u16 u, e8;",
+        "and.b32 $2, u, 0xFF;",
+    ]
     return "{\n\t" + "\n\t".join(lines) + "\n\t}"
 
 
@@ -319,40 +485,85 @@ _QBLOCK_ASM = _qblock_text()
 @dsl_user_op
 def f32_bits(x, loc=None, ip=None):
     """FP32 bit pattern of x as Int32."""
-    return cutlass.Int32(llvm.bitcast(T.i32(), cutlass.Float32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+    return cutlass.Int32(
+        llvm.bitcast(
+            T.i32(), cutlass.Float32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+        )
+    )
 
 
 @dsl_user_op
 def quant_block16(words, enc, loc=None, ip=None):
     """NVFP4 conversion of 16 BF16 values (8 words, element 2i in the low half of word i) with the encode scale:
     (payload word of elements 0-7, payload word of elements 8-15, E4M3 scale byte)."""
-    r = _asm(llvm.StructType.get_literal([T.i32()] * 3),
-             [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in words]
-             + [cutlass.Float32(enc).ir_value(loc=loc, ip=ip)],
-             _QBLOCK_ASM, "=r,=r,=r," + ",".join(["r"] * 8) + ",f", loc, ip)
-    return [cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip)) for i in range(3)]
+    r = _asm(
+        llvm.StructType.get_literal([T.i32()] * 3),
+        [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in words]
+        + [cutlass.Float32(enc).ir_value(loc=loc, ip=ip)],
+        _QBLOCK_ASM,
+        "=r,=r,=r," + ",".join(["r"] * 8) + ",f",
+        loc,
+        ip,
+    )
+    return [
+        cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip))
+        for i in range(3)
+    ]
 
 
 def _hmax8_text():
     lines = [".reg .b32 a<4>, m, u, v;", ".reg .f32 fl, fh;", ".reg .pred gt;"]
     lines += [f"and.b32 a{i}, ${1 + i}, 0x7FFF7FFF;" for i in range(4)]
-    lines += ["max.bf16x2 m, a0, a1;", "max.bf16x2 m, m, a2;", "max.bf16x2 m, m, a3;",
-              "shl.b32 u, m, 16;", "mov.b32 fl, u;", "and.b32 v, m, 0xFFFF0000;", "mov.b32 fh, v;",
-              "setp.gt.f32 gt, fl, fh;", "selp.f32 $0, fl, fh, gt;"]
+    lines += [
+        "max.bf16x2 m, a0, a1;",
+        "max.bf16x2 m, m, a2;",
+        "max.bf16x2 m, m, a3;",
+        "shl.b32 u, m, 16;",
+        "mov.b32 fl, u;",
+        "and.b32 v, m, 0xFFFF0000;",
+        "mov.b32 fh, v;",
+        "setp.gt.f32 gt, fl, fh;",
+        "selp.f32 $0, fl, fh, gt;",
+    ]
     return "{\n\t" + "\n\t".join(lines) + "\n\t}"
 
 
 def _qhalf_text():
-    lines = [".reg .b32 u, v;", ".reg .f32 sf, sfd, rc, t, os, z, f0, f1;", ".reg .b16 e8, h0, h1;",
-             ".reg .b32 e16;", ".reg .pred nz;", ".reg .b8 b<4>;",
-             "mul.ftz.f32 sf, $6, 0f3E2AAAAB;", "mul.ftz.f32 sf, sf, $7;", "mov.f32 z, 0f00000000;",
-             "cvt.rn.satfinite.e4m3x2.f32 e8, z, sf;", "cvt.rn.f16x2.e4m3x2 e16, e8;", "mov.b32 {h0, h1}, e16;",
-             "cvt.f32.f16 sfd, h0;", "setp.neu.ftz.f32 nz, $6, 0f00000000;", "rcp.approx.ftz.f32 rc, $7;",
-             "mul.ftz.f32 t, sfd, rc;", "rcp.approx.ftz.f32 os, t;", "selp.f32 os, os, 0f00000000, nz;"]
+    lines = [
+        ".reg .b32 u, v;",
+        ".reg .f32 sf, sfd, rc, t, os, z, f0, f1;",
+        ".reg .b16 e8, h0, h1;",
+        ".reg .b32 e16;",
+        ".reg .pred nz;",
+        ".reg .b8 b<4>;",
+        "mul.ftz.f32 sf, $6, 0f3E2AAAAB;",
+        "mul.ftz.f32 sf, sf, $7;",
+        "mov.f32 z, 0f00000000;",
+        "cvt.rn.satfinite.e4m3x2.f32 e8, z, sf;",
+        "cvt.rn.f16x2.e4m3x2 e16, e8;",
+        "mov.b32 {h0, h1}, e16;",
+        "cvt.f32.f16 sfd, h0;",
+        "setp.neu.ftz.f32 nz, $6, 0f00000000;",
+        "rcp.approx.ftz.f32 rc, $7;",
+        "mul.ftz.f32 t, sfd, rc;",
+        "rcp.approx.ftz.f32 os, t;",
+        "selp.f32 os, os, 0f00000000, nz;",
+    ]
     for i in range(4):
-        lines += [f"shl.b32 u, ${2 + i}, 16;", "mov.b32 f0, u;", f"and.b32 v, ${2 + i}, 0xFFFF0000;", "mov.b32 f1, v;",
-                  "mul.ftz.f32 f0, f0, os;", "mul.ftz.f32 f1, f1, os;", f"cvt.rn.satfinite.e2m1x2.f32 b{i}, f1, f0;"]
-    lines += ["mov.b32 $0, {b0, b1, b2, b3};", "cvt.u32.u16 u, e8;", "and.b32 $1, u, 0xFF;"]
+        lines += [
+            f"shl.b32 u, ${2 + i}, 16;",
+            "mov.b32 f0, u;",
+            f"and.b32 v, ${2 + i}, 0xFFFF0000;",
+            "mov.b32 f1, v;",
+            "mul.ftz.f32 f0, f0, os;",
+            "mul.ftz.f32 f1, f1, os;",
+            f"cvt.rn.satfinite.e2m1x2.f32 b{i}, f1, f0;",
+        ]
+    lines += [
+        "mov.b32 $0, {b0, b1, b2, b3};",
+        "cvt.u32.u16 u, e8;",
+        "and.b32 $1, u, 0xFF;",
+    ]
     return "{\n\t" + "\n\t".join(lines) + "\n\t}"
 
 
@@ -363,28 +574,56 @@ _QHALF_ASM = _qhalf_text()
 @dsl_user_op
 def absmax8(words, loc=None, ip=None):
     """max |x| of 8 BF16 values (4 words) as FP32 (BF16 max with PTX max.bf16x2, NaN operands dropped)."""
-    return cutlass.Float32(_asm(T.f32(), [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in words], _HMAX8_ASM,
-                                "=f,r,r,r,r", loc, ip))
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in words],
+            _HMAX8_ASM,
+            "=f,r,r,r,r",
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def quant_half8(words, vmax, enc, loc=None, ip=None):
     """NVFP4 conversion of 8 of a block's 16 BF16 values (4 words) given the block max and the encode scale:
     (payload word, E4M3 scale byte)."""
-    r = _asm(llvm.StructType.get_literal([T.i32()] * 2),
-             [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in words]
-             + [cutlass.Float32(vmax).ir_value(loc=loc, ip=ip), cutlass.Float32(enc).ir_value(loc=loc, ip=ip)],
-             _QHALF_ASM, "=r,=r,r,r,r,r,f,f", loc, ip)
-    return [cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip)) for i in range(2)]
+    r = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [cutlass.Int32(w).ir_value(loc=loc, ip=ip) for w in words]
+        + [
+            cutlass.Float32(vmax).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(enc).ir_value(loc=loc, ip=ip),
+        ],
+        _QHALF_ASM,
+        "=r,=r,r,r,r,r,f,f",
+        loc,
+        ip,
+    )
+    return [
+        cutlass.Int32(llvm.extractvalue(T.i32(), r, [i], loc=loc, ip=ip))
+        for i in range(2)
+    ]
 
 
 @dsl_user_op
 def fmax_f32(a, b, loc=None, ip=None):
     """a > b ? a : b."""
-    return cutlass.Float32(_asm(T.f32(), [cutlass.Float32(a).ir_value(loc=loc, ip=ip),
-                                         cutlass.Float32(b).ir_value(loc=loc, ip=ip)],
-                                "{\n\t.reg .pred p;\n\tsetp.gt.f32 p, $1, $2;\n\tselp.f32 $0, $1, $2, p;\n\t}",
-                                "=f,f,f", loc, ip))
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .pred p;\n\tsetp.gt.f32 p, $1, $2;\n\tselp.f32 $0, $1, $2, p;\n\t}",
+            "=f,f,f",
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -452,8 +691,12 @@ class GroupedGemmRowsKernel:
     ):
         if row_amax and not swiglu:
             raise ValueError("row_amax needs the SwiGLU epilogue")
-        if fuse_quant and not (row_amax and mma_inst_shape[0] == 256 and mma_tiler[0] == 256):
-            raise ValueError("fuse_quant needs row_amax and the pair-of-CTAs MMA with tile M 256")
+        if fuse_quant and not (
+            row_amax and mma_inst_shape[0] == 256 and mma_tiler[0] == 256
+        ):
+            raise ValueError(
+                "fuse_quant needs row_amax and the pair-of-CTAs MMA with tile M 256"
+            )
         self.swiglu = swiglu
         self.row_amax_out = row_amax
         self.fuse_quant = fuse_quant
@@ -468,7 +711,9 @@ class GroupedGemmRowsKernel:
         self.raster_along_m = raster_along_m
 
         self.use_2cta_instrs = mma_inst_shape[0] == 256
-        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
         self.arch = arch
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
@@ -508,7 +753,8 @@ class GroupedGemmRowsKernel:
         )
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=3,
-            num_threads=self.threads_per_warp * len((self.mma_warp_id, *self.epilog_warp_id)),
+            num_threads=self.threads_per_warp
+            * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
         self.sched_sync_barrier = pipeline.NamedBarrier(
             barrier_id=4,
@@ -587,7 +833,10 @@ class GroupedGemmRowsKernel:
         c_bytes = c_bytes_per_stage * num_c_stage
         if tma_store_epi_n:
             num_c_stage = 2
-            c_bytes = num_c_stage * cta_tile[0] * tma_store_epi_n * (c_dtype.width // 8) + 1024
+            c_bytes = (
+                num_c_stage * cta_tile[0] * tma_store_epi_n * (c_dtype.width // 8)
+                + 1024
+            )
 
         # Calculate A/B/SFA/SFB stages
         num_ab_stage = (
@@ -647,7 +896,11 @@ class GroupedGemmRowsKernel:
         )
         # columns of the C staging buffer: the output tile width (half the MMA tile in SwiGLU mode); the rest of the
         # shared memory goes to operand stages
-        self.c_smem_cols = self.cta_tile_shape_mnk[1] // 2 if self.swiglu else self.cta_tile_shape_mnk[1]
+        self.c_smem_cols = (
+            self.cta_tile_shape_mnk[1] // 2
+            if self.swiglu
+            else self.cta_tile_shape_mnk[1]
+        )
         self.cta_tile_shape_mnk_sfb = (
             self.mma_tiler_sfb[0] // cute.size(tiled_mma.thr_id.shape),
             self.mma_tiler_sfb[1],
@@ -685,7 +938,9 @@ class GroupedGemmRowsKernel:
             self.epi_tile = (128, 64)
         self.epi_tile_n = cute.size(self.epi_tile[1])
         if self.epi_tile_n % 32 != 0:
-            raise ValueError(f"epilogue tile N {self.epi_tile_n} is not a multiple of 32 (column restore)")
+            raise ValueError(
+                f"epilogue tile N {self.epi_tile_n} is not a multiple of 32 (column restore)"
+            )
 
         # Setup stage counts
         (
@@ -726,7 +981,10 @@ class GroupedGemmRowsKernel:
         swizzled_pad = 16 // (self.c_dtype.width // 8)
         if self.tma_store:
             self.c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.c_dtype, self.c_layout, (self.cta_tile_shape_mnk[0], self.epi_tile_n), self.num_c_stage
+                self.c_dtype,
+                self.c_layout,
+                (self.cta_tile_shape_mnk[0], self.epi_tile_n),
+                self.num_c_stage,
             )
         else:
             self.c_smem_layout_staged = cute.make_layout(
@@ -770,7 +1028,9 @@ class GroupedGemmRowsKernel:
         )
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.num_accumulator_tmem_cols = (
-            self.cta_tile_shape_mnk[1] * self.num_acc_stage * (2 if self.enable_breuse else 1)
+            self.cta_tile_shape_mnk[1]
+            * self.num_acc_stage
+            * (2 if self.enable_breuse else 1)
         )
 
         # Epilogue vectorization config
@@ -785,14 +1045,22 @@ class GroupedGemmRowsKernel:
             self.epi_loop_size = self.epi_tile_n
 
         # copy_size is in bytes for cp.reduce.async.bulk instruction
-        self.out_tile_n = self.cta_tile_shape_mnk[1] // 2 if self.swiglu else self.cta_tile_shape_mnk[1]
+        self.out_tile_n = (
+            self.cta_tile_shape_mnk[1] // 2
+            if self.swiglu
+            else self.cta_tile_shape_mnk[1]
+        )
         # bytes between rows of sC (its padded row stride)
-        self.c_smem_row_bytes = (self.c_smem_cols + 16 // (self.c_dtype.width // 8)) * (self.c_dtype.width // 8)
+        self.c_smem_row_bytes = (self.c_smem_cols + 16 // (self.c_dtype.width // 8)) * (
+            self.c_dtype.width // 8
+        )
         self.copy_size = self.out_tile_n * (self.c_dtype.width // 8)
 
     def _is_interleaved_utccp(self) -> bool:
         """Enable interleaving tcgen05.cp for Bkeep-Breuse case for 4xFP4 kernel."""
-        return self.a_dtype.width == 4 and self.b_dtype.width == 4 and self.enable_breuse
+        return (
+            self.a_dtype.width == 4 and self.b_dtype.width == 4 and self.enable_breuse
+        )
 
     def _mainloop_s2t_copy_and_partition(
         self,
@@ -813,8 +1081,12 @@ class GroupedGemmRowsKernel:
         def appendMNBroadcastMode(smem_layout: cute.Layout):
             mn_dim = cute.get(smem_layout, mode=[0, 0])
             mn_dim = cute.append(mn_dim, cute.make_layout((4), stride=(0)))
-            layout = cute.append(cute.group_modes(mn_dim, 0), cute.get(smem_layout, mode=[0, 1]))
-            layout = cute.append(cute.group_modes(layout, 0), cute.get(smem_layout, mode=[1]))
+            layout = cute.append(
+                cute.group_modes(mn_dim, 0), cute.get(smem_layout, mode=[0, 1])
+            )
+            layout = cute.append(
+                cute.group_modes(layout, 0), cute.get(smem_layout, mode=[1])
+            )
             layout = cute.append(layout, cute.get(smem_layout, mode=[2]))
             layout = cute.append(layout, cute.get(smem_layout, mode=[3]))
             return layout
@@ -824,7 +1096,9 @@ class GroupedGemmRowsKernel:
         )
 
         tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact_bcast)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
+        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
+            tiled_copy_s2t, tCsSF_compact_s2t_
+        )
         tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
 
         return S2TCopyBundle(tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t)
@@ -1019,7 +1293,9 @@ class GroupedGemmRowsKernel:
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # Setup TMA load for A
-        a_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             a_op,
@@ -1031,7 +1307,9 @@ class GroupedGemmRowsKernel:
         )
 
         # Setup TMA load for B
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
@@ -1043,8 +1321,12 @@ class GroupedGemmRowsKernel:
         )
 
         # Setup TMA load for SFA
-        sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
-        sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+        sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
+        sfa_smem_layout = cute.slice_(
+            self.sfa_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
             sfa_op,
             sfa,
@@ -1056,8 +1338,12 @@ class GroupedGemmRowsKernel:
         )
 
         # Setup TMA load for SFB
-        sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma.thr_id)
-        sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+        sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
+        sfb_smem_layout = cute.slice_(
+            self.sfb_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_op,
             sfb,
@@ -1069,12 +1355,16 @@ class GroupedGemmRowsKernel:
         )
 
         # Setup TMA store for the output (logical output columns; epilogue-tile boxes)
-        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            c_out,
-            cute.slice_(self.c_smem_layout_staged, (None, None, 0)),
-            (self.cta_tile_shape_mnk[0], self.epi_tile_n),
-        ) if self.tma_store else (None, None)
+        tma_atom_c, tma_tensor_c = (
+            cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                c_out,
+                cute.slice_(self.c_smem_layout_staged, (None, None, 0)),
+                (self.cta_tile_shape_mnk[0], self.epi_tile_n),
+            )
+            if self.tma_store
+            else (None, None)
+        )
 
         # Handle cta_tile_shape_n=192 case
         if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
@@ -1093,7 +1383,9 @@ class GroupedGemmRowsKernel:
                 tma_tensor_sfb.stride[2],
             )
             tma_tensor_sfb_new_layout = cute.make_layout(new_shape, stride=new_stride)
-            tma_tensor_sfb = cute.make_tensor(tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout)
+            tma_tensor_sfb = cute.make_tensor(
+                tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout
+            )
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
@@ -1128,31 +1420,45 @@ class GroupedGemmRowsKernel:
             ]
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
-            tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+            tile_info_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_tile_stage * 2
+            ]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             qflag: cute.struct.MemRange[cutlass.Int32, 8 + 3 * self.QFIFO]
             sC: cute.struct.Align[
                 cute.struct.MemRange[
                     self.c_dtype,
-                    cute.cosize(self.c_smem_layout_staged.outer if self.tma_store else self.c_smem_layout_staged),
+                    cute.cosize(
+                        self.c_smem_layout_staged.outer
+                        if self.tma_store
+                        else self.c_smem_layout_staged
+                    ),
                 ],
                 self.buffer_align_bytes,
             ]
             sA: cute.struct.Align[
-                cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
+                cute.struct.MemRange[
+                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                ],
                 self.buffer_align_bytes,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
+                cute.struct.MemRange[
+                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                ],
                 self.buffer_align_bytes,
             ]
             sSFA: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)
+                ],
                 self.buffer_align_bytes,
             ]
             sSFB: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                ],
                 self.buffer_align_bytes,
             ]
 
@@ -1265,8 +1571,12 @@ class GroupedGemmRowsKernel:
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+            cta_rank_in_cluster
+        )
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
@@ -1293,7 +1603,9 @@ class GroupedGemmRowsKernel:
         )
 
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        num_acc_consumer_threads = len(self.epilog_warp_id) * (
+            2 if use_2cta_instrs else 1
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -1337,11 +1649,17 @@ class GroupedGemmRowsKernel:
 
         # Setup smem tensors
         if cutlass.const_expr(self.tma_store):
-            sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
+            sC = storage.sC.get_tensor(
+                c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
+            )
         else:
             sC = storage.sC.get_tensor(c_smem_layout_staged)
-        sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+        sA = storage.sA.get_tensor(
+            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
+        )
+        sB = storage.sB.get_tensor(
+            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
+        )
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
@@ -1401,7 +1719,9 @@ class GroupedGemmRowsKernel:
         tCgC = thr_mma.partition_C(gC_mnl)
 
         # Partition for TMA load
-        a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
+        )
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
             block_in_cluster_coord_vmnk[2],
@@ -1409,7 +1729,9 @@ class GroupedGemmRowsKernel:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
-        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+        )
         tBsB, tBgB = cpasync.tma_partition(
             tma_atom_b,
             block_in_cluster_coord_vmnk[1],
@@ -1446,7 +1768,9 @@ class GroupedGemmRowsKernel:
         tCrA = tiled_mma.make_fragment_A(sA)
         tCrB = tiled_mma.make_fragment_B(sB)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+        tCtAcc_fake = tiled_mma.make_fragment_C(
+            cute.append(acc_shape, self.num_acc_stage)
+        )
 
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
@@ -1472,7 +1796,9 @@ class GroupedGemmRowsKernel:
             if cutlass.const_expr(self.raster_along_m):
                 while work_tile.is_valid_tile:
                     cur_tile_coord = work_tile.tile_idx
-                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
+                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(
+                        tiled_mma.thr_id.shape
+                    )
 
                     tile_idx = mma_tile_coord_m
 
@@ -1482,8 +1808,12 @@ class GroupedGemmRowsKernel:
 
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
-                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
-                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
+                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
+                                0
+                            ]
+                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
+                                1
+                            ]
                             sInfo[(2, tile_info_producer_state.index)] = expert_idx
                             sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                                 work_tile.is_valid_tile
@@ -1501,7 +1831,9 @@ class GroupedGemmRowsKernel:
                 is_continue = cutlass.Boolean(1)
                 while work_tile.is_valid_tile and is_continue:
                     cur_tile_coord = work_tile.tile_idx
-                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
+                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(
+                        tiled_mma.thr_id.shape
+                    )
 
                     tile_idx = mma_tile_coord_m
 
@@ -1510,8 +1842,12 @@ class GroupedGemmRowsKernel:
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
-                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
-                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
+                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
+                                0
+                            ]
+                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
+                                1
+                            ]
                             sInfo[(2, tile_info_producer_state.index)] = expert_idx
                             sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                                 work_tile.is_valid_tile
@@ -1568,7 +1904,9 @@ class GroupedGemmRowsKernel:
                 )
 
                 tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, 0)]
-                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                tBgB_slice = tBgB[
+                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
+                ]
                 tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, 0)]
 
                 slice_n = mma_tile_coord_mnl[1]
@@ -1580,10 +1918,14 @@ class GroupedGemmRowsKernel:
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
-                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(
+                        ab_producer_state
+                    )
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    ab_pipeline.producer_acquire(
+                        ab_producer_state, peek_ab_empty_status
+                    )
 
                     cute.copy(
                         tma_atom_a,
@@ -1617,7 +1959,9 @@ class GroupedGemmRowsKernel:
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
-                        peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+                        peek_ab_empty_status = ab_pipeline.producer_try_acquire(
+                            ab_producer_state
+                        )
 
                 # Get next tile
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
@@ -1688,7 +2032,9 @@ class GroupedGemmRowsKernel:
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
                 if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
-                    peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
+                    peek_ab_full_status = ab_pipeline.consumer_try_wait(
+                        ab_consumer_state
+                    )
 
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
@@ -1709,7 +2055,9 @@ class GroupedGemmRowsKernel:
                 # MMA mainloop
                 for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
-                        ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        ab_pipeline.consumer_wait(
+                            ab_consumer_state, peek_ab_full_status
+                        )
 
                         if cutlass.const_expr(not self._is_interleaved_utccp()):
                             self._mainloop_s2t_copies(
@@ -1806,7 +2154,9 @@ class GroupedGemmRowsKernel:
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt:
                         if is_leader_cta:
-                            peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
+                            peek_ab_full_status = ab_pipeline.consumer_try_wait(
+                                ab_consumer_state
+                            )
 
                 if is_leader_cta:
                     acc_pipeline.producer_commit(acc_producer_state)
@@ -1828,8 +2178,17 @@ class GroupedGemmRowsKernel:
         #
         if cutlass.const_expr(self.fuse_quant):
             if warp_idx >= self.conv_warp_ids[0]:
-                self._conv_warps(warp_idx - self.conv_warp_ids[0], tidx % 32, sQflag, c, row_amax, q_out, q_sf,
-                                 q_scale, q_ctl)
+                self._conv_warps(
+                    warp_idx - self.conv_warp_ids[0],
+                    tidx % 32,
+                    sQflag,
+                    c,
+                    row_amax,
+                    q_out,
+                    q_sf,
+                    q_scale,
+                    q_ctl,
+                )
 
         #
         # Specialized epilogue warps with finalize fusion
@@ -1878,7 +2237,9 @@ class GroupedGemmRowsKernel:
                 tiled_copy_r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(
                     self, tiled_copy_t2r, tTR_rC, epi_tidx, sC
                 )
-                gC_epi = cute.flat_divide(mC_out, (self.cta_tile_shape_mnk[0], self.epi_tile_n))
+                gC_epi = cute.flat_divide(
+                    mC_out, (self.cta_tile_shape_mnk[0], self.epi_tile_n)
+                )
                 bSG_sC, bSG_gC = cpasync.tma_partition(
                     tma_atom_c,
                     0,
@@ -1888,7 +2249,9 @@ class GroupedGemmRowsKernel:
                 )
                 c_pipeline = pipeline.PipelineTmaStore.create(
                     num_stages=self.num_c_stage,
-                    producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)),
+                    producer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)
+                    ),
                 )
                 c_count = cute.make_rmem_tensor((1,), cutlass.Int32)
                 c_count[0] = cutlass.Int32(0)
@@ -1937,7 +2300,6 @@ class GroupedGemmRowsKernel:
                 expert_idx = mma_tile_coord_mnl[2]
                 alpha_val = alpha[expert_idx]
 
-
                 # Compute base row index for this tile
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
 
@@ -1945,7 +2307,9 @@ class GroupedGemmRowsKernel:
                 acc_stage_index = acc_consumer_state.index
 
                 # Set tensor memory buffer for current tile
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
+                tTR_tAcc = tTR_tAcc_base[
+                    (None, None, None, None, None, acc_stage_index)
+                ]
 
                 # Wait for accumulator buffer full
                 acc_pipeline.consumer_wait(acc_consumer_state)
@@ -1978,8 +2342,16 @@ class GroupedGemmRowsKernel:
                             up_scale = cutlass.Float32(alpha_up_val) * rs
                         row_max = cutlass.Float32(0.0)
                         for j in cutlass.range(n_subtile_cnt // 2):
-                            cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, (m_iter_idx, 2 * j))], tTR_rAcc)
-                            cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, (m_iter_idx, 2 * j + 1))], tTR_rAcc_hi)
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, (m_iter_idx, 2 * j))],
+                                tTR_rAcc,
+                            )
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, (m_iter_idx, 2 * j + 1))],
+                                tTR_rAcc_hi,
+                            )
                             acc_lo = tTR_rAcc.load()
                             acc_hi = tTR_rAcc_hi.load()
                             tOut = cute.make_rmem_tensor(acc_lo.shape, self.acc_dtype)
@@ -1997,29 +2369,54 @@ class GroupedGemmRowsKernel:
                                         up1 = acc_hi[base + 16 + a_]
                                         gate1 = acc_hi[base + 24 + a_]
                                     o = 16 * q + 2 * a_
-                                    g = cute.arch.mul_packed_f32x2((gate0, gate1), (gate_scale, gate_scale))
-                                    u = cute.arch.mul_packed_f32x2((up0, up1), (up_scale, up_scale))
-                                    t = cute.arch.mul_packed_f32x2((g[0], g[1]), (-LOG2_E, -LOG2_E))
+                                    g = cute.arch.mul_packed_f32x2(
+                                        (gate0, gate1), (gate_scale, gate_scale)
+                                    )
+                                    u = cute.arch.mul_packed_f32x2(
+                                        (up0, up1), (up_scale, up_scale)
+                                    )
+                                    t = cute.arch.mul_packed_f32x2(
+                                        (g[0], g[1]), (-LOG2_E, -LOG2_E)
+                                    )
                                     e = cute.arch.add_packed_f32x2(
-                                        (cute.math.exp2(t[0], fastmath=True), cute.math.exp2(t[1], fastmath=True)),
+                                        (
+                                            cute.math.exp2(t[0], fastmath=True),
+                                            cute.math.exp2(t[1], fastmath=True),
+                                        ),
                                         (1.0, 1.0),
                                     )
                                     r0 = cute.arch.rcp_approx(e[0])
                                     r1 = cute.arch.rcp_approx(e[1])
-                                    sg = cute.arch.mul_packed_f32x2((r0, r1), (g[0], g[1]))
-                                    tOut[o], tOut[o + 1] = cute.arch.mul_packed_f32x2((sg[0], sg[1]), (u[0], u[1]))
+                                    sg = cute.arch.mul_packed_f32x2(
+                                        (r0, r1), (g[0], g[1])
+                                    )
+                                    tOut[o], tOut[o + 1] = cute.arch.mul_packed_f32x2(
+                                        (sg[0], sg[1]), (u[0], u[1])
+                                    )
                                     if cutlass.const_expr(self.row_amax_out):
                                         # BF16 rounding is monotone in |x|, so BF16(max |x|) = max |BF16(x)|.
                                         row_max = abs_max_f32(row_max, tOut[o])
                                         row_max = abs_max_f32(row_max, tOut[o + 1])
                             if cutlass.const_expr(self.tma_store):
                                 self._tma_store_subtile(
-                                    tiled_copy_r2s, tRS_rC, tRS_sC, tOut, bSG_sC, bSG_gC, tma_atom_c, c_pipeline,
-                                    c_count, warp_idx, tile_info[0],
-                                    tile_info[1] * (self.out_tile_n // self.epi_tile_n) + j,
+                                    tiled_copy_r2s,
+                                    tRS_rC,
+                                    tRS_sC,
+                                    tOut,
+                                    bSG_sC,
+                                    bSG_gC,
+                                    tma_atom_c,
+                                    c_pipeline,
+                                    c_count,
+                                    warp_idx,
+                                    tile_info[0],
+                                    tile_info[1] * (self.out_tile_n // self.epi_tile_n)
+                                    + j,
                                 )
                             else:
-                                tRS_rC.store(tiled_copy_r2s.retile(tOut).load().to(self.c_dtype))
+                                tRS_rC.store(
+                                    tiled_copy_r2s.retile(tOut).load().to(self.c_dtype)
+                                )
                                 if is_valid_row:
                                     cute.copy(
                                         tiled_copy_r2s,
@@ -2029,7 +2426,10 @@ class GroupedGemmRowsKernel:
                                 cute.arch.fence_proxy("async.shared", space="cta")
                         if cutlass.const_expr(self.row_amax_out):
                             if is_valid_row:
-                                red_max_bf16_bits(cute.domain_offset((permuted_row,), row_amax), row_max)
+                                red_max_bf16_bits(
+                                    cute.domain_offset((permuted_row,), row_amax),
+                                    row_max,
+                                )
                 else:
                     for m_iter_idx in cutlass.range(m_iter_cnt):
                         # Each thread handles row: tile_m_start + m_iter_idx * 128 + epi_tidx
@@ -2037,11 +2437,15 @@ class GroupedGemmRowsKernel:
                         is_valid_row = permuted_row < tile_info[4]
                         alpha_val_iter = cutlass.Float32(0.0)
                         if is_valid_row:
-                            alpha_val_iter = cutlass.Float32(alpha_val) * row_scale[permuted_row]
+                            alpha_val_iter = (
+                                cutlass.Float32(alpha_val) * row_scale[permuted_row]
+                            )
 
                         for n_iter_idx in cutlass.range(n_subtile_cnt):
                             # Load accumulator from tensor memory buffer to register
-                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, (m_iter_idx, n_iter_idx))]
+                            tTR_tAcc_mn = tTR_tAcc[
+                                (None, None, None, (m_iter_idx, n_iter_idx))
+                            ]
                             cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                             acc_vec = tTR_rAcc.load()
@@ -2052,18 +2456,32 @@ class GroupedGemmRowsKernel:
                                 tPerm[o] = acc_vec[f] * alpha_val_iter
                             if cutlass.const_expr(self.tma_store):
                                 self._tma_store_subtile(
-                                    tiled_copy_r2s, tRS_rC, tRS_sC, tPerm, bSG_sC, bSG_gC, tma_atom_c, c_pipeline,
-                                    c_count, warp_idx, tile_info[0],
-                                    tile_info[1] * (self.out_tile_n // self.epi_tile_n) + n_iter_idx,
+                                    tiled_copy_r2s,
+                                    tRS_rC,
+                                    tRS_sC,
+                                    tPerm,
+                                    bSG_sC,
+                                    bSG_gC,
+                                    tma_atom_c,
+                                    c_pipeline,
+                                    c_count,
+                                    warp_idx,
+                                    tile_info[0],
+                                    tile_info[1] * (self.out_tile_n // self.epi_tile_n)
+                                    + n_iter_idx,
                                 )
                             else:
-                                acc_vec_final = tiled_copy_r2s.retile(tPerm).load().to(self.c_dtype)
+                                acc_vec_final = (
+                                    tiled_copy_r2s.retile(tPerm).load().to(self.c_dtype)
+                                )
                                 tRS_rC.store(acc_vec_final)
                                 if is_valid_row:
                                     cute.copy(
                                         tiled_copy_r2s,
                                         tRS_rC[None, 0, 0],
-                                        tRS_sC_grouped[(None, (m_iter_idx, n_iter_idx), 0)],
+                                        tRS_sC_grouped[
+                                            (None, (m_iter_idx, n_iter_idx), 0)
+                                        ],
                                     )
 
                                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -2081,7 +2499,9 @@ class GroupedGemmRowsKernel:
 
                         if is_valid_row:
                             coord_n = mma_tile_coord_mnl[1] * self.out_tile_n
-                            row_out_offset = cute.domain_offset((permuted_row, coord_n, 0), c)
+                            row_out_offset = cute.domain_offset(
+                                (permuted_row, coord_n, 0), c
+                            )
                             sC_row = m_iter_idx * 128 + epi_tidx
                             blk_copy_s2g(
                                 row_out_offset,
@@ -2218,8 +2638,21 @@ class GroupedGemmRowsKernel:
                         else:
                             nanosleep_hint()
                 if ready == 1:
-                    self._conv_region(lane, rb, n, mn, c_base, c_cols, n_tiles_total, n_row_blocks, amax_base,
-                                      ctl_base, q_base, qsf_base, qscale_base)
+                    self._conv_region(
+                        lane,
+                        rb,
+                        n,
+                        mn,
+                        c_base,
+                        c_cols,
+                        n_tiles_total,
+                        n_row_blocks,
+                        amax_base,
+                        ctl_base,
+                        q_base,
+                        qsf_base,
+                        qscale_base,
+                    )
                 k = k + 2
                 if lane == 0:
                     st_release_cta_s32(q_sbase + (1 + w) * 4, k)
@@ -2236,8 +2669,22 @@ class GroupedGemmRowsKernel:
                         nanosleep_hint()
 
     @cute.jit
-    def _conv_region(self, lane, rb, n, mn, c_base, c_cols, n_tiles_total, n_row_blocks, amax_base, ctl_base, q_base,
-                     qsf_base, qscale_base):
+    def _conv_region(
+        self,
+        lane,
+        rb,
+        n,
+        mn,
+        c_base,
+        c_cols,
+        n_tiles_total,
+        n_row_blocks,
+        amax_base,
+        ctl_base,
+        q_base,
+        qsf_base,
+        qscale_base,
+    ):
         """One warp converts one region (128 rows of a row block x the N tile's 128 output columns). Each step covers
         two rows: lanes 16h .. 16h + 15 read row 2i + h as 16 consecutive 16-byte pieces (8 values each, half a
         16-value block; the two halves of a block exchange their maxima), so every load and store is contiguous."""
@@ -2261,26 +2708,58 @@ class GroupedGemmRowsKernel:
                 pts, enc = token_scales(amaxs[u])
                 pay, sf = quant_half8(words[u], vmax, enc)
                 # scale bytes of blocks 4j .. 4j + 3 (even lanes cc = 8j, 8j + 2, 8j + 4, 8j + 6) as one word
-                word = (sf | (cute.arch.shuffle_sync_down(sf, 2) << 8) | (cute.arch.shuffle_sync_down(sf, 4) << 16)
-                        | (cute.arch.shuffle_sync_down(sf, 6) << 24))
+                word = (
+                    sf
+                    | (cute.arch.shuffle_sync_down(sf, 2) << 8)
+                    | (cute.arch.shuffle_sync_down(sf, 4) << 16)
+                    | (cute.arch.shuffle_sync_down(sf, 6) << 24)
+                )
                 if r < mn:
-                    st_b32(q_base + cutlass.Int64(r) * (c_cols // 2) + cutlass.Int64(n * (self.out_tile_n // 2) + cc * 4),
-                           pay)
+                    st_b32(
+                        q_base
+                        + cutlass.Int64(r) * (c_cols // 2)
+                        + cutlass.Int64(n * (self.out_tile_n // 2) + cc * 4),
+                        pay,
+                    )
                     if cc % 8 == 0:
-                        sf_row = (cutlass.Int64(r // 128) * k_tiles * 512 + cutlass.Int64((r % 32) * 16)
-                                  + cutlass.Int64(((r % 128) // 32) * 4))
+                        sf_row = (
+                            cutlass.Int64(r // 128) * k_tiles * 512
+                            + cutlass.Int64((r % 32) * 16)
+                            + cutlass.Int64(((r % 128) // 32) * 4)
+                        )
                         kt = cutlass.Int64(n * (self.out_tile_n // 64) + cc // 8)
                         st_b32(qsf_base + sf_row + kt * 512, word)
                     if n == 0:
                         if cc == 0:
                             st_b32(qscale_base + cutlass.Int64(r) * 4, f32_bits(pts))
         if lane == 0:
-            st_b32(ctl_base + (cutlass.Int64(n_row_blocks) + cutlass.Int64(rb) * n_tiles_total
-                               + cutlass.Int64(n)) * 4, cutlass.Int32(1))
+            st_b32(
+                ctl_base
+                + (
+                    cutlass.Int64(n_row_blocks)
+                    + cutlass.Int64(rb) * n_tiles_total
+                    + cutlass.Int64(n)
+                )
+                * 4,
+                cutlass.Int32(1),
+            )
 
     @cute.jit
-    def _tma_store_subtile(self, tiled_copy_r2s, tRS_rC, tRS_sC, vals, bSG_sC, bSG_gC, tma_atom_c, c_pipeline,
-                           c_count, warp_idx, m_tile, n_sub):
+    def _tma_store_subtile(
+        self,
+        tiled_copy_r2s,
+        tRS_rC,
+        tRS_sC,
+        vals,
+        bSG_sC,
+        bSG_gC,
+        tma_atom_c,
+        c_pipeline,
+        c_count,
+        warp_idx,
+        m_tile,
+        n_sub,
+    ):
         """Stage one output subtile (128 rows x epilogue tile) in shared memory and store it with one
         tensor-memory-access copy (whole box: rows past mn_limit carry zeros, rows past the tensor are clipped)."""
         tRS_rC.store(tiled_copy_r2s.retile(vals).load().to(self.c_dtype))
@@ -2290,7 +2769,9 @@ class GroupedGemmRowsKernel:
         cute.arch.fence_proxy("async.shared", space="cta")
         self.epilog_sync_barrier.arrive_and_wait()
         if warp_idx == self.epilog_warp_id[0]:
-            cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, m_tile, n_sub, 0)])
+            cute.copy(
+                tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, m_tile, n_sub, 0)]
+            )
             c_pipeline.producer_commit()
             c_pipeline.producer_acquire()
         self.epilog_sync_barrier.arrive_and_wait()
@@ -2495,8 +2976,12 @@ class GroupedGemmRowsKernel:
     ):
         scale_k = k // scaling_vector_size
         num_tiles = m // tile_size
-        a = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
-        b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
+        a = cute.make_tensor(
+            a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2))
+        )
+        b = cute.make_tensor(
+            b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
+        )
         a_sf = cute.make_tensor(
             a_sf_ptr,
             layout=cute.make_ordered_layout(
@@ -2526,7 +3011,9 @@ class GroupedGemmRowsKernel:
         q_scale = cute.make_tensor(q_scale_ptr, layout=cute.make_layout((m,)))
         q_ctl = cute.make_tensor(q_ctl_ptr, layout=cute.make_layout((m,)))
         # logical output (rows, output columns) for the tensor-memory-access store
-        c_out = cute.make_tensor(c_ptr, layout=cute.make_layout((m, c_row, 1), stride=(c_row, 1, m * c_row)))
+        c_out = cute.make_tensor(
+            c_ptr, layout=cute.make_layout((m, c_row, 1), stride=(c_row, 1, m * c_row))
+        )
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -2609,5 +3096,3 @@ class GroupedGemmRowsKernel:
 # ============================================================================
 # Run utilities
 # ============================================================================
-
-

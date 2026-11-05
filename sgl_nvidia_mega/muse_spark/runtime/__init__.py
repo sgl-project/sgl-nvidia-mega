@@ -61,7 +61,10 @@ class BuiltMuseSpark:
         """
         from sgl_nvidia_mega.muse_spark.spec import serves_this_step
 
-        if pp_proxy_tensors is not None or not forward_batch.forward_mode.is_target_verify():
+        if (
+            pp_proxy_tensors is not None
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
             return None
         if not serves_this_step():
             return None

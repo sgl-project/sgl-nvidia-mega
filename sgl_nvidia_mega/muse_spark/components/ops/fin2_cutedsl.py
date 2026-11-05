@@ -54,8 +54,6 @@ index), never on a block of its own grid; all blocks of every rank must make pro
 one-shot exchange). The grid is capped at the caller's block budget (persistent token loop above it).
 """
 
-import functools
-
 import torch
 
 try:
@@ -92,11 +90,17 @@ if HAS_CUTEDSL:
         """Compilation placeholders matching Fin2Arena.arguments(world)."""
 
         def uint32_ptr():
-            return make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
+            return make_ptr(
+                cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16
+            )
 
         return (
-            tuple(uint32_ptr() for _ in range(world)),  # phase-1 slot regions of every rank
-            tuple(uint32_ptr() for _ in range(world)),  # phase-2 slot regions of every rank
+            tuple(
+                uint32_ptr() for _ in range(world)
+            ),  # phase-1 slot regions of every rank
+            tuple(
+                uint32_ptr() for _ in range(world)
+            ),  # phase-2 slot regions of every rank
             tuple(uint32_ptr() for _ in range(world)),  # credit words of every rank
             uint32_ptr(),  # this rank's phase-1 slot region
             uint32_ptr(),  # this rank's phase-2 slot region
@@ -130,7 +134,10 @@ if HAS_CUTEDSL:
     def _st_relaxed_sys_u32(ptr, value, *, loc=None, ip=None):
         llvm.inline_asm(
             None,
-            [ptr.toint(loc=loc, ip=ip).ir_value(), cutlass.Uint32(value).ir_value(loc=loc, ip=ip)],
+            [
+                ptr.toint(loc=loc, ip=ip).ir_value(),
+                cutlass.Uint32(value).ir_value(loc=loc, ip=ip),
+            ],
             "st.relaxed.sys.global.u32 [$0], $1;",
             "l,r,~{memory}",
             has_side_effects=True,
@@ -167,7 +174,10 @@ if HAS_CUTEDSL:
         # Sticky error word, then trap: the CUDA error surfaces on the host.
         llvm.inline_asm(
             None,
-            [err_ptr.toint(loc=loc, ip=ip).ir_value(), cutlass.Uint32(code).ir_value(loc=loc, ip=ip)],
+            [
+                err_ptr.toint(loc=loc, ip=ip).ir_value(),
+                cutlass.Uint32(code).ir_value(loc=loc, ip=ip),
+            ],
             "red.relaxed.sys.global.or.b32 [$0], $1; fence.sc.sys; trap;",
             "l,r,~{memory}",
             has_side_effects=True,
@@ -215,7 +225,9 @@ if HAS_CUTEDSL:
         return ((a - b) & cutlass.Uint32(0x80000000)) != cutlass.Uint32(0)
 
     def _err_code(code, site, rank):
-        return cutlass.Uint32(0x80000000 | (code << 16) | site) | (cutlass.Uint32(rank) << cutlass.Uint32(8))
+        return cutlass.Uint32(0x80000000 | (code << 16) | site) | (
+            cutlass.Uint32(rank) << cutlass.Uint32(8)
+        )
 
     @cute.jit
     def acquire_credits(ex, seq, c, world: cutlass.Constexpr):
@@ -265,7 +277,9 @@ if HAS_CUTEDSL:
         slice_cols = hidden // world
         slice_words = slice_cols // 2
         slot = Int32(seq % cutlass.Uint32(K_SLOTS))
-        expert_values = cute.make_rmem_tensor(cute.make_layout((vec,)), cutlass.BFloat16)
+        expert_values = cute.make_rmem_tensor(
+            cute.make_layout((vec,)), cutlass.BFloat16
+        )
         packed = cute.recast_tensor(expert_values, cutlass.Uint32)
         _, store_atom = _relaxed_sys_atoms()
         for p in cutlass.range_constexpr(iters):
@@ -281,7 +295,9 @@ if HAS_CUTEDSL:
             word = (col - owner * slice_cols) // 2
             for d in cutlass.range_constexpr(world):
                 if owner == d:
-                    row = ((slot * world + rank) * rows_max + token) * slice_words + word
+                    row = (
+                        (slot * world + rank) * rows_max + token
+                    ) * slice_words + word
                     cute.copy(store_atom, packed, _vec_at(p1[d].toint(), row))
 
     @cute.jit
@@ -300,7 +316,14 @@ if HAS_CUTEDSL:
         """Owner: phase-1 words of every source -> fp32 sum in source-rank order -> bf16 -> output and every peer's
         phase-2 slot; the phase-1 slots read are re-armed. Non-owner: phase-2 words of the owner -> output; re-armed."""
         p2 = ex[1]
-        p1_local, p2_local, err, rank, rows_max, max_polls = ex[3], ex[4], ex[7], ex[8], ex[9], ex[10]
+        p1_local, p2_local, err, rank, rows_max, max_polls = (
+            ex[3],
+            ex[4],
+            ex[7],
+            ex[8],
+            ex[9],
+            ex[10],
+        )
         p1_addr = p1_local.toint()
         p2_addr = p2_local.toint()
         slice_cols = hidden // world
@@ -314,13 +337,21 @@ if HAS_CUTEDSL:
             memory_order=cute.nvgpu.MemoryOrder.WEAK,
             memory_scope=cute.nvgpu.MemoryScope.CTA,
         )
-        rank_values = cute.make_rmem_tensor(cute.make_layout((AR_VEC_WORDS, world)), cutlass.Uint32)
+        rank_values = cute.make_rmem_tensor(
+            cute.make_layout((AR_VEC_WORDS, world)), cutlass.Uint32
+        )
         rank_bf16 = cute.recast_tensor(rank_values, cutlass.BFloat16)
-        result = cute.make_rmem_tensor(cute.make_layout((AR_VEC_SIZE,)), cutlass.BFloat16)
+        result = cute.make_rmem_tensor(
+            cute.make_layout((AR_VEC_SIZE,)), cutlass.BFloat16
+        )
         result_words = cute.recast_tensor(result, cutlass.Uint32)
-        empty1 = cute.make_rmem_tensor(cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32)
+        empty1 = cute.make_rmem_tensor(
+            cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32
+        )
         empty1.fill(P1_EMPTY)
-        empty2 = cute.make_rmem_tensor(cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32)
+        empty2 = cute.make_rmem_tensor(
+            cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32
+        )
         empty2.fill(P2_EMPTY)
         got = cute.make_rmem_tensor(cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32)
         for p in cutlass.range_constexpr(iters):
@@ -343,12 +374,18 @@ if HAS_CUTEDSL:
                 ready = False
                 while not ready:
                     for src in cutlass.range_constexpr(world):
-                        row = ((slot * world + src) * rows_max + token) * slice_words + word
-                        cute.copy(load_atom, _vec_at(p1_addr, row), rank_values[None, src])
+                        row = (
+                            (slot * world + src) * rows_max + token
+                        ) * slice_words + word
+                        cute.copy(
+                            load_atom, _vec_at(p1_addr, row), rank_values[None, src]
+                        )
                     ready = True
                     for src in cutlass.range_constexpr(world):
                         for a in cutlass.range_constexpr(AR_VEC_WORDS):
-                            ready = ready & (rank_values[a, src] != cutlass.Uint32(P1_EMPTY))
+                            ready = ready & (
+                                rank_values[a, src] != cutlass.Uint32(P1_EMPTY)
+                            )
                     if not ready:
                         polls += cutlass.Uint32(1)
                         if polls > cutlass.Uint32(K_SPIN_POLLS):
@@ -368,7 +405,9 @@ if HAS_CUTEDSL:
                     result_words[v] = value
                 for d in cutlass.range_constexpr(world):
                     if rank != d:
-                        row = ((slot * world + rank) * rows_max + token) * slice_words + word
+                        row = (
+                            (slot * world + rank) * rows_max + token
+                        ) * slice_words + word
                         cute.copy(store_atom, result_words, _vec_at(p2[d].toint(), row))
                 for src in cutlass.range_constexpr(world):
                     row = ((slot * world + src) * rows_max + token) * slice_words + word
@@ -638,9 +677,13 @@ if HAS_CUTEDSL:
             if self.is_persistent and cluster_size > 1:
                 raise ValueError("Persistent finalize exchange requires cluster_size=1")
             if self.cfg.vec_size != AR_VEC_SIZE:
-                raise ValueError("Finalize exchange requires eight BF16 values per lane")
+                raise ValueError(
+                    "Finalize exchange requires eight BF16 values per lane"
+                )
             if hidden_dim % (world * 2 * AR_VEC_SIZE) or world < 2:
-                raise ValueError("Finalize exchange requires H divisible by 16 * world, world >= 2")
+                raise ValueError(
+                    "Finalize exchange requires H divisible by 16 * world, world >= 2"
+                )
             self.num_token_blocks = num_tokens * cluster_size
             if self.is_persistent:
                 self.num_token_blocks = max_blocks

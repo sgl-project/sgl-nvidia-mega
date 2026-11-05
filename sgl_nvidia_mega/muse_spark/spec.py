@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Requirements,
     )
 
-from sgl_nvidia_mega.muse_spark import ARCHITECTURE, HF_CONFIG
+from sgl_nvidia_mega.muse_spark import HF_CONFIG
 from sgl_nvidia_mega.muse_spark.plan import MAX_ROWS
 
 # the SGLang megakernel contract this spec is written against
