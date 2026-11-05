@@ -25,6 +25,20 @@ import torch
 from . import sgl_compat
 from .ar_norm_residual import launch_config
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "kernels/jit/utils/compile/paths.py": ("KERNEL_PATH",),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+}
+
+
 _CUH = Path(__file__).resolve().parent / "csrc" / "ar2_norm_residual.cuh"
 _MAX_WORLD = 8
 

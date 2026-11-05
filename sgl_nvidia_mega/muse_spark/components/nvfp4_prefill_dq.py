@@ -39,6 +39,15 @@ import os
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_parallel",),
+    "srt/layers/cp/utils.py": ("is_cp_active",),
+    "srt/layers/radix_attention.py": ("AttentionType",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "nvfp4_prefill_dq"

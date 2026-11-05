@@ -30,6 +30,20 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/ops/communication/nvlink_comm.py": (
+        "all_gather_pull",
+        "get_multicast_ptr",
+    ),
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "pull_bounded"  # env MUSE_VR_PULL_BOUNDED
@@ -147,7 +161,7 @@ def all_gather_pull(
 ) -> bool:
     """``nvlink_comm.all_gather_pull(comm, input, output, out_mc_ptr=...)``, with bounded barrier waits when engaged
     (tallied per call site under this option's name). Returns whether the bounded copy ran."""
-    from sglang.kernels.ops.communication import nvlink_comm
+    import sglang.kernels.ops.communication.nvlink_comm as nvlink_comm
 
     if not engage():
         nvlink_comm.all_gather_pull(comm, input, output, out_mc_ptr=out_mc_ptr)

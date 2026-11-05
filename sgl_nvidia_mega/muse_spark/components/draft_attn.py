@@ -40,6 +40,12 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "draft_attn"  # env MUSE_VR_DRAFT_ATTN

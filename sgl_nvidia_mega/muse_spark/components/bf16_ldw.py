@@ -32,6 +32,14 @@ import threading
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/models/muse_spark.py": ("get_forward",),
+    "srt/layers/muse_spark/muse_spark_bf16_moe.py": ("MuseSpark1xBf16Experts",),
+    "srt/layers/moe/utils.py": ("is_sbo_enabled", "is_tbo_enabled"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "bf16_ldw"
@@ -128,7 +136,7 @@ def _tuning() -> bool:
 def _blocked() -> bool:
     """Sequence-parallel MoE or two-batch / single-batch overlap (unknown configuration: blocked)."""
     try:
-        from sglang.srt.models import muse_spark as ms
+        import sglang.srt.models.muse_spark as ms
 
         if bool(getattr(ms.get_forward(), "sp_active", False)):
             return True
@@ -242,7 +250,7 @@ def register() -> bool:
 
     fi_guard.check(NAME)
     import flashinfer.fused_moe as ffm
-    from sglang.srt.layers import muse_spark_bf16_moe as b16
+    import sglang.srt.layers.muse_spark_bf16_moe as b16
 
     cls = b16.MuseSpark1xBf16Experts
     orig_prepare = cls.prepare_trtllm_weights

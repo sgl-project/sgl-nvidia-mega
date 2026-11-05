@@ -22,6 +22,12 @@ from pathlib import Path
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": ("load_jit", "make_cpp_args"),
+}
+
+
 _CUH = Path(__file__).resolve().parents[1] / "csrc" / "mc_push.cuh"
 DEFAULT_UNROLL = 4
 DEFAULT_CTAS_PER_SM = 2

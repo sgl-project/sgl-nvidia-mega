@@ -110,6 +110,22 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/fused_op.py": ("_oot_dispatch_key", "get_fused_op_backend"),
+    "srt/layers/radix_attention.py": ("AttentionType",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+    "kernels/spec.py": ("KernelBackend",),
+    "srt/layers/attention/trtllm_mha_backend.py": ("TRTLLMHAAttnBackend",),
+    "srt/layers/cp/utils.py": ("is_cp_active",),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "kernels/ops/layernorm/muse_spark_norm_gate.py|kernels/ops/muse_spark_v12/fused_norm_gate.py": (
+        "FusedRMSNormGate",
+    ),
+    "srt/environ.py": ("envs",),
+}
+
+
 logger = logging.getLogger(__name__)
 
 SWA = "swa_verify_attn"
@@ -481,7 +497,7 @@ def _qk_prologue_args(attn, positions, qkv, kv_store):
         or qkv.shape[0] // TOKENS > _limit("qk_max_reqs", attn.attn.tp_k_head_num)
     ):
         return None
-    from sglang.kernels import fused_op
+    import sglang.kernels.fused_op as fused_op
     from sglang.kernels.spec import KernelBackend
 
     from .ops import swa_verify_attn as op
@@ -526,7 +542,7 @@ def _qk_rope_args(attn, positions, qkv, kv_store):
     count whose column class the kernel prologues reproduce, with the operand layouts they read, else None."""
     if kv_store is None:
         return None
-    from sglang.kernels import fused_op
+    import sglang.kernels.fused_op as fused_op
     from sglang.kernels.spec import KernelBackend
 
     from .ops import swa_verify_attn as op
@@ -573,7 +589,7 @@ def _qk_full_prologue_eps(attn, qkv, kv_store):
     the full_verify_attn prologue covers, else None."""
     if not _state["fullv_qk"] or kv_store is None:
         return None
-    from sglang.kernels import fused_op
+    import sglang.kernels.fused_op as fused_op
     from sglang.kernels.spec import KernelBackend
 
     from .ops import swa_verify_attn as op
@@ -621,7 +637,7 @@ def _stock_diverts_attention(ra, forward_batch) -> bool:
 
 def _common_reason(attn, qkv, forward_batch):
     """Reason the call must run stock, or None; checks shared by both components. Returns (reason, backend)."""
-    from sglang.srt.layers import radix_attention as ra
+    import sglang.srt.layers.radix_attention as ra
     from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
     from sglang.srt.layers.cp.utils import is_cp_active
     from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -664,7 +680,7 @@ def _norm_gate_eps(attn, qkv, enabled=None):
     ``enabled``: the component's own norm-gate switch (default: the swa / full_verify / SWA-T one)."""
     if not (_state["norm_gate"] if enabled is None else enabled):
         return None
-    from sglang.kernels import fused_op
+    import sglang.kernels.fused_op as fused_op
     from sglang.kernels.ops.muse_spark_v12.fused_norm_gate import FusedRMSNormGate
     from sglang.kernels.spec import KernelBackend
 
@@ -772,7 +788,7 @@ def _norm_gate_cfg(attn, qkv, enabled, allow16: bool):
     in a configuration a fused epilogue reproduces (8 bytes; 16 bytes only with ``allow16``), else None."""
     if not enabled:
         return None
-    from sglang.kernels import fused_op
+    import sglang.kernels.fused_op as fused_op
     from sglang.kernels.ops.muse_spark_v12.fused_norm_gate import FusedRMSNormGate
     from sglang.kernels.spec import KernelBackend
 

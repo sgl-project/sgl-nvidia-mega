@@ -44,6 +44,32 @@ import threading
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/runtime_context.py": (
+        "get_disagg",
+        "get_memory",
+        "get_parallel",
+        "get_spec",
+        "get_exec",
+    ),
+    "srt/speculative/dflash_utils.py": (
+        "get_dflash_attention_sliding_window_size",
+        "get_dflash_layer_types",
+    ),
+    "srt/mem_cache/memory_pool.py": (
+        "KVWriteLoc",
+        "unwrap_write_loc",
+        "write_loc_is_physical",
+        "MHATokenToKVPool",
+    ),
+    "srt/mem_cache/swa_memory_pool.py": ("SWAKVPool",),
+    "srt/layers/radix_attention.py": ("RadixAttention",),
+    "srt/mem_cache/allocator/swa.py": ("SWATokenToKVPoolAllocator",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "kv_draftwin"  # env MUSE_VR_KV_DRAFTWIN

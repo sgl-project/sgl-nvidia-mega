@@ -29,6 +29,28 @@ from sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit import (
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": (
+        "cache_once",
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "kernels/ops/layernorm/muse_spark_norm_residual_jit.py": (
+        "_cluster_launch_config",
+        "norm_residual_launch_config",
+    ),
+    "srt/runtime_context.py": ("get_forward", "get_parallel"),
+    "kernels/ops/layernorm/muse_spark_norm_residual.py": (
+        "FusedPostNormResidualPreNorm",
+    ),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+}
+
+
 if TYPE_CHECKING:
     from sglang.kernels.ops.layernorm.muse_spark_norm_residual import (
         FusedPostNormResidualPreNorm,

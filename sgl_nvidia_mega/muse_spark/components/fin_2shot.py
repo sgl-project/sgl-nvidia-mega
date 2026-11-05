@@ -35,6 +35,13 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_forward", "get_parallel"),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "fin_2shot"

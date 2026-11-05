@@ -32,6 +32,17 @@ import os
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/attention/trtllm_mha_backend.py": ("_trtllm_native_nvfp4_kv_buffer",),
+    "srt/runtime_context.py": ("get_parallel",),
+    "srt/layers/cp/utils.py": ("is_cp_active",),
+    "srt/layers/radix_attention.py": ("AttentionType",),
+    "srt/mem_cache/memory_pool.py": ("KVWriteLoc",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 TARGET_FWD = (
@@ -188,7 +199,7 @@ def _forward_extend_around(
     ):
         bed.count("nvfp4_kv_verify", "stock")
         return original(self, q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
-    from sglang.srt.layers.attention import trtllm_mha_backend as tb
+    import sglang.srt.layers.attention.trtllm_mha_backend as tb
 
     from .ops.nvfp4_verify_attn import nvfp4_verify_attn
 

@@ -34,6 +34,20 @@ from pathlib import Path
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/muse_spark/muse_spark_fp4_moe.py": (
+        "finalize_with_post_expert_norm",
+        "MuseSpark1xFp4Experts",
+    ),
+    "srt/layers/muse_spark/muse_spark_bf16_moe.py": (
+        "finalize_with_post_expert_norm",
+        "MuseSpark1xBf16Experts",
+    ),
+    "srt/layers/moe/token_dispatcher/flashinfer.py": ("FlashinferDispatcher",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "sp_combine_inplace"
@@ -93,8 +107,8 @@ def _fp4_finalize(
     self, deferred_output, *, num_tokens, post_expert_norm, out_dtype, ar_workspace=None
 ):
     """``MuseSpark1xFp4Experts._finalize_deferred_output`` with the fused finalize writing into ``_dest``."""
+    import sglang.srt.layers.muse_spark_fp4_moe as m
     import torch
-    from sglang.srt.layers import muse_spark_fp4_moe as m
 
     dest = _dest.get()
     if dest is None or ar_workspace is not None or out_dtype != torch.bfloat16:
@@ -146,8 +160,8 @@ def _fp4_finalize(
 
 def _bf16_finalize(self, deferred_output, *, num_tokens, post_expert_norm, out_dtype):
     """``MuseSpark1xBf16Experts._finalize_deferred_output`` with the finalize writing into ``_dest``."""
+    import sglang.srt.layers.muse_spark_bf16_moe as m
     import torch
-    from sglang.srt.layers import muse_spark_bf16_moe as m
 
     dest = _dest.get()
     if dest is None or out_dtype != torch.bfloat16:
@@ -227,8 +241,9 @@ def _wrap_dispatcher_init(fn):
 
 
 def install() -> None:
-    from sglang.srt.layers import muse_spark_bf16_moe, muse_spark_fp4_moe
-    from sglang.srt.layers.moe.token_dispatcher import flashinfer as fdisp
+    import sglang.srt.layers.moe.token_dispatcher.flashinfer as fdisp
+    import sglang.srt.layers.muse_spark_bf16_moe as muse_spark_bf16_moe
+    import sglang.srt.layers.muse_spark_fp4_moe as muse_spark_fp4_moe
 
     fp4 = muse_spark_fp4_moe.MuseSpark1xFp4Experts
     bf16 = muse_spark_bf16_moe.MuseSpark1xBf16Experts

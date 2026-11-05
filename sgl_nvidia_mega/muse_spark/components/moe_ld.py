@@ -76,6 +76,16 @@ import threading
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/models/muse_spark.py": ("get_forward",),
+    "srt/layers/muse_spark/muse_spark_fp4_moe.py": ("MuseSpark1xFp4Experts",),
+    "srt/layers/muse_spark/muse_spark_nvfp4_moe.py": ("MuseSparkNvFp4FusedMoEMethod",),
+    "srt/layers/moe/utils.py": ("is_sbo_enabled", "is_tbo_enabled"),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "moe_ld"
@@ -200,7 +210,7 @@ def _overlap_enabled() -> bool:
 
 def _sp_active() -> bool:
     try:
-        from sglang.srt.models import muse_spark as ms
+        import sglang.srt.models.muse_spark as ms
 
         return bool(getattr(ms.get_forward(), "sp_active", False))
     except Exception:  # noqa: BLE001
@@ -800,7 +810,7 @@ def _early_register(HookRegistry=None, HookType=None) -> bool:
     if why:
         bed.report(EARLY_NAME, False, reason=why)
         return False
-    from sglang.srt.layers import muse_spark_fp4_moe as fm
+    import sglang.srt.layers.muse_spark_fp4_moe as fm
 
     from .ops import norm_fp4_quant_early as nfq
 
@@ -841,8 +851,8 @@ def register() -> bool:
     )  # FlashInfer version / batched-GEMM artifact class; raises under MUSE_VR_REQUIRE_ENGAGED=1
     fi_guard.check("moe_ld_ops")
     import flashinfer.fused_moe as ffm
-    from sglang.srt.layers import muse_spark_fp4_moe as fp4
-    from sglang.srt.layers.quantization import muse_spark_nvfp4_moe as q
+    import sglang.srt.layers.muse_spark_fp4_moe as fp4
+    import sglang.srt.layers.quantization.muse_spark_nvfp4_moe as q
 
     orig_pwal = q.MuseSparkNvFp4FusedMoEMethod.process_weights_after_loading
     orig_forward = fp4.MuseSpark1xFp4Experts.forward

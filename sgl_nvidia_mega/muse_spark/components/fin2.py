@@ -33,6 +33,15 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "_allocate_symmetric_memory",
+    ),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "fin2"

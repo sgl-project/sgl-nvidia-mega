@@ -27,6 +27,12 @@ from pathlib import Path
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": ("load_jit", "make_cpp_args"),
+}
+
+
 _CUH = Path(__file__).resolve().parents[1] / "csrc" / "a2a_pull.cuh"
 MAX_RANKS = 8
 DEFAULT_UNROLL = 8

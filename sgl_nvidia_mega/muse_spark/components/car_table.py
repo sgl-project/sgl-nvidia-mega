@@ -45,6 +45,15 @@ import os
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/ops/communication/all_reduce.py": ("AllReduceAlgo",),
+    "srt/distributed/device_communicators/configs/custom_all_reduce_v2.py": (
+        "two_shot_push_slot_bytes",
+    ),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "car_table"

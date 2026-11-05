@@ -40,6 +40,14 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/models/muse_spark.py": ("MuseSpark1xDecoderLayer", "MuseSpark1xMoE"),
+    "srt/layers/muse_spark/muse_spark_fp4_moe.py": ("MuseSpark1xFp4Experts",),
+    "srt/runtime_context.py": ("get_parallel", "get_forward"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "proj_publish"
@@ -113,7 +121,7 @@ def _take_marker(t: torch.Tensor, site: str) -> bool:
 
 
 def install() -> None:
-    from sglang.srt.models import muse_spark as model
+    import sglang.srt.models.muse_spark as model
 
     from .ops import proj_publish as pp
 
@@ -206,7 +214,7 @@ def install() -> None:
         model.MuseSpark1xDecoderLayer.forward = layer_forward
     if "P" in sites:
         model.bf16_gemm_dispatch = bf16_gemm_dispatch
-        from sglang.srt.layers.muse_spark import muse_spark_fp4_moe as fp4
+        import sglang.srt.layers.muse_spark.muse_spark_fp4_moe as fp4
 
         orig_prepare = fp4.MuseSpark1xFp4Experts.prepare_input
         orig_experts = model.MuseSpark1xMoE._forward_experts

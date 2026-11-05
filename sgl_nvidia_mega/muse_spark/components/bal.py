@@ -24,6 +24,12 @@ from typing import Optional
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": ("load_jit", "make_cpp_args"),
+}
+
+
 NUM_EXPERTS = 256
 TOP_K = 8
 MAX_ROWS = 512

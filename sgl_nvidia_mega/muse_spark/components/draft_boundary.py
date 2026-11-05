@@ -61,6 +61,23 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/models/dflash.py": ("DFlashAttention", "_is_npu"),
+    "srt/batch_invariant_ops/__init__.py": ("is_batch_invariant_mode_enabled",),
+    "srt/layers/layernorm.py": ("RMSNorm",),
+    "srt/layers/moe/utils.py": ("should_skip_mlp_all_reduce",),
+    "srt/runtime_context.py": ("get_parallel", "get_forward"),
+    "srt/distributed/*.py": ("get_tp_group",),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+    "srt/layers/quantization/unquant.py": ("UnquantizedLinearMethod",),
+    "srt/layers/logits_processor.py": ("LogitsProcessorOutput",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "draft_boundary"  # env MUSE_VR_DRAFT_BOUNDARY
@@ -346,8 +363,8 @@ def _gemv_ready(m: int, device) -> bool:
 def _qk_eligible(model, flag_name: str = "draft_qk") -> bool:
     if not bed.flag(flag_name):
         return False
+    import sglang.srt.models.dflash as d
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-    from sglang.srt.models import dflash as d
 
     if d._is_npu:
         return False

@@ -29,6 +29,23 @@ import torch
 
 from . import sgl_compat
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "kernels/jit/utils/compile/paths.py": ("KERNEL_PATH",),
+    "kernels/ops/layernorm/muse_spark_norm_residual_jit.py|kernels/ops/muse_spark_v12/norm_residual.py": (
+        "norm_residual_launch_config",
+    ),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "_allocate_symmetric_memory",
+    ),
+}
+
+
 _CUH = Path(__file__).resolve().parent / "csrc" / "moe_tail.cuh"
 ROWS_PER_CTA = 16
 MAX_WORLD = 8

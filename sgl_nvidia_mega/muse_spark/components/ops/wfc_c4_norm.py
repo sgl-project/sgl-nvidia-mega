@@ -15,6 +15,16 @@ from pathlib import Path
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": ("load_jit",),
+    "kernels/jit/utils/compile/paths.py": ("KERNEL_PATH",),
+    "kernels/ops/layernorm/muse_spark_norm_residual_jit.py": (
+        "norm_residual_launch_config",
+    ),
+}
+
+
 _CSRC = Path(__file__).resolve().parents[1] / "csrc"
 _CUH = _CSRC / "wfc_c4_norm.cuh"
 

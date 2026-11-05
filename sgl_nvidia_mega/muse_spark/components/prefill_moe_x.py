@@ -61,6 +61,12 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_flags",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "prefill_moe_x"

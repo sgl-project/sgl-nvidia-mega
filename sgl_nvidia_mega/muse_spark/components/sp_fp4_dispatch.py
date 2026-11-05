@@ -41,6 +41,26 @@ from pathlib import Path
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/moe/token_dispatcher/flashinfer.py": (
+        "FlashinferDispatcher",
+        "FlashinferDispatchOutput",
+    ),
+    "srt/models/muse_spark.py": ("MuseSpark1xMoE",),
+    "srt/environ.py": ("envs",),
+    "srt/layers/muse_spark/muse_spark_fp4_moe.py|srt/layers/muse_spark_fp4_moe.py": (
+        "MuseSpark1xFp4Experts",
+    ),
+    "srt/layers/dp_attention.py": (
+        "get_dp_global_num_tokens",
+        "get_is_extend_in_batch",
+    ),
+    "srt/layers/moe/topk.py": ("StandardTopKOutput", "TopKOutputChecker"),
+    "srt/runtime_context.py": ("get_forward",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "sp_fp4_dispatch"
@@ -408,8 +428,8 @@ def _routed_moe(*args, **kwargs):
 
 def install() -> None:
     import flashinfer.fused_moe as ffm
-    from sglang.srt.layers.moe.token_dispatcher import flashinfer as fdisp
-    from sglang.srt.models import muse_spark
+    import sglang.srt.layers.moe.token_dispatcher.flashinfer as fdisp
+    import sglang.srt.models.muse_spark as muse_spark
 
     if getattr(fdisp.FlashinferDispatcher.dispatch, "__wrapped_by_sp_fp4__", False):
         return

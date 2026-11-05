@@ -35,6 +35,10 @@ import os
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "gemm_pick"
@@ -118,8 +122,8 @@ def _drop_pool_overlap(rules: tuple) -> tuple:
 
 
 def install(rules: tuple) -> None:
-    from sglang.kernels.ops.gemm import cutedsl_bf16_gemm as G
-    from sglang.srt.layers.quantization import unquant as U
+    import sglang.kernels.ops.gemm.cutedsl_bf16_gemm as G
+    import sglang.srt.layers.quantization.unquant as U
 
     orig_use = G.use_cutedsl_bf16_gemm
 

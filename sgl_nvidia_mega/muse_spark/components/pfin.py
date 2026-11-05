@@ -27,6 +27,12 @@ import logging
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_forward",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "pfin"

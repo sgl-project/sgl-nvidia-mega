@@ -40,6 +40,18 @@ import torch
 
 from . import bed, pull_bounded
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/logits_processor.py": ("gathered_softcap_logits", "get_parallel"),
+    "srt/runtime_context.py": ("get_schedule", "get_spec"),
+    "srt/distributed/device_communicators/vocab_gather.py": (
+        "NVLinkVocabGather",
+        "make_vocab_gather",
+    ),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "verify_logits_gather"  # env MUSE_VR_VERIFY_LOGITS_GATHER
@@ -198,7 +210,7 @@ def _eligible(lp, logits: torch.Tensor) -> str | None:
 def finish_deferred_gather(original, lp, logits: torch.Tensor) -> torch.Tensor:
     """``LogitsProcessor.finish_deferred_gather`` with the NCCL gather replaced (pinned revision of the body:
     ``_gather_softcap_fused(logits, None, use_buffer=False)``)."""
-    from sglang.srt.layers import logits_processor as lpmod
+    import sglang.srt.layers.logits_processor as lpmod
 
     reason = _eligible(lp, logits)
     # the tensor-parallel group as the stock body names it on each layout

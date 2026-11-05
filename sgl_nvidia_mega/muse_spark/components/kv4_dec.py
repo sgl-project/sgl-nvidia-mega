@@ -26,6 +26,13 @@ import logging
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "kv4_dec"

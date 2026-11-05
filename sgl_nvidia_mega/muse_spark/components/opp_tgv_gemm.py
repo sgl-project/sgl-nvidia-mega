@@ -55,6 +55,12 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cutlass_dsl import T
 from sglang.srt.utils import get_device_core_count, is_sm100_supported
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/utils/*.py": ("get_device_core_count", "is_sm100_supported"),
+}
+
+
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
 # Tactic 1 (1-CTA 64×8 stages=8) is the default.

@@ -40,6 +40,12 @@ import threading
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/models/muse_spark.py": ("MuseSpark1xModel",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "rs_samem"
@@ -214,8 +220,8 @@ def register() -> bool:
             bed.report(NAME, False, reason=f"pin mismatch: {rel}")
             return False
     try:
-        from sglang.kernels.ops.communication import sp_collective_gemm as scg
-        from sglang.srt.models import muse_spark
+        import sglang.kernels.ops.communication.sp_collective_gemm as scg
+        import sglang.srt.models.muse_spark as muse_spark
 
         from . import fp8_prefill
 

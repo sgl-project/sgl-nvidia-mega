@@ -26,6 +26,18 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "srt/mem_cache/memory_pool.py": ("MHATokenToKVPool",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "draft_kv_append"  # env MUSE_VR_DRAFT_KV_APPEND

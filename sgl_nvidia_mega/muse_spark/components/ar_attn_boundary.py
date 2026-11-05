@@ -55,6 +55,19 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+    "srt/layers/moe/utils.py": ("should_skip_mlp_all_reduce",),
+    "srt/runtime_context.py": ("get_forward", "get_parallel"),
+    "srt/distributed/*.py": ("get_tp_group",),
+    "srt/models/muse_spark.py": ("_use_split_bf16_router",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "ar_attn_boundary"  # env MUSE_VR_AR_ATTN_BOUNDARY

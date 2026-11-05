@@ -18,15 +18,31 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import sglang.kernels.ops.kvcache.hicache as _sgl_kernels_ops_kvcache_hicache
 import torch
-from sglang.kernels.ops.kvcache.hicache import (
-    can_use_write_back_jit_kernel,
+from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
+
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/ops/kvcache/hicache.py": (
+        "can_use_write_back_jit_kernel",
+        "transfer_hicache_all_layer_mla_staged_lf_pf",
+        "transfer_hicache_one_layer_mla",
+    ),
+    "srt/mem_cache/pool_host/common.py": (
+        "ALLOC_MEMORY_FUNCS",
+        "_cuda_host_unregister",
+    ),
+    "srt/mem_cache/pool_host/mha.py": ("MHATokenToKVPoolHost", "_is_cuda", "_is_hip"),
+}
+
+jit_transfer_hicache_all_layer_mla_staged_lf_pf = (
+    _sgl_kernels_ops_kvcache_hicache.transfer_hicache_all_layer_mla_staged_lf_pf
 )
-from sglang.kernels.ops.kvcache.hicache import (
-    transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
-)
-from sglang.kernels.ops.kvcache.hicache import (
-    transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
+import sglang.kernels.ops.kvcache.hicache as _sgl_kernels_ops_kvcache_hicache
+
+jit_transfer_hicache_one_layer_mla = (
+    _sgl_kernels_ops_kvcache_hicache.transfer_hicache_one_layer_mla
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,

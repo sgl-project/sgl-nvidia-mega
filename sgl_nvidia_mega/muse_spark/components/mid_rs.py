@@ -56,6 +56,25 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/ops/layernorm/muse_spark_norm_residual_jit.py": (
+        "fused_norm_residual",
+        "norm_residual_launch_config",
+    ),
+    "srt/layers/quantization/unquant.py": ("bf16_gemm_dispatch",),
+    "srt/runtime_context.py": ("get_forward",),
+    "srt/layers/moe/utils.py": ("should_skip_mlp_all_reduce",),
+    "srt/state_capturer/routed_experts.py": ("get_global_experts_capturer",),
+    "srt/distributed/*.py": ("get_tp_group",),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+    "srt/layers/dp_attention.py": ("is_dp_attention_enabled",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "mid_rs"  # env MUSE_VR_MID_RS

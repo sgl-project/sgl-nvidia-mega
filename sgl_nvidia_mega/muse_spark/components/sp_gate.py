@@ -39,6 +39,17 @@ import threading
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/models/muse_spark.py": (
+        "MuseSpark1xForCausalLM|MuseSparkTextForCausalLM",
+        "MuseSpark1xModel",
+    ),
+    "srt/model_executor/cuda_graph_config.py": ("Backend",),
+    "srt/runtime_context.py": ("get_exec",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "sp_gate"
@@ -173,8 +184,8 @@ def _wrap_entry(fn):
 
 def install(min_tokens: int) -> None:
     """Patch ``layernorm_sp.runs_sp`` and the two Muse Spark forward entry points (also used by the tests)."""
-    from sglang.srt.layers import layernorm_sp
-    from sglang.srt.models import muse_spark
+    import sglang.srt.layers.layernorm_sp as layernorm_sp
+    import sglang.srt.models.muse_spark as muse_spark
 
     with _lock:
         _state["min_tokens"] = int(min_tokens)

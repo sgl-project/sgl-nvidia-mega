@@ -16,6 +16,20 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/arg_groups/overrides.py": (
+        "attention_backends_of",
+        "declare_resolution",
+        "post_capture_kv_sizing_planned",
+        "resolved_view",
+        "resolving_view",
+        "use_mla_backend",
+    ),
+    "srt/runtime_context.py": ("get_platform",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 _DFLASH_DRAFT_BACKENDS_WITH_OWN_POOL = ("fa4",)

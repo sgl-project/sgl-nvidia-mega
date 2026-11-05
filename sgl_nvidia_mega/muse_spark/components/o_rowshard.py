@@ -79,6 +79,14 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/model_executor/model_runner.py": ("ModelRunner",),
+    "srt/model_executor/cuda_graph_config.py": ("Backend",),
+    "srt/runtime_context.py": ("get_exec", "get_parallel"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "o_rowshard"
@@ -978,7 +986,7 @@ def install_into(
     model, group, rank: int, world: int, cap_rows: int, chunks: int
 ) -> RowShardContext:
     """Build the context for ``model`` (collective over ``group``) and hook the SP entry points (also used by tests)."""
-    from sglang.srt.layers import layernorm_sp
+    import sglang.srt.layers.layernorm_sp as layernorm_sp
 
     linears = _o_projs(model) if not isinstance(model, (list, tuple)) else list(model)
     if not linears:
@@ -1113,7 +1121,7 @@ def register() -> bool:
             bed.report(NAME, False, reason=str(e))
             return False
     try:
-        from sglang.srt.model_executor import model_runner as mr
+        import sglang.srt.model_executor.model_runner as mr
 
         runner = mr.ModelRunner
         if not getattr(runner.load_model, "__wrapped_by_o_rowshard__", False):

@@ -27,6 +27,23 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/layernorm_sp.py": ("runs_sp",),
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "srt/layers/muse_spark/muse_spark_layers.py|srt/layers/muse_spark_layers.py": (
+        "MuseSpark1xNormPreservingResidualConnection",
+        "MuseSpark1xRMSNorm",
+        "MuseSpark1xRMSNormWithInputScale",
+    ),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "final_norm"  # env MUSE_VR_FINAL_NORM
@@ -170,7 +187,7 @@ class _Norm(torch.nn.Module):
 
 
 def _eligible(model, forward_batch) -> str | None:
-    from sglang.srt.layers import layernorm_sp
+    import sglang.srt.layers.layernorm_sp as layernorm_sp
     from sglang.srt.layers.muse_spark_layers import (
         MuseSpark1xNormPreservingResidualConnection,
         MuseSpark1xRMSNorm,

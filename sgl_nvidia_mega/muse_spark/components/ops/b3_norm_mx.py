@@ -23,6 +23,17 @@ from typing import Optional, Tuple
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "kernels/jit/utils/compile/paths.py": ("KERNEL_PATH",),
+}
+
+
 _CSRC = Path(__file__).resolve().parents[1] / "csrc"
 _CUH = _CSRC / "b3_norm_mx.cuh"
 H = 8192

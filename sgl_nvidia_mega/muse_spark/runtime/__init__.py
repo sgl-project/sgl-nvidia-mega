@@ -19,6 +19,12 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sgl_nvidia_mega.muse_spark.plan import Facts, plan
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": ("Step",),
+}
+
+
 # Slots whose kernels are built and measured. Empty: nothing is offered yet.
 SLOTS: frozenset[str] = frozenset()
 

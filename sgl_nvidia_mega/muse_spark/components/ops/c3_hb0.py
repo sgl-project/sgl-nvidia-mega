@@ -30,6 +30,16 @@ import torch
 
 from .lb_hop import HopArena, HopSpec
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+}
+
+
 _CSRC = Path(__file__).resolve().parent.parent / "csrc"
 _CUH = _CSRC / "c3_hb0_ops.cuh"
 

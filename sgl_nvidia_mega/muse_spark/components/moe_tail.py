@@ -52,6 +52,19 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/moe/utils.py": ("is_sbo_enabled", "is_tbo_enabled"),
+    "srt/distributed/*.py": ("get_tp_group", "tensor_model_parallel_all_reduce"),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+    "srt/layers/dp_attention.py": ("is_dp_attention_enabled",),
+    "srt/runtime_context.py": ("get_forward",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "moe_tail"  # env MUSE_VR_MOE_TAIL

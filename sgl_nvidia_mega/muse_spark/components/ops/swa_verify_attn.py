@@ -18,6 +18,16 @@ from pathlib import Path
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": (
+        "load_jit",
+        "make_cpp_args",
+        "is_arch_support_pdl",
+    ),
+}
+
+
 _CSRC = Path(__file__).resolve().parent.parent / "csrc" / "swa_verify_attn.cuh"
 
 TOKENS_PER_REQUEST = 8

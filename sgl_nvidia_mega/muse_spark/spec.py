@@ -36,6 +36,19 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_nvidia_mega.muse_spark import HF_CONFIG
 from sgl_nvidia_mega.muse_spark.plan import MAX_ROWS
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
+        "Feature",
+        "MegakernelSpec",
+        "Numerics",
+        "NumericsKind",
+        "Requirements",
+    ),
+    "srt/model_executor/runner/__init__.py": ("get_is_capture_mode",),
+}
+
+
 # the SGLang megakernel contract this spec is written against
 API_VERSION = 2
 

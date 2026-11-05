@@ -47,6 +47,13 @@ from pathlib import Path
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/model_loader/utils.py": ("resolve_language_model",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 FORMAT = "muse_vr_nvfp4_kv_scales/1"

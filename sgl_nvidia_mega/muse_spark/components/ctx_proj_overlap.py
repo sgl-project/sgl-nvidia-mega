@@ -79,6 +79,24 @@ import torch
 
 from . import bed, pull_bounded
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/distributed/*.py": ("get_tp_group",),
+    "srt/distributed/device_communicators/vocab_gather.py": (
+        "NVLinkVocabGather",
+        "make_vocab_gather",
+        "NcclVocabGather",
+    ),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+    "srt/speculative/spec_utils.py": ("draft_tp_context",),
+    "kernels/ops/speculative/fused_kv_materialize.py": ("_fused_norm_rope_stacked",),
+    "srt/models/dflash.py": ("DFlashDraftModel",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "ctx_proj_overlap"  # env MUSE_VR_CTX_PROJ_OVERLAP
@@ -847,8 +865,12 @@ def enable_side_kv(registry=None, hook_type=None) -> bool:
             )
             return False
     if registry is None:
-        from sglang.srt.plugins.hook_registry import HookRegistry as registry
-        from sglang.srt.plugins.hook_registry import HookType as hook_type
+        import sglang.srt.plugins.hook_registry as _sgl_srt_plugins_hook_registry
+
+        registry = _sgl_srt_plugins_hook_registry.HookRegistry
+        import sglang.srt.plugins.hook_registry as _sgl_srt_plugins_hook_registry
+
+        hook_type = _sgl_srt_plugins_hook_registry.HookType
     registry.register(
         TARGET_KV,
         lambda original, *a, **k: _around_materialize(original, *a, **k),

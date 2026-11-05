@@ -99,6 +99,19 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/layernorm_sp.py": ("sp_num_tokens",),
+    "srt/model_executor/model_runner.py": ("ModelRunner",),
+    "srt/models/muse_spark.py": ("MuseSpark1xModel",),
+    "kernels/ops/layernorm/muse_spark_norm_residual.py": (
+        "FusedPostNormResidualPreNorm",
+    ),
+    "srt/model_executor/forward_batch_info.py": ("ForwardMode",),
+    "srt/runtime_context.py": ("get_parallel",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "fp8_prefill"
@@ -876,7 +889,7 @@ def _wrap_g(orig):
         if reason is not None:
             bed.count(NAME, "qkv:stock:" + reason)
             return orig(linear, input_parallel, bias)
-        from sglang.srt.layers import layernorm_sp
+        import sglang.srt.layers.layernorm_sp as layernorm_sp
 
         from . import o_rowshard
 
@@ -1104,7 +1117,7 @@ def _wrap_load_model(fn):
                     uc_push_dense.module(mc_push.config()[0], ctx.agf_uc_fence)
             if ctx.wq_prefetch and _state.get("orig_gbar") is None:
                 # outermost on the o_proj SP entry (o_rowshard installed its own wrapper during the load above)
-                from sglang.srt.layers import layernorm_sp
+                import sglang.srt.layers.layernorm_sp as layernorm_sp
 
                 _state["orig_gbar"] = layernorm_sp.row_parallel_gbar_matmul
                 layernorm_sp.row_parallel_gbar_matmul = _wrap_gbar(_state["orig_gbar"])
@@ -1240,10 +1253,10 @@ def register() -> bool:
             bed.report(NAME, False, reason=f"pin mismatch: {rel}")
             return False
     try:
-        from sglang.srt.layers import layernorm_sp
-        from sglang.srt.layers.quantization import unquant as U
-        from sglang.srt.model_executor import model_runner as mr
-        from sglang.srt.models import muse_spark
+        import sglang.srt.layers.layernorm_sp as layernorm_sp
+        import sglang.srt.layers.quantization.unquant as U
+        import sglang.srt.model_executor.model_runner as mr
+        import sglang.srt.models.muse_spark as muse_spark
 
         with _lock:
             _state.update(
@@ -1262,7 +1275,7 @@ def register() -> bool:
                 agf_uc_fence=not agf_uc_nofence,
             )
             if b3 and _state["orig_boundary"] is None:
-                from sglang.kernels.ops.layernorm import muse_spark_norm_residual as nr
+                import sglang.kernels.ops.layernorm.muse_spark_norm_residual as nr
 
                 bcls = nr.FusedPostNormResidualPreNorm
                 if not getattr(bcls.forward_jit, "__wrapped_by_fp8_prefill__", False):

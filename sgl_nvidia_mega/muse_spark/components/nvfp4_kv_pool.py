@@ -14,6 +14,18 @@ from __future__ import annotations
 
 import logging
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/mem_cache/memory_pool.py": ("MHATokenToKVPool",),
+    "srt/mem_cache/swa_memory_pool.py": ("SWAKVPool",),
+    "srt/runtime_context.py": ("get_exec", "get_parallel", "get_spec"),
+    "srt/layers/quantization/fp4_kv_cache_quant_method.py": (
+        "get_kv_cache_quant_method",
+    ),
+    "srt/configs/model_config.py": ("AttentionArch",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 

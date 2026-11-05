@@ -51,6 +51,14 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/logits_processor.py": ("should_apply_lm_head_quant_method",),
+    "srt/batch_invariant_ops/__init__.py": ("is_batch_invariant_mode_enabled",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "gemm_lt"  # env MUSE_VR_GEMM_LT
@@ -444,7 +452,7 @@ def take(U, x: torch.Tensor, weight: torch.Tensor, bias=None, addend=None):
 
 def _plain_lm_head_path(proc, lm_head, embedding_bias) -> bool:
     """Whether the stock ``_compute_lm_head`` would run its plain ``torch.matmul`` for this call."""
-    from sglang.srt.layers import logits_processor as LP
+    import sglang.srt.layers.logits_processor as LP
 
     if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
         return False
@@ -504,7 +512,7 @@ def _around_lm_head(
 
 
 def install() -> None:
-    from sglang.srt.layers.quantization import unquant as U
+    import sglang.srt.layers.quantization.unquant as U
 
     orig = U._bf16_gemm_dispatch_impl
     has_addend = "addend" in inspect.signature(orig).parameters
@@ -576,7 +584,7 @@ def register() -> bool:
         install()
     except Exception as e:  # noqa: BLE001
         if _state["orig"] is not None:  # leave SGLang's dispatch as it was
-            from sglang.srt.layers.quantization import unquant as U
+            import sglang.srt.layers.quantization.unquant as U
 
             U._bf16_gemm_dispatch_impl = _state["orig"]
         bed.report(NAME, False, reason=f"install failed: {type(e).__name__}: {e}")

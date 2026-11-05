@@ -102,6 +102,23 @@ from triton.language.extra import libdevice
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/distributed/parallel_state.py": ("get_tp_group",),
+    "srt/speculative/dflash_worker_v2.py": ("SIMULATE_ACC_LEN",),
+    "kernels/ops/speculative/reject_sampling.py": (
+        "speculative_sampling_classic_kernel",
+    ),
+    "kernels/jit/utils/__init__.py": ("load_jit",),
+    "srt/speculative/dflash_utils.py": (
+        "_get_or_create_chain_verify_buffers",
+        "build_speculative_verify_target_probs",
+    ),
+    "srt/layers/logits_processor.py": ("LogitsProcessor",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "verify_topk_sample"  # env MUSE_VR_VERIFY_TOPK_SAMPLE
@@ -953,7 +970,7 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
             return
         get_tp_group = _state["tp_group"]
         if get_tp_group is None:
-            from sglang.srt.distributed import parallel_state
+            import sglang.srt.distributed.parallel_state as parallel_state
 
             get_tp_group = _state["tp_group"] = lambda: parallel_state.get_tp_group()
         group = get_tp_group()
@@ -1023,7 +1040,7 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
 
 
 def _simulating() -> bool:
-    from sglang.srt.speculative import dflash_worker_v2 as w
+    import sglang.srt.speculative.dflash_worker_v2 as w
 
     return w.SIMULATE_ACC_LEN > 0
 
@@ -1096,7 +1113,7 @@ def _h_gather(original, lp, logits):
     sinfo, bs, k = pending
     get_tp_group = _state["tp_group"]
     if get_tp_group is None:
-        from sglang.srt.distributed import parallel_state
+        import sglang.srt.distributed.parallel_state as parallel_state
 
         get_tp_group = _state["tp_group"] = lambda: parallel_state.get_tp_group()
     group = get_tp_group()
@@ -1249,7 +1266,7 @@ def _sample_layout_ok(cand, cids, q, a) -> bool:
 def _shadow(kw, a, coins, outs):
     """Debug: the stock gather + verify-probability build + sampling kernel on copies of the chain buffers with the
     same draws, compared bit for bit with the top-k path (host sync)."""
-    from sglang.kernels.ops.speculative import reject_sampling as rs
+    import sglang.kernels.ops.speculative.reject_sampling as rs
     from sglang.srt.speculative.dflash_utils import (
         _get_or_create_chain_verify_buffers,
         build_speculative_verify_target_probs,

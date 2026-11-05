@@ -31,6 +31,23 @@ from sglang.srt.runtime_context import get_forward
 
 from . import muse_spark_moe_finalize_all_reduce_cutedsl
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/fused_op.py": ("BaseFusedOp",),
+    "kernels/jit/utils/__init__.py": ("is_arch_support_pdl",),
+    "kernels/spec.py": ("CapabilityRequirement", "KernelBackend"),
+    "srt/runtime_context.py": ("get_forward",),
+    "srt/layers/communication/muse_spark_finalize_workspace.py": (
+        "FinalizePushWorkspace",
+    ),
+    "kernels/jit/utils/helion_runtime.py": ("helion_supported", "run_pinned_helion"),
+    "kernels/ops/communication/muse_spark_moe_finalize_all_reduce_helion.py": (
+        "POST_EXPERT_FINALIZE_CONFIGS",
+        "_post_expert_finalize_helion_kernel",
+    ),
+}
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
         FinalizePushWorkspace,

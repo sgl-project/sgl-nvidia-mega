@@ -44,6 +44,12 @@ import triton.language as tl
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "spec_sample_split"  # env MUSE_VR_SPEC_SAMPLE_SPLIT

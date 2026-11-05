@@ -25,6 +25,12 @@ import logging
 import os
 from pathlib import Path
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/compile/paths.py": ("DEFAULT_INCLUDE",),
+}
+
+
 logger = logging.getLogger(__name__)
 
 _HERE = Path(__file__).resolve().parent
@@ -124,7 +130,7 @@ def _engage_warp_redux_volatile() -> bool:
             "muse_spark: warp_redux_volatile disabled by MUSE_VR_PLUGIN_DISABLE"
         )
         return False
-    from sglang.kernels.jit.utils.compile import paths
+    import sglang.kernels.jit.utils.compile.paths as paths
 
     upstream = Path(paths.DEFAULT_INCLUDE[-1]) / "sgl_kernel" / "warp.cuh"
     try:

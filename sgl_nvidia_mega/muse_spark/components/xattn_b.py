@@ -54,6 +54,17 @@ import logging
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/attention/trtllm_mha_backend.py": ("TRTLLMHAAttnBackend",),
+    "srt/model_executor/model_runner.py": ("ModelRunner",),
+    "srt/layers/radix_attention.py": ("AttentionType",),
+    "srt/model_executor/forward_batch_info.py": ("ForwardMode",),
+    "srt/layers/cp/utils.py": ("is_cp_active",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "xattn_b"
@@ -502,8 +513,8 @@ def _before_graphs(runner, *a, **kw):
 
 def install() -> None:
     import flashinfer.prefill
-    from sglang.srt.layers.attention import trtllm_mha_backend as tb
-    from sglang.srt.model_executor import model_runner as mr
+    import sglang.srt.layers.attention.trtllm_mha_backend as tb
+    import sglang.srt.model_executor.model_runner as mr
 
     if _state["prev_ctx"] is None:
         _state["prev_ctx"] = flashinfer.prefill.trtllm_batch_context_with_kv_cache

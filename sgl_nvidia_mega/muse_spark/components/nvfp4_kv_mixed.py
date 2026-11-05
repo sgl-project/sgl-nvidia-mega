@@ -37,6 +37,19 @@ import os
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/mem_cache/memory_pool.py": ("MHATokenToKVPool",),
+    "srt/layers/attention/trtllm_mha_backend.py": ("TRTLLMHAAttnBackend",),
+    "srt/layers/cp/utils.py": ("is_cp_active",),
+    "srt/model_executor/forward_context.py": (
+        "get_attn_backend",
+        "get_token_to_kv_pool",
+    ),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 TARGET_EXTEND = (

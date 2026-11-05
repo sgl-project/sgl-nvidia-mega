@@ -78,6 +78,15 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/models/dflash.py": ("DFlashDraftModel",),
+    "srt/runtime_context.py": ("get_parallel", "get_exec"),
+    "srt/model_executor/forward_batch_info.py": ("CaptureHiddenMode",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "ctx_proj_prefill_shard"  # env MUSE_VR_CTX_PROJ_PREFILL_SHARD

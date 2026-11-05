@@ -33,6 +33,19 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/fused_op.py": ("_oot_dispatch_key", "get_fused_op_backend"),
+    "srt/layers/attention/trtllm_mha_backend.py": (
+        "TRTLLMHAAttnBackend",
+        "is_cp_active",
+    ),
+    "kernels/spec.py": ("KernelBackend",),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "prefill_qkn"
@@ -261,7 +274,7 @@ def _triton_version() -> str | None:
 
 def _reason(attn, positions, qkv, forward_batch):
     """Reason the call must run stock, or None (then also returns the RoPE table or None)."""
-    from sglang.kernels import fused_op
+    import sglang.kernels.fused_op as fused_op
     from sglang.kernels.spec import KernelBackend
 
     from .ops import prefill_qkn as op

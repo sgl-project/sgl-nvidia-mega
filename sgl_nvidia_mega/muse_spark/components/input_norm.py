@@ -30,6 +30,21 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/layers/layernorm_sp.py": ("runs_sp",),
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "srt/layers/muse_spark/muse_spark_layers.py|srt/layers/muse_spark_layers.py": (
+        "MuseSpark1xRMSNorm",
+    ),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "input_norm"  # env MUSE_VR_INPUT_NORM
@@ -157,7 +172,7 @@ class _Input(torch.nn.Module):
 
 
 def _eligible(model, input_embeds, forward_batch) -> str | None:
-    from sglang.srt.layers import layernorm_sp
+    import sglang.srt.layers.layernorm_sp as layernorm_sp
     from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
 
     mode = forward_batch.forward_mode

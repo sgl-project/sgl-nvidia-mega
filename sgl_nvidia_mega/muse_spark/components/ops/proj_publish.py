@@ -30,6 +30,20 @@ import torch
 
 from .. import sgl_compat
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "kernels/jit/utils/compile/paths.py": ("KERNEL_PATH",),
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+}
+
+
 _CUH = Path(__file__).resolve().parents[1] / "csrc" / "proj_publish.cuh"
 _WORLDS = (2, 4, 8)
 NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)

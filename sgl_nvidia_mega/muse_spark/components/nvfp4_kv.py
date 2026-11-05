@@ -114,6 +114,15 @@ from pathlib import Path
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+    "srt/arg_groups/resolution_hooks.py": ("register_resolution_hook",),
+    "srt/utils/common.py": ("is_float4_e2m1fn_x2",),
+    "srt/mem_cache/swa_memory_pool.py": ("SWAKVPool",),
+}
+
+
 logger = logging.getLogger("muse_vr_plugin")
 
 NAME = "nvfp4_kv"

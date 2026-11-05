@@ -36,6 +36,19 @@ from typing import Optional, Sequence
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "_allocate_symmetric_memory",
+    ),
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+}
+
+
 K_MAX_WORLD = 16
 K_RING_SLOTS = 3
 K_LINE_WORDS = 16  # 64-bit words per 128-byte line

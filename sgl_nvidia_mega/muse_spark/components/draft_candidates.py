@@ -44,6 +44,30 @@ import torch
 
 from . import bed
 
+# The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
+SGLANG_READS = {
+    "srt/distributed/communication_op.py": ("get_tp_group",),
+    "srt/models/dflash.py": (
+        "_flashinfer_top_k",
+        "get_parallel",
+        "is_dense_head_weight",
+        "should_apply_lm_head_quant_method",
+        "tensor_model_parallel_all_gather",
+        "_project_candidate_logits",
+        "_radix_topk",
+    ),
+    "kernels/jit/utils/__init__.py": (
+        "is_arch_support_pdl",
+        "load_jit",
+        "make_cpp_args",
+    ),
+    "srt/distributed/device_communicators/custom_all_reduce_v2.py": (
+        "CustomAllReduceV2",
+    ),
+    "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 NAME = "draft_candidates"  # env MUSE_VR_DRAFT_CANDIDATES
@@ -270,11 +294,11 @@ def _preload(world: int, device) -> None:
 
 def _eligible(model, hidden: torch.Tensor):
     """(reason, context): reason is None when the fused path applies; context carries what it needs."""
-    from sglang.srt.distributed import communication_op as co
+    import sglang.srt.distributed.communication_op as co
+    import sglang.srt.models.dflash as d
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.models import dflash as d
 
     lm_head = getattr(model, "lm_head", None)
     selector = getattr(model, "candidate_selector", None)
@@ -321,7 +345,7 @@ def _eligible(model, hidden: torch.Tensor):
 
 def _stock_tail(model, lm_head, vals, ids):
     """The rest of ``candidate_topk`` (tensor-parallel branch, pinned revision) and ``_transform_unary_logits``."""
-    from sglang.srt.models import dflash as d
+    import sglang.srt.models.dflash as d
 
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
     gathered_vals = d.tensor_model_parallel_all_gather(vals.float(), dim=-1)
@@ -343,7 +367,7 @@ def compute_candidates(original, model, hidden: torch.Tensor):
     if reason is not None:
         bed.count(NAME, "stock:" + reason)
         return original(model, hidden)
-    from sglang.srt.models import dflash as d
+    import sglang.srt.models.dflash as d
 
     lm_head, comm, tp = ctx
     shard = lm_head.shard_indices
