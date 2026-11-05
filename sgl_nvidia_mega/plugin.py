@@ -23,6 +23,12 @@ SPECS = (
     # The MTP draft offers EAGLE draft-loop and draft-extend entries.
     ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
+    # MiniMax-M3.1-Flash (NVFP4) and its DSpark draft
+    (
+        "MiniMaxM3SparseForConditionalGeneration",
+        "sgl_nvidia_mega.minimax_m31.spec:SPEC",
+    ),
+    ("DSparkMiniMaxDraftModel", "sgl_nvidia_mega.minimax_m31.draft:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
