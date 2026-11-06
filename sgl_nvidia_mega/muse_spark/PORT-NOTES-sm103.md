@@ -38,12 +38,12 @@ Open 816B-A42B NVFP4 with the DFlash2 draft, real draft acceptance:
 
 | GSM8K, 5-shot, 1319 questions, greedy (`sglang.test.few_shot_gsm8k`) | Accuracy | Invalid | Accept length |
 |---|---|---|---|
-| this package, `MUSE_VR_*` components on, NVFP4 KV | 0.950 | 0.000 | ~5.1 |
+| this package, `MUSE_VR_*` components on, NVFP4 KV | 0.953 | 0.000 | ~5.1 |
 | stock SGLang, no components, FP8 KV | 0.951 | 0.000 | ~3.8 |
 
 The stock run uses FP8 KV because stock SGLang rejects DFLASH over native NVFP4 KV (`nvfp4_kv`'s resolution step is
 what accepts it). `bench_serving` (random, ISL 8192, OSL 512, concurrency 112, 448 prompts) with the components on: 448
-of 448 completed, accept length 6.50, output 2241 tok/s, median TPOT 15.4 ms (first run after boot, not tuned).
+of 448 completed, accept length 6.47, output 2643 tok/s, median TPOT 14.5 ms (not tuned).
 
 Each decode step runs the DFLASH draft CUDA graph (about 1 ms) and then the target-verify CUDA graph (about 8 ms), with
 the verify sampling and the draft KV append eager between them; prefill runs SGLang's breakable prefill graph.
