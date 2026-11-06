@@ -42,11 +42,41 @@ NVIDIA GB300 (152 SMs, CUDA 13.4), image `lmsysorg/sglang@sha256:9e6f6097...` (S
 - `swa_t`'s occupancy query gives 76, 46, 36, 28, 23, 15, 15, 15, 13 resident clusters for kC = 2..10, so its kC
   choice adapts to the GB300's SM count.
 
+## Served on a GB300 TP4 (pipeclean)
+
+Four GB300s, same image, `--tp-size 4 --ep-size 4 --quantization modelopt_fp4 --kv-cache-dtype nvfp4
+--attention-backend trtllm_mha --speculative-algorithm DFLASH --speculative-draft-attention-backend fa4
+--speculative-num-draft-tokens 8 --enable-layernorm-sp --moe-a2a-backend flashinfer --enable-hierarchical-cache`,
+CUDA graphs on, with the `MUSE_VR_*` switches of the components below set. Main weights were `--load-format dummy`
+with simulated draft acceptance, and the draft was the public `RadixArk/Muse-Spark-Open-DFlash2`; so this checks that
+the kernels run, not their accuracy, and the throughput is not a performance number.
+
+- The server booted, captured its CUDA graphs and served `bench_serving` (random, ISL 8192, OSL 512, concurrency
+  112, 448 prompts): 448 of 448 completed, no errors in the server log, accept length 4.06.
+- Engaged (each logged `engaged=True` in every rank): `nvfp4_kv` (all parts, `resolution` included, so DFLASH with an
+  fa4 draft over native NVFP4 KV is accepted), `nvfp4_kv_verify`, `nvfp4_kv_verify_wide`, `nvfp4_prefill_dq`,
+  `kv4_dec`, `kv_draftwin`, `swa_verify_attn`, `full_verify_attn`, `full_attn_wide`, `attn_qk_prologue`,
+  `prefill_qkn`, `xattn_b`, `ar_attn_boundary`, `ctx_proj_overlap`, `ctx_proj_prefill_shard`, `draft_boundary`,
+  `draft_candidates`, `draft_kv_append`, `final_norm`, `input_norm`, `spec_sample_split`, `verify_topk_sample`,
+  `gemm_pick`, `gemm_lt`, `prefill_moe_x` (CuTe DSL, blackwell helpers), `sp_gate`, `sp_combine_inplace`,
+  `sp_fp4_dispatch`, `pfin`, `pfront`.
+- `draft_gemv` never hit the shared-memory guard (no `token tile exceeds` count).
+- Not engaged: `pull_bounded` (its SGLang source pin does not match this image's `pull_gather_bounded.cuh`), and
+  `warp_redux_volatile` (the image already carries the fix).
+- SGLang's all-reduce reported `multicast = False` in this container, so the NVLink multicast paths were not taken.
+
+Two things outside sm_103 showed up:
+
+- `--enable-nvidia-megakernel` cannot be used with this SGLang: `muse_spark.spec` declares `NumericsKind.TOLERANCE`
+  with `tolerances={}`, which SGLang's `Numerics` rejects at import ("a TOLERANCE spec must state its tolerances").
+  The run above left the flag off; the components register through the plugin entry point either way.
+- `gemm_pick` / `gemm_lt` rules were measured on another architecture; they ran on GB300 but are not tuned for it.
+
 ## Not checked yet
 
-- No multi-GPU run: the NVLink multicast / all-reduce kernels (`mc_push*`, `uc_push_dense`, `a2a_pull`, `c3_hops`,
-  `c3_hb0`, `lb_hop`, the vendored all-reduce + norm) built but did not run across ranks.
-- No served-model run on a GB300, so no accuracy or speed numbers.
+- Accuracy: no run with the real main weights.
+- The NVLink multicast kernels (`mc_push*`, `uc_push_dense`, `a2a_pull`, `c3_hops`, `c3_hb0`, `lb_hop`) on a GB300
+  NVL72 domain with multicast available.
 - Not exercised: `unorm` (built only with the template arguments the boundary picks at run time), `proj_publish`,
   `wfc_k1s`, `moe_ld_ops`, and the CuTe DSL kernels (`opp_tgv_gemm`, `moe_x_kernels`, `fin2_cutedsl`). They pick
   their architecture from the device or use the sm_100 shared-memory capacity, which is the same on sm_103.
