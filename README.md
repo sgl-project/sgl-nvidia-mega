@@ -328,6 +328,7 @@ sgl-nvidia-mega/
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
 │   └── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
 ├── benchmark/             # the static decode table behind the speed numbers
+├── docs/                  # the developer guide
 └── test/
     ├── unit/              # plugin contracts and setup checks; selected CUDA metadata/graph cases
     ├── kernels/           # GPU: each kernel against SGLang's or FlashInfer's op, fail-stop
@@ -349,7 +350,7 @@ Kimi K3 full-serving qualification is separate from these unit tests; the
 
 ## Contributing
 
-Open a pull request against `main`. The PR title follows `[Type] scope: title` (see `.github/pull_request_template.md`), and `pre-commit run --all-files` must pass.
+See the [developer guide](docs/developer_guide.md) for how the plugin plugs into SGLang, what a covered step gets, and how to add a model. Open a pull request against `main`. The PR title follows `[Type] scope: title` (see `.github/pull_request_template.md`), and `pre-commit run --all-files` must pass.
 
 ## License
 
