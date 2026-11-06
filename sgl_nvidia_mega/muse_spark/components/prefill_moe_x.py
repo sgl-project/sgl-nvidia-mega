@@ -36,7 +36,9 @@ and weights, then the NVFP4 rows), so the rows start 16 bytes off a 32-byte boun
 which happens in eager prefill passes (captured prefill sizes above the token floor keep every region aligned).
 
 Opt in with ``MUSE_VR_PREFILL_MOE_X=1``. The device-specific MMA builder module is named by
-``MUSE_VR_MOE_X_MMA_HELPERS`` (see ``moe_x_kernels/arch.py``); without it the component stays off. Kernel
+``MUSE_VR_MOE_X_MMA_HELPERS`` (see ``moe_x_kernels/arch.py``); without it the component stays off. On a device outside
+``moe_x_kernels.arch.SUPPORTED_ARCHS`` (sm_103 included: its block-scaled MMAs have K = 64 and no operand collectors)
+the component stays off too. Kernel
 configurations: ``MUSE_VR_PREFILL_MOE_X_TACTIC`` = ``<tile_m>,<tile_n1>,<a_path>,<tile_n2>[,2cta]`` (tunable; default
 from ``moe_x_kernels.launch``). Register this component before any component that wraps the same FlashInfer entry point and
 adds per-token scales, so that it receives the completed call.
@@ -482,8 +484,13 @@ def engage() -> bool:
     if not bed.enabled(NAME):
         _state["engaged"] = False
         return False
-    from .moe_x_kernels.arch import HELPERS_ENV, helpers_configured
+    from .moe_x_kernels.arch import HELPERS_ENV, helpers_configured, unsupported_reason
 
+    why = unsupported_reason()
+    if why is not None:
+        bed.report(NAME, False, reason=why)
+        _state["engaged"] = False
+        return False
     if not helpers_configured():
         bed.report(NAME, False, reason=f"{HELPERS_ENV} not set")
         _state["engaged"] = False

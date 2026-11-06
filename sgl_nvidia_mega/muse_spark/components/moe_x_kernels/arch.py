@@ -3,8 +3,8 @@
 """Run-time resolution of the device-specific pieces of the ``moe_x_kernels`` CuTe-DSL kernels.
 
 The block-scaled tensor-core MMA atoms these kernels use are built by a CuTe DSL helper module that depends on the
-device generation. This line serves sm_103 (GB300), so the default is CuTe DSL's ``cutlass.utils.blackwell_helpers``;
-``MUSE_VR_MOE_X_MMA_HELPERS`` (a dotted module path) overrides it. The architecture string handed to CuTe DSL capacity queries comes from the device's
+device generation. The deployment names that module in ``MUSE_VR_MOE_X_MMA_HELPERS`` (a dotted module path); this
+package itself names no device. The architecture string handed to CuTe DSL capacity queries comes from the device's
 compute capability at run time.
 """
 
@@ -14,24 +14,41 @@ import importlib
 import os
 
 HELPERS_ENV = "MUSE_VR_MOE_X_MMA_HELPERS"
-DEFAULT_HELPERS = "cutlass.utils.blackwell_helpers"  # sm_100 family, sm_103 included
 
 _state: dict = {"module": None}
 
 
-def helpers_name() -> str:
-    return os.environ.get(HELPERS_ENV, "").strip() or DEFAULT_HELPERS
+# Device generations whose tensor cores the kernels are written for: they issue block-scaled MMAs with instruction
+# K = 128 and operand-collector hints, and write the activation scale factors to tensor memory in that instruction's
+# layout. The sm_100 family (sm_103 / GB300 included) has K = 64 block-scaled MMAs without collector hints, so the
+# kernels need a port of that layout before they can run there.
+SUPPORTED_ARCHS = frozenset({"sm_107"})
+
+
+def unsupported_reason(index: int | None = None) -> str | None:
+    """Why the kernels cannot run on the device, or None when they can."""
+    arch = device_arch(index)
+    if arch not in SUPPORTED_ARCHS:
+        return (
+            f"{arch}: the kernels use K=128 block-scaled MMAs with operand collectors and their tensor-memory "
+            "scale layout; not ported to this architecture"
+        )
+    return None
 
 
 def helpers_configured() -> bool:
-    return bool(helpers_name())
+    return bool(os.environ.get(HELPERS_ENV, "").strip())
 
 
 def arch_helpers():
     """The configured MMA-builder module (imported once)."""
     mod = _state["module"]
     if mod is None:
-        name = helpers_name()
+        name = os.environ.get(HELPERS_ENV, "").strip()
+        if not name:
+            raise RuntimeError(
+                f"{HELPERS_ENV} is not set: no MMA builder module for this device"
+            )
         mod = importlib.import_module(name)
         for fn in ("make_blockscaled_trivial_tiled_mma", "compute_epilogue_tile_shape"):
             if not hasattr(mod, fn):
