@@ -1,115 +1,58 @@
 # Muse Spark kernels on GB300 (sm_103)
 
-The kernel half in this package was first written and measured on another architecture. This line serves GB300
-(sm_103) only: `spec.REQUIREMENTS.isas` is `{"sm_103"}`. These notes record the sm_103 limits the kernels must
-respect, what was changed for sm_103, what was checked on a GB300, and what is still open.
+This line serves GB300 (sm_103) only: `spec.REQUIREMENTS.isas` is `{"sm_103"}`. It carries the components of the
+Muse Spark kernel half that a GB300 TP4 DFLASH server with NVFP4 KV engages (listed below); components written for
+other configurations are not included.
 
 ## sm_103 limits, and how the kernels meet them
 
 | sm_103 (GB300) | These kernels |
 |---|---|
-| 227 KiB dynamic shared memory per block (232448 B, read on a GB300) | `draft_gemv` token tiles 32 and 64 exceed it (see below); every other kernel fits |
+| 227 KiB dynamic shared memory per block (232448 B) | `draft_gemv` token tiles 32 and 64 exceed it and are guarded; every other kernel fits |
 | 512 tensor-memory columns per SM | every kernel allocates at most 512 columns |
 | clusters of at most 16 CTAs (non-portable) | every cluster launch is at most 16 |
-| 152 SMs (GB300) | grids are sized from the device's SM count at run time |
+| 152 SMs | grids are sized from the device's SM count at run time |
 
-The kernels use sm_100-family instructions only; `tcgen05.ld.red` (in `prefill_attn`) and the three-input `max.f32`
-compile for `sm_103a`.
+`draft_gemv` / `draft_boundary`: the default SwiGLU tactic's shared-memory ring is 240 KiB at token tile 32 and 298 KiB
+at 64. `draft_gemv.fits()` compares the ring with the device's per-block opt-in, and `draft_boundary` keeps the stock
+projections for a row block whose tile does not fit (counted as `draft_gemv: token tile exceeds the device's shared
+memory`). At the default `MUSE_VR_DRAFT_GEMV_MAX_M=16` (tiles 8 and 16) nothing changes.
 
-## Changes for sm_103
+## Components
 
-- `spec.py`: `isas` is `{"sm_103"}`.
-- `draft_gemv` / `draft_boundary`: the default SwiGLU tactic's shared-memory ring is 240 KiB at token tile 32 and
-  298 KiB at 64 (the convolution tactic's is 298 KiB at 64), above sm_103's 227 KiB. `draft_gemv.fits()` compares the
-  ring with the device's per-block opt-in, and `draft_boundary` keeps the stock projections for a row block whose tile
-  does not fit (counted as `draft_gemv: token tile exceeds the device's shared memory`) instead of failing at the
-  launch. At the default `MUSE_VR_DRAFT_GEMV_MAX_M=16` (tiles 8 and 16, at most 211 KiB) nothing changes. Checked on a
-  GB300: `fits()` is true for tiles 8 and 16 and false for 32 and 64.
-- `prefill_moe_x` / `moe_x_kernels`: stays off on sm_103 (`moe_x_kernels.arch.SUPPORTED_ARCHS`), reported as
-  `engaged=False` with the reason before any launch. Its grouped GEMMs issue block-scaled MMAs with instruction K = 128
-  and operand-collector hints (`a_collector_op` / `b_collector_op`, B-operand reuse), and their transform warps write
-  the activation scale factors to tensor memory in that instruction's layout. CuTe DSL's sm_100-family builders
-  (`cutlass.utils.blackwell_helpers`) make K = 64 block-scaled MMAs without collector hints; with them the first
-  launch fails (`unexpected keyword argument 'a_collector_op'`) and the component falls back to the stock op. Dropping
-  the hints would be safe (both B-reuse MMAs read the same shared-memory B stage, released after the k-block loop), but
-  the K = 64 scale-factor layout of the transform warps is a kernel port that is not done. FlashInfer's TRT-LLM fused
-  MoE serves these calls on sm_103.
+Engaged on a GB300 TP4 server (`--tp-size 4 --ep-size 4 --quantization modelopt_fp4 --kv-cache-dtype nvfp4
+--attention-backend trtllm_mha --speculative-algorithm DFLASH --speculative-draft-attention-backend fa4
+--speculative-num-draft-tokens 8 --enable-layernorm-sp --moe-a2a-backend flashinfer --enable-hierarchical-cache`):
+`nvfp4_kv` (with `nvfp4_kv_verify`, `nvfp4_prefill_dq`, `kv4_dec`, `kv_draftwin`), `verify_attn` (`swa_verify_attn`,
+`full_verify_attn`, `full_attn_wide`, `attn_qk_prologue`), `prefill_qkn`, `xattn_b`, `ar_attn_boundary`,
+`ctx_proj_overlap`, `ctx_proj_prefill`, `draft_boundary`, `draft_candidates`, `draft_kv_append`, `final_norm`,
+`input_norm`, `spec_sample_split`, `verify_topk_sample`, `gemm_pick`, `gemm_lt`, `sp_gate`, `sp_combine_inplace`,
+`sp_fp4_dispatch`, `pfin`.
+
+`pull_bounded` stays off on SGLang `306ccf6` (its source pin does not match `pull_gather_bounded.cuh`).
 
 ## Checked on a GB300
 
-NVIDIA GB300 (152 SMs, CUDA 13.4), image `lmsysorg/sglang@sha256:9e6f6097...` (SGLang `306ccf6`), one GPU:
-
-- Every JIT CUDA module under `components/ops`, `bal`, `final_norm` and `draft_kv_append` builds for `sm_103a`.
-- The `preload` paths, which launch on zeros with each kernel's shared-memory attribute set, run for
-  `nvfp4_verify_attn`, `kv4_attn_wide`, `full_attn_wide`, `full_verify_attn` (1-64 requests), `swa_verify_attn`
-  (windows 511 and 1023, 1-64 requests), `swa_t`, `prefill_attn`, `prefill_qkn`, `nvfp4_kv_store`,
-  `norm_fp4_quant_early`, `moe_ldw`, `moe_ldwb` and `bal`.
-- `swa_t`'s occupancy query gives 76, 46, 36, 28, 23, 15, 15, 15, 13 resident clusters for kC = 2..10, so its kC
-  choice adapts to the GB300's SM count.
-
-## Served on a GB300 TP4, dummy weights (pipeclean)
-
-Four GB300s, same image, `--tp-size 4 --ep-size 4 --quantization modelopt_fp4 --kv-cache-dtype nvfp4
---attention-backend trtllm_mha --speculative-algorithm DFLASH --speculative-draft-attention-backend fa4
---speculative-num-draft-tokens 8 --enable-layernorm-sp --moe-a2a-backend flashinfer --enable-hierarchical-cache`,
-CUDA graphs on, with the `MUSE_VR_*` switches of the components below set. Main weights were `--load-format dummy`
-with simulated draft acceptance, and the draft was the public `RadixArk/Muse-Spark-Open-DFlash2`; so this checks that
-the kernels run, not their accuracy, and the throughput is not a performance number.
-
-- The server booted, captured its CUDA graphs and served `bench_serving` (random, ISL 8192, OSL 512, concurrency
-  112, 448 prompts): 448 of 448 completed, no errors in the server log, accept length 4.06.
-- Engaged (each logged `engaged=True` in every rank): `nvfp4_kv` (all parts, `resolution` included, so DFLASH with an
-  fa4 draft over native NVFP4 KV is accepted), `nvfp4_kv_verify`, `nvfp4_kv_verify_wide`, `nvfp4_prefill_dq`,
-  `kv4_dec`, `kv_draftwin`, `swa_verify_attn`, `full_verify_attn`, `full_attn_wide`, `attn_qk_prologue`,
-  `prefill_qkn`, `xattn_b`, `ar_attn_boundary`, `ctx_proj_overlap`, `ctx_proj_prefill_shard`, `draft_boundary`,
-  `draft_candidates`, `draft_kv_append`, `final_norm`, `input_norm`, `spec_sample_split`, `verify_topk_sample`,
-  `gemm_pick`, `gemm_lt`, `sp_gate`, `sp_combine_inplace`,
-  `sp_fp4_dispatch`, `pfin`, `pfront`.
-- `draft_gemv` never hit the shared-memory guard (no `token tile exceeds` count).
-- Not engaged: `pull_bounded` (its SGLang source pin does not match this image's `pull_gather_bounded.cuh`), and
-  `warp_redux_volatile` (the image already carries the fix).
-- `prefill_moe_x` logged `engaged=True` but failed at its first launch and fell back (see above); it is now off on
-  sm_103.
-- SGLang's all-reduce logged `multicast = False`. That is its tuned table, not the hardware: SGLang's sm_100-family
-  all-reduce configuration has no multicast block count for 4 ranks, so the stock all-reduce does not take its
-  multicast form at TP4. Multicast itself works on a GB300 (`cuMulticastCreate` with fabric and POSIX handles, and a
-  non-zero `multicast_ptr` from PyTorch symmetric memory with the CUDA and NCCL backends across 4 ranks).
-
-## Served on a GB300 TP4, real weights
-
-Same node type, image and server arguments as above, with the Muse Spark Open 816B-A42B NVFP4 checkpoint and the
-DFlash2 draft loaded, real draft acceptance, `prefill_moe_x` off.
+NVIDIA GB300 (152 SMs, CUDA 13.4), image `lmsysorg/sglang@sha256:9e6f6097...` (SGLang `306ccf6`), TP4, Muse Spark
+Open 816B-A42B NVFP4 with the DFlash2 draft, real draft acceptance:
 
 | GSM8K, 5-shot, 1319 questions, greedy (`sglang.test.few_shot_gsm8k`) | Accuracy | Invalid | Accept length |
 |---|---|---|---|
 | this package, `MUSE_VR_*` components on, NVFP4 KV | 0.950 | 0.000 | ~5.1 |
 | stock SGLang, no components, FP8 KV | 0.951 | 0.000 | ~3.8 |
 
-The stock run uses FP8 KV because stock SGLang rejects DFLASH over native NVFP4 KV (this package's `nvfp4_kv`
-resolution step is what accepts it), so the two rows differ in KV dtype as well. `bench_serving` (random, ISL 8192,
-OSL 512, concurrency 112, 448 prompts) with the components on: 448 of 448 completed, accept length 6.50, output
-throughput 2241 tok/s, median TPOT 15.4 ms, median ITL 5.0 ms (first run after boot; not a tuned performance number).
+The stock run uses FP8 KV because stock SGLang rejects DFLASH over native NVFP4 KV (`nvfp4_kv`'s resolution step is
+what accepts it). `bench_serving` (random, ISL 8192, OSL 512, concurrency 112, 448 prompts) with the components on: 448
+of 448 completed, accept length 6.50, output 2241 tok/s, median TPOT 15.4 ms (first run after boot, not tuned).
 
-A torch-profiler GPU trace of the same server (concurrency 112) shows each decode step as the DFLASH draft CUDA graph
-(about 1 ms) followed by the target-verify CUDA graph (about 8 ms), with the verify sampling and the draft KV append
-running eagerly between them; prefill runs as SGLang's breakable prefill graph with eager attention between layers.
+Each decode step runs the DFLASH draft CUDA graph (about 1 ms) and then the target-verify CUDA graph (about 8 ms), with
+the verify sampling and the draft KV append eager between them; prefill runs SGLang's breakable prefill graph.
 
-Two things outside sm_103 showed up:
+## Open
 
-- `--enable-nvidia-megakernel` cannot be used with this SGLang: `muse_spark.spec` declares `NumericsKind.TOLERANCE`
-  with `tolerances={}`, which SGLang's `Numerics` rejects at import ("a TOLERANCE spec must state its tolerances").
-  The run above left the flag off; the components register through the plugin entry point either way.
-- `gemm_pick` / `gemm_lt` rules were measured on another architecture; they ran on GB300 but are not tuned for it.
-
-## Not checked yet
-
-- `prefill_moe_x` on sm_103 (the K = 64 port above), and its GB300 tuning.
-- The plugin's NVLink multicast kernels (`mc_push*`, `uc_push_dense`, `a2a_pull`, `c3_hops`, `c3_hb0`, `lb_hop`)
-  under a configuration that selects them on a GB300.
-- Not exercised: `unorm` (built only with the template arguments the boundary picks at run time), `proj_publish`,
-  `wfc_k1s`, `moe_ld_ops`, and the CuTe DSL kernels (`opp_tgv_gemm`, `moe_x_kernels`, `fin2_cutedsl`). They pick
-  their architecture from the device or use the sm_100 shared-memory capacity, which is the same on sm_103.
-- Per-device tuning tables have no GB300 entry (device key `af3c79acd7d1e85f`). `moe_tactic` has no
-  `data/moe_tactic/af3c79acd7d1e85f.json`, so its table is empty on a GB300 and FlashInfer's own tactic choice
-  stands. `car_table` keeps the stock dispatch outside `SWEPT_DEVICES`. Both need the sweeps their docstrings name,
-  run on a GB300. `vendor/sglang_pr47174` already carries a GB300 TP4 launch override.
+- `--enable-nvidia-megakernel` cannot be used with SGLang `306ccf6`: `muse_spark.spec` declares
+  `NumericsKind.TOLERANCE` with `tolerances={}`, which SGLang's `Numerics` rejects at import. The components register
+  through the plugin entry point either way.
+- SGLang's all-reduce logs `multicast = False` at TP4 on a GB300: its sm_100-family table has no multicast block count
+  for 4 ranks. Multicast itself works on these nodes.
+- `gemm_pick` / `gemm_lt` rules were measured on another architecture and are not tuned for GB300.
