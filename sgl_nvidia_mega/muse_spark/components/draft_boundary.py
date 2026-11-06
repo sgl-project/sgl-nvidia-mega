@@ -318,6 +318,16 @@ def _gemv_eligible(model, m: int) -> bool:
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+    from .ops import draft_gemv
+
+    # A token tile whose ring does not fit the device's per-block shared memory (227 KiB on sm_103)
+    # keeps the stock projections instead of failing at the kernel's launch.
+    if not all(
+        draft_gemv.fits(draft_gemv.token_tile(m), epi, torch.cuda.current_device())
+        for epi in (draft_gemv.EPI_CONV, draft_gemv.EPI_SWIGLU)
+    ):
+        bed.count(NAME, "draft_gemv: token tile exceeds the device's shared memory")
+        return False
     for ly in model.layers:
         for conv in (ly.attention_conv, ly.mlp_conv):
             kp = conv.kernel_projection

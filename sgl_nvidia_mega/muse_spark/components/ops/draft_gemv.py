@@ -77,6 +77,19 @@ def smem_bytes(tok_tile: int, t: Tactic) -> int:
 
 
 @functools.lru_cache(maxsize=None)
+def _smem_optin(device_index: int) -> int:
+    return int(
+        torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+    )
+
+
+def fits(tok_tile: int, epi: int, device_index: int, tactic=None) -> bool:
+    """Whether the tactic's shared-memory ring fits one block on the device (227 KiB on sm_103; the default SwiGLU
+    tactic exceeds it at token tiles 32 and 64)."""
+    return smem_bytes(tok_tile, _tactic(epi, tactic)) <= _smem_optin(device_index)
+
+
+@functools.lru_cache(maxsize=None)
 def use_pdl() -> bool:
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
