@@ -104,6 +104,7 @@ SGLANG_READS = {
     "srt/distributed/parallel_state.py": ("get_tp_group",),
     "srt/speculative/dflash_worker_v2.py": ("SIMULATE_ACC_LEN",),
     "kernels/jit/utils/__init__.py": ("load_jit",),
+    "srt/speculative/dflash_utils.py": ("_get_or_create_chain_verify_buffers",),
     "srt/layers/logits_processor.py": ("LogitsProcessor",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
 }
@@ -1260,7 +1261,6 @@ def _h_sample(original, worker, **kw):
         bed.count(NAME, "fallback:full rows")
         kw["next_token_logits"] = _full_logits(a)
         return original(worker, **kw)
-    from sglang.srt.speculative.dflash_utils import _get_or_create_chain_verify_buffers
 
     cand = kw["candidates"]
     bs, block = cand.shape

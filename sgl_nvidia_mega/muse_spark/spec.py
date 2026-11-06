@@ -108,9 +108,13 @@ REQUIREMENTS = Requirements(
 # stock path, so the declared agreement is a tolerance.
 NUMERICS = Numerics(
     kind=NumericsKind.TOLERANCE,
-    # TODO: fill from the A/B that measures each slot against the stock forward
-    # on the same GPU, before this spec is offered to anyone.
-    tolerances={},
+    tolerances={
+        # End to end, measured on a GB300 TP4 (SGLang 306ccf6, DFLASH, real weights): GSM8K 5-shot, 1319 questions,
+        # greedy, 0.953 with the components against 0.951 stock. The bound is about one standard error of the
+        # difference of two such runs at this accuracy (sqrt(2 * 0.95 * 0.05 / 1319) ~= 0.0085).
+        # TODO: per-slot bounds from an A/B of each slot against the stock forward on the same GPU.
+        "gsm8k_5shot.accuracy.abs": 0.01,
+    },
 )
 
 
