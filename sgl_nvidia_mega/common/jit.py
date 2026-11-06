@@ -13,6 +13,8 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sgl_nvidia_mega.common.build import cache_dir
+
 
 def driver():
     from cuda.bindings import driver
@@ -54,12 +56,6 @@ def nvrtc_version() -> tuple[int, int]:
 
     major, minor = check(nvrtc.nvrtcVersion(), "nvrtcVersion")
     return int(major), int(minor)
-
-
-def cache_dir() -> Path:
-    """Where compiled cubins persist: SGLang's cache directory, as SGLang's JIT kernels."""
-    root = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
-    return Path(os.path.expanduser(root)) / "sgl_nvidia_mega"
 
 
 def compile_source(
@@ -158,6 +154,8 @@ def launch(
     arguments: list,
     stream: int,
     cluster: Optional[tuple[int, int, int]] = None,
+    *,
+    pdl: bool = True,
 ) -> None:
     """Launch with programmatic stream serialization (PDL), in thread-block clusters
     of ``cluster`` blocks when given; graph-capturable."""
@@ -174,12 +172,14 @@ def launch(
     config.blockDimX, config.blockDimY, config.blockDimZ = kernel.block
     config.sharedMemBytes = kernel.shared_memory_bytes
     config.hStream = cu.CUstream(stream)
-    attribute = cu.CUlaunchAttribute()
-    attribute.id = (
-        cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
-    )
-    attribute.value.programmaticStreamSerializationAllowed = 1
-    attributes = [attribute]
+    attributes = []
+    if pdl:
+        attribute = cu.CUlaunchAttribute()
+        attribute.id = (
+            cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+        )
+        attribute.value.programmaticStreamSerializationAllowed = 1
+        attributes.append(attribute)
     if cluster is not None:
         dims = cu.CUlaunchAttribute()
         dims.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION

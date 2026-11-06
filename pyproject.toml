@@ -13,6 +13,10 @@ requires-python = ">=3.10"
 # SGLang's CUDA image
 dependencies = []
 
+# Optional typed host bindings for NVCC-based kernels.
+[project.optional-dependencies]
+ffi = ["apache-tvm-ffi>=0.1.11"]
+
 # SGLang loads the package as a general plugin; --enable-nvidia-megakernel turns the
 # megakernel on
 [project.entry-points."sglang.srt.plugins"]
@@ -23,4 +27,4 @@ include = ["sgl_nvidia_mega*"]
 
 # the kernels' CUDA sources and launch tables ship with the package
 [tool.setuptools.package-data]
-"*" = ["*.cu", "*.cuh", "*.json"]
+"*" = ["*.cu", "*.cuh", "*.h", "*.json"]
