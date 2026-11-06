@@ -25,6 +25,10 @@ compile for `sm_103a`.
   does not fit (counted as `draft_gemv: token tile exceeds the device's shared memory`) instead of failing at the
   launch. At the default `MUSE_VR_DRAFT_GEMV_MAX_M=16` (tiles 8 and 16, at most 211 KiB) nothing changes. Checked on a
   GB300: `fits()` is true for tiles 8 and 16 and false for 32 and 64.
+- `moe_x_kernels/arch.py`: the MMA helper module (`MUSE_VR_MOE_X_MMA_HELPERS`) defaults to
+  `cutlass.utils.blackwell_helpers`, which serves the sm_100 family including sm_103, instead of failing when the
+  variable is unset. A set variable still wins. Checked on a GB300 image: the module has
+  `make_blockscaled_trivial_tiled_mma` and `compute_epilogue_tile_shape`.
 
 ## Checked on a GB300
 

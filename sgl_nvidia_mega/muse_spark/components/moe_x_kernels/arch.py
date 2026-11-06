@@ -3,8 +3,8 @@
 """Run-time resolution of the device-specific pieces of the ``moe_x_kernels`` CuTe-DSL kernels.
 
 The block-scaled tensor-core MMA atoms these kernels use are built by a CuTe DSL helper module that depends on the
-device generation. The deployment names that module in ``MUSE_VR_MOE_X_MMA_HELPERS`` (a dotted module path); this
-package itself names no device. The architecture string handed to CuTe DSL capacity queries comes from the device's
+device generation. This line serves sm_103 (GB300), so the default is CuTe DSL's ``cutlass.utils.blackwell_helpers``;
+``MUSE_VR_MOE_X_MMA_HELPERS`` (a dotted module path) overrides it. The architecture string handed to CuTe DSL capacity queries comes from the device's
 compute capability at run time.
 """
 
@@ -14,23 +14,24 @@ import importlib
 import os
 
 HELPERS_ENV = "MUSE_VR_MOE_X_MMA_HELPERS"
+DEFAULT_HELPERS = "cutlass.utils.blackwell_helpers"  # sm_100 family, sm_103 included
 
 _state: dict = {"module": None}
 
 
+def helpers_name() -> str:
+    return os.environ.get(HELPERS_ENV, "").strip() or DEFAULT_HELPERS
+
+
 def helpers_configured() -> bool:
-    return bool(os.environ.get(HELPERS_ENV, "").strip())
+    return bool(helpers_name())
 
 
 def arch_helpers():
     """The configured MMA-builder module (imported once)."""
     mod = _state["module"]
     if mod is None:
-        name = os.environ.get(HELPERS_ENV, "").strip()
-        if not name:
-            raise RuntimeError(
-                f"{HELPERS_ENV} is not set: no MMA builder module for this device"
-            )
+        name = helpers_name()
         mod = importlib.import_module(name)
         for fn in ("make_blockscaled_trivial_tiled_mma", "compute_epilogue_tile_shape"):
             if not hasattr(mod, fn):
