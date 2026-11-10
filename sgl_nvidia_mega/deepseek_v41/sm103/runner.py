@@ -59,6 +59,7 @@ class Runner:
         row_tile_layer_input: bool = False,
         wide_row_tile_layer_input: bool = False,
         publish_trigger_max_rows: int = 0,
+        mbarrier_exchange: bool = False,
     ) -> None:
         """The Lamport mailbox (collective over ``group``) and the publishing GEMM;
         with ``hop_b`` also the MoE finalize's quantized and streams-only consumers."""
@@ -77,6 +78,7 @@ class Runner:
             hop_b_start_trigger=hop_b_start_trigger,
             row_tile_layer_input=row_tile_layer_input,
             publish_trigger_max_rows=publish_trigger_max_rows,
+            mbarrier_exchange=mbarrier_exchange,
         )
         self.publisher = PublishingMxfp8Linear(self.hop)
         # slot hop_b_wide: hop B past hop A's widths on a mailbox of its own, so hop A's
@@ -95,6 +97,7 @@ class Runner:
                 hop_b_start_trigger=hop_b_start_trigger,
                 row_tile_layer_input=wide_row_tile_layer_input,
                 publish_trigger_max_rows=publish_trigger_max_rows,
+                mbarrier_exchange=mbarrier_exchange,
             )
             if hop_b and hop_b_wide_rows > hop_a_rows
             else None

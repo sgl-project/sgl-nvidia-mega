@@ -95,13 +95,16 @@ DRAFT_SLOTS = frozenset(
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
-# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned)
+# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
+# hop_mbar: the Lamport consumers' RMSNorm sums cross the cluster by st.async onto
+# mbarriers, not a cluster barrier, bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
     "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
+    "hop_mbar",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -156,6 +159,7 @@ def slot_reasons() -> list[str]:
         ("hop_b_wide", "attn_qkv_a"),
         ("hop_b_cap16", "hop_b_wide"),
         ("hop_b_quad_trigger", "hop_b"),
+        ("hop_mbar", "hop_a"),
         ("draft_lm_head", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
@@ -346,6 +350,7 @@ def build(model, ctx):
         "hop_b_cap16": bound["boundary"].hop_b
         and all(w in hop.rows for w in hop.hop_b_rows),
         "hop_b_quad_trigger": bound["boundary"].hop_b,
+        "hop_mbar": facts.hop_a,
         # step-head work that needs no build: on when requested
         "sched_ahead": "sched_ahead" in SLOTS,
         # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is

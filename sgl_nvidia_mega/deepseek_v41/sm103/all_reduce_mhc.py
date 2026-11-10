@@ -32,7 +32,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor
+from cutlass.cutlass_dsl import T, dsl_user_op
 from flashinfer.cute_dsl.fp4_common import get_ptr_as_int64, st_global_u64
 from flashinfer.quantization.quantization_cute_dsl_utils import (
     INV_FLOAT8_E4M3_MAX,
@@ -111,6 +113,65 @@ SCALE_TILE_ROWS = 128
 SCALE_TILE_COLS = 4
 # The row-tile layout (mxfp8_ll, past 8 rows): every 8-row tile owns a 128-row atom
 ROW_TILE_ROWS = 8
+
+
+def _asm(result, operands, text, constraints, *, loc, ip):
+    return llvm.inline_asm(
+        result,
+        operands,
+        text,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_async_peer_f32(
+    slot: cute.Pointer,
+    value: Float32,
+    barrier: cute.Pointer,
+    peer: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``value`` into ``slot`` of cluster CTA ``peer``, completing 4 bytes on that
+    CTA's ``barrier`` (both given as this CTA's own shared addresses)."""
+    _asm(
+        None,
+        [
+            slot.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            value.ir_value(loc=loc, ip=ip),
+            barrier.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            peer.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 dst, bar; mapa.shared::cluster.u32 dst, $0, $3; "
+        "mapa.shared::cluster.u32 bar, $2, $3; "
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [dst], $1, [bar]; }",
+        "r,f,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbarrier_try_wait_cluster(barrier: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    """1 once phase 0 of ``barrier`` completed (acquire at cluster scope), else 0."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [barrier.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "{ .reg .pred p; mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+            "p, [$1], 0; selp.u32 $0, 1, 0, p; }",
+            "=r,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @cute.jit
@@ -617,6 +678,7 @@ class _LamportMHCDeviceKernel:
         deadline_ns: int = 0,
         early_trigger: bool | str = False,
         row_tile_scales: bool = False,
+        mbarrier_exchange: bool = False,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -653,8 +715,13 @@ class _LamportMHCDeviceKernel:
         self.deadline_ns = deadline_ns
         # where dependents may launch: "end" (after the epilogue), "poll" or "start"
         self.trigger_at = {False: "end", True: "poll", "start": "start"}[early_trigger]
+        # the CTA sums of the RMSNorm cross the cluster by st.async onto an mbarrier of
+        # each CTA instead of DSMEM stores and a cluster barrier (same values, same order)
+        self.mbarrier_exchange = mbarrier_exchange and self.write_layer_input
 
     def smem_size_in_bytes(self) -> int:
+        if self.mbarrier_exchange:
+            return 8 + (self.warps + self.cluster_size) * 4
         return (self.warps + self.cluster_size) * 4
 
     @cute.jit
@@ -724,6 +791,19 @@ class _LamportMHCDeviceKernel:
         # for this whole grid, and the launch needs every CTA of it to have triggered.
         if cutlass.const_expr(self.enable_pdl and self.trigger_at == "start"):
             cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.mbarrier_exchange):
+            smem = cutlass.utils.SmemAllocator()
+            exchange_barrier = smem.allocate_array(Int64, 1)
+            warp_sums = smem.allocate_array(Float32, self.warps)
+            cluster_sums = smem.allocate_array(Float32, self.cluster_size)
+            if tidx == 0:
+                cute.arch.mbarrier_init(exchange_barrier, 1)
+                cute.arch.mbarrier_init_fence()
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    exchange_barrier, self.cluster_size * 4
+                )
+            # peers may st.async into this CTA once every CTA passed this arrive
+            cute.arch.cluster_arrive_relaxed()
 
         prenorm_fragments = cute.make_rmem_tensor(
             cute.make_layout(
@@ -933,21 +1013,45 @@ class _LamportMHCDeviceKernel:
                         reduction_profile=0,
                     )
 
-            smem = cutlass.utils.SmemAllocator()
-            warp_sums = smem.allocate_array(Float32, self.warps)
-            cluster_sums = smem.allocate_array(Float32, self.cluster_size)
+            if cutlass.const_expr(not self.mbarrier_exchange):
+                smem = cutlass.utils.SmemAllocator()
+                warp_sums = smem.allocate_array(Float32, self.warps)
+                cluster_sums = smem.allocate_array(Float32, self.cluster_size)
             cta_sum = _group_leader_block_sum(
                 thread_sum,
                 warp_sums,
                 self.warps,
                 self.rank_lanes,
             )
-            if tidx < self.cluster_size:
-                local_slot = cluster_sums + cluster_rank
-                remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
-                store_shared_cluster_f32(remote_slot, cta_sum)
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+            if cutlass.const_expr(self.mbarrier_exchange):
+                cute.arch.cluster_wait()
+                if tidx < self.cluster_size:
+                    _st_async_peer_f32(
+                        cluster_sums + cluster_rank,
+                        cta_sum,
+                        exchange_barrier,
+                        Int32(tidx),
+                    )
+                received = _mbarrier_try_wait_cluster(exchange_barrier)
+                polls = Int32(0)
+                started = Int64(0)
+                while received == Int32(0):
+                    if cutlass.const_expr(self.deadline_ns > 0):
+                        polls = polls + 1
+                        if polls % _DEADLINE_POLLS == 0:
+                            now = global_timer_ns()
+                            if started == Int64(0):
+                                started = now
+                            if now - started > Int64(self.deadline_ns):
+                                fault_at_null()
+                    received = _mbarrier_try_wait_cluster(exchange_barrier)
+            else:
+                if tidx < self.cluster_size:
+                    local_slot = cluster_sums + cluster_rank
+                    remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
+                    store_shared_cluster_f32(remote_slot, cta_sum)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             full_sum = Float32(0.0)
             for peer in cutlass.range_constexpr(self.cluster_size):
                 full_sum = full_sum + cute.arch.load(
@@ -1059,6 +1163,8 @@ class AllReduceMHC:
     ``early_trigger``, the consumer lets the next kernel launch right after its
     poll instead of after its epilogue. With ``hop_b_start_trigger``, the quantized
     and residual-only consumers (the MoE post's) let it launch at their start.
+    With ``mbarrier_exchange``, the consumers' RMSNorm sums cross the cluster by
+    st.async onto mbarriers instead of a cluster barrier (bitwise).
     """
 
     def __init__(
@@ -1076,6 +1182,7 @@ class AllReduceMHC:
         hop_b_start_trigger: bool = False,
         row_tile_layer_input: bool = False,
         publish_trigger_max_rows: int = 0,
+        mbarrier_exchange: bool = False,
     ) -> None:
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
@@ -1202,6 +1309,7 @@ class AllReduceMHC:
                             else early_trigger
                         ),
                         row_tile_scales=row_tiles,
+                        mbarrier_exchange=mbarrier_exchange,
                     ),
                     make_fake_compact_tensor(
                         BFloat16,

@@ -61,13 +61,15 @@ def build(
     hop_b_wide: bool = False,
     hop_b_cap16: bool = False,
     hop_b_quad_trigger: bool = False,
+    mbarrier_exchange: bool = False,
 ) -> tuple[Optional[HopA], str]:
     """(the hop, "") or (None, why not). Collective over the TP group: a failure on
     any rank raises on every rank; an unsupported wo_b leaves the hop off. ``hop_b``
     also compiles the MoE finalize's consumers; ``early_trigger`` launches the
     consumer's dependents right after its poll, ``hop_b_start_trigger`` the MoE
     finalize's at its start; ``batch2`` (slot hop_a_batch2) adds 9-16 rows; ``hop_b_wide``
-    runs hop B at every width up to plan.HOP_B_MAX_ROWS, not only hop A's."""
+    runs hop B at every width up to plan.HOP_B_MAX_ROWS, not only hop A's;
+    ``mbarrier_exchange`` (slot hop_mbar) is AllReduceMHC's, on every mailbox."""
     from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner
 
     m = model.model
@@ -103,6 +105,7 @@ def build(
             publish_trigger_max_rows=(
                 slot_plan.HOP_A_BATCH1_ROWS if hop_b_quad_trigger else 0
             ),
+            mbarrier_exchange=mbarrier_exchange,
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
         if hop_b and hop_b_quad_trigger:
