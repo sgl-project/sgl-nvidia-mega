@@ -18,6 +18,11 @@ Arms run in palindrome order (``--repeats`` rounds) from a CUDA-graph replay eac
 from a torch profiler trace; medians over halves and replays per round, then the
 median and the spread of the rounds.
 
+With ``--check-replays N`` it instead replays the layer graphs of fold_quant and
+fold_quant_early N times each and checks every half's down_proj output bitwise against
+one fold_quant replay (the quant buffers are shared by the layers, so a down_proj
+reading them early reads another layer's).
+
 python benchmark/bench_deepseek_v41_shared_fold.py --rows 6 --layers 39 --repeats 4
 """
 
@@ -267,6 +272,31 @@ def _gate_topk(logits, bias, weights, ids):
     )
 
 
+def _check_replays(layer, replays: int) -> None:
+    graphs, outs = {}, {}
+    for arm in ("fold_quant", "fold_quant_early"):
+        outs[arm] = []
+        graphs[arm] = _graph(layer(arm, outs[arm]))
+    graphs["fold_quant"].replay()
+    torch.cuda.synchronize()
+    want = torch.stack(outs["fold_quant"]).view(torch.int16).clone()
+    for arm in ("fold_quant", "fold_quant_early"):
+        bad = torch.zeros((), dtype=torch.int64, device="cuda")
+        bad_replays = torch.zeros((), dtype=torch.int64, device="cuda")
+        for _ in range(replays):
+            graphs[arm].replay()
+            got = torch.stack(outs[arm]).view(torch.int16)
+            diff = (got != want).sum()
+            bad += diff
+            bad_replays += (diff > 0).long()
+        torch.cuda.synchronize()
+        print(
+            f"CHECK {arm}: replays={replays} halves={got.shape[0]} "
+            f"bad_replays={int(bad_replays)} bad_values={int(bad)}"
+        )
+        assert int(bad) == 0, arm
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=6)
@@ -274,6 +304,7 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=4)
     parser.add_argument("--replays", type=int, default=10)
     parser.add_argument("--inter", type=int, default=INTER)
+    parser.add_argument("--check-replays", type=int, default=0)
     args = parser.parse_args()
     rows, layers = args.rows, args.layers
 
@@ -304,12 +335,14 @@ def main() -> None:
 
         return run
 
-    def layer(arm):
+    def layer(arm, outs=None):
         """moe/step.py's dual-stream half: the router and routed pair on the main
         stream, the routed input quant on its own stream, the shared expert on the
         alternate stream, all from one fork."""
 
         def run():
+            if outs is not None:
+                outs.clear()
             current = torch.cuda.current_stream()
             for i in range(layers):
                 x = xs[i]
@@ -323,10 +356,16 @@ def main() -> None:
                 current.wait_stream(quant_stream)
                 routed(x_q, x_s, ids, weights)
                 with torch.cuda.stream(alt):
-                    shared[i](x, arm)
+                    out = shared[i](x, arm)
                 current.wait_stream(alt)
+                if outs is not None:
+                    outs.append(out)
 
         return run
+
+    if args.check_replays:
+        _check_replays(layer, args.check_replays)
+        return
 
     graphs = {arm: (_graph(chain_only(arm)), _graph(layer(arm))) for arm in ARMS}
     torch.cuda.synchronize()
