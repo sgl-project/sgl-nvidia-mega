@@ -15,6 +15,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | GB300 (SM103); 148-SM B300 (SM103) with `sm148` | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request); on B300, speed was measured at one request only, serving passed a GSM8K canary at client concurrency 12 and 16 with decode CUDA graphs up to batch 16 (DSpark block 5), and larger batches and other block sizes rely on the kernel tests |
+| DeepSeek-V4.1-Flash | GB300 (SM103) | 8, with the MoE at TP4 x EP2 (two trays, one NVLink domain) | The same verify widths and the DSpark draft step; served and measured at one request (DSpark block 5); larger batches rely on the world-8 kernel tests. See [TP8 + EP2](#deepseek-v41-flash-at-tp8--ep2) |
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs) | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py) |
 
@@ -86,9 +87,9 @@ The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/
 | Replicated embedding (`embed`) | 1–48 | SGLang's fused lookup on the whole table, all-gathered once at build; no all-reduce |
 | Indexer top-k (`attn_indexer`) | 30–48 (batch 5–8) | The decode indexer's top-k in the plugin's forward, reading SGLang's paged indexer metadata and writing its selection into SGLang's buffer; the index query and head weights run on the layer's second stream, under the compressor. At 6–24 rows, chunked metadata or without paged metadata SGLang's indexer runs |
 | Engram prefetch (`engram`) | 1–8 (batch 1) | Every Engram layer's lookup and WKV quarter on a side stream; their two all-reduces on the main stream (SGLang's TP group) |
-| Attention and MoE all-reduce + mHC post + next norm (`two_shot`) | 49–384 | Two-shot exchange: each rank sends row t only to its owner rank (t mod 4), which sums the four partials in rank order and sends the row back; the MoE post also folds the top-k finalize and the shared-expert add, and quantizes the next input to MXFP8 where SGLang's fused post does |
+| Attention and MoE all-reduce + mHC post + next norm (`two_shot`) | 49–384 | Two-shot exchange: each rank sends row t only to its owner rank (t mod the TP size), which sums the partials in rank order and sends the row back; the MoE post also folds the top-k finalize and the shared-expert add, and quantizes the next input to MXFP8 where SGLang's fused post does |
 
-With the megakernel on, the default 39 slots run: the ones above, the attention chain, hop B's triggers, and the DSpark draft step's 16 slots. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting; empty runs every step function's stock code. The opt-in slots run only when listed there: `target_lm_head` (the target's LM head on the low-M kernel at 1-8 rows), `lm_head_pinned_tactic` (both low-M LM heads on one fixed tactic per row count, untuned), `hop_b_quad_trigger` (hop B's finalize-publish launches its consumer right after its own wait, batch 1 only), `hop_b_cap16` and `draft_embed`; listing `sm148` there admits the 148 SMs of a B300 instead of the 152 required otherwise.
+With the megakernel on, the default 40 slots run: the ones above, the attention chain, hop B's triggers, and the DSpark draft step's 17 slots (`draft_hop` among them, which acts at TP8 only). `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting; empty runs every step function's stock code. The opt-in slots run only when listed there: `target_lm_head` (the target's LM head on the low-M kernel at 1-8 rows), `lm_head_pinned_tactic` (both low-M LM heads on one fixed tactic per row count, untuned), `hop_b_quad_trigger` (hop B's finalize-publish launches its consumer right after its own wait, batch 1 only), `hop_b_cap16`, `draft_embed`, and at attention TP8 `swapab_h8` (swap-AB on the 8 local heads, target and draft) and `wo_a_g1` (the fused wo_a on the 1 local group), which replace SGLang's FlashMLA and einsum there; listing `sm148` there admits the 148 SMs of a B300 instead of the 152 required otherwise.
 
 Qwen3.5 (`qwen3_5/runtime`) runs the same way: per layer the stage boundary (`boundary/`), the GatedDeltaNet or the attention (`gdn/`, `attention/`) and the MoE (`moe/`), each with a stock implementation that reproduces SGLang's verify step bit for bit. It reads the running forward's metadata and pools through SGLang's EAGLE binding (`sglang.srt.kernel_plugins.nvidia.eagle_binding`). With the megakernel enabled, its shape-bounded bitwise paths run by default. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` overrides that policy for testing and bisecting; an empty value runs the stock paths.
 
@@ -163,7 +164,7 @@ The sampling and acceptance after the verify stay SGLang's own code. `gdn_prefil
 
 - An SGLang with the megakernels framework (`sglang.kernels.plugin_kernels.nvidia`, or `sglang.srt.megakernels` before sgl-project/sglang#45389; `--enable-nvidia-megakernel`); Qwen3.5 also needs `sglang.srt.kernel_plugins.nvidia.eagle_binding`
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.2), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
-- DeepSeek-V4.1-Flash: 4 x GB300, or 4 x 148-SM B300 (SM103) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`
+- DeepSeek-V4.1-Flash: 4 x GB300, or 4 x 148-SM B300 (SM103) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`; at TP8 + EP2, 8 x GB300 on two trays of one NVLink domain
 - Qwen3.5: 8 x GB300, two trays of one NVLink domain
 - Kimi K3: 8 x GB300 (SM103, 152 SMs), BF16, context length up to 262144 within the
   native model limit, TP8, DP1 and DCP off,
@@ -205,6 +206,32 @@ python -m sglang.launch_server \
 ```
 
 The three environment variables are required by the DeepSeek-V4.1 spec; without them the server stops at startup, naming each.
+
+### DeepSeek-V4.1-Flash at TP8 + EP2
+
+On two GB300 trays of one NVLink domain the spec admits one more layout: attention TP8 with the MoE at TP4 x EP2 (`--tp 8 --ep-size 2`). Each EP half holds 192 of the 384 routed experts and the shared expert is split over all 8 ranks, as SGLang loads them; every other (tp, ep) pair, TP4 over several nodes, a non-trivial expert placement and `SGLANG_SHARED_EXPERT_TP1` are refused at startup. The recommended launch, on each tray (`--node-rank 0` and `1`):
+
+```bash
+SGLANG_NVIDIA_MEGAKERNEL_SLOTS=$(python -c "from sgl_nvidia_mega.deepseek_v41.runtime import SHIPPED_SLOTS as s; print(','.join(s + ('swapab_h8', 'wo_a_g1')))") \
+SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
+NCCL_CUMEM_ENABLE=1 NCCL_MNNVL_ENABLE=1 \
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --tp 8 --ep-size 2 --nnodes 2 --node-rank 0 --dist-init-addr <tray-0 host>:<port> \
+  --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsv4-attn-backend flashmla \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --enable-nvidia-megakernel
+```
+
+The variable lists the shipped slots plus the two TP8 attention slots, since a value replaces the shipped list rather than extending it. Each rank keeps its own Engram host table (`per_rank`), as at TP4.
+
+`swapab_h8` and `wo_a_g1` are opt-in because they change the arithmetic against stock SGLang at TP8, which runs the decode attention as FlashMLA with the 8 local heads padded to 64 and wo_a as inverse RoPE, a BF16 einsum and wo_b's MXFP8 quantize. The two slots run TP4's kernels instead: swap-AB on the 8 local heads and the fused wo_a on the 1 local group, each bit for bit the TP4 kernel on the same heads or group. The fused wo_a writes the same MXFP8 codes as stock TP8 at 1 and 6 rows; at 16 rows 0.012 % of codes move by at most one eighth of a block step. GSM8K with the two slots matched stock TP8. Without them TP8 still serves, on SGLang's FlashMLA and einsum, at about 4.0 ms per verify step instead of 3.2 ms (one request, DSpark acceptance length forced to 3.51).
+
+SGLang fuses its all-reduce + mHC posts only at TP2 and TP4. At TP8 the target's posts run on the plugin's hops (hop A, hop B and the two-shot) and the draft's posts on a Lamport mailbox of their own (slot `draft_hop`, shipped; it builds nothing at TP4). At startup the draft logs each requested draft slot as built, declined (with the reason) or not needed.
 
 Qwen3.5, on each of the two trays (`--node-rank 0` and `1`):
 
@@ -341,6 +368,8 @@ pytest test/unit               # host tests plus CUDA cases when a compatible GP
 pytest test/kernels            # DeepSeek-V4.1-Flash: 4 x GB300
 pytest test/e2e                # DeepSeek-V4.1-Flash: 4 x GB300, with SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH set
 ```
+
+The DeepSeek-V4.1-Flash TP8 + EP2 kernel tests (`test_deepseek_v41_moe_ep.py`, `test_deepseek_v41_hop_b.py`, `test_deepseek_v41_hops.py`, `test_deepseek_v41_draft_hop.py`, and `test_deepseek_v41_draft.py -k ranks`) run on both trays under a two-node torchrun (`--nnodes 2 --nproc-per-node 4 -m pytest <file> -s`).
 
 Qwen3.5 runs TP8, which spans two GB300 trays: its e2e tests read a server launched on them through `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` and the files its ranks log to (`SGLANG_NVIDIA_MEGAKERNEL_E2E_LOGS`, comma-separated).
 
