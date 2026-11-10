@@ -4,7 +4,11 @@
 SM100-family GPUs (GB300) with NVLink multicast:
 
 - ``mbarrier_exchange`` (slot hop_mbar): the RMSNorm's CTA sums cross the cluster by
-  st.async onto mbarriers instead of DSMEM stores and a cluster barrier.
+  st.async onto mbarriers instead of DSMEM stores and a cluster barrier;
+- ``final_collapse`` (slot hop_final_collapse): the last layer's hop B also writes the
+  head's mHC collapse, bit for bit SGLang's ``mhc_combine`` of the streams it writes
+  (and the streams bit for bit the residual-only variant's), so the head runs only
+  SGLang's RMSNorm on it.
 
 Each against the same mailbox without it, bit for bit: hop A (with and without the
 MXFP8 layer input) and every hop B variant (normed, 128x4 and row-tile MXFP8,
@@ -277,6 +281,32 @@ def test_lever_is_bitwise_on_the_wide_mailbox(env, lever):
             want = _run(base, kind, inp)
             got = _run(hop, kind, inp)
             assert all(_same(a, b) for a, b in zip(got, want)), (lever, kind, rows)
+    torch.cuda.synchronize()
+    dist.barrier(group=env.cpu_group)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("capacity", [16, 48])
+def test_final_collapse_is_sglangs_head_combine(env, capacity):
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
+
+    kw = TRIGGERS["serving"]
+    hop = _hop(env.device, env.group, capacity=capacity, final_collapse=True, **kw)
+    plain = _hop(env.device, env.group, capacity=capacity, **kw)
+    mix = lambda inp: (inp.residual, inp.post, inp.comb)  # noqa: E731
+    rows_list = range(1, capacity + 1) if capacity == 16 else (17, 24, 33, 48)
+    for rows in rows_list:
+        inp = _inputs(rows, 900 + rows, env.rank, env.device)
+        moe = (inp.gemm2, inp.weights, inp.idx, inp.shared, *mix(inp))
+        for _ in range(4):  # cycle the generations, alternating with the plain path
+            streams, collapsed = hop.finalize(*moe, inp.pre, None, EPS, collapse=True)
+            want = plain.finalize(*moe, None, None, EPS)[0]
+            head = mhc_combine(streams.flatten(1).float(), inp.pre, HC, streams.dtype)
+            assert _same(streams, want), rows
+            assert _same(collapsed, head), rows
+            # the plain hop on the same instance stays bitwise too
+            again = hop.finalize(*moe, None, None, EPS)[0]
+            assert _same(again, want), rows
     torch.cuda.synchronize()
     dist.barrier(group=env.cpu_group)
 

@@ -7,7 +7,9 @@ Each arm is one CUDA graph of 64 seams captured with the serving triggers: hop A
 (attention post: publish, consumer with the FFN norm), hop B (MoE post: finalize
 publish, consumer with the next layer's MXFP8 input), the two alternating (AB), or, as
 in a step, hop A published by the wo_b GEMM's epilogue alternating with hop B (GB; the
-GEMM's time is in the seam). Arms are timed in a palindrome order per repeat (base, levers..., levers
+GEMM's time is in the seam). Kind T is the step's tail: the last hop B (streams only),
+then the head's FP32 cast, mhc_combine and RMSNorm; the collapse arm writes the collapse
+in hop B and runs the RMSNorm only. Arms are timed in a palindrome order per repeat (base, levers..., levers
 reversed, base), every rank replaying the same graph; the per-seam time is the
 graph's replay time over 64. Run with
 ``torchrun --nproc_per_node=4 benchmark/bench_deepseek_v41_boundary_levers.py``.
@@ -54,7 +56,11 @@ def _wo_b(device, rows):
     return linear, (q, sf.reshape(-1))
 
 
-ARMS = {"base": {}, "mbar": dict(mbarrier_exchange=True)}
+ARMS = {
+    "base": {},
+    "mbar": dict(mbarrier_exchange=True),
+    "collapse": dict(final_collapse=True),
+}
 
 
 def main():
@@ -62,7 +68,7 @@ def main():
     parser.add_argument("--rows", type=int, default=6)
     parser.add_argument("--repeats", type=int, default=8)
     parser.add_argument("--replays", type=int, default=200)
-    parser.add_argument("--arms", default=",".join(ARMS))
+    parser.add_argument("--arms", default="base,mbar")
     parser.add_argument("--kinds", default="A,B,AB,GB")
     args = parser.parse_args()
     e = t._init_dist()
@@ -77,7 +83,23 @@ def main():
         for p in publishers.values():
             p.precompile(wo_b, args.rows)
 
+        from sglang.kernels.ops.layernorm.mhc import mhc_combine
+        from sglang.srt.layers.layernorm import RMSNorm
+
+        head_norm = RMSNorm(t.HIDDEN, eps=t.EPS).to(e.device, torch.bfloat16)
+        moe = (inp.gemm2, inp.weights, inp.idx, inp.shared, inp.residual, inp.post)
+        moe += (inp.comb,)
+
         def seam(arm, kind):
+            if kind == "t":
+                if ARMS[arm].get("final_collapse"):
+                    _, c = hops[arm].finalize(*moe, inp.pre, None, t.EPS, collapse=True)
+                else:
+                    streams = hops[arm].finalize(*moe, None, None, t.EPS)[0]
+                    c = mhc_combine(
+                        streams.flatten(1).float(), inp.pre, t.HC, streams.dtype
+                    )
+                return head_norm(c)
             if kind == "g":
                 x = publishers[arm](wo_b, publishers[arm].prepare(wo_b, qa))
                 return t._run(hops[arm], "a", SimpleNamespace(**{**vars(inp), "x": x}))
@@ -90,6 +112,7 @@ def main():
                 "B": ["quant"],
                 "AB": ["a", "quant"],
                 "GB": ["g", "quant"],
+                "T": ["t"],
             }[kind]
             for arm in arms:
                 for _ in range(3):  # compile and warm outside the capture
