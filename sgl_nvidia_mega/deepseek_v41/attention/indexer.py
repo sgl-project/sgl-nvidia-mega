@@ -407,7 +407,9 @@ class StepIndexer:
     def _consume_fused(data: Query, k_cache, table: Table, out, logits=None) -> None:
         torch.cuda.current_stream().wait_event(table.ready)
         # the query (stream 1) and the table (the source's stream) join this stream by
-        # events, full dependencies: the kernel reads them before its PDL wait
+        # events, which a captured graph turns into programmatic edges: the kernel reads
+        # them before its PDL wait because their writers finished layers earlier (the
+        # table) or end at their exit (the query's RoPE + pack, which never triggers)
         reindex_select.reindex_select(
             data.q_fp4,
             data.q_sf,
