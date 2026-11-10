@@ -66,6 +66,11 @@ SHIPPED_SLOTS = (
     "draft_wo_b_ll",
     "sched_ahead",
     "req_pos_once",
+    # kv_before_wait: on the low-ratio layers swap-AB gathers the window KV before its
+    # PDL wait; a layer's own sparse range (its top-k's selection, its compressor's
+    # rows) only after it, since a captured stream join is a programmatic edge and
+    # SGLang's top-k releases its dependents before it writes (bitwise). The window KV
+    # store also releases before it stores; its rows are still gathered before the wait
     "kv_before_wait",
 )
 # the draft's slots, which build with the draft spec

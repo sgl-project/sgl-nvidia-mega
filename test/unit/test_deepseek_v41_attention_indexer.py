@@ -422,3 +422,61 @@ def test_the_check_ignores_the_emission_order(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     p.compare(SimpleNamespace(compress_ratio=1), view, lambda: out.copy_(out.flip(-1)))
     assert p.differ == 0
+
+
+@pytest.mark.parametrize(
+    "kv_before_wait, has_indexer, has_compressor, want",
+    [
+        (True, True, True, True),  # a source layer: its selection and rows after
+        (True, True, False, True),  # an index layer: its selection after the wait
+        (True, False, False, False),  # a reuse layer: written layers earlier
+        (False, True, True, False),  # everything after the wait already
+    ],
+)
+def test_swapab_reads_the_layers_own_sparse_range_after_its_wait(
+    kv_before_wait, has_indexer, has_compressor, want
+):
+    """With kv_before_wait, a layer whose sparse range its own top-k (or compressor)
+    writes in the step reads that range after swap-AB's PDL wait: a captured stream
+    join is a programmatic edge, and SGLang's top-k releases its dependents before it
+    writes."""
+    import importlib
+
+    step_mod = importlib.import_module("sgl_nvidia_mega.deepseek_v41.attention.step")
+
+    attn = SimpleNamespace(
+        layer_id=3,
+        compress_ratio=1,
+        indexer=object() if has_indexer else None,
+        compressor=object() if has_compressor else None,
+        alt_streams=None,
+    )
+    with (
+        mock.patch.object(chain, "ChainOps", lambda *a, **k: SimpleNamespace()),
+        mock.patch.object(chain, "swapab_applies", return_value=False),
+    ):
+        st = step_mod.AttentionStep(attn, chain_ops=True, kv_before_wait=kv_before_wait)
+    assert st.index_after_wait is want
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def sparse_decode(*a, **kw):
+        seen.update(kw)
+        raise Stop
+
+    attn.maybe_use_decode_attn_tp = lambda fb: nullcontext()
+    view = SimpleNamespace(kv_pool=SimpleNamespace(uniform_fp8=False))
+    with (
+        mock.patch.object(prepare, "low_ratio", return_value="q"),
+        mock.patch.object(st, "takes_swapab", return_value=True),
+        mock.patch.object(
+            st, "_prepare_path", side_effect=lambda *a: prepare.low_ratio
+        ),
+        mock.patch.object(chain, "sparse_decode", side_effect=sparse_decode),
+        pytest.raises(Stop),
+    ):
+        st.run(torch.zeros(6, 4), None, None, view=view)
+    assert seen["kv_before_wait"] is kv_before_wait
+    assert seen["extra_after_wait"] is want
