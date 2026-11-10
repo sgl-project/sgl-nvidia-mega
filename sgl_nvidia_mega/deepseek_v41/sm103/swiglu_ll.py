@@ -44,8 +44,11 @@ as two more launches on the alternate stream, beside the routed GEMMs.
 
 Layout. :func:`interleave_gate_up` reorders the weight rows so each 128-row tile
 holds 64 gate rows and their 64 up rows: tile ``t`` is gate rows ``64t .. 64t+63``
-then up rows ``I + 64t .. I + 64t + 63`` (``I`` = N / 2, any multiple of 64). Each
-output element is the same K reduction as before, in the same order (the split-K
+then up rows ``I + 64t .. I + 64t + 63`` (``I`` = N / 2, any multiple of 32). When
+64 does not divide I (TP8's shard: I = 288) the last tile holds the 32 remaining
+gate rows at 0-31 and their up rows at 64-95, the rest zero rows: the weight is
+padded to whole tiles. Each output element is the same K reduction as before, in
+the same order (the tactic is the one the unpadded N selects, and the split-K
 partials are added in the base kernel's order), so the BF16 gate_up values are the
 unfused GEMM's.
 
@@ -103,8 +106,11 @@ SF_ATOM_ROWS, SF_ATOM_COLS = 128, 4
 
 
 def _unswizzle_128x4(scale: torch.Tensor, n: int, k_sf: int) -> torch.Tensor:
-    """FlashInfer's 128x4-swizzled UE8M0 bytes as [n, k_sf] rows."""
-    s = scale.reshape(-1).view(torch.uint8)[: n * k_sf]
+    """FlashInfer's 128x4-swizzled UE8M0 bytes as [n, k_sf] rows (n % 128 == 0)."""
+    s = scale.reshape(-1).view(torch.uint8)
+    if s.numel() < n * k_sf:
+        raise ValueError(f"{s.numel()} scale bytes, the 128x4 layout needs {n * k_sf}")
+    s = s[: n * k_sf]
     s = s.view(n // 128, k_sf // 4, 32, 4, 4)  # (row block, col block, r32, r4, c4)
     return s.permute(0, 3, 2, 1, 4).reshape(n, k_sf)
 
@@ -115,30 +121,44 @@ def _swizzle_128x4(linear: torch.Tensor) -> torch.Tensor:
     return s.permute(0, 3, 2, 1, 4).reshape(-1).contiguous()
 
 
+def _tiles(n: int) -> int:
+    return -(-(n // 2) // HALF)
+
+
 def gate_up_order(n: int, device=None) -> torch.Tensor:
-    """The source row of each interleaved row: per 128-row tile, 64 gate rows then
-    the matching 64 up rows."""
+    """The source row of each interleaved row (whole 128-row tiles): per tile, 64
+    gate rows then the matching 64 up rows; -1 for a padding row."""
     inter = n // 2
-    p = torch.arange(n, device=device)
+    p = torch.arange(_tiles(n) * TILE_M, device=device)
     tile, local = p // TILE_M, p % TILE_M
-    return torch.where(
-        local < HALF, tile * HALF + local, inter + tile * HALF + local - HALF
-    )
+    j = tile * HALF + local % HALF  # the SwiGLU column
+    return torch.where(j < inter, torch.where(local < HALF, j, inter + j), -1)
 
 
 def interleave_gate_up(
     weight: torch.Tensor, weight_scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The gate_up weight [2I, K] (E4M3) and its 128x4-swizzled UE8M0 scales with the
-    rows in :func:`gate_up_order`; new tensors, the inputs are untouched."""
+    rows in :func:`gate_up_order`, padding rows zero; new tensors, the inputs are
+    untouched."""
     n, k = weight.shape
-    if n % TILE_M or k % 128:
-        raise ValueError(f"gate_up {n} x {k}: needs N % 128 == 0 and K % 128 == 0")
+    if n % (2 * SF_VEC) or k % 128:
+        raise ValueError(f"gate_up {n} x {k}: needs N % 64 == 0 and K % 128 == 0")
     order = gate_up_order(n, weight.device)
-    w = weight.index_select(0, order).contiguous()
-    linear = _unswizzle_128x4(weight_scale, n, k // SF_VEC)
-    s = _swizzle_128x4(linear.index_select(0, order).contiguous())
-    return w, s.view(weight_scale.dtype) if weight_scale.dtype != torch.uint8 else s
+    valid = order >= 0
+    w = torch.zeros((order.numel(), k), dtype=torch.uint8, device=weight.device)
+    w[valid] = weight.view(torch.uint8).index_select(0, order[valid])
+    k_sf = k // SF_VEC
+    linear = _unswizzle_128x4(weight_scale, -(-n // TILE_M) * TILE_M, k_sf)
+    interleaved = torch.zeros(
+        (order.numel(), k_sf), dtype=torch.uint8, device=weight.device
+    )
+    interleaved[valid] = linear.index_select(0, order[valid])
+    s = _swizzle_128x4(interleaved)
+    return (
+        w.view(weight.dtype),
+        s.view(weight_scale.dtype) if weight_scale.dtype != torch.uint8 else s,
+    )
 
 
 def limit_bits(limit: float) -> int:
@@ -307,14 +327,17 @@ class SwigluLowLatencyBlockscaledGemmKernel(LowLatencyBlockscaledGemmKernel):
             raise ValueError("the fold takes 128 x 8 output tiles")
         if self.use_bias or self.use_scale:
             raise ValueError("no bias or output scale with the fold")
-        if quant and (inter % HALF or q_address % 16 or sf_address % 16):
-            raise ValueError("quant: I % 64 == 0 and 16-byte aligned buffers")
+        if inter <= 0 or inter % SF_VEC:
+            raise ValueError("the fold takes I % 32 == 0")
+        if quant and (q_address % 16 or sf_address % 16):
+            raise ValueError("quant: 16-byte aligned buffers")
         self.limit = limit
         self.early_release = early_release
         self.quant = quant
         self.inter = inter
         self.q_address = q_address
         self.sf_address = sf_address
+        self.last_m = -(-inter // HALF) - 1
         self.sf_cols = inter // SF_VEC
         self.padded_sf_cols = -(-self.sf_cols // SF_ATOM_COLS) * SF_ATOM_COLS
 
@@ -510,14 +533,16 @@ class SwigluLowLatencyBlockscaledGemmKernel(LowLatencyBlockscaledGemmKernel):
             bits[q] = swiglu_clamp_bf16(tile[gate], tile[gate + HALF], self.limit)
         h_col = m_idx * HALF + col
         if cutlass.const_expr(not self.quant):
-            if token < rows:
-                inter = mC_mnl.shape[0] // 2
-                address = mC_mnl.iterator.toint() + Int64((token * inter + h_col) * 2)
-                _st_global_v2_u32(
-                    address,
-                    bits[0] | (bits[1] << Uint32(16)),
-                    bits[2] | (bits[3] << Uint32(16)),
-                )
+            if token < rows:  # noqa: SIM102
+                if h_col < self.inter:
+                    address = mC_mnl.iterator.toint() + Int64(
+                        (token * self.inter + h_col) * 2
+                    )
+                    _st_global_v2_u32(
+                        address,
+                        bits[0] | (bits[1] << Uint32(16)),
+                        bits[2] | (bits[3] << Uint32(16)),
+                    )
         else:
             amax = _max_f32(
                 _max_f32(_bf16_bits_abs_f32(bits[0]), _bf16_bits_abs_f32(bits[1])),
@@ -537,25 +562,27 @@ class SwigluLowLatencyBlockscaledGemmKernel(LowLatencyBlockscaledGemmKernel):
                 bits[2] | (bits[3] << Uint32(16)), inv_scale
             )
             sf_col = h_col // SF_VEC
-            first_of_block = (epi_tid % 8) == 0
-            if token < rows:
-                _st_global_u32(
-                    Int64(self.q_address) + Int64(token * self.inter + h_col),
-                    (fp8_lo & Uint32(0xFFFF))
-                    | ((fp8_hi & Uint32(0xFFFF)) << Uint32(16)),
-                )
-                if first_of_block:
+            # the last tile's columns past I (a half tile) are zero rows: no store
+            if h_col < self.inter:
+                first_of_block = (epi_tid % 8) == 0
+                if token < rows:
+                    _st_global_u32(
+                        Int64(self.q_address) + Int64(token * self.inter + h_col),
+                        (fp8_lo & Uint32(0xFFFF))
+                        | ((fp8_hi & Uint32(0xFFFF)) << Uint32(16)),
+                    )
+                    if first_of_block:
+                        _st_global_u8(
+                            Int64(self.sf_address)
+                            + Int64(_sf_offset(token, sf_col, self.padded_sf_cols)),
+                            scale_u32,
+                        )
+                elif first_of_block:
                     _st_global_u8(
                         Int64(self.sf_address)
                         + Int64(_sf_offset(token, sf_col, self.padded_sf_cols)),
-                        scale_u32,
+                        Uint32(0),
                     )
-            elif first_of_block:
-                _st_global_u8(
-                    Int64(self.sf_address)
-                    + Int64(_sf_offset(token, sf_col, self.padded_sf_cols)),
-                    Uint32(0),
-                )
             self.zero_scale_padding(rows, m_idx, n_idx, epi_tid)
 
     @cute.jit
@@ -563,22 +590,25 @@ class SwigluLowLatencyBlockscaledGemmKernel(LowLatencyBlockscaledGemmKernel):
         self, rows: Int32, m_idx: Int32, n_idx: Int32, epi_tid: Int32
     ):
         """The scale bytes FlashInfer zeroes that no token tile covers: the padding
-        rows past the last tile (by the last token tile's CTAs, their 2 columns) and
-        the padding columns (by the last column tile's CTAs)."""
+        rows past the last tile (by the last token tile's CTAs, their real columns)
+        and the padding columns (by the last column tile's CTAs)."""
         padded_rows = (rows + SF_ATOM_ROWS - 1) // SF_ATOM_ROWS * SF_ATOM_ROWS
         last_n = (rows + self.cta_n - 1) // self.cta_n - 1
         tile_end = (n_idx + 1) * self.cta_n
         col0 = m_idx * (HALF // SF_VEC)
+        cols = Int32(HALF // SF_VEC)
+        if m_idx == self.last_m:
+            cols = self.sf_cols - col0
         if n_idx == last_n:
             index = epi_tid
-            span = (padded_rows - tile_end) * (HALF // SF_VEC)
+            span = (padded_rows - tile_end) * cols
             while index < span:
                 _st_global_u8(
                     Int64(self.sf_address)
                     + Int64(
                         _sf_offset(
-                            tile_end + index // (HALF // SF_VEC),
-                            col0 + index % (HALF // SF_VEC),
+                            tile_end + index // cols,
+                            col0 + index % cols,
                             self.padded_sf_cols,
                         )
                     ),
@@ -587,7 +617,7 @@ class SwigluLowLatencyBlockscaledGemmKernel(LowLatencyBlockscaledGemmKernel):
                 index = index + 128
         if cutlass.const_expr(self.padded_sf_cols > self.sf_cols):
             pad_cols = self.padded_sf_cols - self.sf_cols
-            if col0 + HALF // SF_VEC == self.sf_cols:
+            if m_idx == self.last_m:
                 row_end = tile_end
                 if n_idx == last_n:
                     row_end = padded_rows

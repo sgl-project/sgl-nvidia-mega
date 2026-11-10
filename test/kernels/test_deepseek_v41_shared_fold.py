@@ -8,7 +8,7 @@ scales) that ``down_proj`` runs.
 - The epilogue's SwiGLU against SGLang's kernel on every BF16 gate value x a set of up
   values (clamp edges, signed zeros, subnormals, infinities, NaN), at two limits.
 - The interleaved weight: its GEMM columns are the plain GEMM's, reordered.
-- The folded GEMM at 1-48 rows (TP4's gate_up, and narrower / wider shards), with
+- The folded GEMM at 1-48 rows (TP4's and TP8's gate_up, narrower / wider ones), with
   zero, negative and clamped rows, eager and replayed from a CUDA graph, on output
   and scale memory poisoned first (every byte must be written).
 """
@@ -34,6 +34,8 @@ needs_gpu = pytest.mark.skipif(not _ready(), reason="needs an SM100-family GPU")
 
 K = 5120  # hidden
 INTER = 576  # the shared expert's TP4 shard (2 x 576 gate_up rows)
+INTER_TP8 = 288  # TP8's: half a 128-row tile at the end
+WIDTHS = [2 * INTER, 2 * INTER_TP8, 2 * 64, 2 * 1152]
 LIMITS = (10.0, 6.9)  # DSV4.1's swiglu_limit; one that BF16 rounds
 POISON = (0xFF, 0x7F)
 
@@ -172,8 +174,9 @@ def _reference(x_q, x_s, w_q, w_sf, limit, quant):
 
 
 @needs_gpu
-@pytest.mark.parametrize("n", [2 * INTER, 2 * 1152, 2 * 64])
+@pytest.mark.parametrize("n", WIDTHS)
 def test_interleaved_weight_reorders_the_gemm_columns(n):
+    """On the unfolded gate_up's tactic, which the fold runs; padding columns are 0."""
     from sgl_nvidia_mega.deepseek_v41.sm103.swiglu_ll import (
         gate_up_order,
         interleave_gate_up,
@@ -181,26 +184,33 @@ def test_interleaved_weight_reorders_the_gemm_columns(n):
 
     w_q, w_sf = _weights(n, 1, edges=False)
     wi_q, wi_sf = interleave_gate_up(w_q, w_sf)
+    order = gate_up_order(n, "cuda")
+    valid = order >= 0
+    assert wi_q.shape[0] == order.numel() and wi_q.shape[0] % 128 == 0
     for rows in (1, 6, 48):
         x_q, x_s = _rows(rows, rows)
-        want = mxfp8_ll.linear(x_q, x_s, w_q, w_sf)[:, gate_up_order(n, "cuda")]
-        got = mxfp8_ll.linear(x_q, x_s, wi_q, wi_sf)
-        assert torch.equal(got.view(torch.int16), want.view(torch.int16)), rows
+        tactic = mxfp8_ll.swiglu_tactic(x_q.device, n // 2, K, rows)
+        want = mxfp8_ll.linear(x_q, x_s, w_q, w_sf)[:, order[valid]]
+        got = mxfp8_ll.linear(x_q, x_s, wi_q, wi_sf, tactic=tactic)
+        assert torch.equal(got[:, valid].view(torch.int16), want.view(torch.int16))
+        assert not got[:, ~valid].view(torch.int16).any(), rows
 
 
-def _fold(x_q, x_s, wi_q, wi_sf, limit, buffers, byte):
+def _fold(x_q, x_s, wi_q, wi_sf, limit, inter, buffers, byte):
     from sgl_nvidia_mega.deepseek_v41.sm103.swiglu_ll import limit_bits
 
-    rows, inter = x_q.shape[0], wi_q.shape[0] // 2
+    rows = x_q.shape[0]
     if buffers is not None:
         buffers.quant.view(torch.uint8).fill_(byte)
         buffers.scale.fill_(byte)
         return mxfp8_ll.linear_swiglu(
-            x_q, x_s, wi_q, wi_sf, limit_bits(limit), buffers=buffers
+            x_q, x_s, wi_q, wi_sf, limit_bits(limit), inter, buffers=buffers
         )
     out = torch.empty((rows, inter), dtype=torch.bfloat16, device="cuda")
     out.view(torch.uint8).fill_(byte)
-    return mxfp8_ll.linear_swiglu(x_q, x_s, wi_q, wi_sf, limit_bits(limit), out=out)
+    return mxfp8_ll.linear_swiglu(
+        x_q, x_s, wi_q, wi_sf, limit_bits(limit), inter, out=out
+    )
 
 
 def _same(got, want) -> bool:
@@ -214,7 +224,7 @@ def _same(got, want) -> bool:
 
 @needs_gpu
 @pytest.mark.parametrize("quant", [False, True], ids=["swiglu", "quant"])
-@pytest.mark.parametrize("n", [2 * INTER, 2 * 64, 2 * 1152])
+@pytest.mark.parametrize("n", WIDTHS)
 @pytest.mark.parametrize("limit", LIMITS)
 def test_fold_is_bitwise_at_every_width(limit, n, quant):
     from sgl_nvidia_mega.deepseek_v41.sm103.swiglu_ll import (
@@ -226,13 +236,13 @@ def test_fold_is_bitwise_at_every_width(limit, n, quant):
     wi_q, wi_sf = interleave_gate_up(w_q, w_sf)
     buffers = mxfp8_ll.swiglu_mxfp8_buffers(0, n // 2, 48) if quant else None
     rows_all = list(range(1, 49))
-    mxfp8_ll.precompile_swiglu(wi_q, rows_all, limit_bits(limit), buffers)
+    mxfp8_ll.precompile_swiglu(wi_q, rows_all, limit_bits(limit), n // 2, buffers)
     failed = []
     for rows in rows_all:
         x_q, x_s = _rows(rows, 100 + rows)
         want = _reference(x_q, x_s, w_q, w_sf, limit, quant)
         for byte in POISON:
-            got = _fold(x_q, x_s, wi_q, wi_sf, limit, buffers, byte)
+            got = _fold(x_q, x_s, wi_q, wi_sf, limit, n // 2, buffers, byte)
             torch.cuda.synchronize()
             if not _same(got, want):
                 failed.append((rows, hex(byte)))
@@ -243,25 +253,26 @@ def test_fold_is_bitwise_at_every_width(limit, n, quant):
 @needs_gpu
 @pytest.mark.parametrize("quant", [False, True], ids=["swiglu", "quant"])
 @pytest.mark.parametrize("rows", [6, 12, 48])
-def test_fold_replays_bitwise_from_a_graph(rows, quant):
+@pytest.mark.parametrize("inter", [INTER, INTER_TP8])
+def test_fold_replays_bitwise_from_a_graph(inter, rows, quant):
     from sgl_nvidia_mega.deepseek_v41.sm103.swiglu_ll import (
         interleave_gate_up,
         limit_bits,
     )
 
-    limit, n = LIMITS[0], 2 * INTER
-    w_q, w_sf = _weights(n, 3, edges=True)
+    limit = LIMITS[0]
+    w_q, w_sf = _weights(2 * inter, 3, edges=True)
     wi_q, wi_sf = interleave_gate_up(w_q, w_sf)
-    buffers = mxfp8_ll.swiglu_mxfp8_buffers(0, INTER, 48) if quant else None
-    mxfp8_ll.precompile_swiglu(wi_q, [rows], limit_bits(limit), buffers)
+    buffers = mxfp8_ll.swiglu_mxfp8_buffers(0, inter, 48) if quant else None
+    mxfp8_ll.precompile_swiglu(wi_q, [rows], limit_bits(limit), inter, buffers)
     x_q, x_s = _rows(rows, rows)
     want = _reference(x_q, x_s, w_q, w_sf, limit, quant)
-    _fold(x_q, x_s, wi_q, wi_sf, limit, buffers, 0)
+    _fold(x_q, x_s, wi_q, wi_sf, limit, inter, buffers, 0)
     torch.cuda.synchronize()
     for byte in POISON:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            got = _fold(x_q, x_s, wi_q, wi_sf, limit, buffers, byte)
+            got = _fold(x_q, x_s, wi_q, wi_sf, limit, inter, buffers, byte)
         graph.replay()
         torch.cuda.synchronize()
         assert _same(got, want), hex(byte)
@@ -269,7 +280,8 @@ def test_fold_replays_bitwise_from_a_graph(rows, quant):
 
 @needs_gpu
 @pytest.mark.parametrize("rows", [1, 6, 9, 48])
-def test_down_proj_output_is_bitwise_on_the_folded_quant(rows):
+@pytest.mark.parametrize("inter", [INTER, INTER_TP8])
+def test_down_proj_output_is_bitwise_on_the_folded_quant(inter, rows):
     """down_proj (FlashInfer's cute-dsl MXFP8 linear, as SGLang dispatches it on GB300)
     on the folded quant against its own quant of the SwiGLU rows."""
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -282,13 +294,13 @@ def test_down_proj_output_is_bitwise_on_the_folded_quant(rows):
     )
 
     limit = LIMITS[0]
-    w_q, w_sf = _weights(2 * INTER, 5, edges=True)
+    w_q, w_sf = _weights(2 * inter, 5, edges=True)
     wi_q, wi_sf = interleave_gate_up(w_q, w_sf)
     g = torch.Generator(device="cuda").manual_seed(rows)
-    d = torch.randn(K, INTER, device="cuda", generator=g) / INTER**0.5
+    d = torch.randn(K, inter, device="cuda", generator=g) / inter**0.5
     d_q, d_sf = mxfp8_ll.quantize(d.bfloat16())
     d_q, d_sf = d_q.contiguous(), d_sf.reshape(-1).contiguous()
-    buffers = mxfp8_ll.swiglu_mxfp8_buffers(0, INTER, 48)
+    buffers = mxfp8_ll.swiglu_mxfp8_buffers(0, inter, 48)
     x_q, x_s = _rows(rows, 300 + rows)
     gate_up = mxfp8_ll.linear(x_q, x_s, w_q, w_sf)
     clamped = int((gate_up.float().abs() > limit).sum())
@@ -296,7 +308,7 @@ def test_down_proj_output_is_bitwise_on_the_folded_quant(rows):
         _sglang_swiglu(gate_up, limit), d_q, d_sf, backend="cute-dsl"
     )
     q, s = mxfp8_ll.linear_swiglu(
-        x_q, x_s, wi_q, wi_sf, limit_bits(limit), buffers=buffers
+        x_q, x_s, wi_q, wi_sf, limit_bits(limit), inter, buffers=buffers
     )
     got = flashinfer_mxfp8_blockscaled_linear(
         q, d_q, d_sf, input_scale=s, backend="cute-dsl"

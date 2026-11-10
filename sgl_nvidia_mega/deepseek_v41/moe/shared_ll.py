@@ -73,8 +73,10 @@ def why_not(mlp: torch.nn.Module) -> str:
     ):
         return "gate_up has no MXFP8 view"
     n, k = gate_up.weight.shape
-    if n % 128 or k % 128:
-        return f"gate_up {n} x {k}: the kernel takes multiples of 128"
+    # N: the TP8 shard's 576 (2 x 288) ends in half a 128-row tile, which the kernel's
+    # TMA zero-fills and its predicated stores drop; its swizzled scales are padded
+    if n % 64 or k % 128:
+        return f"gate_up {n} x {k}: the kernel takes N % 64 == 0 and K % 128 == 0"
     return ""
 
 
@@ -170,18 +172,22 @@ class SwigluFold:
             weight, weight_scale
         )
         self.limit = swiglu_ll.limit_bits(limit)
+        self.inter = weight.shape[0] // 2
         self.early_release = early_release
         self.buffers = (
-            mxfp8_ll.swiglu_mxfp8_buffers(
-                weight.device.index, weight.shape[0] // 2, max_rows
-            )
+            mxfp8_ll.swiglu_mxfp8_buffers(weight.device.index, self.inter, max_rows)
             if quant
             else None
         )
 
     def precompile(self, rows) -> None:
         mxfp8_ll.precompile_swiglu(
-            self.weight, list(rows), self.limit, self.buffers, self.early_release
+            self.weight,
+            list(rows),
+            self.limit,
+            self.inter,
+            self.buffers,
+            self.early_release,
         )
 
     def __call__(self, x_q: torch.Tensor, x_s: torch.Tensor):
@@ -192,6 +198,7 @@ class SwigluFold:
             self.weight,
             self.weight_scale,
             self.limit,
+            self.inter,
             buffers=self.buffers,
             early_release=self.early_release,
         )

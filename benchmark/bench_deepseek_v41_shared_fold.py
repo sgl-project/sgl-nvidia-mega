@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Slot shared_ll's chain against shared_fold / shared_fold_quant on one GB300, at the
-DSV4.1-Flash TP4 shapes, from CUDA graphs of ``--layers`` MoE halves with their own
-weights (the routed experts share one layer's weights, each half its own routing).
+DSV4.1-Flash TP4 shapes (``--inter 288``: TP8's shared expert), from CUDA graphs of
+``--layers`` MoE halves with their own weights (the routed experts share one layer's
+weights, each half its own routing).
 
 Per half, from the fork (the first kernel of the half on either stream):
 
@@ -83,15 +84,16 @@ def _routed_layer(seed: int):
 class Shared:
     """One layer's shared expert: gate_up (plain and interleaved), down_proj."""
 
-    def __init__(self, seed: int, rows: int):
+    def __init__(self, seed: int, rows: int, inter: int):
         from sgl_nvidia_mega.deepseek_v41.moe.shared_ll import SwigluFold
         from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 
         g = torch.Generator(device="cuda").manual_seed(seed)
-        w = torch.randn(2 * INTER, HIDDEN, device="cuda", generator=g) / HIDDEN**0.5
+        self.inter = inter
+        w = torch.randn(2 * inter, HIDDEN, device="cuda", generator=g) / HIDDEN**0.5
         self.w, self.w_s = (t.contiguous() for t in mxfp8_ll.quantize(w.bfloat16()))
         self.w_s = self.w_s.reshape(-1)
-        d = torch.randn(HIDDEN, INTER, device="cuda", generator=g) / INTER**0.5
+        d = torch.randn(HIDDEN, inter, device="cuda", generator=g) / inter**0.5
         self.d, self.d_s = (t.contiguous() for t in mxfp8_ll.quantize(d.bfloat16()))
         self.d_s = self.d_s.reshape(-1)
         self.fold = SwigluFold(self.w, self.w_s, LIMIT, 48, quant=False)
@@ -130,7 +132,7 @@ class Shared:
         if arm in ("fold_quant", "fold_quant_early"):
             return self.down(tuple(getattr(self, arm)(x_q, x_s)))
         gate_up = mxfp8_ll.linear(x_q, x_s, self.w, self.w_s)
-        h = gate_up.new_empty((x.shape[0], INTER))
+        h = gate_up.new_empty((x.shape[0], self.inter))
         sglang_ops.silu_and_mul_clamp(gate_up, h, LIMIT)
         return self.down(h)
 
@@ -271,11 +273,12 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=39)
     parser.add_argument("--repeats", type=int, default=4)
     parser.add_argument("--replays", type=int, default=10)
+    parser.add_argument("--inter", type=int, default=INTER)
     args = parser.parse_args()
     rows, layers = args.rows, args.layers
 
     torch.manual_seed(0)
-    shared = [Shared(100 + i, rows) for i in range(layers)]
+    shared = [Shared(100 + i, rows, args.inter) for i in range(layers)]
     routed = _routed_layer(7)
     routers = [
         (torch.randn(EXPERTS, HIDDEN, device="cuda") / HIDDEN**0.5).bfloat16()
@@ -370,7 +373,8 @@ def main() -> None:
         print(f"round {arm}: {results[arm][-1]}")
 
     print(
-        f"\nrows={rows} layers={layers} repeats={args.repeats} (us; median [min, max])"
+        f"\nrows={rows} inter={args.inter} layers={layers} repeats={args.repeats}"
+        " (us; median [min, max])"
     )
     keys = list(results[ARMS[0]][0])
     print("metric".ljust(14) + "".join(a.rjust(26) for a in ARMS))

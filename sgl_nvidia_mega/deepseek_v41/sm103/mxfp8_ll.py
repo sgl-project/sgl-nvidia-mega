@@ -313,10 +313,10 @@ def _swiglu_compiled(
     tactic: Tactic,
     device: torch.device,
     limit: int,
+    inter: int,
     buffers: Optional[SwigluMxfp8Buffers],
     early_release: bool = False,
 ):
-    inter = 0 if buffers is None else buffers.quant.shape[1]
     addresses = (
         (0, 0)
         if buffers is None
@@ -365,19 +365,26 @@ def _swiglu_compiled(
     return _SWIGLU_COMPILED[key]
 
 
+def swiglu_tactic(device: torch.device, inter: int, k: int, rows: int) -> Tactic:
+    """The tactic :func:`linear` takes for the unfolded gate_up [2I, K] at ``rows``:
+    the fold keeps its K split and reduction order, so its output stays bitwise."""
+    major, minor = torch.cuda.get_device_capability(device)
+    return tuple(select_tactic(major * 10 + minor, 2 * inter, k, row_bucket(rows)))
+
+
 def precompile_swiglu(
     weight: torch.Tensor,
     rows: list[int],
     limit: int,
+    inter: int,
     buffers: Optional[SwigluMxfp8Buffers] = None,
     early_release: bool = False,
 ) -> None:
     """Compile the SwiGLU kernels these row counts select; before graph capture."""
-    n, k = weight.shape
-    major, minor = torch.cuda.get_device_capability(weight.device)
+    k = weight.shape[1]
     for r in rows:
-        tactic = select_tactic(major * 10 + minor, n, k, row_bucket(r))
-        _swiglu_compiled(tuple(tactic), weight.device, limit, buffers, early_release)
+        tactic = swiglu_tactic(weight.device, inter, k, r)
+        _swiglu_compiled(tactic, weight.device, limit, inter, buffers, early_release)
 
 
 def linear_swiglu(
@@ -386,16 +393,18 @@ def linear_swiglu(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     limit: int,
+    inter: int,
     *,
     buffers: Optional[SwigluMxfp8Buffers] = None,
     out: Optional[torch.Tensor] = None,
-    tactic: Optional[Tactic] = None,
     early_release: bool = False,
 ):
-    """SGLang's clamped SwiGLU of ``a @ gate_up.T`` for the interleaved gate_up
-    ``weight`` [2I, K] (``limit``: the BF16 bits of the clamp): BF16 [M, I], or with
-    ``buffers`` the (E4M3 [M, I], 128x4 UE8M0 scales) views FlashInfer's
-    ``mxfp8_quantize`` would return for it. Operands and tactic as :func:`linear`."""
+    """SGLang's clamped SwiGLU of ``a @ gate_up.T`` for the gate_up [2I, K] that
+    ``weight`` holds interleaved and padded to whole tiles
+    (``swiglu_ll.interleave_gate_up``; ``limit``: the BF16 bits of the clamp): BF16
+    [M, I], or with ``buffers`` the (E4M3 [M, I], 128x4 UE8M0 scales) views
+    FlashInfer's ``mxfp8_quantize`` would return for it. Operands as :func:`linear`;
+    the tactic is the unfolded gate_up's (:func:`swiglu_tactic`)."""
     from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Int32
 
     from sgl_nvidia_mega.common.sync import current_cu_stream
@@ -403,13 +412,11 @@ def linear_swiglu(
 
     rows, k = a.shape
     n = weight.shape[0]
-    inter = n // 2
     assert 0 < rows <= WIDE_MAX_ROWS and k % 128 == 0 and weight.shape[1] == k
-    assert n % 128 == 0 and a.is_contiguous() and weight.is_contiguous()
+    assert n % 128 == 0 and 2 * inter <= n < 2 * inter + 128
+    assert a.is_contiguous() and weight.is_contiguous()
     assert a_scale.numel() >= scale_bytes(rows, k)
-    if tactic is None:
-        major, minor = torch.cuda.get_device_capability(a.device)
-        tactic = select_tactic(major * 10 + minor, n, k, row_bucket(rows))
+    tactic = swiglu_tactic(a.device, inter, k, rows)
     if buffers is not None:
         assert buffers.quant.shape[1] == inter and rows <= buffers.quant.shape[0]
         c = buffers.quant
@@ -418,7 +425,7 @@ def linear_swiglu(
             out = torch.empty((rows, inter), dtype=torch.bfloat16, device=a.device)
         assert out.shape == (rows, inter) and out.is_contiguous()
         c = out
-    _swiglu_compiled(tuple(tactic), a.device, limit, buffers, early_release)(
+    _swiglu_compiled(tactic, a.device, limit, inter, buffers, early_release)(
         _ptr(Float8E4M3FN, weight.data_ptr(), 16),
         _ptr(Float8E8M0FNU, weight_scale.data_ptr(), 32),
         _ptr(Float8E4M3FN, a.data_ptr(), 16),
