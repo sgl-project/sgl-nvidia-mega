@@ -95,13 +95,18 @@ DRAFT_SLOTS = frozenset(
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
-# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned)
+# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
+# prologue_fork: the Engram hashes forked at the step start and the embedding written
+# into the streams, bitwise; engram_side_ar: the Engram prefetch's two all-reduces on
+# its own stream, joined at the first Engram gate, bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
     "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
+    "prologue_fork",
+    "engram_side_ar",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -173,6 +178,8 @@ def slot_reasons() -> list[str]:
         ("draft_prenorm", "draft"),
         ("draft_qkv_a_ll", "draft_qkv_a"),
         ("draft_wo_b_ll", "draft_wo_a"),
+        ("engram_side_ar", "engram"),
+        ("engram_side_ar", "prologue_fork"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -316,6 +323,8 @@ def build(model, ctx):
         engram_prefetch=engram.prefetch is not None,
         two_shot=getattr(bound["boundary"], "two_shot", None) is not None,
         fast_gate_wide="gate_wide" in SLOTS,
+        prologue_fork="prologue_fork" in SLOTS,
+        engram_side_ar="engram_side_ar" in SLOTS,
     )
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
@@ -358,6 +367,8 @@ def build(model, ctx):
             s.fast_gate and w not in slot_plan.FAST_GATE_ROWS for w, s in slots.items()
         ),
         "req_pos_once": "req_pos_once" in SLOTS,
+        "prologue_fork": "prologue_fork" in SLOTS,
+        "engram_side_ar": any(s.engram_side_ar for s in slots.values()),
         "attn_indexer": any(
             a.chain is not None and a.chain[0].indexer is not None
             for a in bound["attention"].values()
