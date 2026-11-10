@@ -95,13 +95,18 @@ DRAFT_SLOTS = frozenset(
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
-# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned)
+# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
+# target_lm_head_mxfp8 / draft_lm_head_mxfp8: the target's / the draft's LM head at 1-8
+# rows on an MXFP8 copy of the shard, a numerics change; the draft's is measurement only,
+# plan.MEASUREMENT_ONLY_SLOTS)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
     "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
+    "target_lm_head_mxfp8",
+    "draft_lm_head_mxfp8",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -157,6 +162,8 @@ def slot_reasons() -> list[str]:
         ("hop_b_cap16", "hop_b_wide"),
         ("hop_b_quad_trigger", "hop_b"),
         ("draft_lm_head", "markov"),
+        ("target_lm_head_mxfp8", "target_lm_head"),
+        ("draft_lm_head_mxfp8", "draft_lm_head"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),
@@ -258,6 +265,10 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         ),
         "engram": bound["engram"].prefetch is not None,
         "target_lm_head": bound.get("logits") is not None,
+        "target_lm_head_mxfp8": getattr(
+            getattr(bound.get("logits"), "quant_method", None), "mxfp8", None
+        )
+        is not None,
     }
 
 
