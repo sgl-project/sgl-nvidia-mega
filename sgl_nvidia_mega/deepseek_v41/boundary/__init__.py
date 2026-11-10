@@ -24,7 +24,13 @@ from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import Boundaries, Boundar
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/models/deepseek_v4.py": ("layers", "start_layer", "end_layer"),
+    "srt/models/deepseek_v4.py": (
+        "layers",
+        "start_layer",
+        "end_layer",
+        "attn_hc",
+        "ffn_hc",
+    ),
     "srt/models/deepseek_v4_mhc.py": ("materialized", "residual", "pre"),
     "srt/runtime_context.py": (
         "get_forward",
@@ -71,6 +77,8 @@ def build(model, ctx, group) -> Boundaries:
         two_shot, two_shot_reason = _build_two_shot(model, ctx, group)
     # a load-time fact of the platform and config, the same on every rank
     use_prenorm = "hc_prenorm" in runtime.SLOTS and not prenorm.reason()
+    if use_prenorm and "hc_coeff_fused" in runtime.SLOTS:
+        _build_hc_coeff(model, group)
     return Boundaries(
         [m.layers[i] for i in range(m.start_layer, m.end_layer)],
         hop_a=hop,
@@ -80,6 +88,19 @@ def build(model, ctx, group) -> Boundaries:
         hop_b="hop_b" in runtime.SLOTS,
         prenorm=use_prenorm,
     )
+
+
+def _build_hc_coeff(model, group) -> None:
+    """Slot hc_coeff_fused: the one-launch coefficients, checked bit for bit against
+    the prenorm pair on every sublayer's weights; raises on every rank alike."""
+    from sgl_nvidia_mega.deepseek_v41.boundary import prenorm
+
+    m = model.model
+    layers = [m.layers[i] for i in range(m.start_layer, m.end_layer)]
+    subs = [hc for layer in layers for hc in (layer.attn_hc, layer.ffn_hc)]
+    device = layers[0].self_attn.wo_b.weight.device
+    if why := prenorm.build_fused(subs, device, group):
+        raise RuntimeError(f"NVIDIA megakernel: slot hc_coeff_fused: {why}")
 
 
 def _build_two_shot(model, ctx, group):

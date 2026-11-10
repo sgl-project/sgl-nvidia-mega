@@ -98,7 +98,8 @@ DRAFT_SLOTS = frozenset(
 # lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
 # prologue_fork: the Engram hashes forked at the step start and the embedding written
 # into the streams, bitwise; engram_side_ar: the Engram prefetch's two all-reduces on
-# its own stream, joined at the first Engram gate, bitwise)
+# its own stream, joined at the first Engram gate, bitwise; hc_coeff_fused: the
+# prenorm's mHC coefficients in one launch, bitwise with hc_prenorm's two)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -107,6 +108,7 @@ OPT_IN_SLOTS = (
     "lm_head_pinned_tactic",
     "prologue_fork",
     "engram_side_ar",
+    "hc_coeff_fused",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -180,6 +182,7 @@ def slot_reasons() -> list[str]:
         ("draft_wo_b_ll", "draft_wo_a"),
         ("engram_side_ar", "engram"),
         ("engram_side_ar", "prologue_fork"),
+        ("hc_coeff_fused", "hc_prenorm"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -285,6 +288,7 @@ def build(model, ctx):
 
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
+    from sgl_nvidia_mega.deepseek_v41.boundary import prenorm
     from sgl_nvidia_mega.deepseek_v41.runtime import embedding
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
         PACKAGES,
@@ -341,6 +345,7 @@ def build(model, ctx):
             for step in bound["attention"].values()
         ),
         "hc_prenorm": bound["boundary"].prenorm,
+        "hc_coeff_fused": bound["boundary"].prenorm and bool(prenorm.fused()),
         "early_trigger": "early_trigger" in SLOTS and facts.hop_a,
         "hop_a_batch2": any(
             s.hop_a and w > slot_plan.HOP_A_BATCH1_ROWS for w, s in slots.items()
