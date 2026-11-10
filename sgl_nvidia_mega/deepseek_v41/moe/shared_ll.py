@@ -18,10 +18,14 @@ input as FlashInfer's quant would, so ``down_proj`` skips its own quant."""
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import mxfp8_row_tiles
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -35,7 +39,11 @@ SGLANG_READS = {
         "gate_up_proj",
         "down_proj",
     ),
-    "srt/layers/quantization/fp8.py": ("weight_scale_inv_swizzled",),
+    "srt/layers/quantization/fp8.py": (
+        "weight_scale_inv_swizzled",
+        "mxfp8_dense_backend",
+    ),
+    "srt/layers/quantization/fp8_utils.py": ("is_flashinfer_cutedsl",),
     "srt/layers/quantization/mxfp8_input.py": (
         "Mxfp8SwizzledInput",
         "accepts_mxfp8_swizzled_input",
@@ -98,6 +106,27 @@ def why_not_quant_fold(mlp: torch.nn.Module) -> str:
     return ""
 
 
+# FlashInfer releases with the dense GEMM down_proj's cute-dsl MXFP8 linear launches
+# for the folded quant, read for where it waits on its producer grid
+EARLY_RELEASE_FLASHINFER = ("0.7.2", "0.7.3")
+
+
+def why_not_early_release(mlp: torch.nn.Module) -> str:
+    """Why the folded GEMM may not release its dependent at its loads ("" when it
+    may): the dependent must be FlashInfer's cute-dsl MXFP8 GEMM, which does nothing
+    before its grid wait that reads the folded quant (it then reads only after the
+    whole fold grid completed)."""
+    import flashinfer
+
+    down = mlp.shared_experts.down_proj
+    backend = getattr(down.quant_method, "mxfp8_dense_backend", None)
+    if backend is None or not backend.is_flashinfer_cutedsl():
+        return "down_proj is not FlashInfer's cute-dsl MXFP8 GEMM"
+    if flashinfer.__version__ not in EARLY_RELEASE_FLASHINFER:
+        return f"FlashInfer {flashinfer.__version__}: its GEMM's wait is unchecked"
+    return ""
+
+
 class SharedLL:
     """One layer's shared expert at 1-``max_rows`` rows."""
 
@@ -116,8 +145,21 @@ class SharedLL:
         self.fold = None
         if "shared_fold" in SLOTS:
             quant = "shared_fold_quant" in SLOTS and not why_not_quant_fold(mlp)
+            early = quant and "shared_fold_early_release" in SLOTS
+            if early and (why := why_not_early_release(mlp)):
+                logger.warning(
+                    "NVIDIA megakernel: shared_fold_early_release off (%s); the fold "
+                    "releases after its stores",
+                    why,
+                )
+                early = False
             self.fold = SwigluFold(
-                self.weight, self.weight_scale, self.limit, max_rows, quant=quant
+                self.weight,
+                self.weight_scale,
+                self.limit,
+                max_rows,
+                quant=quant,
+                early_release=early,
             )
 
     def precompile(self, widths) -> None:

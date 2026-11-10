@@ -97,7 +97,9 @@ DRAFT_SLOTS = frozenset(
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
 # lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
 # shared_fold: slot shared_ll's gate_up epilogue writes the clamped SwiGLU, bitwise;
-# shared_fold_quant: it also writes down_proj's MXFP8 input, bitwise)
+# shared_fold_quant: it also writes down_proj's MXFP8 input, bitwise;
+# shared_fold_early_release: that GEMM releases down_proj's GEMM at its loads, as
+# FlashInfer's own gate_up does, not after its stores)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -106,6 +108,7 @@ OPT_IN_SLOTS = (
     "lm_head_pinned_tactic",
     "shared_fold",
     "shared_fold_quant",
+    "shared_fold_early_release",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -149,6 +152,7 @@ def slot_reasons() -> list[str]:
         ("shared_ll", "moe"),
         ("shared_fold", "shared_ll"),
         ("shared_fold_quant", "shared_fold"),
+        ("shared_fold_early_release", "shared_fold_quant"),
         ("gate_wide", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),

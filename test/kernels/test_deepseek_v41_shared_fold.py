@@ -317,3 +317,27 @@ def test_down_proj_output_is_bitwise_on_the_folded_quant(inter, rows):
     print(f"DOWN rows={rows} clamped_gate_up={clamped}")
     assert clamped > 0
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+def test_early_release_is_refused_unless_down_proj_is_the_checked_gemm(monkeypatch):
+    """Early release relies on down_proj's GEMM reading nothing before its grid wait:
+    FlashInfer's cute-dsl MXFP8 GEMMs (persistent and split-K) at a checked release."""
+    from types import SimpleNamespace
+
+    flashinfer = pytest.importorskip("flashinfer")
+
+    from sgl_nvidia_mega.deepseek_v41.moe import shared_ll
+
+    def mlp(cutedsl):
+        backend = SimpleNamespace(is_flashinfer_cutedsl=lambda: cutedsl)
+        quant_method = SimpleNamespace(mxfp8_dense_backend=backend)
+        down = SimpleNamespace(quant_method=quant_method)
+        return SimpleNamespace(shared_experts=SimpleNamespace(down_proj=down))
+
+    monkeypatch.setattr(
+        flashinfer, "__version__", shared_ll.EARLY_RELEASE_FLASHINFER[0]
+    )
+    assert shared_ll.why_not_early_release(mlp(True)) == ""
+    assert "cute-dsl" in shared_ll.why_not_early_release(mlp(False))
+    monkeypatch.setattr(flashinfer, "__version__", "0.0.0")
+    assert "unchecked" in shared_ll.why_not_early_release(mlp(True))
