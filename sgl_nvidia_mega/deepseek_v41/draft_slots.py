@@ -53,13 +53,17 @@ def warn_declined(table: dict[str, tuple[str, str]]) -> None:
             )
 
 
-_PROPOSAL = ("markov", "draft_lm_head")
+_PROPOSAL = ("markov", "draft_lm_head", "markov_pdl", "markov_lowlat")
 
 
 def _proposal(built, name):
-    if name == "markov":
+    if name in ("markov", "markov_pdl", "markov_lowlat"):
         if built.draft_sampler is None:
             return DECLINED, "SGLang's proposal"
+        if name == "markov_pdl":
+            return BUILT, "the chain a PDL dependent of the draft LM head"
+        if name == "markov_lowlat":
+            return BUILT, "the chain's low-latency exchange"
         return BUILT, "Markov chain in one kernel, built with the proposal's buffers"
     if not built.low_m:
         return DECLINED, "LM head SGLang's"

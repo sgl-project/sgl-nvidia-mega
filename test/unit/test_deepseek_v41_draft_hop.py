@@ -393,3 +393,17 @@ def test_the_proposal_only_draft_reports_its_slots():
 
     built = DraftProposal(None, deadline_s=1.0, slots=frozenset({"markov"}))
     assert "draft slots: markov built" in built.summary()
+
+
+def test_the_markov_chain_slots_are_reported_with_the_proposal():
+    slots = frozenset({"markov", "markov_pdl", "markov_lowlat"})
+    table = draft_slots.states(_built(), slots)
+    assert {name: state for name, (state, _) in table.items()} == {
+        "markov": draft_slots.BUILT,
+        "markov_lowlat": draft_slots.BUILT,
+        "markov_pdl": draft_slots.BUILT,
+    }
+    built = _built()
+    built.draft_sampler = None
+    assert table.keys() == draft_slots.states(built, slots).keys()
+    assert draft_slots.states(built, slots)["markov_pdl"][0] == draft_slots.DECLINED
