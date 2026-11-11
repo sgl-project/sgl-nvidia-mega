@@ -13,6 +13,8 @@ import logging
 import msgspec
 import torch
 
+from sgl_nvidia_mega.deepseek_v41.runtime import bench
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -59,6 +61,7 @@ SGLANG_READS = {
         "is_hash",
         "alt_stream",
         "num_fused_shared_experts",
+        "layer_id",
     ),
     "srt/configs/deepseek_v4.py": ("image_token_id",),
     "srt/models/deepseek_v4.py": ("mlp", "layers", "start_layer", "end_layer"),
@@ -94,6 +97,11 @@ class MoeSlot:
         )
         self.bias = config.correction_bias_for_dtype(torch.float32) if gate else None
         self.eps = _RENORMALIZE_SUM_EPSILON
+        # benchmark only (runtime/bench.py): the layer's fixed routing, else None
+        self.fixed = bench.bind_fixed(mlp, gemm, self.bias, self.scale)
+        # benchmark only: the fast gate's ids in a buffer the step stamps can read
+        # after the graph's replay (None without them)
+        self.ids_out = bench.ids_buffer(gemm.max_rows, gemm.top_k, gemm.clamp.device)
 
     def select(
         self,
@@ -107,6 +115,8 @@ class MoeSlot:
                 f"NVIDIA megakernel: the fast gate cannot take router logits "
                 f"{router_logits.dtype} {tuple(router_logits.shape)}"
             )
+        if self.fixed is not None:
+            router_logits = self.fixed.router_logits(router_logits)
         alt, eps = None, 0.0
         if use_vision_topk:
             # vision routing: image tokens rank with the alternate bias
@@ -168,7 +178,7 @@ class MoeSlot:
             # the join would cost GEMM1 its PDL early launch
             torch.cuda.current_stream().wait_event(ready)
         if isinstance(topk_output, _GateTopK):
-            rows, weights, permuted, _ = self.gemm.gate_topk_and_gemms(
+            rows, weights, permuted, ids = self.gemm.gate_topk_and_gemms(
                 x_q,
                 x_s,
                 topk_output.router_logits,
@@ -177,12 +187,20 @@ class MoeSlot:
                 topk_output.num_valid,
                 alt=topk_output.alt,
                 renormalize_epsilon=topk_output.eps,
+                **({"ids_out": self.ids_out} if self.ids_out is not None else {}),
                 **({"x": x} if quant_in_gate else {}),
             )
+            persistent = self.ids_out is not None
         else:
-            rows, weights, permuted = self.gemm(
-                x_q, x_s, topk_output.topk_ids, topk_output.topk_weights
-            )
+            ids, w = topk_output.topk_ids, topk_output.topk_weights
+            # SGLang's top-k ids live in the graph's pool: the stamps read only a
+            # fixed table there
+            persistent = self.fixed is not None
+            if self.fixed is not None:
+                ids, w = self.fixed.topk(ids, w)
+            rows, weights, permuted = self.gemm(x_q, x_s, ids, w)
+        if persistent:
+            bench.note_ids(ids, self.mlp.layer_id, self.gemm.router_experts)
         return FlashInferTrtllmDeferredFinalizeOutput(
             gemm2_out=rows,
             expert_weights=weights,
