@@ -19,6 +19,11 @@ from sgl_nvidia_mega.deepseek_v41.moe.step import step
 logger = logging.getLogger(__name__)
 
 
+def gemm2_options(slots) -> dict:
+    """The routed GEMM2 build the slots ask for (slot gemm2_pipe)."""
+    return dict(gemm2_pipe="gemm2_pipe" in slots)
+
+
 def build(model, ctx, group) -> routed.Bound:
     """The routed-expert GEMM pair of every MoE layer (slot ``moe``; slot ``gate``:
     its fast top-k); the result is ``st.bound["moe"]``."""
@@ -32,6 +37,7 @@ def build(model, ctx, group) -> routed.Bound:
         gate_topk="gate" in SLOTS,
         shared_ll="shared_ll" in SLOTS,
         widths=ctx.widths,
+        **gemm2_options(SLOTS),
     )
     logger.info(
         "NVIDIA megakernel: DeepSeek-V4.1 MoE: routed experts on the GEMM pair in %d "
@@ -46,4 +52,4 @@ def build(model, ctx, group) -> routed.Bound:
     return bound
 
 
-__all__ = ["build", "step"]
+__all__ = ["build", "gemm2_options", "step"]
