@@ -57,7 +57,7 @@ PARAMETERS = {
     "gemm2_pipe": GEMM2_PARAMETERS,  # H as a TMA tensor map (launch.json tensor_maps)
 }
 # Slot gemm2_pipe (opt-in): GEMM2 as muLLM's reference-pipeline + prelude build of the
-# same kernel (gemm2_pipe.cu, gemm2_pipe_strided.cu; port_gemm2.py), bit for bit
+# same kernel (gemm2_pipe.cu, gemm2_pipe_strided.cu), bit for bit
 # the default GEMM2's. ``gemm2_registers`` (no slot): that build at
 # GEMM2_POOL_REGISTERS registers per thread (__maxnreg__; muLLM's register pool), so a
 # CTA holds 48 K of the SM's 64 K registers and a dependent's CTA can land beside it.
