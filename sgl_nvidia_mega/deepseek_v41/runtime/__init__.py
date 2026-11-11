@@ -97,6 +97,7 @@ DRAFT_SLOTS = frozenset(
         "draft_prenorm",
         "draft_qkv_a_ll",
         "draft_wo_b_ll",
+        "markov_lowlat",
     }
 )
 # Slots that run only when listed (draft_embed: the draft's tokens from the target's
@@ -131,7 +132,9 @@ DRAFT_SLOTS = frozenset(
 # input's MXFP8 quant (FlashInfer's linear-layout mxfp8_quantize bit for bit,
 # sm103/moe/src/route_quant.cuh), so the MoE half forks no routed-quant stream and the
 # top-k launches as the router's programmatic dependent, target and draft (bitwise);
-# gemm2_pipe: the routed
+# markov_lowlat: the Markov chain's low-latency exchange, converged pollers and acquire
+# loads, the direct exchange to 4 rows at world 4 and 2 at world 8, the narrow kernel to
+# 8 rows at every world; bitwise); gemm2_pipe: the routed
 # GEMM2, target and draft, on muLLM's reference-pipeline + prelude build of the same
 # kernel (bitwise))
 OPT_IN_SLOTS = (
@@ -155,6 +158,7 @@ OPT_IN_SLOTS = (
     "wo_a_g1",
     "gate_route",
     "gate_route_quant",
+    "markov_lowlat",
     "gemm2_pipe",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
@@ -222,6 +226,7 @@ def slot_reasons() -> list[str]:
         ("draft_lm_head", "markov"),
         ("target_lm_head_mxfp8", "target_lm_head"),
         ("draft_lm_head_mxfp8", "draft_lm_head"),
+        ("markov_lowlat", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),

@@ -235,6 +235,8 @@ def build_steps(
     if refusal:
         raise ValueError(refusal)
     cache_dtype = head.step_logits_dtype(torch.bfloat16)
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
     # symmetric memory is invisible to memory_allocated
     free_before, _ = torch.cuda.mem_get_info()
     chain = markov.ShardedMarkov(
@@ -249,9 +251,8 @@ def build_steps(
         max_bs=max_bs,
         deadline_s=deadline_s,
         keeps_logits=not greedy_draft,
+        lowlat="markov_lowlat" in SLOTS,
     )
-    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
-
     lm_head = DraftLmHead(
         lm.lm_head,
         low_m=low_m and low_m_lm_head_supported(),
@@ -284,7 +285,7 @@ def build_steps(
     }
     logger.info(
         "NVIDIA megakernel: draft proposal on rank %d: Markov chain in one kernel "
-        "(%d ranks, batch 1-%d, %d draft tokens), LM head %s at 1-%d rows%s; wait "
+        "(%d ranks, batch 1-%d, %d draft tokens), LM head %s at 1-%d rows%s%s; wait "
         "deadline %.0f s; %.1f MiB of device memory",
         rank,
         world,
@@ -293,6 +294,7 @@ def build_steps(
         "low-M" if lm_head.low_m else "SGLang's",
         LM_HEAD_MAX_ROWS,
         " (MXFP8 stream at 1-8)" if lm_head.mxfp8 is not None else "",
+        ", low-latency exchange" if chain.lowlat else "",
         chain.timeout_ns / 1e9,
         (free_before - torch.cuda.mem_get_info()[0]) / 2**20,
     )
