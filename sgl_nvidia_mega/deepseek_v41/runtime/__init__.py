@@ -134,9 +134,25 @@ DRAFT_SLOTS = frozenset(
 # top-k launches as the router's programmatic dependent, target and draft (bitwise);
 # markov_lowlat: the Markov chain's low-latency exchange, converged pollers and acquire
 # loads, the direct exchange to 4 rows at world 4 and 2 at world 8, the narrow kernel to
-# 8 rows at every world; bitwise); gemm2_pipe: the routed
+# 8 rows at every world; bitwise);
+# attn_q_norm_gemm: at 1-8 rows the q_lora norm + MXFP8 quant inside wq_b's GEMM in
+# the layers without an indexer, target and draft (sm103/attention/q_norm_gemm.py;
+# bitwise; 0-0.5 us a layer); attn_index_q_first: the plugin indexer's index query
+# (wq_b, RoPE + pack) on the main stream and wq_b on the second, so the index chain does
+# not wait for the SMs wq_b and the attention hold (bitwise); attn_index_weights_bf16:
+# the index head weights the BF16 scorers read made beside the head weights, not cast
+# before the logits (bitwise); attn_cluster_merge: swap-AB merges a row's tiles through its
+# CTA cluster's shared memory instead of the separate combine (swapab.cluster_merge_takes:
+# 8 heads, the low-ratio range, 1-8 rows), target and draft, bitwise; faster in the
+# attention-half bench, no step gain served at TP8 batch 1; gemm2_pipe: the routed
 # GEMM2, target and draft, on muLLM's reference-pipeline + prelude build of the same
-# kernel (bitwise))
+# kernel (bitwise);
+# attn_wo_a_fp8: the target's fused wo_a streams wo_a as E4M3 with 32x32 UE8M0 scales
+# (half the bytes), recovered from SGLang's BF16 wo_a and widened exactly in shared memory;
+# bitwise where the recovery is exact, which build checks per layer;
+# attn_compressor_priority (a scheduling switch derived from muLLM, NVIDIA Corporation,
+# Apache-2.0; bitwise: the same kernels on the same inputs): the compressor layers'
+# compressor on a stream at the device's highest priority)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -159,7 +175,13 @@ OPT_IN_SLOTS = (
     "gate_route",
     "gate_route_quant",
     "markov_lowlat",
+    "attn_q_norm_gemm",
+    "attn_index_q_first",
+    "attn_index_weights_bf16",
+    "attn_cluster_merge",
     "gemm2_pipe",
+    "attn_wo_a_fp8",
+    "attn_compressor_priority",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -247,6 +269,12 @@ def slot_reasons() -> list[str]:
         ("hc_coeff_fused", "hc_prenorm"),
         ("swapab_h8", "attn"),
         ("wo_a_g1", "attn"),
+        ("attn_q_norm_gemm", "attn"),
+        ("attn_index_q_first", "attn_indexer"),
+        ("attn_index_weights_bf16", "attn_indexer"),
+        ("attn_cluster_merge", "attn"),
+        ("attn_wo_a_fp8", "attn"),
+        ("attn_compressor_priority", "attn"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -388,6 +416,7 @@ def build(model, ctx):
         PACKAGES,
         MegakernelDecode,
     )
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention.swapab import CLUSTER_HEADS
 
     # benchmark-only switches: refused without simulated acceptance, before any build
     bench.setup()
@@ -484,6 +513,38 @@ def build(model, ctx):
             and a.chain[0].indexer.fused
             for a in bound["attention"].values()
         ),
+        # the in-cluster merge takes swap-AB on 8 local heads only (attention TP8)
+        "attn_cluster_merge": any(
+            getattr(a, "cluster_merge", False) and a.attn.n_local_heads in CLUSTER_HEADS
+            for a in bound["attention"].values()
+        ),
+        # the norm inside wq_b's GEMM: a chain with the low-latency wq_b, 1-8 rows
+        "attn_q_norm_gemm": any(w <= 8 for w in pctx.widths)
+        and any(
+            a.chain is not None and a.chain[1].q_norm_gemm
+            for a in bound["attention"].values()
+        ),
+        "attn_wo_a_fp8": any(
+            getattr(a, "wo_a_fp8_weight", None) is not None
+            for a in bound["attention"].values()
+        ),
+        "attn_index_q_first": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].index_q_first
+            for a in bound["attention"].values()
+        ),
+        # a compressor layer's chain runs its compressor on the high-priority stream
+        "attn_compressor_priority": any(
+            a.chain is not None and a.chain[0].compressor_stream is not None
+            for a in bound["attention"].values()
+        ),
+        "attn_index_weights_bf16": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].index_weights_bf16
+            for a in bound["attention"].values()
+        ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
         "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)
         and any(
@@ -499,6 +560,11 @@ def build(model, ctx):
         if any(a.swapab and a.low_ratio for a in bound["attention"].values())
         else {"kv_before_wait"}
     )
+    # likewise attn_cluster_merge without 8 local heads (attention TP4)
+    if not any(
+        a.attn.n_local_heads in CLUSTER_HEADS for a in bound["attention"].values()
+    ):
+        moot.add("attn_cluster_merge")
     # every package's build agrees across ranks, so this raises on every rank alike
     missing = sorted(name for name in (SLOTS & built.keys()) - moot if not built[name])
     if missing:
