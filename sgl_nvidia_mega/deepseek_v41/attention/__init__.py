@@ -112,6 +112,8 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
     swapab = "swap-AB 1-24" if step_.swapab else "no swap-AB"
     if step_.swapab and step_.kv_before_wait and step_.low_ratio:
         swapab += " (KV before the PDL wait)"
+        if step_.index_after_wait:
+            swapab += " (the sparse range after the wait)"
     parts.append(swapab)
     parts.append("fused wo_a 1-48" if attn.use_fused_wo_a else "wo_a SGLang's")
     return ", ".join(parts)
