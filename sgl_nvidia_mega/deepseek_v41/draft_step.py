@@ -20,6 +20,7 @@ import torch
 from sgl_nvidia_mega.deepseek_v41 import boundary, draft_attention, draft_slots, moe
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 from sgl_nvidia_mega.deepseek_v41.draft import DraftProposal
+from sgl_nvidia_mega.deepseek_v41.runtime import bench
 from sgl_nvidia_mega.deepseek_v41.runtime.state import StepState
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class DraftDecode(DraftProposal):
     built widths, and the proposal (``draft_sampler``) as before."""
 
     def __init__(self, lm, *, deadline_s: float, slots: frozenset[str], binding=None):
+        bench.setup()
         super().__init__(lm, deadline_s=deadline_s, slots=slots)
         self._binding = binding
         self._tokens = tokens = tokens_per_request(lm)
@@ -181,7 +183,7 @@ class DraftDecode(DraftProposal):
             f"{len(self._attn)} stages ({_kernel_counts(self._attn.values())}), "
             f"embedding {_embed_summary(self._embed_table)}"
             f", mHC prenorm {'on' if self._bound['boundary'].prenorm else 'off'}, BF16 tail "
-            f"{'on' if self._tail_bf16 else 'off'}; {super().summary()}"
+            f"{'on' if self._tail_bf16 else 'off'}; {super().summary()}{bench.fixed_summary()}"
         )
 
     def plan(self, input_ids, forward_batch, *args, **kwargs):
@@ -251,27 +253,29 @@ class DraftDecode(DraftProposal):
             slots=self._slots[step.rows],
             bound=self._bound,
         )
-        try:
-            x = self._embed(input_ids) if input_embeds is None else input_embeds
-            boundary.start(st, x)
-            # draft stages have no recorder layer indices
-            with get_global_expert_distribution_recorder().disable_this_region():
-                for stage in lm.stages:
-                    st.layer_id = stage.layer_id
-                    with st.exit:
-                        a_in = boundary.pre(stage, "attn", st)
-                        part = attention_step(stage, a_in, st, self._attn, view)
-                        m_in = boundary.post(stage, "attn", part, st)
-                        out = moe.step(stage, m_in, st)
-                        boundary.post(stage, "ffn", out, st)
-            residual, pre = boundary.final(st)
-        finally:
-            boundary.clear(st)
-        streams = residual.flatten(1)
-        if not self._tail_bf16:
-            streams = streams.float()
-        x = sglang_ops.hc_combine(streams, pre, lm.hc_mult, residual.dtype)
-        return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
+        # benchmark only (runtime/bench.py): the draft step's stamps, when requested
+        with bench.forward("draft", positions):
+            try:
+                x = self._embed(input_ids) if input_embeds is None else input_embeds
+                boundary.start(st, x)
+                # draft stages have no recorder layer indices
+                with get_global_expert_distribution_recorder().disable_this_region():
+                    for stage in lm.stages:
+                        st.layer_id = stage.layer_id
+                        with st.exit:
+                            a_in = boundary.pre(stage, "attn", st)
+                            part = attention_step(stage, a_in, st, self._attn, view)
+                            m_in = boundary.post(stage, "attn", part, st)
+                            out = moe.step(stage, m_in, st)
+                            boundary.post(stage, "ffn", out, st)
+                residual, pre = boundary.final(st)
+            finally:
+                boundary.clear(st)
+            streams = residual.flatten(1)
+            if not self._tail_bf16:
+                streams = streams.float()
+            x = sglang_ops.hc_combine(streams, pre, lm.hc_mult, residual.dtype)
+            return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
 def _prenorm(slots) -> bool:

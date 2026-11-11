@@ -378,12 +378,14 @@ def build(model, ctx):
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
     from sgl_nvidia_mega.deepseek_v41.boundary import prenorm
-    from sgl_nvidia_mega.deepseek_v41.runtime import embedding
+    from sgl_nvidia_mega.deepseek_v41.runtime import bench, embedding
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
         PACKAGES,
         MegakernelDecode,
     )
 
+    # benchmark-only switches: refused without simulated acceptance, before any build
+    bench.setup()
     group = get_parallel().tp_group
     if not ctx.widths:
         raise RuntimeError(
@@ -518,6 +520,7 @@ def build(model, ctx):
                 for k, v in pctx.copies.items()
             }
         )
+        + bench.fixed_summary()
     )
     return MegakernelDecode(
         model, slots, bound, widths=pctx.widths, summary=summary, binding=ctx.binding

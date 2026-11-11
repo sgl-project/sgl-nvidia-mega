@@ -661,6 +661,7 @@ class RoutedExpertGemm:
         num_valid: Optional[torch.Tensor],
         alt: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
         renormalize_epsilon: float = 0.0,
+        ids_out: Optional[torch.Tensor] = None,
         x: Optional[torch.Tensor] = None,
     ):
         """``__call__`` from the router's fp32 logits: the router's gate_topk.cuh variant
@@ -670,6 +671,8 @@ class RoutedExpertGemm:
         caller joins the quantized input before this call: a stream join between the route
         kernel and GEMM1 would cost GEMM1 its PDL early launch.
         The ids are the router's; a slot whose expert another rank holds maps to row -1.
+        ``ids_out``: an int32 [>= rows, top_k] buffer the top-k ids go to (a persistent
+        one for runtime/bench.py's step stamps), else a new tensor.
         ``x``: the BF16 routed input [rows, HIDDEN] in place of ``x_quant`` / ``x_scale``
         (None): slot gate_route_quant's launch quantizes it (``serves_gate_route_quant``).
         Returns (gemm2 rows, top-k weights, slot -> row, top-k ids)."""
@@ -677,7 +680,10 @@ class RoutedExpertGemm:
         device = logits.device
         stream = torch.cuda.current_stream(device).cuda_stream
         weights = torch.empty((rows, self.top_k), dtype=torch.float32, device=device)
-        ids = torch.empty((rows, self.top_k), dtype=torch.int32, device=device)
+        if ids_out is not None:
+            ids = ids_out[:rows]
+        else:
+            ids = torch.empty((rows, self.top_k), dtype=torch.int32, device=device)
         bias_alt, input_ids, alt_token_id = alt if alt is not None else (None, None, -1)
         gate_args = [
             _pointer(logits),

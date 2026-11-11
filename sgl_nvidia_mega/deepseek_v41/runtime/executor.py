@@ -38,7 +38,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
 from sgl_nvidia_mega.deepseek_v41 import attention, boundary, engram, logits, moe
-from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS, embedding, prologue
+from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS, bench, embedding, prologue
 from sgl_nvidia_mega.deepseek_v41.runtime.state import StepState
 
 logger = logging.getLogger(__name__)
@@ -185,10 +185,12 @@ class MegakernelDecode:
             view=step.view,
             binding=self.binding,
         )
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden, pre_hc_head = self._model_forward(st, input_embeds)
-        aux = st.aux if lm.capture_aux_hidden_states else None
-        return logits.logits(st, hidden, pre_hc_head, aux)
+        # benchmark only (runtime/bench.py): the step's stamps, when requested
+        with bench.forward("verify", positions):
+            with get_attn_tp_context().maybe_input_scattered(forward_batch):
+                hidden, pre_hc_head = self._model_forward(st, input_embeds)
+            aux = st.aux if lm.capture_aux_hidden_states else None
+            return logits.logits(st, hidden, pre_hc_head, aux)
 
     def _model_forward(self, st, input_embeds):
         """``DeepseekV4Model.forward``: the embedding, the layers, the head."""
