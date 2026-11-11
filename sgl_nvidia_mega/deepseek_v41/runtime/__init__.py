@@ -11,6 +11,26 @@ from typing import Any
 
 import msgspec
 
+# Slots described with the opt-in slots below that run by default: each is bitwise with
+# the path it replaces and measured faster served at batch 1. On a default start (no
+# SLOTS_ENV) one that has nothing to serve stays off instead of refusing the start;
+# listed in SLOTS_ENV it must build like any other slot.
+DEFAULT_ON_SLOTS = (
+    "gate_route",
+    "gate_route_quant",
+    "gemm2_pipe",
+    "hop_mbar",
+    "attn_indexer_narrow",
+    "attn_indexer_fused",
+    "shared_fold",
+    "shared_fold_quant",
+    "shared_fold_early_release",
+    "prologue_fork",
+    "hc_coeff_fused",
+    "markov_lowlat",
+    "attn_q_norm_gemm",
+    "attn_compressor_priority",
+)
 # The kernel slots this package ships; with the megakernel on, all of them run. The
 # Engram prefetch needs SGLang's per-rank Engram host table (spec.REQUIREMENTS).
 SHIPPED_SLOTS = (
@@ -75,6 +95,7 @@ SHIPPED_SLOTS = (
     # SGLang's top-k releases its dependents before it writes (bitwise). The window KV
     # store also releases before it stores; its rows are still gathered before the wait
     "kv_before_wait",
+    *DEFAULT_ON_SLOTS,
 )
 # the draft's slots, which build with the draft spec
 DRAFT_SLOTS = frozenset(
@@ -101,15 +122,17 @@ DRAFT_SLOTS = frozenset(
         "markov_lowlat",
     }
 )
-# Slots that run only when listed (draft_embed: the draft's tokens from the target's
-# gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
+# Slots that run only when listed, except those in DEFAULT_ON_SLOTS (draft_embed: the
+# draft's tokens from the target's gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
 # lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
 # hop_mbar: the Lamport consumers' RMSNorm sums cross the cluster by st.async onto
 # mbarriers, not a cluster barrier, bitwise; hop_final_collapse: the last layer's hop B
-# also writes the head's mHC collapse, so the head runs only its RMSNorm, bitwise;
+# also writes the head's mHC collapse, so the head runs only its RMSNorm (bitwise at
+# TP4; at attention TP8 + EP2 one DSpark proposal in 4183 verify steps differs, with the
+# same target outputs, so it is not in DEFAULT_ON_SLOTS);
 # attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
 # attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
 # one cluster launch, sm103/attention/reindex_select.py;
@@ -168,31 +191,17 @@ OPT_IN_SLOTS = (
     "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
-    "hop_mbar",
     "hop_final_collapse",
-    "attn_indexer_narrow",
-    "attn_indexer_fused",
     "target_lm_head_mxfp8",
     "draft_lm_head_mxfp8",
-    "shared_fold",
-    "shared_fold_quant",
-    "shared_fold_early_release",
-    "prologue_fork",
-    "hc_coeff_fused",
     "swapab_h8",
     "wo_a_g1",
-    "gate_route",
-    "gate_route_quant",
     "markov_pdl",
-    "markov_lowlat",
-    "attn_q_norm_gemm",
     "attn_index_q_first",
     "attn_index_weights_bf16",
     "attn_cluster_merge",
-    "gemm2_pipe",
     "attn_q_cluster",
     "attn_wo_a_fp8",
-    "attn_compressor_priority",
     "attn_index_early_trigger",
     "attn_defer_block_select",
 )
@@ -606,6 +615,14 @@ def build(model, ctx):
         a.attn.n_local_heads in CLUSTER_HEADS for a in bound["attention"].values()
     ):
         moot.add("attn_cluster_merge")
+    # a default start leaves off the default-on slots with nothing to serve here (for
+    # example hc_coeff_fused where the prenorm cannot run, as in batch-invariant mode)
+    declined = (
+        sorted(s for s in DEFAULT_ON_SLOTS if s in built and not built[s])
+        if os.environ.get(SLOTS_ENV) is None
+        else []
+    )
+    moot.update(declined)
     # every package's build agrees across ranks, so this raises on every rank alike
     missing = sorted(name for name in (SLOTS & built.keys()) - moot if not built[name])
     if missing:
@@ -621,7 +638,8 @@ def build(model, ctx):
     active = sorted(name for name, on in built.items() if on and name in SLOTS)
     summary = (
         f"slots {active or 'none (stock)'}; "
-        f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
+        + (f"default slots left off {declined}; " if declined else "")
+        + f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
         f"{[w for w, x in slots.items() if x.fast_gate]} rows, Engram prefetch at "
         f"{[w for w, x in slots.items() if x.engram_prefetch]} rows "
         f"({engram.reason or 'built, checked bit for bit'}); boundary: "

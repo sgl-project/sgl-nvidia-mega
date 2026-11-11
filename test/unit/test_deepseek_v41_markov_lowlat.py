@@ -8,10 +8,11 @@ from sgl_nvidia_mega.deepseek_v41 import runtime
 from sgl_nvidia_mega.deepseek_v41.sm103 import markov
 
 
-def test_the_slot_is_an_opt_in_draft_slot():
-    assert "markov_lowlat" in runtime.OPT_IN_SLOTS
+def test_the_slot_is_a_default_draft_slot():
+    assert "markov_lowlat" in runtime.DEFAULT_ON_SLOTS
     assert "markov_lowlat" in runtime.DRAFT_SLOTS
-    assert "markov_lowlat" not in runtime.SHIPPED_SLOTS
+    assert "markov_lowlat" in runtime.SHIPPED_SLOTS
+    assert "markov_lowlat" not in runtime.OPT_IN_SLOTS
 
 
 def test_the_slot_needs_the_markov_chain(monkeypatch):

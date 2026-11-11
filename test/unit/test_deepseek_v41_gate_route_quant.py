@@ -14,9 +14,10 @@ from sgl_nvidia_mega.deepseek_v41 import runtime
 from sgl_nvidia_mega.deepseek_v41.moe import routed
 
 
-def test_the_slot_is_opt_in():
-    assert "gate_route_quant" in runtime.OPT_IN_SLOTS
-    assert "gate_route_quant" not in runtime.SHIPPED_SLOTS
+def test_the_slots_run_by_default():
+    for slot in ("gate_route", "gate_route_quant", "gemm2_pipe"):
+        assert slot in runtime.DEFAULT_ON_SLOTS and slot in runtime.SHIPPED_SLOTS
+        assert slot not in runtime.OPT_IN_SLOTS
 
 
 def test_the_slot_needs_gate_route(monkeypatch):

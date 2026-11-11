@@ -558,7 +558,8 @@ def test_the_fused_slot_needs_attn_indexer(monkeypatch):
         runtime, "SLOTS", frozenset({"attn", "attn_indexer", "attn_indexer_fused"})
     )
     assert runtime.slot_reasons() == []
-    assert "attn_indexer_fused" not in runtime.SHIPPED_SLOTS
+    for slot in ("attn_indexer_narrow", "attn_indexer_fused"):
+        assert slot in runtime.DEFAULT_ON_SLOTS and slot in runtime.SHIPPED_SLOTS
 
 
 @pytest.mark.parametrize(

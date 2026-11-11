@@ -34,10 +34,12 @@ NEW = (
 )
 
 
-def test_the_slots_are_opt_in():
+def test_the_slots_are_opt_in_but_compressor_priority():
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    for slot in NEW:
+    assert "attn_compressor_priority" in runtime.DEFAULT_ON_SLOTS
+    assert "attn_compressor_priority" in runtime.SHIPPED_SLOTS
+    for slot in NEW[1:]:
         assert slot in runtime.OPT_IN_SLOTS
         assert slot not in runtime.SHIPPED_SLOTS
 
