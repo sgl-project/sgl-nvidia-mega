@@ -122,6 +122,9 @@ def env():
             group=tp.device_group,
             deadline_s=30.0,
         )
+        from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
+        # slot gate_route (SGLANG_NVIDIA_MEGAKERNEL_SLOTS): top-k + route in one launch
         pair = reg.RoutedExpertGemm(
             *full,
             top_k=TOP_K,
@@ -129,6 +132,8 @@ def env():
             gate_topk=True,
             router_experts=EXPERTS,
             expert_offset=offset,
+            gate_route="gate_route" in SLOTS,
+            **single.GEMM2_OPTIONS,
         )
     yield SimpleNamespace(
         rank=rank,
@@ -165,6 +170,7 @@ def _step_inputs(rows, seed, rank, device):
     )
     return SimpleNamespace(
         rows=rows,
+        x=x,
         x_q=x_q,
         x_s=x_s.view(torch.float8_e4m3fn).reshape(rows, -1),
         num_valid=torch.tensor([rows], dtype=torch.int32, device=device),
@@ -254,6 +260,8 @@ def test_pair_widths_gate_route_gemms_hop_b(env):
         a = _step_inputs(rows, 700 + rows, env.rank, env.device)
         where = f"rank {env.rank} rows={rows}"
         assert env.pair.supports_gate_topk(a.logits, a.bias), where
+        if env.pair.gate_route_kernel is not None:
+            assert env.pair.serves_gate_route(rows) == (rows <= reg.MAX_ROWS), where
         rows_out, weights, permuted, ids = env.pair.gate_topk_and_gemms(
             a.x_q, a.x_s, a.logits, a.bias, SCALE, a.num_valid
         )
@@ -306,7 +314,8 @@ def test_pair_widths_gate_route_gemms_hop_b(env):
         )
         if env.rank == 0:
             print(
-                f"EP2 pair rows={rows}: kept {int(local.sum())}/{local.numel()} slots; "
+                f"EP2 pair rows={rows} gate_route="
+                f"{env.pair.serves_gate_route(rows)}: kept {int(local.sum())}/{local.numel()} slots; "
                 f"hop B vs one-shot streams max_ulp={int(streams_ulps.max())}, "
                 f"vs SGLang's whole chain max_abs="
                 f"{(streams.float() - whole[0].float()).abs().max().item():.3g}",
@@ -315,6 +324,71 @@ def test_pair_widths_gate_route_gemms_hop_b(env):
     assert worst["equal"] >= 0.9999, worst
     assert worst["streams"] <= NUMERICS.tolerances["hop_b.residual.ulp"], worst
     assert worst["normed"] <= NUMERICS.tolerances["hop_b.normed.ulp"], worst
+
+
+@torch.inference_mode()
+def test_gate_route_quant_matches_gate_route_on_every_rank(env):
+    """Slot gate_route_quant at world 8 (each rank's EP window): the launch that quantizes
+    the BF16 rows itself against gate_route on SGLang's quant of them, through hop B: ids,
+    weights, slot -> row map, GEMM2 rows and hop B's streams and layer input bit for bit,
+    on every rank."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.all_reduce_mhc import mxfp8_scale_bytes
+
+    pair = reg.RoutedExpertGemm(
+        *env.layer,
+        top_k=TOP_K,
+        max_rows=reg.SERVED_MAX_ROWS,
+        gate_topk=True,
+        router_experts=EXPERTS,
+        expert_offset=env.offset,
+        gate_route=True,
+        gate_route_quant=True,
+        **single.GEMM2_OPTIONS,
+    )
+    for rows in (1, 6, 8):
+        a = _step_inputs(rows, 1100 + rows, env.rank, env.device)
+        where = f"rank {env.rank} rows={rows}"
+        assert pair.serves_gate_route_quant(rows, None, a.x), where
+        outs = {}
+        for fused in (False, True):
+            q_in = (None, None) if fused else (a.x_q, a.x_s)
+            rows_out, weights, permuted, ids = pair.gate_topk_and_gemms(
+                *q_in,
+                a.logits,
+                a.bias,
+                SCALE,
+                a.num_valid,
+                **({"x": a.x} if fused else {}),
+            )
+            q, sf = _mxfp8_buffers(rows, env.device, mxfp8_scale_bytes)
+            streams, normed = env.hop_b.finalize(
+                rows_out,
+                weights,
+                permuted,
+                a.shared,
+                a.residual,
+                a.post,
+                a.comb,
+                a.pre,
+                a.norm_weight,
+                EPS,
+                mxfp8_out=(q, sf),
+            )
+            torch.cuda.synchronize()
+            kept = rows_out[permuted.clamp(min=0).long()][permuted >= 0]
+            outs[fused] = (ids, weights, permuted, kept, streams, normed, q, sf)
+        for name, b, f in zip(
+            ("ids", "weights", "permuted", "rows", "streams", "normed", "q", "sf"),
+            outs[False],
+            outs[True],
+        ):
+            assert _same(f, b), f"{where}: {name}"
+        assert _alike_on_every_rank(outs[True][0], env.group, env.world), where
+        if env.rank == 0:
+            print(
+                f"gate_route_quant world 8 rows={rows}: bitwise through hop B",
+                flush=True,
+            )
 
 
 @torch.inference_mode()
