@@ -44,7 +44,7 @@ def test_only_the_last_layer_writes_the_collapse(final_collapse, layer_id):
     st = boundaries.BoundaryState(hc=None)
     layer = SimpleNamespace(layer_id=layer_id, ffn_hc="hc")
     opened = SimpleNamespace(streams="streams_in")
-    state = b._hop_b_moe(layer, _moe(), opened, None, st)
+    state = b._hop_b_moe(layer, _moe(), opened, None, st, b.hop_a)
     collapse = final_collapse and layer_id == 39
     # the collapse consumer takes the pre-mix and no norm weight; the plain one neither
     assert calls == [

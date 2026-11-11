@@ -586,6 +586,7 @@ def test_swapab_reads_the_layers_own_sparse_range_after_its_wait(
         indexer=object() if has_indexer else None,
         compressor=object() if has_compressor else None,
         alt_streams=None,
+        use_fused_wo_a=False,
     )
     with (
         mock.patch.object(chain, "ChainOps", lambda *a, **k: SimpleNamespace()),

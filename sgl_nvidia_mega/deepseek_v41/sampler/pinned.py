@@ -19,7 +19,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 # (SM version, N, K, rows) -> (FlashInfer runner class, tactic); rows absent here, or a
-# tactic FlashInfer no longer offers, run FlashInfer's default (its first runner, tactic
+# tactic the runner no longer runs, run FlashInfer's default (its first runner, tactic
 # -1), which is fixed per shape too. GB300 TP4 shard (N 32320, K 5120), CUDA graph
 # replay: the fastest offered tactic per row count, 0.4-1.4 us under the default.
 _DIRECT, _WARP = "CuteDSLDirectBf16Runner", "CuteDSLWarpSplitKBf16Runner"
@@ -31,6 +31,17 @@ PINNED_TACTICS: dict[tuple[int, int, int, int], tuple[str, tuple[int, ...]]] = {
     (103, 32320, 5120, 8): (_WARP, (16, 8, 128, 12, 1)),
     (103, 32320, 5120, 12): (_WARP, (16, 16, 256, 4, 2)),
     (103, 32320, 5120, 16): (_WARP, (16, 16, 256, 4, 2)),
+    # GB300 TP8 shard (N 16160): 1.8-2.4 us under the default (23.9-26.0 us vs
+    # 25.6-28.0; benchmark/sweep_deepseek_v41_tactics.py, which also re-picks the TP4 pin
+    # at 6 rows)
+    (103, 16160, 5120, 1): (_DIRECT, (128, 2, 1)),
+    (103, 16160, 5120, 2): (_WARP, (32, 8, 256, 2, 1)),
+    (103, 16160, 5120, 4): (_WARP, (32, 8, 256, 2, 1)),
+    (103, 16160, 5120, 5): (_WARP, (32, 8, 256, 2, 1)),
+    (103, 16160, 5120, 6): (_WARP, (32, 8, 256, 2, 1)),
+    (103, 16160, 5120, 8): (_WARP, (32, 8, 256, 2, 1)),
+    (103, 16160, 5120, 12): (_WARP, (32, 16, 128, 3, 2)),
+    (103, 16160, 5120, 16): (_WARP, (32, 16, 128, 3, 2)),
 }
 _LOGGED_ROWS: set[int] = set()
 
@@ -65,8 +76,7 @@ def _choice(sm_version: int, n: int, k: int, rows: int, device: torch.device):
                 _inputs(x, weight_t, out)
             ):
                 continue
-            offered = runner.get_valid_tactics(_inputs(x, weight_t, out), None)
-            if tactic in [tuple(t) for t in offered]:
+            if _runs(runner, _inputs(x, weight_t, out), tactic):
                 return runner, tactic
         logger.warning(
             "NVIDIA megakernel: pinned LM-head tactic %s %s not offered at %d rows; "
@@ -76,6 +86,15 @@ def _choice(sm_version: int, n: int, k: int, rows: int, device: torch.device):
             rows,
         )
     return runners[0], -1
+
+
+def _runs(runner, inputs: list, tactic: tuple[int, ...]) -> bool:
+    """Whether the runner offers the tactic, or (FlashInfer 0.7.3 prunes its warp split-K
+    autotune list) its own tactic check accepts it."""
+    if tactic in [tuple(t) for t in runner.get_valid_tactics(inputs, None)]:
+        return True
+    compatible = getattr(runner, "is_tactic_compatible", None)
+    return compatible is not None and compatible(inputs, tactic)
 
 
 def pinned_mm(x: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:

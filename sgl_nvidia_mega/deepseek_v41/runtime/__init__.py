@@ -55,6 +55,9 @@ SHIPPED_SLOTS = (
     "draft_gate",
     "draft_tail",
     "draft_post",
+    # draft_hop: at attention TP8 with MoE TP4 x EP2, where SGLang has no fused post,
+    # draft_post's posts on the plugin's Lamport all-reduce + mHC (no effect at TP4)
+    "draft_hop",
     "draft_seam",
     "draft_attn",
     "draft_qfront",
@@ -83,6 +86,7 @@ DRAFT_SLOTS = frozenset(
         "draft_gate",
         "draft_tail",
         "draft_post",
+        "draft_hop",
         "draft_seam",
         "draft_attn",
         "draft_qfront",
@@ -106,7 +110,21 @@ DRAFT_SLOTS = frozenset(
 # also writes the head's mHC collapse, so the head runs only its RMSNorm, bitwise;
 # attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
 # attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
-# one cluster launch, sm103/attention/reindex_select.py)
+# one cluster launch, sm103/attention/reindex_select.py;
+# target_lm_head_mxfp8 / draft_lm_head_mxfp8: the target's / the draft's LM head at 1-8
+# rows on an MXFP8 copy of the shard, a numerics change; the draft's is measurement only,
+# plan.MEASUREMENT_ONLY_SLOTS;
+# shared_fold: slot shared_ll's gate_up epilogue writes the clamped SwiGLU, bitwise;
+# shared_fold_quant: it also writes down_proj's MXFP8 input, bitwise;
+# shared_fold_early_release: that GEMM releases down_proj's GEMM at its loads, as
+# FlashInfer's own gate_up does, not after its stores;
+# prologue_fork: the Engram hashes forked at the step start and the embedding written
+# into the streams, bitwise; hc_coeff_fused: the prenorm's mHC coefficients in one
+# launch, bitwise with hc_prenorm's two;
+# swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
+# on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
+# TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
+# TP8 arm); no effect at TP4)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -117,6 +135,15 @@ OPT_IN_SLOTS = (
     "hop_final_collapse",
     "attn_indexer_narrow",
     "attn_indexer_fused",
+    "target_lm_head_mxfp8",
+    "draft_lm_head_mxfp8",
+    "shared_fold",
+    "shared_fold_quant",
+    "shared_fold_early_release",
+    "prologue_fork",
+    "hc_coeff_fused",
+    "swapab_h8",
+    "wo_a_g1",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -158,6 +185,9 @@ def slot_reasons() -> list[str]:
     for slot, needs in (
         ("gate", "moe"),
         ("shared_ll", "moe"),
+        ("shared_fold", "shared_ll"),
+        ("shared_fold_quant", "shared_fold"),
+        ("shared_fold_early_release", "shared_fold_quant"),
         ("gate_wide", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
@@ -176,12 +206,15 @@ def slot_reasons() -> list[str]:
         ("hop_mbar", "hop_a"),
         ("hop_final_collapse", "hop_b"),
         ("draft_lm_head", "markov"),
+        ("target_lm_head_mxfp8", "target_lm_head"),
+        ("draft_lm_head_mxfp8", "draft_lm_head"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),
         ("draft_tail", "draft"),
         ("draft_post", "draft"),
         ("draft_seam", "draft_post"),
+        ("draft_hop", "draft_post"),
         ("draft_attn", "draft"),
         ("draft_qfront", "draft_attn"),
         ("draft_wo_a", "draft_attn"),
@@ -192,6 +225,9 @@ def slot_reasons() -> list[str]:
         ("draft_prenorm", "draft"),
         ("draft_qkv_a_ll", "draft_qkv_a"),
         ("draft_wo_b_ll", "draft_wo_a"),
+        ("hc_coeff_fused", "hc_prenorm"),
+        ("swapab_h8", "attn"),
+        ("wo_a_g1", "attn"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -277,6 +313,10 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         ),
         "engram": bound["engram"].prefetch is not None,
         "target_lm_head": bound.get("logits") is not None,
+        "target_lm_head_mxfp8": getattr(
+            getattr(bound.get("logits"), "quant_method", None), "mxfp8", None
+        )
+        is not None,
     }
 
 
@@ -297,6 +337,7 @@ def build(model, ctx):
 
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
+    from sgl_nvidia_mega.deepseek_v41.boundary import prenorm
     from sgl_nvidia_mega.deepseek_v41.runtime import embedding
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
         PACKAGES,
@@ -335,6 +376,7 @@ def build(model, ctx):
         engram_prefetch=engram.prefetch is not None,
         two_shot=getattr(bound["boundary"], "two_shot", None) is not None,
         fast_gate_wide="gate_wide" in SLOTS,
+        prologue_fork="prologue_fork" in SLOTS,
     )
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
@@ -351,6 +393,7 @@ def build(model, ctx):
             for step in bound["attention"].values()
         ),
         "hc_prenorm": bound["boundary"].prenorm,
+        "hc_coeff_fused": bound["boundary"].prenorm and bool(prenorm.fused()),
         "early_trigger": "early_trigger" in SLOTS and facts.hop_a,
         "hop_a_batch2": any(
             s.hop_a and w > slot_plan.HOP_A_BATCH1_ROWS for w, s in slots.items()
@@ -379,6 +422,7 @@ def build(model, ctx):
             s.fast_gate and w not in slot_plan.FAST_GATE_ROWS for w, s in slots.items()
         ),
         "req_pos_once": "req_pos_once" in SLOTS,
+        "prologue_fork": "prologue_fork" in SLOTS,
         "attn_indexer": any(
             a.chain is not None and a.chain[0].indexer is not None
             for a in bound["attention"].values()
@@ -400,8 +444,16 @@ def build(model, ctx):
             for a in bound["attention"].values()
         ),
     }
+    # kv_before_wait only moves swap-AB's KV gather: with no low-ratio layer on
+    # swap-AB (attention TP8 without slot swapab_h8) it has nothing to serve, which is
+    # not a failed build; it is left off the active slots
+    moot = (
+        set()
+        if any(a.swapab and a.low_ratio for a in bound["attention"].values())
+        else {"kv_before_wait"}
+    )
     # every package's build agrees across ranks, so this raises on every rank alike
-    missing = sorted(name for name in SLOTS & built.keys() if not built[name])
+    missing = sorted(name for name in (SLOTS & built.keys()) - moot if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "
