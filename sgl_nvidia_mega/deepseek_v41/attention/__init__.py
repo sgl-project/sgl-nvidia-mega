@@ -118,6 +118,8 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
     )
     if step_.swapab and step_.kv_before_wait and step_.low_ratio:
         swapab += " (KV before the PDL wait)"
+        if step_.index_after_wait:
+            swapab += " (the sparse range after the wait)"
     parts.append(swapab)
     parts.append(
         f"fused wo_a 1-48 ({attn.n_local_groups} groups)"

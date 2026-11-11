@@ -128,6 +128,8 @@ class BoundaryState(msgspec.Struct):
     open: Optional[Open] = None
     # slot aux_mean_stats: the capture means issued on a stats stream, joined in final
     aux_done: list = []
+    # slot hop_final_collapse: the head's collapse, written by the last layer's hop B
+    final_collapse: Optional[torch.Tensor] = None
 
 
 class Boundaries:
@@ -146,6 +148,7 @@ class Boundaries:
         hop_b: bool = False,
         mhc_fusions: Optional[bool] = None,
         prenorm: bool = False,
+        final_collapse: bool = False,
         draft_hop=None,
     ):
         from sglang.srt.models import deepseek_v4_mhc as mhc
@@ -167,6 +170,8 @@ class Boundaries:
         self.hop_b = hop_b and hop_a is not None  # the MoE post on hop A's mailbox
         # slot draft_hop: both posts of the draft's stages on the draft's own mailbox
         self.draft_hop = draft_hop  # draft_hop.DraftHop, or None
+        # slot hop_final_collapse: the last layer's hop B also writes the head's collapse
+        self.final_collapse = final_collapse and self.hop_b
         self._served: set = set()
         self._attn_mxfp8 = {}
         self._ffn_next = {}  # the attention post's next: the FFN norm
@@ -193,6 +198,7 @@ class Boundaries:
             self._attn_next[prev] = self._attention_boundary(layer)
             self._next_layer[prev] = layer.layer_id
         self._attn_next[ids[-1]] = None
+        self._last_layer = ids[-1]
 
     def _fuses(self, layer) -> bool:
         if self._mhc_fusions is None:
@@ -295,10 +301,10 @@ class Boundaries:
                 st.hc = self._two_shot_moe(layer, partial, opened, nxt)
                 return
             if self._hop_b_takes(rows, partial):
-                st.hc = self._hop_b_moe(layer, partial, opened, nxt, self.hop_a)
+                st.hc = self._hop_b_moe(layer, partial, opened, nxt, st, self.hop_a)
                 return
             if self._draft_hop_fits(rows, layer, kind) and _finalize_takes(partial):
-                st.hc = self._hop_b_moe(layer, partial, opened, nxt, self.draft_hop)
+                st.hc = self._hop_b_moe(layer, partial, opened, nxt, st, self.draft_hop)
                 return
         if not self._sglang_fuses_moe(partial, layer):
             self._log_unfused(layer, kind, opened.streams.shape[0])
@@ -529,7 +535,7 @@ class Boundaries:
             and not out.shared_is_replicated
         )
 
-    def _hop_b_moe(self, layer, out, opened, nxt, hop):
+    def _hop_b_moe(self, layer, out, opened, nxt, st, hop):
         """Hop B: the Lamport MoE finalize on ``hop`` (hop A's mailbox, or the
         draft's); the next input as SGLang's post builds it at these widths: MXFP8 for
         an MXFP8 receiver whose norm folds, else the streams only."""
@@ -545,6 +551,17 @@ class Boundaries:
         rows = r.expert_weights.shape[0]
         args = (r.gemm2_out, r.expert_weights, r.expanded_idx_to_permuted_idx)
         args += (out.shared, opened.streams, post_mix, comb)
+        if (
+            hop is self.hop_a
+            and nxt is None
+            and self.final_collapse
+            and layer.layer_id == self._last_layer
+        ):
+            self._log_served("hop B final collapse", rows)
+            updated, st.final_collapse = self.hop_a.finalize(
+                *args, pre, None, 0.0, rows=rows, collapse=True
+            )
+            return mhc.HcState(updated, pre)
         if not (nxt is not None and _quantizes(nxt, rows)):
             updated, _ = hop.finalize(*args, None, None, 0.0, rows=rows)
             return mhc.HcState(updated, pre)
