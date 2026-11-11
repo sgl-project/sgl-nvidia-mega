@@ -224,6 +224,9 @@ GATE_TOPK_NVRTC_OPTIONS = (
     "--prec-sqrt=false",
     "--prec-div=false",
 )
+# The warp router's build (nvcc -O3, no fast math): no flush to zero. gate_topk.cuh writes
+# its float operations as PTX, so these only set the compares and selects around them.
+GATE_TOPK_WARP_NVRTC_OPTIONS = ("-std=c++17", "-default-device")
 GATE_TOPK_HEADERS = ("gate_topk.cuh",)
 # slot gate_route: the router's top-k and the route record in one cluster launch of one CTA
 # per row (gate_route.cuh), at 1-MAX_ROWS rows; per router (experts, top_k) as gate_topk
@@ -249,13 +252,124 @@ GATE_ROUTE_QUANT_VARIANTS = {
     ),
 }
 
+# Which kernel serves moe_fused_gate for the DSV4.1 routers in the installed SGLang, as
+# gate_topk.cuh's DSV41_GATE_REFERENCE: the Triton router, or the CUDA warp router
+# (route_warp.cuh, sgl-project/sglang#47641) with its renormalize sum before or after
+# sgl-project/sglang#49017.
+GATE_REFERENCE_TRITON = 0
+GATE_REFERENCE_WARP = 1
+GATE_REFERENCE_WARP_SUM = 2
+
+# What the probe below reads (test/unit/test_contract.py pins them where installed)
+SGLANG_OPTIONAL_READS = {
+    "kernels/ops/moe/moe_route_warp.py": (
+        "moe_route_warp",
+        "covered",
+        "bias_layout_ok",
+    ),
+}
+
+# route_warp.cuh's renormalize reduction, by reference
+_WARP_SUM_LINES = {
+    "warp::reduce_sum<std::bit_ceil(K)>(w)": GATE_REFERENCE_WARP,
+    "warp::reduce_sum<1,std::bit_ceil(K)>(w)": GATE_REFERENCE_WARP_SUM,
+}
+# sha256 of the warp router's fast-math sqrt_softplus (route_warp.cuh's sqrtsoftplus, later
+# sgl_kernel/activation.cuh's sqrt_softplus<true>) from its kHalfL2e constant to its return,
+# comments and whitespace removed and the math:: constants spelled as the first version's.
+_WARP_SQRT_SOFTPLUS_SHA256 = (
+    "0a5fb696fd4e767294917d481260e498f640430dcb7243589e5e6657b9f53dd0"
+)
+
+
+def _warp_sqrt_softplus_digest(text: str) -> Optional[str]:
+    import hashlib
+    import re
+
+    flat = re.sub(r"\s+", "", re.sub(r"//[^\n]*", "", text))
+    begin = flat.find("constexprfloatkHalfL2e=")
+    end = flat.find("*(pos?1.0f:w);", begin)
+    if begin < 0 or end < 0:
+        return None
+    body = flat[begin : end + len("*(pos?1.0f:w);")]
+    body = body.replace("math::log2e", "kLog2e").replace("math::loge2", "kLn2")
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _warp_reference(jit_dir: Path) -> Optional[int]:
+    """The warp router variant whose source is under ``jit_dir`` (SGLang's
+    ``kernels/jit``), or None when its sqrt_softplus or renormalize sum is not one
+    gate_topk.cuh reproduces."""
+    import re
+
+    route = (jit_dir / "csrc" / "moe" / "route_warp.cuh").read_text()
+    activation = jit_dir / "include" / "sgl_kernel" / "activation.cuh"
+    sources = [route] + ([activation.read_text()] if activation.is_file() else [])
+    if not any(
+        _warp_sqrt_softplus_digest(t) == _WARP_SQRT_SOFTPLUS_SHA256 for t in sources
+    ):
+        return None
+    flat = re.sub(r"\s+", "", re.sub(r"//[^\n]*", "", route))
+    if not ("sqrt_softplus(x)" in flat or "sqrtsoftplus(x)" in flat):
+        return None  # the router scores with another sqrt_softplus (e.g. <false>)
+    found = {ref for line, ref in _WARP_SUM_LINES.items() if f"sum={line};" in flat}
+    return found.pop() if len(found) == 1 else None
+
+
+@cache
+def gate_reference(experts: int, top_k: int) -> Optional[int]:
+    """The kernel moe_fused_gate runs for this DSV4.1 router (sqrtsoftplus, fp32 logits,
+    ungrouped, no fused shared expert) in the installed SGLang, or None when it is one
+    gate_topk.cuh does not reproduce. Probed from SGLang's kernels, not its version."""
+    try:
+        from sglang.kernels.ops.moe import moe_route_warp
+    except ImportError:  # SGLang before sgl-project/sglang#47641
+        return GATE_REFERENCE_TRITON
+    if not moe_route_warp.covered(torch.float32, experts, top_k, "sqrtsoftplus"):
+        return GATE_REFERENCE_TRITON
+    jit_dir = Path(moe_route_warp.__file__).resolve().parents[2] / "jit"
+    try:
+        return _warp_reference(jit_dir)
+    except OSError:
+        return None
+
+
+def warp_bias_layout_ok(*biases) -> bool:
+    """Whether SGLang's warp router takes these router biases (else it runs the Triton
+    router, which a warp-reference gate_topk.cuh does not reproduce)."""
+    try:
+        from sglang.kernels.ops.moe import moe_route_warp
+    except ImportError:
+        return True
+    return moe_route_warp.bias_layout_ok(*biases)
+
+
+def gate_topk_nvrtc_options(experts: int, top_k: int) -> tuple[str, ...]:
+    """The NVRTC options of every program that includes gate_topk.cuh for this router:
+    the build of the reference ``gate_reference`` found, and DSV41_GATE_REFERENCE (which
+    gate_topk.cuh requires)."""
+    reference = gate_reference(experts, top_k)
+    if reference is None:
+        raise RuntimeError(
+            f"the installed SGLang routes ({experts} experts, top-{top_k}) with a kernel "
+            "gate_topk.cuh does not reproduce"
+        )
+    options = (
+        GATE_TOPK_NVRTC_OPTIONS
+        if reference == GATE_REFERENCE_TRITON
+        else GATE_TOPK_WARP_NVRTC_OPTIONS
+    )
+    return options + (f"-DDSV41_GATE_REFERENCE={reference}",)
+
 
 @cache
 def load_gate_topk(
     device_index: int, experts: int = GATE_TOPK_EXPERTS, top_k: int = GATE_TOPK_TOP_K
 ) -> _Kernel:
-    """The gate top-k kernel of the (experts, top_k) router, one thread per expert."""
+    """The gate top-k kernel of the (experts, top_k) router, one thread per expert, built
+    for the installed SGLang's router (``gate_reference``)."""
     name, symbol = GATE_TOPK_VARIANTS[(experts, top_k)]
+    options = gate_topk_nvrtc_options(experts, top_k)
     device = torch.device("cuda", device_index)
     with torch.cuda.device(device):
         torch.zeros(1, device=device)
@@ -266,7 +380,7 @@ def load_gate_topk(
             source,
             name,
             f"sm_{major}{minor}a",
-            GATE_TOPK_NVRTC_OPTIONS,
+            options,
             headers=headers,
         )
         return _load(cubin, symbol, (experts, 1, 1), 0)
@@ -280,9 +394,11 @@ def load_gate_route(
     quant: bool = False,
 ) -> _Kernel:
     """The fused top-k + route kernel of the (experts, top_k) router (slot gate_route);
-    with ``quant``, the build that also quantizes the routed input (slot gate_route_quant)."""
+    with ``quant``, the build that also quantizes the routed input (slot gate_route_quant).
+    Built for the installed SGLang's router (``gate_reference``)."""
     variants = GATE_ROUTE_QUANT_VARIANTS if quant else GATE_ROUTE_VARIANTS
     name, symbol = variants[(experts, top_k)]
+    options = gate_topk_nvrtc_options(experts, top_k)
     device = torch.device("cuda", device_index)
     with torch.cuda.device(device):
         torch.zeros(1, device=device)
@@ -293,7 +409,7 @@ def load_gate_route(
             source,
             name,
             f"sm_{major}{minor}a",
-            GATE_TOPK_NVRTC_OPTIONS,
+            options,
             headers=headers,
         )
         return _load(cubin, symbol, (experts, 1, 1), 0)
@@ -471,7 +587,10 @@ class RoutedExpertGemm:
             load_route_wide(w13.device.index) if max_rows > MAX_ROWS else None
         )
         # the router's (experts, top_k) picks the variant: target or DSpark draft
-        fits_gate_topk = (self.router_experts, top_k) in GATE_TOPK_VARIANTS
+        # and the installed SGLang's router must be one gate_topk.cuh reproduces
+        fits_gate_topk = (self.router_experts, top_k) in GATE_TOPK_VARIANTS and (
+            gate_reference(self.router_experts, top_k) is not None
+        )
         self.gate_topk_kernel = (
             load_gate_topk(w13.device.index, self.router_experts, top_k)
             if gate_topk and fits_gate_topk

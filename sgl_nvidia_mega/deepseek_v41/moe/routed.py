@@ -229,6 +229,10 @@ def shared_topk_slots(config) -> int:
 
 def gate_applies(mlp: torch.nn.Module) -> bool:
     """The DSV4.1 router gate_topk.cu reproduces bit for bit."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
+        warp_bias_layout_ok,
+    )
+
     config = mlp.topk.topk_config
     bias_vl = getattr(mlp.gate, "e_score_correction_bias_vl", None)
     return (
@@ -241,6 +245,8 @@ def gate_applies(mlp: torch.nn.Module) -> bool:
         and config.custom_routing_function is None
         and config.correction_bias is not None
         and (bias_vl is None or bias_vl.dtype == torch.float32)
+        # SGLang's warp router takes these biases (else it falls back to Triton)
+        and warp_bias_layout_ok(config.correction_bias, bias_vl)
     )
 
 
