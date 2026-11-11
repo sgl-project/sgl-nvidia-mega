@@ -7,7 +7,7 @@
 // prelude: the same rows = h W2^T (BF16) per routed expert, 128 x 8 tiles, 5-stage
 // weight ring streamed before the grid wait, as gemm2.cu, bit for bit. Derived
 // from muLLM v0.4.1 (NVIDIA Corporation, Apache-2.0), its generated GEMM2 build
-// (pipe, prelude, stages 5) with its symbols renamed (port_gemm2.py unrename):
+// (pipe, prelude, stages 5) with its symbols renamed:
 // - pipe: one TMA warp loads the weights and their scales, one warp the intermediate
 //   (a TMA tensor map, H) and its scales (cp.async), both on one full barrier per
 //   stage; the MMA warp copies the scales to tensor memory itself (tcgen05.cp), so the
