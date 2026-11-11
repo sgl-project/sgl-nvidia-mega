@@ -66,10 +66,15 @@ ARCHITECTURE = "DeepseekV4ForCausalLM"
 # the SGLang megakernel contract this spec is written against
 API_VERSION = 2
 # The FlashInfer low-latency GEMM file the wo_b publish epilogue subclasses, by the
-# sha256 of its source; it is byte-identical in FlashInfer 0.7.0, 0.7.1 and 0.7.2
+# sha256 of its source. FlashInfer 0.7.0-0.7.2 share one file; 0.7.3 only adds
+# tactic-enumeration caching, leaving the kernel class (including epilog_warp)
+# unchanged. Keep rejecting other source revisions until they are checked.
 FLASHINFER_LL_GEMM = "gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py"
 FLASHINFER_LL_GEMM_SHA256 = frozenset(
-    {"118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280"}
+    {
+        "118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280",  # 0.7.0-0.7.2
+        "c9d16930cc99c98d2de57e10882f52611a784268ba497b2b10d613a935a5596c",  # 0.7.3
+    }
 )
 
 # Test-only switches that run the covered step eagerly: the composition check

@@ -84,6 +84,34 @@ def test_the_documented_setup_is_accepted():
     assert _refusal() == ""
 
 
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280",
+        "c9d16930cc99c98d2de57e10882f52611a784268ba497b2b10d613a935a5596c",
+    ],
+    ids=["flashinfer-0.7.0-0.7.2", "flashinfer-0.7.3"],
+)
+def test_known_flashinfer_gemm_sources_are_accepted(digest):
+    with (
+        patch.object(spec, "flashinfer_ll_gemm_digest", return_value=digest),
+        patch.object(spec.importlib.util, "find_spec", return_value=object()),
+    ):
+        assert spec.toolchain_reasons() == []
+
+
+@pytest.mark.parametrize("digest", ["0" * 64, "missing"])
+def test_unknown_or_missing_flashinfer_gemm_source_is_refused(digest):
+    with (
+        patch.object(spec, "flashinfer_ll_gemm_digest", return_value=digest),
+        patch.object(spec.importlib.util, "find_spec", return_value=object()),
+    ):
+        reasons = spec.toolchain_reasons()
+    assert len(reasons) == 1
+    assert spec.FLASHINFER_LL_GEMM in reasons[0]
+    assert digest[:12] in reasons[0]
+
+
 BREAKABLE = with_phase(
     default_cuda_graph_config(), Phase.DECODE, backend=Backend.BREAKABLE
 )
