@@ -688,6 +688,12 @@ def build(model, ctx):
     hook_factory = (
         hooks.build(model, ctx.binding) if "sharded_gumbel" in SLOTS else None
     )
+    if bound["gdn"].gdn_core:
+        from sgl_nvidia_mega.qwen3_5.sm103.gdn import checkpoint_commit
+
+        hook_factory = checkpoint_commit.bind(
+            hook_factory, torch.cuda.current_device(), parallel.attn_tp_size
+        )
     on = sorted(name for name, ok in built.items() if ok)
     return Qwen35Verify(
         model,
