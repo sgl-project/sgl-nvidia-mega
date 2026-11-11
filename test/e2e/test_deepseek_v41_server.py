@@ -28,6 +28,7 @@ from sglang.test.test_utils import (
 
 from sgl_nvidia_mega.deepseek_v41.attention.indexer import CHECK_ENV
 from sgl_nvidia_mega.deepseek_v41.runtime import SHIPPED_SLOTS, SLOTS_ENV
+from sgl_nvidia_mega.deepseek_v41.runtime.bench import FIXED_ENV
 from sgl_nvidia_mega.plugin import FLAG_CLI
 
 LAUNCH_TIMEOUT = 3600
@@ -35,6 +36,9 @@ LAUNCH_TIMEOUT = 3600
 # the switch-off arm's own band for anything finer
 GSM8K_BOUND = float(os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_GSM8K_BOUND", "0.85"))
 URL_ = URL or DEFAULT_URL_FOR_TEST
+# benchmark-only fixed routing ignores the router (wrong outputs): never score with it
+if os.environ.get(FIXED_ENV, "") not in ("", "0"):
+    raise RuntimeError(f"{FIXED_ENV} is benchmark only; unset it for accuracy tests")
 
 
 def _launch(args=ARGS, extra_env=None, extra_args=(), log=None, backend=True):
