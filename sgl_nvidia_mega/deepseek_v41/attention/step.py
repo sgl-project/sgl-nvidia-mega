@@ -162,6 +162,7 @@ class AttentionStep:
         index_q_first: bool = False,
         index_weights_bf16: bool = False,
         cluster_merge: bool = False,
+        q_cluster: bool = False,
         wo_a_fp8: bool = False,
     ):
         self.attn = attn
@@ -188,6 +189,7 @@ class AttentionStep:
                     q_norm_gemm=q_norm_gemm,
                     index_q_first=index_q_first,
                     index_weights_bf16=index_weights_bf16,
+                    q_cluster=q_cluster,
                 )
                 for rope in (False, True)
             )

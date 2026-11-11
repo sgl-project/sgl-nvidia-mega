@@ -35,10 +35,11 @@ def multi_stream(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
     if attn.fuse_wqa_wkv:
         qkv_a = q_ops.qkv_a(attn, x_linear)
         qkv_a_ready = current.record_event()
-    # slot attn_q_norm_gemm: no indexer reads q_lora, so wq_b may norm it itself
+    # slots attn_q_norm_gemm / attn_q_cluster: no indexer reads q_lora, so the query's
+    # launch may norm it itself
     if (
         attn.indexer is None
-        and getattr(q_ops, "q_norm_gemm", False)
+        and (getattr(q_ops, "q_norm_gemm", False) or getattr(q_ops, "q_cluster", False))
         and q_ops.defers_norm(attn, x.shape[0])
     ):
         q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a, defer=True)
@@ -117,7 +118,7 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
     # query's wq_b instead, the norm delays the index chain: slower per step)
     defer = (
         attn.indexer is None
-        and getattr(q_ops, "q_norm_gemm", False)
+        and (getattr(q_ops, "q_norm_gemm", False) or getattr(q_ops, "q_cluster", False))
         and q_ops.defers_norm(attn, x.shape[0])
     )
     q_lora, q_for_wqb = (

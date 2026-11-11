@@ -149,7 +149,10 @@ DRAFT_SLOTS = frozenset(
 # 8 heads, the low-ratio range, 1-8 rows), target and draft, bitwise; faster in the
 # attention-half bench, no step gain served at TP8 batch 1; gemm2_pipe: the routed
 # GEMM2, target and draft, on muLLM's reference-pipeline + prelude build of the same
-# kernel (bitwise);
+# kernel (bitwise); attn_q_cluster: at 1-8 rows the q_lora norm + MXFP8 quant + wq_b in
+# one cluster launch in the target's layers without an indexer
+# (sm103/attention/q_cluster.py, ahead of attn_q_norm_gemm), a numerics change:
+# a different RMS order and the FP8 mma.sync k-block fold in place of FlashInfer's GEMM;
 # attn_wo_a_fp8: the target's fused wo_a streams wo_a as E4M3 with 32x32 UE8M0 scales
 # (half the bytes), recovered from SGLang's BF16 wo_a and widened exactly in shared memory;
 # bitwise where the recovery is exact, which build checks per layer;
@@ -187,6 +190,7 @@ OPT_IN_SLOTS = (
     "attn_index_weights_bf16",
     "attn_cluster_merge",
     "gemm2_pipe",
+    "attn_q_cluster",
     "attn_wo_a_fp8",
     "attn_compressor_priority",
     "attn_index_early_trigger",
@@ -283,6 +287,7 @@ def slot_reasons() -> list[str]:
         ("attn_index_q_first", "attn_indexer"),
         ("attn_index_weights_bf16", "attn_indexer"),
         ("attn_cluster_merge", "attn"),
+        ("attn_q_cluster", "attn"),
         ("attn_wo_a_fp8", "attn"),
         ("attn_compressor_priority", "attn"),
         ("attn_index_early_trigger", "attn_indexer_fused"),
@@ -539,6 +544,12 @@ def build(model, ctx):
         ),
         "attn_wo_a_fp8": any(
             getattr(a, "wo_a_fp8_weight", None) is not None
+            for a in bound["attention"].values()
+        ),
+        # the query's cluster launch: a chain with the low-latency wq_b, 1-8 rows
+        "attn_q_cluster": any(w <= 8 for w in pctx.widths)
+        and any(
+            a.chain is not None and a.chain[1].q_cluster
             for a in bound["attention"].values()
         ),
         "attn_index_q_first": any(

@@ -21,6 +21,7 @@ import torch
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 from sgl_nvidia_mega.deepseek_v41.attention import ops
 from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_cluster as q_cluster_kernel
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm, swapab
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a as wo_a_kernel
 from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import rmsnorm_mxfp8
@@ -203,8 +204,9 @@ class Mxfp8Rows(NamedTuple):
 
 
 class DeferredNorm(NamedTuple):
-    """Slot attn_q_norm_gemm: q_lora not yet normed, for wq_b to norm and quantize in
-    its own launch (``sm103/attention/q_norm_gemm``, ``ChainOps.compute_q_b``)."""
+    """Slots attn_q_norm_gemm / attn_q_cluster: q_lora not yet normed, for wq_b to norm
+    and quantize in its own launch (``sm103/attention/q_norm_gemm`` or ``q_cluster``,
+    ``ChainOps.compute_q_b``)."""
 
     q_lora: torch.Tensor
 
@@ -251,6 +253,32 @@ def wq_b_consumer(attn):
     return mxfp8_ll.WQ_B_TP8 if attn.n_local_heads == 8 else None
 
 
+def q_cluster_weight(attn):
+    """Slot attn_q_cluster: the layer's wq_b repacked once for the cluster kernel (shared
+    by the layer's chains), or None where the kernel cannot take it (logged once)."""
+    packed = getattr(attn, "_mega_q_cluster_wq_b", None)
+    if packed is not None or getattr(attn, "_mega_q_cluster_reason", None):
+        return packed
+    why = q_cluster_kernel.reason(attn.wq_b.weight)
+    if not why:
+        try:
+            packed = q_cluster_kernel.pack(
+                attn.wq_b.weight, attn.wq_b.weight_scale_inv_swizzled
+            )
+        except ValueError as error:
+            why = str(error)
+    if why:
+        attn._mega_q_cluster_reason = why
+        logger.info(
+            "NVIDIA megakernel: slot attn_q_cluster declines layer %d: %s",
+            attn.layer_id,
+            why,
+        )
+        return None
+    attn._mega_q_cluster_wq_b = packed
+    return packed
+
+
 def wq_b_ll_applies(attn) -> bool:
     """wq_b runs on the low-latency GEMM, fed by the chain's PDL norm + quant."""
     return _ll_linear_applies(attn.wq_b) and attn.q_norm.weight.dtype == torch.bfloat16
@@ -271,6 +299,7 @@ class ChainOps:
         q_norm_gemm: bool = False,
         index_q_first: bool = False,
         index_weights_bf16: bool = False,
+        q_cluster: bool = False,
     ):
         self.rope_in_attention = rope_in_attention
         self.wq_b_ll = wq_b_ll_applies(attn)
@@ -288,6 +317,14 @@ class ChainOps:
         # slot attn_q_norm_gemm: at 1-8 rows the norm + quant run inside wq_b's GEMM in
         # layers without an indexer, where the prepare path defers them (bitwise)
         self.q_norm_gemm = q_norm_gemm and self.wq_b_ll
+        # slot attn_q_cluster: at 1-8 rows the norm + quant + wq_b in one cluster launch
+        # in layers without an indexer, ahead of attn_q_norm_gemm (a numerics change)
+        self.q_cluster_wq_b = (
+            q_cluster_weight(attn)
+            if q_cluster and self.wq_b_ll and getattr(attn, "indexer", None) is None
+            else None
+        )
+        self.q_cluster = self.q_cluster_wq_b is not None
         # slot attn_index_q_first: with the plugin indexer, the index query's wq_b runs on
         # the main stream with its RoPE + pack, wq_b on the second stream (bitwise)
         self.index_q_first = index_q_first and self.wq_b_ll
@@ -353,7 +390,10 @@ class ChainOps:
         )
 
     def defers_norm(self, attn, rows: int) -> bool:
-        """Whether slot attn_q_norm_gemm takes this step's norm into wq_b's GEMM."""
+        """Whether slot attn_q_cluster or attn_q_norm_gemm takes this step's norm into
+        the query's launch."""
+        if self.q_cluster and 0 < rows <= q_cluster_kernel.MAX_ROWS:
+            return True
         return self.q_norm_gemm and not q_norm_gemm.reason(
             attn.wq_b.weight, rows, wq_b_consumer(attn)
         )
@@ -385,7 +425,18 @@ class ChainOps:
     def compute_q_b(self, attn, q, positions, q_out):
         from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope
 
-        if isinstance(q, DeferredNorm):
+        if (
+            isinstance(q, DeferredNorm)
+            and self.q_cluster
+            and q.q_lora.shape[0] <= q_cluster_kernel.MAX_ROWS
+        ):
+            out = q_cluster_kernel.q_cluster(
+                q.q_lora,
+                attn.q_norm.weight,
+                attn.q_norm.variance_epsilon,
+                self.q_cluster_wq_b,
+            )
+        elif isinstance(q, DeferredNorm):
             out = q_norm_gemm.q_norm_linear(
                 q.q_lora,
                 attn.q_norm.weight,
@@ -588,6 +639,7 @@ def precompile(
     qkv_a_ll: bool = False,
     wo_a_one_group: bool = False,
     q_norm_gemm_on: bool = False,
+    q_cluster_on: bool = False,
     wo_a_fp8_on: bool = False,
 ) -> None:
     """Compile the chain's kernels that do not depend on the KV pool, for these widths:
@@ -626,6 +678,8 @@ def precompile(
                 pdl=True,
                 row_tiles=r > mxfp8_ll.MAX_ROWS,
             )
+        if q_cluster_on and any(r <= q_cluster_kernel.MAX_ROWS for r in rows):
+            q_cluster_kernel.precompile(attn.wq_b.weight.shape[0])
         if q_norm_gemm_on:
             eps = attn.q_norm.variance_epsilon
             q_norm_gemm.precompile(

@@ -96,6 +96,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             index_q_first="attn_index_q_first" in SLOTS,
             index_weights_bf16="attn_index_weights_bf16" in SLOTS,
             cluster_merge="attn_cluster_merge" in SLOTS,
+            q_cluster="attn_q_cluster" in SLOTS,
             wo_a_fp8="attn_wo_a_fp8" in SLOTS,
         )
         if chain_on:
@@ -117,6 +118,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
                 qkv_a_ll=qkv_a_ll,
                 wo_a_one_group="wo_a_g1" in SLOTS,
                 q_norm_gemm_on=ops0.q_norm_gemm and attn.indexer is None,
+                q_cluster_on=ops0.q_cluster,
                 wo_a_fp8_on=step_.wo_a_fp8_weight is not None,
             )
             kinds[_chain_kind(attn, step_)] += 1
