@@ -89,3 +89,46 @@ Client: `python3 -m sglang.benchmark.serving --dataset-name random --random-inpu
 --temperature 1 --top-p 0.95` (the AgentX sampling). Read the server's decode step at
 batch C (`SGLANG_RECORD_STEP_TIME=1`, `/server_info` `step_time_dict`). Protocol as
 above: palindrome order (off, on, on, off), two launches per arm, two passes each.
+
+## Served A/B from step stamps (benchmark only)
+
+`ab_step_times.py` resolves step-time differences of a few microseconds on a served
+model, where the static table's client-side gaps cannot (routing follows the generated
+tokens, so the MoE halves alone move by up to ±110 µs per step between identical runs).
+Two benchmark-only switches of `runtime/bench.py`, both off by default:
+
+- `SGLANG_NVIDIA_MEGAKERNEL_BENCH_FIXED_ROUTING=synth[:d=25,half0=13,...]` or
+  `table:<file.npz>`: every covered MoE layer (target and draft, fast-gate and hash
+  layers) routes to a fixed expert table, so two arms do the same expert GEMMs every
+  step; everything downstream runs unchanged on the real weights. Outputs are wrong:
+  the server refuses it without `SGLANG_SIMULATE_ACC_LEN`, and the accuracy test
+  refuses to run with it set.
+- `SGLANG_NVIDIA_MEGAKERNEL_BENCH_STEP_TIMES=<dir>`: a one-CTA kernel forked at the start
+  of every covered verify and draft forward stamps `%globaltimer` and the position into a
+  pinned ring (plus, on rank 0, each MoE layer's distinct-expert count of the previous
+  replay); a host thread drains it to `<dir>`.
+
+```
+# login node, inside an allocation (one node for tp4, two trays for tp8: --node 0,1)
+python3 benchmark/ab_step_times.py run --job <jobid> --topology tp4 --node 0 \
+    --image <sqsh> --model <model dir> --src <this checkout> --out <dir> \
+    --arm off "" --arm pf "AB_SLOTS_ADD=prologue_fork" --launches 2 --passes 4
+python3 benchmark/ab_step_times.py analyze <dir>          # numpy; --fixed off runs use the covariate
+```
+
+Each launch: `ab_serve.sh` (fresh server, forced acceptance 3.51, batch 1,
+`SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1` unless `--runtime-opt off`) and
+`ab_client.sh` (a warm-up pass, then static_table.py passes). `analyze` takes per request
+the median verify-step period (after dropping host-stall steps and slow-episode
+requests, both counted), a launch as the mean over its requests, and reports B - A with
+a pooled two-sample t over launch means; with real routing (`--fixed off`) it first
+regresses the period on the step's distinct-expert count within each launch. Pass and
+step intervals are printed for information only: launches differ by a few microseconds
+(GB300 TP4, fixed routing: about 2.6 us sd per launch mean, against 0.3-0.8 us between
+passes of one launch), so the launch is the unit. The client's step p50 per launch is
+printed alongside.
+
+The stamps cost about 18 us per step (client step p50 with them on vs off, 2 + 2
+launches, 95 % [12, 24]), the same in both arms; an A/B that changes the boundary between
+the plugin's forward and SGLang's code may interact with it, so check such a result on
+the client's p50 too (`--no-stamps`).
