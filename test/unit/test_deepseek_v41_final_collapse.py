@@ -68,5 +68,7 @@ def test_the_slot_is_opt_in_and_needs_hop_b():
 
     assert "hop_final_collapse" in runtime.OPT_IN_SLOTS
     assert "hop_final_collapse" not in runtime.SHIPPED_SLOTS
-    assert "hop_mbar" in runtime.OPT_IN_SLOTS
-    assert "hop_mbar" not in runtime.SHIPPED_SLOTS
+    assert (
+        "hop_mbar" in runtime.DEFAULT_ON_SLOTS and "hop_mbar" in runtime.SHIPPED_SLOTS
+    )
+    assert "hop_mbar" not in runtime.OPT_IN_SLOTS

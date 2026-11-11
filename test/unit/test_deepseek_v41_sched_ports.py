@@ -19,11 +19,11 @@ from test_deepseek_v41_attention_indexer import _fb, _Stream  # noqa: E402
 sys.path.pop(0)
 
 
-def test_the_slot_is_opt_in():
+def test_the_slot_runs_by_default():
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    assert "attn_compressor_priority" in runtime.OPT_IN_SLOTS
-    assert "attn_compressor_priority" not in runtime.SHIPPED_SLOTS
+    assert "attn_compressor_priority" in runtime.DEFAULT_ON_SLOTS
+    assert "attn_compressor_priority" in runtime.SHIPPED_SLOTS
 
 
 def test_the_slot_needs_attn(monkeypatch):
