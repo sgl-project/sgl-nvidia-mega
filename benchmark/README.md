@@ -61,3 +61,31 @@ of covered steps against the normal prefill path, and a passkey past the indexer
 candidate span. With `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` set it tests a running server, so the
 same checks run against the switch-off arm; judge the switch-on numbers against that
 arm's own band.
+
+## GLM-5.2 (GLM DSA) decode A/B
+
+The GLM rows run at the InferenceX AgentX point configurations (`tp4-416`:
+aggregated TP4, EAGLE 4/1/5, HiCache; `tp8-516`: aggregated TP8 on two trays,
+EAGLE 5/1/6, HiCache; `tp4-516`: the disaggregated decode role, TP4, EAGLE 5/1/6,
+run standalone). Both arms set
+`SGLANG_ENABLE_EMBED_REPLICATION=1` and differ only by `--enable-nvidia-megakernel`.
+Acceptance is pinned at the golden length (3.33 at EAGLE 4/1/5, 3.61 at 5/1/6), so both
+arms run the same verify steps:
+
+```
+SGLANG_ENABLE_EMBED_REPLICATION=1 \
+SGLANG_SIMULATE_ACC_LEN=3.61 SGLANG_SIMULATE_ACC_METHOD=match-expected \
+SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
+python3 -m sglang.launch_server --model-path nvidia/GLM-5.2-NVFP4 --trust-remote-code \
+  --quantization modelopt_fp4 --tp 4 --fp4-gemm-backend flashinfer_cutedsl \
+  --speculative-algorithm EAGLE --speculative-eagle-topk 1 \
+  --speculative-num-steps 5 --speculative-num-draft-tokens 6 \
+  --max-running-requests 24 --cuda-graph-max-bs-decode 24 --mem-fraction-static 0.9 \
+  [--enable-nvidia-megakernel]
+```
+
+Client: `python3 -m sglang.benchmark.serving --dataset-name random --random-input-len 8192
+--random-output-len 1024 --random-range-ratio 1 --max-concurrency C --num-prompts 8C
+--temperature 1 --top-p 0.95` (the AgentX sampling). Read the server's decode step at
+batch C (`SGLANG_RECORD_STEP_TIME=1`, `/server_info` `step_time_dict`). Protocol as
+above: palindrome order (off, on, on, off), two launches per arm, two passes each.

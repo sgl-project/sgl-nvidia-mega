@@ -1,0 +1,129 @@
+name: Run CI on SGLang
+
+# A maintainer adds the run-ci-sglang label to a PR here; this workflow then
+# dispatches SGLang's pr-test-megakernel.yml, which runs this PR's tests on
+# SGLang's GPU runners, waits for that run and reports its outcome as the
+# "sglang-ci/megakernel" status on the PR's head commit. For a branch in this
+# repo, pushes and reopens while the label is on dispatch again; a fork's new
+# commits run only when a maintainer applies the label again.
+
+on:
+  # pull_request_target so a fork PR can read the dispatch token. This workflow
+  # never checks out or executes the PR's code: it only passes its head commit on.
+  pull_request_target:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  statuses: write
+
+env:
+  SGLANG_REPO: sgl-project/sglang
+  SGLANG_WORKFLOW: pr-test-megakernel.yml
+  STATUS_CONTEXT: sglang-ci/megakernel
+
+jobs:
+  run:
+    # A fork's author can push or reopen without review, so for a fork only a
+    # maintainer applying the label dispatches.
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'run-ci-sglang') &&
+      (github.event.label.name == 'run-ci-sglang' ||
+       (github.event.action != 'labeled' &&
+        github.event.pull_request.head.repo.full_name == github.repository))
+    # On the job, not the workflow, so an event that skips the job does not
+    # cancel a run in progress
+    concurrency:
+      group: run-ci-sglang-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    # GitHub's limit for a hosted job; covers the GB300 queue and the run
+    timeout-minutes: 360
+    steps:
+      # The PR's metadata goes through env, never into the script text.
+      - name: Mark the commit queued
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$STATUS_CONTEXT" \
+            -f description="Queued on SGLang CI" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      # The token only needs Actions write on SGLang; nothing else uses it.
+      - name: Dispatch the megakernel tests on SGLang
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_MEGAKERNEL_CI }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run "$SGLANG_WORKFLOW" -R "$SGLANG_REPO" --ref main \
+            -f mega_repo="$HEAD_REPO" -f mega_sha="$HEAD_SHA" -f mega_pr="$PR_NUMBER" \
+            -f dispatch_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      # SGLang's runs are public, so finding and watching one needs no token
+      # beyond this repo's own.
+      - name: Find the SGLang run
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="(${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT})"
+          for _ in $(seq 30); do
+            id=$(gh run list -R "$SGLANG_REPO" --workflow "$SGLANG_WORKFLOW" \
+              --event workflow_dispatch --limit 50 --json databaseId,displayTitle \
+              --jq "map(select(.displayTitle | endswith(\"$tag\"))) | .[0].databaseId // empty")
+            if [ -n "$id" ]; then
+              echo "id=$id" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "No SGLang run found for $tag"
+          exit 1
+
+      - name: Mark the commit running
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ steps.find.outputs.id }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$STATUS_CONTEXT" \
+            -f description="Running on SGLang CI" \
+            -f target_url="${GITHUB_SERVER_URL}/${SGLANG_REPO}/actions/runs/${RUN_ID}"
+
+      - name: Wait for the SGLang run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.find.outputs.id }}
+        run: |
+          gh run watch "$RUN_ID" -R "$SGLANG_REPO" --interval 60 > /dev/null
+          gh run view "$RUN_ID" -R "$SGLANG_REPO" --json conclusion --jq .conclusion
+
+      # Also runs when an earlier step failed, so the status never stays pending.
+      - name: Report the outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ steps.find.outputs.id }}
+        run: |
+          conclusion=""
+          if [ -n "$RUN_ID" ]; then
+            conclusion=$(gh run view "$RUN_ID" -R "$SGLANG_REPO" --json conclusion --jq .conclusion || true)
+            target="${GITHUB_SERVER_URL}/${SGLANG_REPO}/actions/runs/${RUN_ID}"
+          else
+            target="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+          case "$conclusion" in
+            success)   state=success; description="Megakernel tests passed on SGLang CI" ;;
+            failure)   state=failure; description="Megakernel tests failed on SGLang CI" ;;
+            cancelled) state=error;   description="SGLang run cancelled, possibly by a newer push" ;;
+            "")        state=error;   description="Stopped before an SGLang run finished" ;;
+            *)         state=error;   description="SGLang run ended: $conclusion" ;;
+          esac
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f description="$description" -f target_url="$target"
