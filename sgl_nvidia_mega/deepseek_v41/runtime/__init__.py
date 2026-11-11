@@ -107,6 +107,9 @@ DRAFT_SLOTS = frozenset(
 # attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
 # attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
 # one cluster launch, sm103/attention/reindex_select.py;
+# target_lm_head_mxfp8 / draft_lm_head_mxfp8: the target's / the draft's LM head at 1-8
+# rows on an MXFP8 copy of the shard, a numerics change; the draft's is measurement only,
+# plan.MEASUREMENT_ONLY_SLOTS;
 # shared_fold: slot shared_ll's gate_up epilogue writes the clamped SwiGLU, bitwise;
 # shared_fold_quant: it also writes down_proj's MXFP8 input, bitwise;
 # shared_fold_early_release: that GEMM releases down_proj's GEMM at its loads, as
@@ -121,6 +124,8 @@ OPT_IN_SLOTS = (
     "hop_final_collapse",
     "attn_indexer_narrow",
     "attn_indexer_fused",
+    "target_lm_head_mxfp8",
+    "draft_lm_head_mxfp8",
     "shared_fold",
     "shared_fold_quant",
     "shared_fold_early_release",
@@ -186,6 +191,8 @@ def slot_reasons() -> list[str]:
         ("hop_mbar", "hop_a"),
         ("hop_final_collapse", "hop_b"),
         ("draft_lm_head", "markov"),
+        ("target_lm_head_mxfp8", "target_lm_head"),
+        ("draft_lm_head_mxfp8", "draft_lm_head"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),
@@ -287,6 +294,10 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         ),
         "engram": bound["engram"].prefetch is not None,
         "target_lm_head": bound.get("logits") is not None,
+        "target_lm_head_mxfp8": getattr(
+            getattr(bound.get("logits"), "quant_method", None), "mxfp8", None
+        )
+        is not None,
     }
 
 
