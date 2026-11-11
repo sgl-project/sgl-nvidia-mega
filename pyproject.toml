@@ -24,3 +24,4 @@ include = ["sgl_nvidia_mega*"]
 # the kernels' CUDA sources and launch tables ship with the package
 [tool.setuptools.package-data]
 "*" = ["*.cu", "*.cuh", "*.json"]
+"sgl_nvidia_mega.glm5_3.ll" = ["csrc/**/*.cuh"]
