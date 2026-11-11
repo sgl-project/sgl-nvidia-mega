@@ -3,8 +3,9 @@ name: Run CI on SGLang
 # A maintainer adds the run-ci-sglang label to a PR here; this workflow then
 # dispatches SGLang's pr-test-megakernel.yml, which runs this PR's tests on
 # SGLang's GPU runners, waits for that run and reports its outcome as the
-# "sglang-ci/megakernel" status on the PR's head commit. Pushes while the label
-# is on dispatch again.
+# "sglang-ci/megakernel" status on the PR's head commit. For a branch in this
+# repo, pushes and reopens while the label is on dispatch again; a fork's new
+# commits run only when a maintainer applies the label again.
 
 on:
   # pull_request_target so a fork PR can read the dispatch token. This workflow
@@ -15,10 +16,6 @@ on:
 permissions:
   statuses: write
 
-concurrency:
-  group: run-ci-sglang-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 env:
   SGLANG_REPO: sgl-project/sglang
   SGLANG_WORKFLOW: pr-test-megakernel.yml
@@ -26,7 +23,18 @@ env:
 
 jobs:
   run:
-    if: contains(github.event.pull_request.labels.*.name, 'run-ci-sglang')
+    # A fork's author can push or reopen without review, so for a fork only a
+    # maintainer applying the label dispatches.
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'run-ci-sglang') &&
+      (github.event.label.name == 'run-ci-sglang' ||
+       (github.event.action != 'labeled' &&
+        github.event.pull_request.head.repo.full_name == github.repository))
+    # On the job, not the workflow, so an event that skips the job does not
+    # cancel a run in progress
+    concurrency:
+      group: run-ci-sglang-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     # GitHub's limit for a hosted job; covers the GB300 queue and the run
     timeout-minutes: 360
