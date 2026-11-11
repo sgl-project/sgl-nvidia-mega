@@ -121,7 +121,26 @@ class MoeSlot:
             router_logits, self.bias, self.scale, num_token_non_padded, alt, eps
         )
 
-    def run(self, x: torch.Tensor, topk_output, pre_quant_input) -> object:
+    def quant_in_gate(
+        self, x: torch.Tensor, input_ids_global, use_vision_topk: bool
+    ) -> bool:
+        """Slot gate_route_quant serves this call: the fast top-k's launch quantizes the
+        routed input itself, so the caller issues no routed-input quant."""
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            routed_hidden_size,
+        )
+
+        return (
+            self.gate
+            and routed_hidden_size(self.mlp.experts) == x.shape[-1]
+            and self.gemm.serves_gate_route_quant(
+                x.shape[0], input_ids_global if use_vision_topk else None, x
+            )
+        )
+
+    def run(self, x: torch.Tensor, topk_output, pre_quant_input, quant_in_gate=False):
+        """``quant_in_gate`` (``quant_in_gate``'s answer, no ``pre_quant_input``): the
+        top-k launch writes the routed input's MXFP8 (slot gate_route_quant)."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
         )
@@ -131,7 +150,14 @@ class MoeSlot:
 
         experts = self.mlp.experts
         ready = None
-        if pre_quant_input is not None:
+        if quant_in_gate:
+            if pre_quant_input is not None or not isinstance(topk_output, _GateTopK):
+                raise RuntimeError(
+                    "NVIDIA megakernel: slot gate_route_quant takes the fast top-k "
+                    "without a pre-quantized input"
+                )
+            x_q = x_s = None
+        elif pre_quant_input is not None:
             x_q, x_s, ready = pre_quant_input
         else:
             x_q, x_s = experts.quant_method.quantize_routed_input(
@@ -151,6 +177,7 @@ class MoeSlot:
                 topk_output.num_valid,
                 alt=topk_output.alt,
                 renormalize_epsilon=topk_output.eps,
+                **({"x": x} if quant_in_gate else {}),
             )
         else:
             rows, weights, permuted = self.gemm(
@@ -206,23 +233,54 @@ def expert_offset(experts: torch.nn.Module) -> int:
 
 
 def build(
-    model: torch.nn.Module, group, *, gate_topk: bool, shared_ll=False, widths=()
+    model: torch.nn.Module,
+    group,
+    *,
+    gate_topk: bool,
+    shared_ll=False,
+    widths=(),
+    gemm2_pipe: bool = False,
+    gemm2_registers: int = 0,
 ) -> Bound:
     """A routed-expert GEMM pair per MoE layer; every rank agrees, or none is built."""
     m = model.model
     layers = [m.layers[i] for i in range(m.start_layer, m.end_layer)]
     return build_layers(
-        layers, group, gate_topk=gate_topk, shared_ll=shared_ll, widths=widths
+        layers,
+        group,
+        gate_topk=gate_topk,
+        shared_ll=shared_ll,
+        widths=widths,
+        gemm2_pipe=gemm2_pipe,
+        gemm2_registers=gemm2_registers,
     )
 
 
 def build_layers(
-    layers, group, *, gate_topk: bool, shared_ll: bool = False, widths=()
+    layers,
+    group,
+    *,
+    gate_topk: bool,
+    shared_ll: bool = False,
+    widths=(),
+    gate_route: bool | None = None,
+    gate_route_quant: bool | None = None,
+    gemm2_pipe: bool = False,
+    gemm2_registers: int = 0,
 ) -> Bound:
     """``build`` over a list of decoder layers (the target's, or the draft's stages),
     keyed by ``layer_id``. With ``shared_ll``, each built layer's shared expert on the
     low-latency GEMM where it applies, compiled for ``widths``; every rank agrees on
-    those layers too, or none takes it."""
+    those layers too, or none takes it. ``gate_route`` (default: slot gate_route
+    requested): the fast top-k and the route record in one launch at 1-8 rows;
+    ``gate_route_quant`` (default: slot gate_route_quant requested): that launch also
+    quantizes the routed input."""
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
+    if gate_route is None:
+        gate_route = "gate_route" in SLOTS
+    if gate_route_quant is None:
+        gate_route_quant = "gate_route_quant" in SLOTS
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
     )
@@ -254,6 +312,10 @@ def build_layers(
                 gate_topk=gate_topk,
                 router_experts=experts.num_experts,
                 expert_offset=expert_offset(experts),
+                gate_route=gate_route,
+                gate_route_quant=gate_route_quant,
+                gemm2_pipe=gemm2_pipe,
+                gemm2_registers=gemm2_registers,
             )
             gate = gate_topk and gemm.gate_topk_kernel is not None and gate_applies(mlp)
             slots[i] = MoeSlot(mlp, gemm, gate=gate)

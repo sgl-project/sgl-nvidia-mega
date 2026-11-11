@@ -124,7 +124,16 @@ DRAFT_SLOTS = frozenset(
 # swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
 # on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
-# TP8 arm); no effect at TP4)
+# TP8 arm); no effect at TP4;
+# gate_route: the router's top-k and the routed pair's route
+# record in one cluster launch at 1-8 rows, target and draft (sm103/moe/src/gate_route.cuh;
+# bitwise with gate_topk + route); gate_route_quant: that launch also writes the routed
+# input's MXFP8 quant (FlashInfer's linear-layout mxfp8_quantize bit for bit,
+# sm103/moe/src/route_quant.cuh), so the MoE half forks no routed-quant stream and the
+# top-k launches as the router's programmatic dependent, target and draft (bitwise);
+# gemm2_pipe: the routed
+# GEMM2, target and draft, on muLLM's reference-pipeline + prelude build of the same
+# kernel (bitwise))
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -144,6 +153,9 @@ OPT_IN_SLOTS = (
     "hc_coeff_fused",
     "swapab_h8",
     "wo_a_g1",
+    "gate_route",
+    "gate_route_quant",
+    "gemm2_pipe",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -189,6 +201,8 @@ def slot_reasons() -> list[str]:
         ("shared_fold_quant", "shared_fold"),
         ("shared_fold_early_release", "shared_fold_quant"),
         ("gate_wide", "gate"),
+        ("gate_route", "gate"),
+        ("gate_route_quant", "gate_route"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
         ("attn_indexer", "attn"),
@@ -323,6 +337,21 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
             for slot in getattr(bound["moe"], "slots", {}).values()
         ),
         "engram": bound["engram"].prefetch is not None,
+        # slot gate_route: a layer's fast top-k built with the route record in one launch
+        "gate_route": any(
+            getattr(slot.gemm, "gate_route_kernel", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
+        # slot gate_route_quant: that launch's build that quantizes the routed input
+        "gate_route_quant": any(
+            getattr(slot.gemm, "gate_route_quant_kernel", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
+        # slot gemm2_pipe: a layer's GEMM2 on the pipelined build
+        "gemm2_pipe": any(
+            getattr(slot.gemm, "gemm2_pipe", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
         "target_lm_head": bound.get("logits") is not None,
         "target_lm_head_mxfp8": getattr(
             getattr(bound.get("logits"), "quant_method", None), "mxfp8", None

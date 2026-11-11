@@ -98,7 +98,10 @@ class DraftDecode(DraftProposal):
             from sglang.srt.runtime_context import get_parallel
 
             moe_bound = moe.routed.build_layers(
-                stages, get_parallel().tp_group, gate_topk="draft_gate" in slots
+                stages,
+                get_parallel().tp_group,
+                gate_topk="draft_gate" in slots,
+                **moe.gemm2_options(slots),
             )
         # slot draft_hop: the posts on the plugin's Lamport hop where SGLang has no
         # fused post (TP8 with EP2)
