@@ -59,8 +59,20 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
     kinds: Counter = Counter()
     # slot attn_indexer: one plugin indexer for every layer it takes
     step_indexer = (
-        indexer.StepIndexer(model.config, fused="attn_indexer_fused" in SLOTS)
+        indexer.StepIndexer(
+            model.config,
+            fused="attn_indexer_fused" in SLOTS,
+            early_trigger="attn_index_early_trigger" in SLOTS,
+            defer_blocks="attn_defer_block_select" in SLOTS,
+        )
         if chain_on and "attn_indexer" in SLOTS
+        else None
+    )
+    # slot attn_compressor_priority: one stream at the device's highest priority for
+    # every compressor layer's compressor (the low-ratio prepare)
+    compressor_stream = (
+        torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
+        if chain_on and "attn_compressor_priority" in SLOTS
         else None
     )
     # slots attn_indexer_narrow / _fused: also the swap-AB widths' query ops
@@ -80,9 +92,17 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             kv_before_wait="kv_before_wait" in SLOTS,
             swapab_h8="swapab_h8" in SLOTS,
             wo_a_g1="wo_a_g1" in SLOTS,
+            q_norm_gemm="attn_q_norm_gemm" in SLOTS,
+            index_q_first="attn_index_q_first" in SLOTS,
+            index_weights_bf16="attn_index_weights_bf16" in SLOTS,
+            cluster_merge="attn_cluster_merge" in SLOTS,
+            wo_a_fp8="attn_wo_a_fp8" in SLOTS,
         )
         if chain_on:
             ops0 = step_.chain[0]
+            if compressor_stream is not None and attn.compressor is not None:
+                for ops_ in step_.chain:
+                    ops_.compressor_stream = compressor_stream
             if (
                 step_indexer is not None
                 and ops0.wq_b_ll
@@ -92,7 +112,12 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
                 if narrow_indexer:
                     step_.chain[1].indexer = step_indexer
             chain.precompile(
-                attn, ctx.widths, qkv_a_ll=qkv_a_ll, wo_a_one_group="wo_a_g1" in SLOTS
+                attn,
+                ctx.widths,
+                qkv_a_ll=qkv_a_ll,
+                wo_a_one_group="wo_a_g1" in SLOTS,
+                q_norm_gemm_on=ops0.q_norm_gemm and attn.indexer is None,
+                wo_a_fp8_on=step_.wo_a_fp8_weight is not None,
             )
             kinds[_chain_kind(attn, step_)] += 1
     logger.info(
@@ -120,6 +145,23 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
             + (", swap-AB widths too" if step_.chain[1].indexer is not None else "")
             + (", fused consumers 1-8" if step_.chain[0].indexer.fused else "")
         )
+    if step_.chain[0].indexer is not None and step_.chain[0].index_q_first:
+        parts.append("index query first on the main stream")
+    if step_.chain[0].indexer is not None and step_.chain[0].index_weights_bf16:
+        parts.append("BF16 index head weights beside the head weights")
+    if step_.chain[0].q_norm_gemm and attn.indexer is None:
+        parts.append("q_norm + quant inside wq_b's GEMM 1-8")
+    if step_.chain[0].compressor_stream is not None:
+        parts.append("compressor at high stream priority")
+    ix = step_.chain[0].indexer
+    if ix is not None and ix.early_trigger and ix.fused:
+        parts.append("fused consumer triggers after its wait")
+    if (
+        ix is not None
+        and ix.defer_blocks
+        and getattr(attn.indexer, "is_candidate_source", False)
+    ):
+        parts.append("block selection after the attention")
     parts.append("wq_b low-latency 1-48" if step_.chain[0].wq_b_ll else "wq_b SGLang's")
     swapab = (
         f"swap-AB 1-24 ({attn.n_local_heads} heads)" if step_.swapab else "no swap-AB"
@@ -128,6 +170,8 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
         swapab += " (KV before the PDL wait)"
         if step_.index_after_wait:
             swapab += " (the sparse range after the wait)"
+    if step_.swapab and step_.cluster_merge:
+        swapab += " (cluster merge where it applies)"
     parts.append(swapab)
     parts.append(
         f"fused wo_a 1-48 ({attn.n_local_groups} groups)"

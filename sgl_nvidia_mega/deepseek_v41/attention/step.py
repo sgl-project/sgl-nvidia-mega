@@ -158,6 +158,11 @@ class AttentionStep:
         kv_before_wait: bool = False,
         swapab_h8: bool = False,
         wo_a_g1: bool = False,
+        q_norm_gemm: bool = False,
+        index_q_first: bool = False,
+        index_weights_bf16: bool = False,
+        cluster_merge: bool = False,
+        wo_a_fp8: bool = False,
     ):
         self.attn = attn
         # swap-AB gathers the KV before its PDL wait on the low-ratio prepare (slot
@@ -180,13 +185,22 @@ class AttentionStep:
                     qkv_a_ll=qkv_a_ll,
                     qkv_a_bf16=qkv_a_bf16,
                     index_q_mxfp8_in=index_q_mxfp8_in,
+                    q_norm_gemm=q_norm_gemm,
+                    index_q_first=index_q_first,
+                    index_weights_bf16=index_weights_bf16,
                 )
                 for rope in (False, True)
             )
         # slot swapab_h8: swap-AB on attention TP8's 8 local heads
         self.swapab = chain_ops and chain.swapab_applies(attn, heads8=swapab_h8)
+        # slot attn_cluster_merge: swap-AB merges its tiles in the kernel where it applies
+        self.cluster_merge = self.swapab and cluster_merge
         # slot wo_a_g1: the fused wo_a on attention TP8's 1 local group
         self.fused_wo_a = chain_ops and chain.fused_wo_a_applies(attn, wo_a_g1)
+        # slot attn_wo_a_fp8: the fused wo_a streams wo_a as E4M3 (bitwise where exact)
+        self.wo_a_fp8_weight = (
+            chain.wo_a_fp8_weight(attn) if self.fused_wo_a and wo_a_fp8 else None
+        )
         # fp32 [positions, 64]: cos, sin interleaved, as the swap-AB query RoPE reads them
         self.freqs = (
             torch.view_as_real(attn.freqs_cis).flatten(-2).contiguous()
@@ -287,11 +301,21 @@ class AttentionStep:
                     self.freqs,
                     kv_before_wait=early,
                     extra_after_wait=after_wait,
+                    cluster_merge=self.cluster_merge,
                 )
+                self._flush_blocks()
                 tiles = _publish_row_tiles(rows, publish)
                 return ops.wo_b(
                     attn,
-                    chain.wo_a(attn, o, positions, fb, tiles, fused=fused),
+                    chain.wo_a(
+                        attn,
+                        o,
+                        positions,
+                        fb,
+                        tiles,
+                        fused=fused,
+                        fp8_weight=self.wo_a_fp8_weight,
+                    ),
                     publish,
                 )
             heads, q_padded, q_out, tp_slice = self._query_buffer(x, view)
@@ -309,14 +333,34 @@ class AttentionStep:
                 save_kv_cache=False,
             )
             o = o[:, tp_slice, :]
+            self._flush_blocks()
             if use_chain:
                 tiles = _publish_row_tiles(rows, publish)
                 return ops.wo_b(
                     attn,
-                    chain.wo_a(attn, o, positions, fb, tiles, fused=fused),
+                    chain.wo_a(
+                        attn,
+                        o,
+                        positions,
+                        fb,
+                        tiles,
+                        fused=fused,
+                        fp8_weight=self.wo_a_fp8_weight,
+                    ),
                     publish,
                 )
             return ops.wo_b(attn, ops.wo_a(attn, o, positions, fb), publish)
+
+    def _flush_blocks(self) -> None:
+        """Slot attn_defer_block_select: a candidate source's block selection, deferred
+        by the plugin indexer, issued behind this layer's attention."""
+        if self.chain is None:
+            return
+        for ops_ in self.chain:
+            plugin = getattr(ops_, "indexer", None)
+            if plugin is not None:
+                plugin.flush_blocks(self.attn.layer_id)
+                return
 
 
 def _publish_row_tiles(rows: int, publish) -> bool:

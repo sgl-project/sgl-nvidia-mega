@@ -53,6 +53,7 @@ def _plugin():
     p._served_rows, p._declined, p.compared, p.differ = set(), {}, 0, 0
     p._meta, p._serves, p._table = None, False, None
     p.fused, p._fused_logged, p._fused_now = False, set(), False
+    p.early_trigger, p.defer_blocks, p._pending = False, False, None
     return p
 
 

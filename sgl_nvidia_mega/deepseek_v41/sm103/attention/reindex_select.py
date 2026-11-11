@@ -155,6 +155,7 @@ def reindex_select(
     logits: Optional[torch.Tensor] = None,
     inputs_before_wait: bool = False,
     trigger_after_write: bool = True,
+    trigger_after_wait: bool = False,
 ) -> None:
     """``topk_transform_sparse(sparse_logits(q_fp4, q_sf, k_cache, weights.bf16,
     schedule, n), valid_lens, blocks, out)`` with ``n = blocks.shape[1]``, on the
@@ -169,7 +170,10 @@ def reindex_select(
     a stream join into this launch is a programmatic edge too, so an event wait does
     not order an input that its writer publishes after its own trigger.
     ``trigger_after_write``: the dependents launch once ``out`` is written and fenced, so
-    one may read it before its own wait (else just before it is written)."""
+    one may read it before its own wait (else just before it is written).
+    ``trigger_after_wait`` (slot attn_index_early_trigger): the dependents launch right
+    after this kernel's PDL wait, before it scores; one may read ``out`` only after its
+    own wait."""
     rows, width = blocks.shape[0], blocks.shape[1] * BLOCK
     page_size = k_cache.shape[1]
     why = reason(rows, width, out.shape[1], page_size, q_fp4.shape[2])
@@ -201,7 +205,7 @@ def reindex_select(
         _null_or_pointer(logits),
         ctypes.c_int64(0 if logits is None else logits.stride(0)),
         ctypes.c_int32(int(inputs_before_wait)),
-        ctypes.c_int32(int(trigger_after_write)),
+        ctypes.c_int32(2 if trigger_after_wait else int(trigger_after_write)),
     ]
     _launch(
         kernel,

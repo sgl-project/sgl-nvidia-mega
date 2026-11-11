@@ -31,7 +31,16 @@ Slot attn_indexer_fused: a consumer at 1-8 rows runs the sparse logits and the t
 one cluster launch (sm103/attention/reindex_select.py): DeepGEMM's logits bit for bit,
 the stock top-k's selection on them (its pick among elements equal to the k-th value
 follows warp arrival; the fused kernel's is the in-order one); ``CHECK_ENV`` then
-checks the logits and that the selection is a top-k of them."""
+checks the logits and that the selection is a top-k of them.
+
+Slot attn_index_early_trigger (with kv_before_wait): the fused consumer lets its
+dependents launch right after its PDL wait, not after it writes the selection; the
+layer's swap-AB reads the selection only after its own wait (bitwise: the same kernels on
+the same inputs). Slot attn_defer_block_select: the candidate source's block selection and
+sparse schedule start on the side stream only after the layer's attention, not beside it
+(bitwise: the same kernels on the same inputs; the consumers read the table layers later).
+Both are derived from the POOL_TOPK_EARLY_TRIGGER and DEFER_BLOCK_SELECT switches of muLLM v0.4.1
+(NVIDIA Corporation, Apache-2.0)."""
 
 from __future__ import annotations
 
@@ -124,6 +133,9 @@ class Query(NamedTuple):
     q_fp4: torch.Tensor  # [rows, 1, heads, 64]
     q_sf: torch.Tensor  # [rows, 1, heads]
     weights: torch.Tensor  # [rows, heads] fp32
+    # slot attn_index_weights_bf16: ``weights`` as BF16 (exact: they are BF16 values),
+    # made beside the head weights before q_lora; the BF16 scorers read it uncast
+    weights_bf16: Optional[torch.Tensor] = None
 
 
 class Table(NamedTuple):
@@ -172,9 +184,21 @@ def reason(attn, config) -> str:
 class StepIndexer:
     """One process's plugin indexer: its block-selection stream and its counters."""
 
-    def __init__(self, config, fused: bool = False):
+    def __init__(
+        self,
+        config,
+        fused: bool = False,
+        early_trigger: bool = False,
+        defer_blocks: bool = False,
+    ):
         self.topk_blocks = int(config.candidate_topk_blocks)
         self.stream = torch.cuda.Stream()
+        # slot attn_index_early_trigger: the fused consumer triggers after its PDL wait
+        self.early_trigger = early_trigger
+        # slot attn_defer_block_select: the source's block selection after its attention
+        self.defer_blocks = defer_blocks
+        # the deferred block selection: (layer id, its inputs), issued by flush_blocks
+        self._pending: Optional[tuple] = None
         self.check = os.environ.get(CHECK_ENV) == "1"
         # slot attn_indexer_fused: the consumers' fused kernel, built here (not in capture)
         self.fused = fused and self.topk_blocks * 8 == reindex_select.WIDTH
@@ -197,6 +221,7 @@ class StepIndexer:
         meta = view.metadata
         if meta is not self._meta:
             self._meta, self._table = meta, None
+            self._pending = None
             paged = [
                 m
                 for m in (
@@ -223,19 +248,30 @@ class StepIndexer:
         input, so they run before q_lora is ready."""
         return attn.indexer.head_weights_raw(x)
 
-    def query(self, attn, q_quant, head_weights, positions) -> Query:
+    @staticmethod
+    def weights_bf16(attn, head_weights) -> torch.Tensor:
+        """The head weights as SGLang's ``head_weights(x)`` rounds them (BF16 of the
+        FP32 product), which ``index_q_rope_pack_weights`` widens to FP32: the BF16
+        scorers' input without the cast in front of them."""
+        return head_weights * attn.indexer.head_weight_scale
+
+    def query(self, attn, q_quant, head_weights, positions, weights_bf16=None) -> Query:
         """``_index_q_and_weights`` with the wq_b on the low-latency GEMM (the chain's
         q_lora quant: 128x4 scales to 8 rows, row tiles past)."""
+        wq_b = attn.indexer.wq_b
+        q = mxfp8_ll.linear(
+            q_quant.quant, q_quant.scale, wq_b.weight, wq_b.weight_scale_inv_swizzled
+        )
+        return self.pack(attn, q, head_weights, positions, weights_bf16)
+
+    def pack(self, attn, q, head_weights, positions, weights_bf16=None) -> Query:
+        """The index query's RoPE + FP4 pack + head weights on the wq_b output ``q``."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_q_rope_pack_weights,
         )
 
         indexer = attn.indexer
-        wq_b = indexer.wq_b
         rows, heads = head_weights.shape[0], indexer.n_local_heads
-        q = mxfp8_ll.linear(
-            q_quant.quant, q_quant.scale, wq_b.weight, wq_b.weight_scale_inv_swizzled
-        )
         q_fp4, q_sf, weights = index_q_rope_pack_weights(
             q.view(rows, heads, indexer.index_head_dim),
             torch.view_as_real(attn.freqs_cis).flatten(-2),
@@ -243,7 +279,12 @@ class StepIndexer:
             head_weights,
             indexer.head_weight_scale,
         )
-        return Query(q_fp4.view(rows, 1, heads, 64), q_sf.view(rows, 1, heads), weights)
+        return Query(
+            q_fp4.view(rows, 1, heads, 64),
+            q_sf.view(rows, 1, heads),
+            weights,
+            weights_bf16,
+        )
 
     def topk(self, attn, data: Query, req, view) -> None:
         """``_low_ratio_index_topk`` (decode branch) on the current stream: writes the
@@ -284,7 +325,9 @@ class StepIndexer:
         else:
             logits = self._paged_logits(data, k_cache, paged)
             if is_source:
-                self._table = self._publish(data, logits, paged, req, out)
+                self._table = self._publish(
+                    data, logits, paged, req, out, layer_id=attn.layer_id
+                )
             else:
                 from sglang.srt.layers.attention.dsv4.indexer import (
                     topk_transform_paged_from_metadata,
@@ -313,31 +356,39 @@ class StepIndexer:
         return deep_gemm_fp4_paged_mqa_logits(
             (q_fp4, q_sf),
             k_cache,
-            data.weights,
+            data.weights if data.weights_bf16 is None else data.weights_bf16,
             lens,
             table,
             paged.deep_gemm_metadata,
             paged.max_compressed_seq_len,
         )
 
-    def _publish(self, data: Query, logits, paged, req, out) -> Table:
-        """``SparseTableBackend.publish_decode`` (unchunked, verify rows)."""
-        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-            amax_topk_blocks,
-            candidate_row_lens,
-        )
-        from sglang.kernels.ops.attention.dsv4.candidate_table import (
-            build_sparse_indexer_schedule,
-            sort_candidate_blocks,
-        )
+    def _publish(
+        self, data: Query, logits, paged, req, out, layer_id=None
+    ) -> Optional[Table]:
+        """``SparseTableBackend.publish_decode`` (unchunked, verify rows). With slot
+        attn_defer_block_select the block selection waits for ``flush_blocks`` (after the
+        layer's attention) and this returns None."""
         from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
         from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_bf16
 
         seq_lens = paged.compressed_seq_lens.reshape(-1)
         main = torch.cuda.current_stream()
-        self.stream.wait_stream(main)
-        # the block selection reads the logits after this stream moves on
-        logits.record_stream(self.stream)
+        rows = data.q_fp4.shape[0]
+        if self.defer_blocks:
+            self._pending = (
+                layer_id,
+                logits,
+                seq_lens,
+                paged,
+                req,
+                rows,
+                data.q_fp4.dtype,
+            )
+        else:
+            self.stream.wait_stream(main)
+            # the block selection reads the logits after this stream moves on
+            logits.record_stream(self.stream)
         if logits.dtype == torch.bfloat16:
             topk_transform_paged_bf16(
                 logits, seq_lens, paged.page_table, out, paged.compressed_page_size
@@ -351,19 +402,46 @@ class StepIndexer:
                 paged.compressed_page_size,
                 paged.topk_metadata,
             )
+        if self.defer_blocks:
+            return None
+        return self._blocks(logits, seq_lens, paged, req, rows, data.q_fp4.dtype, main)
+
+    def flush_blocks(self, layer_id: int) -> None:
+        """Slot attn_defer_block_select: the deferred block selection of source layer
+        ``layer_id``, on the side stream behind everything issued so far on the current
+        stream (the layer's attention); a no-op for any other layer."""
+        if self._pending is None or self._pending[0] != layer_id:
+            return
+        _, logits, seq_lens, paged, req, rows, dtype = self._pending
+        self._pending = None
+        main = torch.cuda.current_stream()
+        self.stream.wait_stream(main)
+        logits.record_stream(self.stream)
+        self._table = self._blocks(logits, seq_lens, paged, req, rows, dtype, main)
+
+    def _blocks(self, logits, seq_lens, paged, req, rows, dtype, main) -> Table:
+        """The block selection and the sparse schedule on the side stream."""
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            amax_topk_blocks,
+            candidate_row_lens,
+        )
+        from sglang.kernels.ops.attention.dsv4.candidate_table import (
+            build_sparse_indexer_schedule,
+            sort_candidate_blocks,
+        )
+
         with torch.cuda.stream(self.stream):
             nblocks, valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
             blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
             phys_blocks = sort_candidate_blocks(
                 blocks, seq_lens, paged.page_table, paged.compressed_page_size
             )
-            rows = data.q_fp4.shape[0]
             schedule = build_sparse_indexer_schedule(
                 blocks,
                 seq_lens,
                 paged.page_table,
                 paged.compressed_page_size,
-                data.q_fp4.dtype,
+                dtype,
                 req[:rows].to(torch.int32).contiguous(),
             )
             # the consumers read these on their own streams
@@ -403,8 +481,9 @@ class StepIndexer:
             )
         return not why
 
-    @staticmethod
-    def _consume_fused(data: Query, k_cache, table: Table, out, logits=None) -> None:
+    def _consume_fused(
+        self, data: Query, k_cache, table: Table, out, logits=None
+    ) -> None:
         torch.cuda.current_stream().wait_event(table.ready)
         # the query (stream 1) and the table (the source's stream) join this stream by
         # events, which a captured graph turns into programmatic edges: the kernel reads
@@ -420,6 +499,7 @@ class StepIndexer:
             out,
             logits,
             inputs_before_wait=True,
+            trigger_after_wait=self.early_trigger,
         )
 
     @staticmethod
@@ -433,7 +513,9 @@ class StepIndexer:
             data.q_fp4,
             data.q_sf,
             k_cache,
-            data.weights.to(torch.bfloat16),
+            data.weights.to(torch.bfloat16)
+            if data.weights_bf16 is None
+            else data.weights_bf16,
             table.schedule,
             table.blocks.shape[1],
         )
