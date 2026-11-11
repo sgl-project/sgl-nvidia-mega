@@ -97,9 +97,8 @@ DRAFT_SLOTS = frozenset(
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
 # lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
 # prologue_fork: the Engram hashes forked at the step start and the embedding written
-# into the streams, bitwise; engram_side_ar: the Engram prefetch's two all-reduces on
-# its own stream, joined at the first Engram gate, bitwise; hc_coeff_fused: the
-# prenorm's mHC coefficients in one launch, bitwise with hc_prenorm's two)
+# into the streams, bitwise; hc_coeff_fused: the prenorm's mHC coefficients in one
+# launch, bitwise with hc_prenorm's two)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -107,7 +106,6 @@ OPT_IN_SLOTS = (
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
     "prologue_fork",
-    "engram_side_ar",
     "hc_coeff_fused",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
@@ -180,8 +178,6 @@ def slot_reasons() -> list[str]:
         ("draft_prenorm", "draft"),
         ("draft_qkv_a_ll", "draft_qkv_a"),
         ("draft_wo_b_ll", "draft_wo_a"),
-        ("engram_side_ar", "engram"),
-        ("engram_side_ar", "prologue_fork"),
         ("hc_coeff_fused", "hc_prenorm"),
     ):
         if slot in SLOTS and needs not in SLOTS:
@@ -328,7 +324,6 @@ def build(model, ctx):
         two_shot=getattr(bound["boundary"], "two_shot", None) is not None,
         fast_gate_wide="gate_wide" in SLOTS,
         prologue_fork="prologue_fork" in SLOTS,
-        engram_side_ar="engram_side_ar" in SLOTS,
     )
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
@@ -373,7 +368,6 @@ def build(model, ctx):
         ),
         "req_pos_once": "req_pos_once" in SLOTS,
         "prologue_fork": "prologue_fork" in SLOTS,
-        "engram_side_ar": any(s.engram_side_ar for s in slots.values()),
         "attn_indexer": any(
             a.chain is not None and a.chain[0].indexer is not None
             for a in bound["attention"].values()

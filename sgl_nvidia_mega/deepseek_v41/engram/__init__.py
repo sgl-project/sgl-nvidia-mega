@@ -12,9 +12,8 @@ With the ``engram`` slot (``prefetch``), ``hashes`` also issues every layer's ow
 rows on a side stream, ``before_moe`` / ``before_layer`` run the prefetch's two
 main-stream all-reduces at its layers, and ``apply`` only gates. With slot
 ``prologue_fork``, ``fork`` runs the hashes and the prefetch's lookups on the Engram
-stream from the step start (they read only the step's inputs); with slot
-``engram_side_ar`` the prefetch's two all-reduces follow there too, and the main
-stream joins its rows at the first Engram layer.
+stream from the step start (they read only the step's inputs); the prefetch's two
+all-reduces stay on the main stream at their layers.
 """
 
 from __future__ import annotations
@@ -77,7 +76,7 @@ _HASHED = "engram.hashed"
 
 def fork(st) -> None:
     """Slot prologue_fork, at the step start: ``hashes`` on the Engram stream (with
-    the prefetch's lookups, and with slot engram_side_ar its all-reduces, behind them)."""
+    the prefetch's lookups behind them)."""
     import torch
 
     hasher, side = st.model.engram_hasher, st.bound["engram"].stream
@@ -88,11 +87,7 @@ def fork(st) -> None:
     with torch.cuda.stream(side):
         st.hash_ids = hasher(st.input_ids, st.fb)
         if st.slots.engram_prefetch:
-            prefetch = st.bound["engram"].prefetch
-            if st.slots.engram_side_ar:
-                prefetch.run_side(st.hash_ids)
-            else:
-                prefetch.issue(st.hash_ids)
+            st.bound["engram"].prefetch.issue(st.hash_ids)
         else:
             st.scratch[_HASHED] = torch.cuda.Event()
             st.scratch[_HASHED].record(side)
@@ -123,11 +118,7 @@ def _join_hashes(st) -> None:
 
 def before_moe(i: int, st) -> None:
     """Layer ``i`` between its attention and its MoE: the prefetch's lookup reduce."""
-    if (
-        st.slots.engram_prefetch
-        and not st.slots.engram_side_ar
-        and st.hash_ids is not None
-    ):
+    if st.slots.engram_prefetch and st.hash_ids is not None:
         prefetch = st.bound["engram"].prefetch
         if i == prefetch.reduce_at:
             prefetch.reduce()
@@ -138,10 +129,7 @@ def before_layer(i: int, st) -> None:
     if st.slots.engram_prefetch and st.hash_ids is not None:
         prefetch = st.bound["engram"].prefetch
         if i == prefetch.gather_at:
-            if st.slots.engram_side_ar:
-                prefetch.join()
-            else:
-                prefetch.gather()
+            prefetch.gather()
 
 
 def apply(layer, st) -> None:

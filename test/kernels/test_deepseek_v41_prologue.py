@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The step prologue with slots ``prologue_fork`` / ``engram_side_ar``, against the
-serial prologue it replaces.
+"""The step prologue with slot ``prologue_fork``, against the serial prologue it
+replaces.
 
 - One GPU: the embedding written straight into the mHC streams equals SGLang's fused
   lookup of the whole table followed by ``hc_broadcast``, bit for bit (int32 / int64
   ids, 1-48 rows, ids outside the table, -0.0 and NaN payloads in the table).
 - Every rank (torchrun): the Engram package's forked prologue (``engram.fork``: the
-  hashes, the prefetch's lookups and, with ``engram_side_ar``, both all-reduces and the
-  WKV quarters on the Engram stream; ``before_layer`` joins) gives the same rows as the
-  serial one (``engram.hashes`` + the main-stream ``reduce`` / ``gather``), from CUDA
-  graphs replayed with fresh token ids every replay. The graphs run beside a main
-  stream that spins in an NCCL all-reduce and sleeps, with the side stream or one rank
-  late in turn, and a reader after the join must always see the step's own rows.
+  hashes and the prefetch's lookups on the Engram stream; the main-stream ``reduce``
+  joins them) gives the same rows as the serial one (``engram.hashes`` + the same
+  ``reduce`` / ``gather``), from CUDA graphs replayed with fresh token ids every
+  replay. The graphs run beside a main stream that spins in an NCCL all-reduce and
+  sleeps, with the side stream or one rank late in turn.
   Stand-in Engram layers (per-rank table shards, SGLang's TP all-reduce, a real MXFP8
   WKV on FlashInfer's GEMM) at DeepSeek-V4.1-Flash's shapes.
 
@@ -164,7 +163,7 @@ class _Hasher:
         return (h % self.mod).view(-1, LAYERS, HASH_COLS)
 
 
-def _state(env, prefetch, stream, ids, fork, side_ar):
+def _state(env, prefetch, stream, ids, fork):
     from sgl_nvidia_mega.deepseek_v41.engram import Bound
 
     return SimpleNamespace(
@@ -172,24 +171,21 @@ def _state(env, prefetch, stream, ids, fork, side_ar):
         bound={"engram": Bound(prefetch, "", stream if fork else None)},
         input_ids=ids,
         fb=None,
-        slots=SimpleNamespace(
-            engram_prefetch=True, prologue_fork=fork, engram_side_ar=side_ar
-        ),
+        slots=SimpleNamespace(engram_prefetch=True, prologue_fork=fork),
         scratch={},
         hash_ids=None,
     )
 
 
-def _step(env, prefetch, stream, ids, out, *, fork, side_ar, late, read_early=False):
+def _step(env, prefetch, stream, ids, out, *, fork, late):
     """One prologue up to the first Engram gate's read; the main stream meanwhile runs
     layer 0's stand-in (a sleep and an NCCL all-reduce). ``late``: where to sleep
-    ~0.2 ms (the side stream, this rank's main stream, or nowhere). ``read_early``
-    (the control): the reader runs before the join."""
+    ~0.2 ms (the side stream, this rank's main stream, or nowhere)."""
     import torch.distributed as dist
 
     from sgl_nvidia_mega.deepseek_v41 import engram
 
-    st = _state(env, prefetch, stream, ids, fork, side_ar)
+    st = _state(env, prefetch, stream, ids, fork)
     if fork:
         if late == "side":
             stream.wait_stream(torch.cuda.current_stream())
@@ -203,11 +199,8 @@ def _step(env, prefetch, stream, ids, out, *, fork, side_ar, late, read_early=Fa
     dist.all_reduce(busy, group=env.group.device_group)
     engram.before_moe(prefetch.reduce_at, st)
     torch.cuda._sleep(20_000)
-    if read_early:
-        out.copy_(prefetch.kv)
     engram.before_layer(prefetch.gather_at, st)
-    if not read_early:
-        out.copy_(prefetch.kv)
+    out.copy_(prefetch.kv)
 
 
 def _graph(env, prefetch, stream, ids, out, **kw):
@@ -224,9 +217,8 @@ def _graph(env, prefetch, stream, ids, out, **kw):
 
 
 @needs_dist
-@pytest.mark.parametrize("side_ar", [False, True])
 @pytest.mark.parametrize("rows", [1, 6, 8])
-def test_the_forked_prologue_gives_the_serial_rows(env, side_ar, rows):
+def test_the_forked_prologue_gives_the_serial_rows(env, rows):
     from sgl_nvidia_mega.deepseek_v41.engram import prefetch as ep
 
     engrams = _engrams(env.rank, env.tp)
@@ -238,9 +230,7 @@ def test_the_forked_prologue_gives_the_serial_rows(env, side_ar, rows):
     got = torch.empty_like(want)
     # the rank sleeps on its own main stream in turn
     delays = ["none", "side"] + [f"rank{r}" for r in range(env.tp)]
-    serial = _graph(
-        env, prefetch, stream, ids, want, fork=False, side_ar=False, late="none"
-    )
+    serial = _graph(env, prefetch, stream, ids, want, fork=False, late="none")
     forked = {
         late: _graph(
             env,
@@ -249,12 +239,11 @@ def test_the_forked_prologue_gives_the_serial_rows(env, side_ar, rows):
             ids,
             got,
             fork=True,
-            side_ar=side_ar,
             late="main" if late == f"rank{env.rank}" else late,
         )
         for late in delays
     }
-    gen = torch.Generator().manual_seed(rows * 2 + side_ar)
+    gen = torch.Generator().manual_seed(rows * 2)
     checked = 0
     for late, graph in forked.items():
         for _ in range(REPLAYS):
@@ -267,45 +256,10 @@ def test_the_forked_prologue_gives_the_serial_rows(env, side_ar, rows):
             checked += 1
     # an eager serial step on the last ids: the rows are real, not a stale buffer
     eager = torch.empty_like(want)
-    _step(env, prefetch, stream, ids, eager, fork=False, side_ar=False, late="none")
+    _step(env, prefetch, stream, ids, eager, fork=False, late="none")
     torch.cuda.synchronize()
     assert torch.equal(eager.view(torch.int16), want.view(torch.int16))
     assert checked == len(delays) * REPLAYS
-
-
-@needs_dist
-def test_a_reader_before_the_join_sees_a_stale_step(env):
-    """The control: with the side stream late, a reader placed before the join reads
-    the previous replay's rows, so the bitwise test above would see a missing join."""
-    from sgl_nvidia_mega.deepseek_v41.engram import prefetch as ep
-
-    rows = 6
-    engrams = _engrams(env.rank, env.tp)
-    prefetch = ep.EngramPrefetch(engrams, env.group, min(engrams))
-    ids = torch.zeros(rows, dtype=torch.int64, device="cuda")
-    want = torch.empty((LAYERS, rows, N), dtype=torch.bfloat16, device="cuda")
-    got = torch.empty_like(want)
-    kw = dict(fork=True, side_ar=True, late="side")
-    serial = _graph(
-        env,
-        prefetch,
-        prefetch.stream,
-        ids,
-        want,
-        fork=False,
-        side_ar=False,
-        late="none",
-    )
-    early = _graph(env, prefetch, prefetch.stream, ids, got, read_early=True, **kw)
-    gen = torch.Generator().manual_seed(17)
-    stale = 0
-    for _ in range(20):
-        ids.copy_(torch.randint(0, 129280, (rows,), generator=gen))
-        serial.replay()
-        early.replay()
-        torch.cuda.synchronize()
-        stale += not torch.equal(got.view(torch.int16), want.view(torch.int16))
-    assert stale >= 15, stale
 
 
 if __name__ == "__main__":
