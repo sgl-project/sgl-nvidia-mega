@@ -207,9 +207,12 @@ def build_steps(
     draft_tokens: torch.Tensor,
     step_logits: Optional[torch.Tensor],
     step_temperatures: torch.Tensor,
+    verify_ids: Optional[torch.Tensor] = None,
 ) -> dict:
     """The per-batch-size steps over SGLang's buffers; collective over the TP group, so
-    every rank runs it. Raises on every rank when any rank cannot run the chain, or
+    every rank runs it. ``verify_ids`` [max_bs, gamma + 1] (SGLang's
+    SGLANG_OPT_DSV41_DSPARK_PLUGIN_VERIFY_IDS): each step writes its rows' [anchor |
+    draft tokens] there, in the chain's launch with slot markov_tail. Raises on every rank when any rank cannot run the chain, or
     when the ranks would serve different sizes (their graphs would wait on each other)."""
     from sglang.srt.runtime_context import get_parallel
 
@@ -252,7 +255,11 @@ def build_steps(
         deadline_s=deadline_s,
         keeps_logits=not greedy_draft,
         lowlat="markov_lowlat" in SLOTS,
+        tail="markov_tail" in SLOTS,
     )
+    if verify_ids is not None:
+        assert verify_ids.dtype == torch.int64 and verify_ids.is_contiguous()
+        assert tuple(verify_ids.shape) == (max_bs, gamma + 1)
     lm_head = DraftLmHead(
         lm.lm_head,
         low_m=low_m and low_m_lm_head_supported(),
@@ -280,6 +287,7 @@ def build_steps(
             draft_tokens=draft_tokens,
             step_logits=step_logits,
             step_temperatures=step_temperatures,
+            verify_ids=verify_ids,
         )
         for bs in range(1, chain.max_rows + 1)
     }
@@ -294,7 +302,8 @@ def build_steps(
         "low-M" if lm_head.low_m else "SGLang's",
         LM_HEAD_MAX_ROWS,
         " (MXFP8 stream at 1-8)" if lm_head.mxfp8 is not None else "",
-        ", low-latency exchange" if chain.lowlat else "",
+        (", low-latency exchange" if chain.lowlat else "")
+        + (", chain writes the tail" if chain.tail else ""),
         chain.timeout_ns / 1e9,
         (free_before - torch.cuda.mem_get_info()[0]) / 2**20,
     )
@@ -340,8 +349,10 @@ class _Step:
         draft_tokens,
         step_logits,
         step_temperatures,
+        verify_ids=None,
     ):
         self.lm, self.chain, self.lm_head = lm, chain, lm_head
+        self.verify_ids = None if verify_ids is None else verify_ids[:bs]
         self.bs, self.gamma, self.greedy_draft, self.noise = (
             bs,
             gamma,
@@ -375,16 +386,27 @@ class _Step:
         base_logits = self.lm_head(x).view(self.bs, self.gamma, -1)
         if not self.greedy_draft:
             self.chain.join_noise()
+        tail = self.chain.tail
         self.chain.sample(
             base_logits=base_logits,
             anchor_tokens=anchor_tokens,
             temperatures=self.temperatures,
             logits_cache=self.step_logits,
             draft_tokens=self.tokens,
+            # slot markov_tail: the two launches below, in the chain's
+            verify_ids=self.verify_ids if tail else None,
+            noise_offset=self.noise.offset if tail and not self.greedy_draft else None,
         )
-        if not self.greedy_draft:
+        if not self.greedy_draft and not tail:
             # one block advances the counter once, as draft_markov_block does
             self.noise.offset.add_(1)
+        if self.verify_ids is not None and not tail:
+            # SGLang's DsparkDraftSampler concat, which it skips for this step
+            torch.cat(
+                [anchor_tokens.view(self.bs, 1), self.tokens],
+                dim=1,
+                out=self.verify_ids,
+            )
         if PARITY:
             _parity(self.lm).check(self, hidden_states, anchor_tokens)
         return self.tokens, hidden_states

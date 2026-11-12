@@ -119,6 +119,8 @@ DRAFT_SLOTS = frozenset(
         "draft_qkv_a_ll",
         "draft_wo_b_ll",
         "markov_lowlat",
+        "markov_tail",
+        "draft_final_collapse",
     }
 )
 # Slots that run only when listed, except those in DEFAULT_ON_SLOTS (draft_embed: the
@@ -188,7 +190,12 @@ DRAFT_SLOTS = frozenset(
 # attention core (cluster merge with the sink and the inverse RoPE in the kernel) in
 # place of swap-AB + combine, target and draft, on SGLang's v41_new KV layout
 # (SGLANG_DSV4_KV_LAYOUT=v41_new; swap-AB reads only the V4 layout), a numerics change:
-# the V4.1 KV encodings, P in BF16, muLLM's split and merge order
+# the V4.1 KV encodings, P in BF16, muLLM's split and merge order;
+# markov_tail: the Markov chain's kernel also advances the draft-noise offset and, when
+# SGLang hands the proposal its verify ids, writes [anchor | draft tokens] there (the
+# add and SGLang's concat after the chain, bitwise); draft_final_collapse: with draft_hop,
+# the last draft stage's MoE post also writes the head's mHC collapse, so the draft
+# forward skips its hc_combine (bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -207,6 +214,8 @@ OPT_IN_SLOTS = (
     "attn_q_cluster",
     "attn_wo_a_fp8",
     "attn_core_lean",
+    "markov_tail",
+    "draft_final_collapse",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -275,6 +284,8 @@ def slot_reasons() -> list[str]:
         ("target_lm_head_mxfp8", "target_lm_head"),
         ("draft_lm_head_mxfp8", "draft_lm_head"),
         ("markov_lowlat", "markov"),
+        ("markov_tail", "markov"),
+        ("draft_final_collapse", "draft_hop"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),

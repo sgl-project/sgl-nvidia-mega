@@ -112,7 +112,10 @@ class DraftDecode(DraftProposal):
             from sgl_nvidia_mega.deepseek_v41.boundary import draft_hop
 
             hop, self._hop_reason = draft_hop.build(
-                stages, deadline_s=deadline_s, max_rows=DRAFT_MAX_ROWS
+                stages,
+                deadline_s=deadline_s,
+                max_rows=DRAFT_MAX_ROWS,
+                final_collapse="draft_final_collapse" in slots,
             )
         self._bound = {
             # slot draft_post: SGLang's fused all-reduce + mHC posts on the stages;
@@ -269,8 +272,12 @@ class DraftDecode(DraftProposal):
                             out = moe.step(stage, m_in, st)
                             boundary.post(stage, "ffn", out, st)
                 residual, pre = boundary.final(st)
+                # slot draft_final_collapse: the last MoE post wrote hc_combine's rows
+                collapsed = boundary.final_collapse(st)
             finally:
                 boundary.clear(st)
+            if collapsed is not None:
+                return LogitsProcessorOutput(next_token_logits=None, hidden_states=collapsed)
             streams = residual.flatten(1)
             if not self._tail_bf16:
                 streams = streams.float()

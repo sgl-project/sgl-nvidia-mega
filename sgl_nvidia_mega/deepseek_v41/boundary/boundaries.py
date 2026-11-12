@@ -552,13 +552,18 @@ class Boundaries:
         args = (r.gemm2_out, r.expert_weights, r.expanded_idx_to_permuted_idx)
         args += (out.shared, opened.streams, post_mix, comb)
         if (
-            hop is self.hop_a
-            and nxt is None
-            and self.final_collapse
+            nxt is None
+            and (
+                (hop is self.hop_a and self.final_collapse)
+                or (hop is self.draft_hop and hop.final_collapse)
+            )
             and layer.layer_id == self._last_layer
         ):
-            self._log_served("hop B final collapse", rows)
-            updated, st.final_collapse = self.hop_a.finalize(
+            self._log_served(
+                "hop B final collapse" if hop is self.hop_a else "draft hop final collapse",
+                rows,
+            )
+            updated, st.final_collapse = hop.finalize(
                 *args, pre, None, 0.0, rows=rows, collapse=True
             )
             return mhc.HcState(updated, pre)
