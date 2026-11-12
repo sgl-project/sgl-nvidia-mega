@@ -20,6 +20,15 @@ Every cross-GPU wait is on the main stream, in the same order on every rank, as 
 SGLang's inline path. Both all-reduces sum one owner's value with zeros and the WKV
 runs the same CuTe DSL GEMM, so the rows equal SGLang's inline ones bit for bit;
 build checks that at every width it serves, with the new buffers poisoned first.
+
+With slot ``engram_publish`` (exchange.py; muLLM's Engram publish / gate collect) no
+zero-padded rows and no second all-reduce: right after ``reduce`` the side stream runs
+the first Engram layer's WKV columns and publishes them into every rank's mailbox; a
+later Engram layer's columns follow when the main stream reaches the layer
+``LATE_LEAD`` before it (muLLM's late-layer schedule), off the first layer's path and away
+from layer 0's MoE; at each Engram layer the main stream collects the layer's rows
+from its own mailbox (the only waiting kernel). The rows are SGLang's whole WKV GEMM
+bit for bit (no sum with zeros turns a -0.0 into +0.0); build checks every width.
 """
 
 from __future__ import annotations
@@ -82,8 +91,21 @@ SGLANG_READS = {
 }
 
 MAX_ROWS = plan.ENGRAM_PREFETCH_MAX_ROWS
+# slot engram_publish: a later Engram layer's WKV columns start at the start of the layer
+# this many before it (muLLM's late-layer lead: its projection waits for layer L - 4)
+LATE_LEAD = 4
 # The WKV slice of each rank is whole 128-row scale tiles
 SCALE_TILE_ROWS = 128
+
+
+def project_points(layer_ids, first_layer: int) -> dict:
+    """Slot engram_publish: each Engram layer's start point for its WKV columns, the
+    main-stream layer at whose start they start, or None for right after ``reduce``
+    (the first layer, and any layer within ``LATE_LEAD`` of it)."""
+    return {
+        i: (i - LATE_LEAD if i - LATE_LEAD > first_layer else None)
+        for i in sorted(layer_ids)
+    }
 
 
 def _per_rank_host_table(table) -> bool:
@@ -168,7 +190,10 @@ class _Layer:
 class EngramPrefetch:
     """The side stream, its persistent buffers and the two main-stream points."""
 
-    def __init__(self, engrams: dict, group, first_layer: int):
+    exchange = None  # slot engram_publish: the mailbox exchange
+
+    def __init__(self, engrams: dict, group, first_layer: int, deadline_s: float = 0.0):
+        """``deadline_s`` > 0: slot engram_publish, the exchange with that wait deadline."""
         rank, tp_size = group.rank_in_group, group.world_size
         self.group = group
         self.stream = torch.cuda.Stream()
@@ -195,6 +220,32 @@ class EngramPrefetch:
         self.rows = 0
         self.kv = None  # this step's rows [layers, rows, n], from ``gather``
         self._emb = None  # ``reduce``'s all-reduced rows, read by the side stream
+        if deadline_s > 0:
+            from sgl_nvidia_mega.deepseek_v41.engram.exchange import EngramExchange
+
+            self.exchange = EngramExchange(
+                group,
+                list(self.layers),
+                n=first.n,
+                max_rows=MAX_ROWS,
+                deadline_s=deadline_s,
+                device=device,
+            )
+            # each layer's collected rows, persistent: [layers, MAX_ROWS, n]
+            self.rows_out = torch.empty(
+                n * MAX_ROWS * first.n, dtype=torch.bfloat16, device=device
+            )
+            self.published = {i: torch.cuda.Event() for i in self.layers}
+            # the main-stream layer at whose start a layer's columns start (None: reduce)
+            self.project_at = project_points(self.layers, first_layer)
+            self.last_layer = max(self.layers)
+            self._columns = {}  # this step's published columns, held until the join
+
+    def _rows_of(self, layer_id: int, rows: int) -> torch.Tensor:
+        """Slot engram_publish: layer ``layer_id``'s collected rows [rows, n]."""
+        width = next(iter(self.layers.values())).n
+        start = self.index[layer_id] * MAX_ROWS * width
+        return self.rows_out[start : start + rows * width].view(rows, width)
 
     def _looked(self, rows: int) -> torch.Tensor:
         n = len(self.layers)
@@ -233,6 +284,13 @@ class EngramPrefetch:
         emb.record_stream(self.stream)
         self._emb = emb
         self.reduced.record(main)
+        if self.exchange is not None:
+            with torch.cuda.stream(self.stream):
+                self.stream.wait_event(self.reduced)
+                for i, at in self.project_at.items():
+                    if at is None:
+                        self._project(i)
+            return
         parts = self._parts(self.rows)
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(self.reduced)
@@ -240,6 +298,33 @@ class EngramPrefetch:
             for j, layer in enumerate(self.layers.values()):
                 parts[j, :, layer.cols] = layer.quarter(emb[j])
             self.wkv_done.record(self.stream)
+
+    def _project(self, layer_id: int) -> None:
+        """Slot engram_publish, on the side stream: this rank's WKV columns of
+        ``layer_id`` into every rank's mailbox."""
+        layer = self.layers[layer_id]
+        columns = layer.quarter(self._emb[self.index[layer_id]]).contiguous()
+        self._columns[layer_id] = columns  # held until the main stream joins
+        self.exchange.publish(layer_id, columns)
+        self.published[layer_id].record(self.stream)
+
+    def at_layer(self, i: int) -> None:
+        """Slot engram_publish, main stream at the start of layer ``i``: a later Engram
+        layer's columns start on the side stream; at an Engram layer its rows are
+        collected (the last one also joins the side stream)."""
+        main = torch.cuda.current_stream()
+        for layer_id, at in self.project_at.items():
+            if at == i:
+                self.stream.wait_stream(main)
+                with torch.cuda.stream(self.stream):
+                    self._project(layer_id)
+        if i in self.layers:
+            main.wait_event(self.published[i])
+            self.exchange.collect(i, self._rows_of(i, self.rows))
+            if i == self.last_layer:
+                # every side-stream read of these is now ordered before main
+                self._emb = None
+                self._columns.clear()
 
     def gather(self) -> None:
         """Main stream at ``gather_at``: the zero-padded quarters summed into every
@@ -253,13 +338,30 @@ class EngramPrefetch:
         from sglang.srt.layers.engram import engram_gate
 
         e = self.layers[layer_id].engram
-        kv = self.kv[self.index[layer_id]][: x.size(0)]
+        if self.exchange is not None:
+            kv = self._rows_of(layer_id, self.rows)[: x.size(0)]
+        else:
+            kv = self.kv[self.index[layer_id]][: x.size(0)]
         return engram_gate(x, kv, e.q_weight, e.k_weight, e.eps, e.clamp_value)
 
     def poison(self, byte: int) -> None:
         """Fill the persistent buffers with ``byte`` (build's check)."""
         self.looked.view(torch.uint8).fill_(byte)
         self.parts.view(torch.uint8).fill_(byte)
+        if self.exchange is not None:
+            self.rows_out.view(torch.uint8).fill_(byte)
+
+    def run(self, hash_ids: torch.Tensor) -> dict:
+        """A whole step's prefetch in layer order (build's check, tests): every Engram
+        layer's rows {layer: [rows, n]}."""
+        self.issue(hash_ids)
+        self.reduce()
+        if self.exchange is None:
+            self.gather()
+            return {i: self.kv[j] for i, j in self.index.items()}
+        for i in range(self.gather_at, self.last_layer + 1):
+            self.at_layer(i)
+        return {i: self._rows_of(i, self.rows) for i in self.layers}
 
 
 def _any_error(group, error: str) -> str:
@@ -286,8 +388,9 @@ def _hash_ids(w: int, cols: int, ranges: list) -> torch.Tensor:
     return out
 
 
-def build(model, ctx, group):
-    """The Engram prefetch, or None, and the reason it is off. Build runs it at every
+def build(model, ctx, group, publish: bool = False):
+    """The Engram prefetch, or None, and the reason it is off (``publish``: slot
+    engram_publish, the mailbox exchange). Build runs it at every
     width it takes, with its buffers poisoned (0xFF: a NaN in BF16), and compares each
     layer's rows with SGLang's inline lookup + WKV bit for bit (which also compiles its
     GEMMs before capture)."""
@@ -335,19 +438,27 @@ def build(model, ctx, group):
     error = _any_error(group, error)
     if error:
         return None, error
+    if publish:
+        # collective (the mailboxes' rendezvous): every rank reaches it or none does
+        prefetch = EngramPrefetch(engrams, group, first_layer, ctx.deadline_s)
     # every collective below runs on the main stream, in the same order on every
     # rank; a mismatch is recorded, not raised, so no rank leaves them early
     mismatch = ""
     for w in widths:
         prefetch.poison(0xFF)
-        prefetch.issue(ids[w])
-        prefetch.reduce()
-        prefetch.gather()
+        rows = prefetch.run(ids[w])
         for i, layer in prefetch.layers.items():
             e = layer.engram
             want, _ = e.wkv(e.embed(ids[w][:, e.layer_hash_index]).flatten(-2))
-            got = prefetch.kv[prefetch.index[i]]
-            if not mismatch and not torch.equal(got, want):
+            got = rows[i]
+            # the exchange copies bits: compare them (the all-reduce's sum with zeros
+            # turns a -0.0 into +0.0, so its rows compare by value)
+            same = (
+                torch.equal(got.view(torch.int16), want.view(torch.int16))
+                if prefetch.exchange is not None
+                else torch.equal(got, want)
+            )
+            if not mismatch and not same:
                 mismatch = f"layer {i} at {w} rows: not SGLang's rows"
     prefetch.kv = None
     error = _any_error(group, mismatch)

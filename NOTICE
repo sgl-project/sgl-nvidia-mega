@@ -37,7 +37,9 @@ this repository), the
 query-projection cluster kernel in sgl_nvidia_mega/deepseek_v41/sm103/attention/src/
 q_cluster.cu, the FP8 wo_a weight widening in sm103/attention/src/wo_a_fused.cu, the
 sparse attention core in sm103/attention/src/core_lean.cu, the split-K wo_b projection
-that publishes into the all-reduce mailbox in sm103/attention/src/wo_b_split.cu, and the
+that publishes into the all-reduce mailbox in sm103/attention/src/wo_b_split.cu, the
+Engram projection's tagged-mailbox exchange (publish and collect) in
+sgl_nvidia_mega/deepseek_v41/engram/exchange.cu and its later-layer schedule, and the
 scheduling switches behind slots attn_compressor_priority, attn_index_early_trigger and
 attn_defer_block_select (Apache License 2.0, Copyright (c) 2026 NVIDIA CORPORATION &
 AFFILIATES). Each adapted file names its origin in its header.

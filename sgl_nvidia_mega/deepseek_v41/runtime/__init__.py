@@ -217,7 +217,13 @@ DRAFT_SLOTS = frozenset(
 # epilogue publishes into the hop's mailbox (sm103/attention/wo_b_split.py), on hop A in
 # place of the publishing low-latency GEMM and, with slot draft_hop, on the draft stages
 # in place of the low-latency GEMM + the hop's publish kernel, a numerics change: each
-# k-block's FP8 mma.sync product folded into FP32 with its scales in muLLM's split order
+# k-block's FP8 mma.sync product folded into FP32 with its scales in muLLM's split order;
+# engram_publish: with the Engram prefetch, each Engram layer's WKV columns go from the
+# Engram stream into every rank's mailbox as tagged words (muLLM's Engram publish) and
+# the main stream collects the layer's rows at its gate, in place of the zero-padded
+# rows' all-reduce at the first Engram layer; a later Engram layer's columns start at
+# the layer 4 before it (muLLM's late-layer schedule), off layer 1's path (engram/exchange.py;
+# bitwise: SGLang's whole WKV GEMM bit for bit)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -244,6 +250,7 @@ OPT_IN_SLOTS = (
     "draft_stage0_table",
     "draft_shared_ll",
     "wo_b_publish_split",
+    "engram_publish",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -352,6 +359,7 @@ def slot_reasons() -> list[str]:
         ("attn_core_lean", "swapab_h8"),
         ("attn_core_lean", "wo_a_g1"),
         ("wo_b_publish_split", "hop_a"),
+        ("engram_publish", "engram"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -447,6 +455,9 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
             for slot in getattr(bound["moe"], "slots", {}).values()
         ),
         "engram": bound["engram"].prefetch is not None,
+        # slot engram_publish: the prefetch built on the mailbox exchange
+        "engram_publish": getattr(bound["engram"].prefetch, "exchange", None)
+        is not None,
         # slot gate_route: a layer's fast top-k built with the route record in one launch
         "gate_route": any(
             getattr(slot.gemm, "gate_route_kernel", None) is not None
