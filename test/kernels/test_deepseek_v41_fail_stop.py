@@ -53,6 +53,32 @@ HOP_FAULT_WORKER = textwrap.dedent(
             return hop(x, torch.randn(rows, HC, H, device=dev).bfloat16(),
                        torch.rand(rows, HC, device=dev), torch.rand(rows, HC, HC, device=dev),
                        torch.rand(rows, HC, device=dev), torch.randn(H, device=dev).bfloat16(), 1e-6)
+    elif case == "lamport_split":
+        # slot wo_b_publish_split: muLLM's split-K wo_b publishes, the consumer collects
+        from types import SimpleNamespace
+        from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
+        from sgl_nvidia_mega.deepseek_v41.sm103 import all_reduce_mhc as m
+        from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_cluster
+        from sgl_nvidia_mega.deepseek_v41.sm103.runner import SplitPublisher
+        m.set_wait_deadline(deadline)
+        hop = m.AllReduceMHC(hidden_size=H, hc_mult=HC, max_num_tokens=16, top_k=6, device=dev,
+                             group=tp.device_group)
+        K = 1024
+        linear = SimpleNamespace(
+            weight=(torch.randn(H, K, device=dev) * 64).clamp(-448, 448).to(torch.float8_e4m3fn),
+            weight_scale_inv_swizzled=q_cluster.swizzle_scales(
+                torch.full((H, K // 32), 117, dtype=torch.uint8, device=dev)))
+        split = SplitPublisher(hop, "fail-stop")
+        assert split.add(linear) == ""
+        rows = 6
+        def run():
+            q, sf = flashinfer_mxfp8_quantize(torch.randn(rows, K, device=dev).bfloat16(),
+                                              is_sf_swizzled_layout=True, alignment=32)
+            x = split(linear, (q, sf.reshape(-1)))
+            assert x is not None
+            return hop(x, torch.randn(rows, HC, H, device=dev).bfloat16(),
+                       torch.rand(rows, HC, device=dev), torch.rand(rows, HC, HC, device=dev),
+                       torch.rand(rows, HC, device=dev), torch.randn(H, device=dev).bfloat16(), 1e-6)
     elif case == "draft_hop":
         # the draft's mailbox as draft_hop.build makes it; its deadline is the build's
         from types import SimpleNamespace
@@ -109,7 +135,9 @@ def _gpu4() -> bool:
 
 
 @pytest.mark.skipif(not _gpu4(), reason="needs 4 SM100-family GPUs")
-@pytest.mark.parametrize("case", ["lamport", "lamport_mbar", "two_shot", "draft_hop"])
+@pytest.mark.parametrize(
+    "case", ["lamport", "lamport_mbar", "lamport_split", "two_shot", "draft_hop"]
+)
 def test_a_missing_rank_faults_its_hop_peers_in_time(case, tmp_path):
     script = tmp_path / "worker.py"
     script.write_text(HOP_FAULT_WORKER)
@@ -125,12 +153,11 @@ def test_a_missing_rank_faults_its_hop_peers_in_time(case, tmp_path):
     # the waiting ranks fault (the kernel's store to 0x0 surfaces as a CUDA error);
     # none returns as if the hop had completed
     assert "NO-FAULT" not in log, log[-4000:]
-    faulted = [l for l in log.splitlines() if "FAULTED after" in l]
+    # the ranks' prints can share a line: count the reports, not the lines
+    faulted = log.split("FAULTED after ")[1:]
     assert len(faulted) == 3, log[-4000:]
-    for line in faulted:
-        assert (
-            float(line.split("after ")[1].split(" s")[0]) < 4 * FAULT_DEADLINE_S + 10
-        ), line
+    for report in faulted:
+        assert float(report.split(" s")[0]) < 4 * FAULT_DEADLINE_S + 10, report[:80]
     assert time.time() - t0 < 300
 
 
@@ -205,12 +232,11 @@ def test_a_missing_rank_faults_its_markov_peers_in_time(
     log = out.stdout + out.stderr
     assert log.count("HEALTHY") == 4, log[-4000:]
     assert "NO-FAULT" not in log, log[-4000:]
-    faulted = [l for l in log.splitlines() if "FAULTED after" in l]
+    # the ranks' prints can share a line: count the reports, not the lines
+    faulted = log.split("FAULTED after ")[1:]
     assert len(faulted) == 3, log[-4000:]
-    for line in faulted:
-        assert (
-            float(line.split("after ")[1].split(" s")[0]) < 4 * FAULT_DEADLINE_S + 10
-        ), line
+    for report in faulted:
+        assert float(report.split(" s")[0]) < 4 * FAULT_DEADLINE_S + 10, report[:80]
     assert time.time() - t0 < 300
 
 

@@ -212,7 +212,12 @@ DRAFT_SLOTS = frozenset(
 # GPU at TP8); draft_shared_ll: the draft stages' shared expert as slot shared_ll runs the
 # target's (gate_up on the low-latency GEMM, with shared_fold* folding the SwiGLU and
 # down_proj's quant; following muLLM's draft MoE; not bitwise: summation order, so the
-# draft's tokens may change, the target's verify stays exact)
+# draft's tokens may change, the target's verify stays exact);
+# wo_b_publish_split: at 1-8 rows wo_b on muLLM's cluster split-K FP8 projection whose
+# epilogue publishes into the hop's mailbox (sm103/attention/wo_b_split.py), on hop A in
+# place of the publishing low-latency GEMM and, with slot draft_hop, on the draft stages
+# in place of the low-latency GEMM + the hop's publish kernel, a numerics change: each
+# k-block's FP8 mma.sync product folded into FP32 with its scales in muLLM's split order
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -238,6 +243,7 @@ OPT_IN_SLOTS = (
     "draft_final_collapse",
     "draft_stage0_table",
     "draft_shared_ll",
+    "wo_b_publish_split",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -345,6 +351,7 @@ def slot_reasons() -> list[str]:
         ("attn_core_lean", "attn"),
         ("attn_core_lean", "swapab_h8"),
         ("attn_core_lean", "wo_a_g1"),
+        ("wo_b_publish_split", "hop_a"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -605,6 +612,8 @@ def build(model, ctx):
         ),
         # muLLM's one-launch core: 8 local heads with the fused wo_a
         "attn_core_lean": any(a.core_lean for a in bound["attention"].values()),
+        # muLLM's split-K wo_b + publish: hop A built with every target wo_b repacked
+        "wo_b_publish_split": hop is not None and hop.wo_b_split,
         # the query's cluster launch: a chain with the low-latency wq_b, 1-8 rows
         "attn_q_cluster": any(w <= 8 for w in pctx.widths)
         and any(

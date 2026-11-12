@@ -173,6 +173,9 @@ class Kernels(NamedTuple):
     # slot attn_core_lean: muLLM's one-launch window core on the v41_new pool, with the
     # fused wo_a rotating by an identity
     core_lean: bool = False
+    # slot wo_b_publish_split (with slot draft_hop): wo_b at 1-8 rows on muLLM's split-K
+    # kernel, publishing into the draft hop's mailbox (sm103.runner.SplitPublisher)
+    wo_b_split: Optional[object] = None
 
 
 def wo_a_applies(attn, one_group: bool = False) -> bool:
@@ -423,6 +426,7 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view, stage0=None):
                 rope=core_lean.identity_rope(rows, o.device),
             ),
             kernels.wo_b_ll,
+            kernels.wo_b_split,
         )
     if swapab:
         freqs = torch.view_as_real(attn.freqs_cis).flatten(-2)
@@ -449,7 +453,12 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view, stage0=None):
         )
     if o.shape[1] != attn.n_local_heads:
         o = o[:, : attn.n_local_heads, :]
-    return _wo_b(attn, _wo_a(attn, o, positions, fb, kernels.wo_a), kernels.wo_b_ll)
+    return _wo_b(
+        attn,
+        _wo_a(attn, o, positions, fb, kernels.wo_a),
+        kernels.wo_b_ll,
+        kernels.wo_b_split,
+    )
 
 
 def _swapab_takes(rows, fb, view) -> bool:
@@ -542,13 +551,19 @@ def _wo_a(attn, o, positions, fb, fused: bool, rope=None):
     return o.reshape(o.shape[0], o.shape[1] * o.shape[2])
 
 
-def _wo_b(attn, o, ll: bool = False):
+def _wo_b(attn, o, ll: bool = False, split=None):
     """wo_b with the TP sum left to the stage's attention post, as SGLang's draft; with
     slot draft_wo_b_ll, the fused wo_a's MXFP8 rows on the low-latency GEMM at 1-8
-    rows (the target wo_b's shape and tactics)."""
+    rows (the target wo_b's shape and tactics); with ``split`` (slot
+    wo_b_publish_split), those rows on muLLM's split-K kernel, published into the draft
+    hop's mailbox, whose post then only collects."""
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
+    if split is not None and isinstance(o, Mxfp8SwizzledInput):
+        out = split(attn.wo_b, o)
+        if out is not None:
+            return mhc.AttnOutput(out)
     if (
         ll
         and isinstance(o, Mxfp8SwizzledInput)
