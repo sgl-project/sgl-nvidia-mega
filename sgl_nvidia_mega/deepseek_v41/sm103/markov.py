@@ -336,9 +336,15 @@ class ShardedMarkov:
         pdl: bool = False,
         stamps: bool = False,
         lowlat: bool = False,
+        tail: bool = False,
         extra_defines: tuple[str, ...] = (),
     ):
         device = embed_weight.device
+        # slot markov_tail: the kernel also writes the verify ids and advances the
+        # draft-noise offset (sample's verify_ids / noise_offset)
+        self.tail = tail
+        if tail:
+            extra_defines = tuple(extra_defines) + ("-DMARKOV_TAIL=1",)
         reason = unsupported_reason(
             world=world,
             vocab_size=vocab_size,
@@ -556,11 +562,17 @@ class ShardedMarkov:
         logits_cache: Optional[torch.Tensor],
         draft_tokens: torch.Tensor,
         anchor_staged: bool = False,
+        verify_ids: Optional[torch.Tensor] = None,
+        noise_offset: Optional[torch.Tensor] = None,
     ) -> None:
         """Draft tokens of every row into ``draft_tokens`` [rows, num_steps] and, when
         ``logits_cache`` [>= rows, num_steps, vocab] is given, the full-vocab step logits
         of every row at a nonzero temperature (temperature-0 rows are left untouched);
-        without it every row is argmaxed. The noise must be drawn already."""
+        without it every row is argmaxed. The noise must be drawn already.
+
+        Built with ``tail`` only: ``verify_ids`` [>= rows, num_steps + 1] int64 also gets
+        each row's [anchor | draft tokens], and ``noise_offset`` (int64 [1]) is advanced
+        by one after the chain."""
         rows = base_logits.shape[0]
         assert self.supports(base_logits)
         assert temperatures.dtype == torch.float32
@@ -614,6 +626,22 @@ class ShardedMarkov:
             ctypes.c_int64(self.timeout_ns),
             ctypes.c_int64(self.wide_offset if wide else self.mailbox_offset),
         ]
+        if self.tail:
+            if verify_ids is not None:
+                assert verify_ids.dtype == torch.int64 and verify_ids.stride(1) == 1
+                assert verify_ids.shape[0] >= rows
+                assert verify_ids.shape[1] == self.num_steps + 1
+            if noise_offset is not None:
+                assert noise_offset.dtype == torch.int64 and noise_offset.numel() == 1
+            arguments += [
+                _pointer(verify_ids) if verify_ids is not None else ctypes.c_void_p(0),
+                ctypes.c_int64(verify_ids.stride(0) if verify_ids is not None else 0),
+                _pointer(noise_offset)
+                if noise_offset is not None
+                else ctypes.c_void_p(0),
+            ]
+        else:
+            assert verify_ids is None and noise_offset is None, "built without tail"
         if self.stamp_phases and not wide:
             arguments.append(_pointer(self.stamps))
         stream = torch.cuda.current_stream(self.device).cuda_stream

@@ -86,6 +86,12 @@ using i64 = long long;
 #ifndef MARKOV_STAMPS
 #define MARKOV_STAMPS 0
 #endif
+// Slot markov_tail: the chain also writes SGLang's verify ids [anchor | draft tokens]
+// (when given) and advances its draft-noise offset (when given), the two launches
+// that followed it.
+#ifndef MARKOV_TAIL
+#define MARKOV_TAIL 0
+#endif
 
 namespace {
 
@@ -343,6 +349,10 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
     u32* control,                                   // local control words
     int rank, int world, int vocab_local, int rows, int max_rows, i64 timeout_ns,
     i64 mailbox_offset  // bytes from a peer buffer's base to the direct-exchange mailbox
+#if MARKOV_TAIL
+    , i64* verify_ids, i64 verify_stride  // [rows, STEPS + 1] (row stride), or null
+    , i64* noise_offset                   // the draft-noise counter, or null
+#endif
 #if MARKOV_STAMPS
     , u64* stamps
 #endif
@@ -672,6 +682,12 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
     STAMP_SEEN_STORE(8 + 8 * step + 4);
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(row_best[step][threadIdx.x]);
+#if MARKOV_TAIL
+      if (verify_ids != nullptr) {
+        verify_ids[threadIdx.x * verify_stride + 1 + step] = KeyIndex(row_best[step][threadIdx.x]);
+        if (step == 0) verify_ids[threadIdx.x * verify_stride] = input_ids[threadIdx.x * query_per_row];
+      }
+#endif
     }
     if (step + 1 < STEPS) {
       if (warp < rows) {
@@ -804,6 +820,12 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
     STAMP_SEEN_STORE(8 + 8 * step + 4);
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(winner[threadIdx.x]);
+#if MARKOV_TAIL
+      if (verify_ids != nullptr) {
+        verify_ids[threadIdx.x * verify_stride + 1 + step] = KeyIndex(winner[threadIdx.x]);
+        if (step == 0) verify_ids[threadIdx.x * verify_stride] = input_ids[threadIdx.x * query_per_row];
+      }
+#endif
     }
     if (step + 1 < STEPS && warp < rows) {
       reinterpret_cast<uint4*>(embedding[warp])[lane] =
@@ -840,6 +862,9 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
   STAMP_TIMED(3);
   // This thread read the counter at launch start; the next launch is stream-ordered.
   if (threadIdx.x == 0) control[kCountWord + blockIdx.x] = s_count + 1u;
+#if MARKOV_TAIL
+  if (noise_offset != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *noise_offset += 1;
+#endif
 }
 #undef STAMP
 #undef STAMP_TIMED
@@ -857,7 +882,11 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
     int query_per_row, const i32* idx_mapping, const float* temperature, const float* noise, CACHE_T* logits_cache,
     i64 cache_stride0, i64 cache_stride1, i64* draft_tokens, i64 draft_stride, const u64* __restrict__ peers,
     u32* control, int rank, int world, int vocab_local, int rows, int max_rows, i64 timeout_ns,
-    i64 mailbox_offset) {  // bytes from a peer buffer's base to this kernel's records
+    i64 mailbox_offset  // bytes from a peer buffer's base to this kernel's records
+#if MARKOV_TAIL
+    , i64* verify_ids, i64 verify_stride, i64* noise_offset
+#endif
+    ) {
   __shared__ __align__(16) __nv_bfloat16 embedding[kWideRows][kRankDim];
   __shared__ unsigned long long row_best[kMaxSteps][kWideRows];
   __shared__ unsigned long long rank_key[kWideRows];
@@ -1075,6 +1104,12 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
     __syncthreads();
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(winner[threadIdx.x]);
+#if MARKOV_TAIL
+      if (verify_ids != nullptr) {
+        verify_ids[threadIdx.x * verify_stride + 1 + step] = KeyIndex(winner[threadIdx.x]);
+        if (step == 0) verify_ids[threadIdx.x * verify_stride] = input_ids[threadIdx.x * query_per_row];
+      }
+#endif
     }
     if (step + 1 < STEPS) {
       for (int r = warp; r < rows; r += kWarps) {
@@ -1108,5 +1143,8 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
   }
   // This thread read the counter at launch start; the next launch is stream-ordered.
   if (threadIdx.x == 0) control[kWideCountWord + blockIdx.x] = s_count + 1u;
+#if MARKOV_TAIL
+  if (noise_offset != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *noise_offset += 1;
+#endif
 }
 #endif  // !MARKOV_DIRECT

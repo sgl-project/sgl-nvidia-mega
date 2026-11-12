@@ -53,17 +53,23 @@ def warn_declined(table: dict[str, tuple[str, str]]) -> None:
             )
 
 
-_PROPOSAL = ("markov", "draft_lm_head", "markov_pdl", "markov_lowlat")
+_PROPOSAL = ("markov", "draft_lm_head", "markov_pdl", "markov_lowlat", "markov_tail")
 
 
 def _proposal(built, name):
-    if name in ("markov", "markov_pdl", "markov_lowlat"):
+    if name in ("markov", "markov_pdl", "markov_lowlat", "markov_tail"):
         if built.draft_sampler is None:
             return DECLINED, "SGLang's proposal"
         if name == "markov_pdl":
             return BUILT, "the chain a PDL dependent of the draft LM head"
         if name == "markov_lowlat":
             return BUILT, "the chain's low-latency exchange"
+        if name == "markov_tail":
+            return (
+                BUILT,
+                "the chain advances the noise offset, and writes the verify ids "
+                "where SGLang hands them over",
+            )
         return BUILT, "Markov chain in one kernel, built with the proposal's buffers"
     if not built.low_m:
         return DECLINED, "LM head SGLang's"
@@ -73,7 +79,13 @@ def _proposal(built, name):
 def _forward(built, stages, slots, name):
     if name == "draft":
         return BUILT, f"widths {list(built.widths)}"
-    if name in ("draft_post", "draft_hop", "draft_seam", "draft_prenorm"):
+    if name in (
+        "draft_post",
+        "draft_hop",
+        "draft_seam",
+        "draft_prenorm",
+        "draft_final_collapse",
+    ):
         return _boundary(built, stages, name)
     if name in ("draft_moe", "draft_gate"):
         return _moe(built, name)
@@ -89,6 +101,10 @@ def _boundary(built, stages, name):
     hop = bound.draft_hop
     if name == "draft_prenorm":
         return (BUILT, "DeepGEMM TF32") if bound.prenorm else (DECLINED, "not served")
+    if name == "draft_final_collapse":
+        if hop is None or not hop.final_collapse:
+            return DECLINED, f"no draft hop ({built._hop_reason})"
+        return BUILT, "the last stage's MoE post writes the head's collapse"
     if name == "draft_hop":
         if hop is None:
             from sgl_nvidia_mega.deepseek_v41.boundary import draft_hop
