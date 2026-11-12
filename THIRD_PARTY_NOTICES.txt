@@ -1,0 +1,181 @@
+Third-party notices for sgl-nvidia-mega
+
+This file lists the third-party code included in this source tree and the terms
+that apply to it. The project's own code is licensed under the Apache License 2.0
+(see LICENSE and NOTICE). The full text of the Apache License 2.0 is in the
+LICENSE file at the root of this repository; it applies to every Apache-2.0
+component listed below.
+
+==============================================================================
+1. DeepGEMM
+==============================================================================
+Source: https://github.com/sgl-project/DeepGEMM (sgl-deep-gemm 0.2.3.post2, a
+fork of https://github.com/deepseek-ai/DeepGEMM)
+License: MIT
+Files:
+  sgl_nvidia_mega/kimi_k31/dsa/dg_logits.cuh
+    A copy of deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh from
+    sgl-deep-gemm 0.2.3.post2, modified by NVIDIA: the additions are marked
+    "K3.1:" in the file.
+  sgl_nvidia_mega/kimi_k31/dsa/dg_include/deep_gemm/** (17 files)
+    Unmodified copies of the headers under deep_gemm/include/deep_gemm/ of
+    sgl-deep-gemm 0.2.3.post2 that dg_logits.cuh includes (common/, epilogue/,
+    layout/, mma/, ptx/, scheduler/). dg_include/README.md lists each file with
+    its SHA-256.
+
+MIT License
+
+Copyright (c) 2025 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+==============================================================================
+2. SGLang
+==============================================================================
+Source: https://github.com/sgl-project/sglang
+License: Apache License 2.0 (Copyright 2023-2024 SGLang Team)
+Files:
+  sgl_nvidia_mega/kimi_k31/dsa/x47960/topk_v2.cuh
+  sgl_nvidia_mega/kimi_k31/dsa/x47960/topk_impl.cuh
+    Copies of SGLang's DeepSeek-V4 top-k kernels
+    (python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh and
+    python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh)
+    at public commit b2833196d85f79e6876a7359bd01f318fdcbc18f (main; pull request
+    48501, which follows pull request 47960's merge). Modified by NVIDIA with six
+    edits marked "k31 edit" in the files and listed in
+    sgl_nvidia_mega/kimi_k31/dsa/x47960/__init__.py (the include of topk_impl.cuh
+    points at the copy next to topk_v2.cuh; the staging buffer of the small-batch
+    cluster kernel moved to dynamic shared memory, without the smem-spilling
+    pragma; one packed add spelled with the CUDA intrinsic; the barrier header
+    taken from sgl_kernel/ptx/barrier.cuh when the SGLang tree has it; the mode
+    as a template argument of the host-side TopKKernel struct).
+  sgl_nvidia_mega/kimi_k31/dsa/x47960/topk_v2_tkpush.cuh
+    A second copy of the same topk_v2.cuh, modified by NVIDIA: its own symbol
+    namespace, a tag-push epilogue in the small-batch cluster kernel and the
+    transform_paged_push host entry, marked "k31 TKPUSH" in the file.
+  sgl_nvidia_mega/kimi_k31/dsa/tsi.cuh
+    The exact top-k merge is adapted from
+    python/sglang/kernels/jit/csrc/dsa/dcp_topk_merge.cuh at public commit
+    f3532057e15fb8ede90ce1aeddfb5bd20dfbd4b6 (pull request 48588).
+  sgl_nvidia_mega/kimi_k31/dsa/tsim.cuh, sgl_nvidia_mega/kimi_k31/dsa/tsim_lean.cuh
+    select_kth and the (score, position) key encoding are adapted from the
+    same dcp_topk_merge.cuh at the same commit.
+  sgl_nvidia_mega/deepseek_v41/** (files whose header names SGLang)
+    Adapted from SGLang's DeepSeek-V4.1 model and kernel code, as listed in NOTICE.
+
+==============================================================================
+3. vLLM
+==============================================================================
+Source: https://github.com/vllm-project/vllm
+License: Apache License 2.0 (Copyright contributors to the vLLM project)
+Files:
+  sgl_nvidia_mega/kimi_k31/dsa/x47960/topk_v2.cuh
+  sgl_nvidia_mega/kimi_k31/dsa/x47960/topk_v2_tkpush.cuh
+    SGLang adapted parts of csrc/persistent_topk.cuh at commit
+    a8c6ee9b787d273916206a29b77feebadb80c368; each file credits it in its header.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/gemm/splitk_tmem8.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/gemm/splitk_tmem64.py
+    Contain the kernel launch, the kernel prologue, the weight TMA producer
+    loop and parts of the MMA and DSMEM reduce of
+    vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk.py
+    (SplitKGemm) at commit 642c18d64c4cb6db3ded8fbe1786718cd4005fcb
+    (pull request 61867). vLLM adapted that file from FlashInfer v0.7.0.post1
+    flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py (section 4).
+    Modified by NVIDIA.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/moe/wide_plan.py
+    Contains methods of ExpertsPlanKernel from
+    vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts.py at
+    commit 642c18d64c4cb6db3ded8fbe1786718cd4005fcb. Modified by NVIDIA.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/latent_primitives.py
+    A copy of vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/primitives.py
+    at commit 642c18d64c4cb6db3ded8fbe1786718cd4005fcb, unmodified.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/common/policy.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/common/__init__.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/moe/__init__.py
+    Copies of the same-named files under
+    vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/ at commit
+    642c18d64c4cb6db3ded8fbe1786718cd4005fcb, unmodified.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/common/primitives.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/common/host.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/common/mailbox.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/common/twoshot.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/moe/experts.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/moe/experts_runtime.py
+    Derived from the same-named files under
+    vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/ at commit
+    642c18d64c4cb6db3ded8fbe1786718cd4005fcb, modified by NVIDIA; each file
+    says so in its header.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/moe/experts_rubin.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/moe/experts_rubin64.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/moe/experts_vw.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/moe/experts_wide.py
+    NVIDIA-authored files that contain portions adapted from
+    vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts.py at
+    commit 642c18d64c4cb6db3ded8fbe1786718cd4005fcb.
+vLLM has no NOTICE file. The Apache License 2.0 text is in LICENSE.
+
+==============================================================================
+4. FlashInfer
+==============================================================================
+Source: https://github.com/flashinfer-ai/flashinfer
+License: Apache License 2.0 (one file also BSD-3-Clause, see below)
+Files:
+  sgl_nvidia_mega/kimi_k31/dsa/gvr2/gvr2_topk_host.py
+  sgl_nvidia_mega/kimi_k31/dsa/gvr2/gvr2_topk_decode.py
+    Copies of flashinfer/topk_varlen/kernels/gvr2_topk_host.py and
+    gvr2_topk_decode.py from a FlashInfer development branch
+    (https://github.com/akhilg-nv/flashinfer, commit
+    321f0f1554bacde46e1e953a8e487eceee5ca439). gvr2_topk_host.py is
+    unmodified. gvr2_topk_decode.py is modified by NVIDIA: an optional
+    programmatic-dependent-launch trigger, off by default, marked
+    "sgl-nvidia-mega local" in the file.
+  sgl_nvidia_mega/kimi_k31/dsa/x47960/topk_v2.cuh
+  sgl_nvidia_mega/kimi_k31/dsa/x47960/topk_v2_tkpush.cuh
+    SGLang adapted parts of include/flashinfer/topk.cuh at commit
+    c2b4db2b1a84448d802f0e6ac445243312bd6a4c.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/gemm/splitk.py
+    Adapted from flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at
+    v0.7.0.post1.
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/gemm/splitk_tmem8.py
+  sgl_nvidia_mega/kimi_k31/k3/cutedsl/gemm/splitk_tmem64.py
+    Adapted, through vLLM's SplitKGemm (section 3), from
+    flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at v0.7.0.post1.
+  sgl_nvidia_mega/common/sync.py, sgl_nvidia_mega/deepseek_v41/sm103/all_reduce_mhc.py
+    Adapted from FlashInfer's Lamport and low-latency all-reduce primitives.
+  sgl_nvidia_mega/deepseek_v41/sm103/wo_b_publish.py
+    The epilogue is adapted from FlashInfer (BSD-3-Clause, Copyright (c) 2026
+    NVIDIA CORPORATION & AFFILIATES); the full BSD-3-Clause notice is kept in
+    that file.
+
+FlashInfer's NOTICE file reads, in the part that pertains to these files:
+
+FlashInfer
+Copyright 2025-2026 NVIDIA
+Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+==============================================================================
+5. TensorRT-LLM
+==============================================================================
+Source: https://github.com/NVIDIA/TensorRT-LLM
+License: Apache License 2.0 (Copyright (c) 2026 NVIDIA CORPORATION)
+Files:
+  sgl_nvidia_mega/kimi_k31/dsa/gvr2/gvr2_topk_host.py, gvr2_topk_decode.py
+    FlashInfer ported these near-verbatim from
+    tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/ (pull request 17821,
+    commit ed94d4cfbf, and fixes from pull requests 18501 and 18625).

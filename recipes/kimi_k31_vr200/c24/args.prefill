@@ -1,0 +1,49 @@
+# Kimi K3.1 on VR200, c24 published point, prefill role: server arguments, one per line, as served; replace the <...> placeholders.
+--model-path <TARGET_WEIGHTS>
+--nnodes 2
+--node-rank <NODE_RANK>
+--dist-init-addr <DIST_INIT_ADDR>
+--trust-remote-code
+--dtype bfloat16
+--language-only
+--tp-size 8
+--dp-size 1
+--dcp-size 1
+--ep-size 1
+--kv-cache-dtype fp8_e4m3
+--page-size 64
+--moe-runner-backend flashinfer_mxfp4
+--mamba-ssm-dtype float32
+--cuda-graph-backend-decode full
+--mem-fraction-static 0.88
+--random-seed 42
+--reasoning-parser kimi_k3
+--tool-call-parser kimi_k3
+--decode-log-interval 1
+--enable-metrics
+--attention-backend dsa
+--dsa-prefill-backend trtllm
+--dsa-decode-backend trtllm
+--context-length 1048576
+--chunked-prefill-size 16384
+--max-prefill-tokens 16384
+--mamba-track-interval 256
+--mamba-max-states-per-path 2
+--enable-cache-report
+--max-running-requests 8
+--cuda-graph-bs-decode 1 2 4 8
+--speculative-algorithm DFLASH
+--speculative-draft-model-path <DRAFTER_WEIGHTS>
+--speculative-num-draft-tokens 8
+--speculative-draft-kv-cache-dtype fp8_e4m3
+--speculative-draft-model-quantization unquant
+--speculative-draft-window-size 1024
+--speculative-draft-attention-backend triton
+--mamba-radix-cache-strategy extra_buffer
+--max-mamba-cache-size 96
+--enable-hierarchical-cache
+--hicache-size 80
+--hicache-write-policy write_back
+--disaggregation-mode prefill
+--disaggregation-bootstrap-port 8998
+--disaggregation-transfer-backend mooncake

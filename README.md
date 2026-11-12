@@ -19,6 +19,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs) | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py) |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
+| Kimi K3.1 (packed MXFP4) | Rubin VR200 (SM107) | 16 (four nodes of one NVLink domain; DCP off) | DFlash target verify steps of 8 rows a request (7 drafted tokens and the anchor) at 1 to 8 requests, and 1 to 16 with `K31MK_VERIFY_BATCHES`; the decode role of a PD-disaggregated deployment, or one aggregated server at one request; the prefill role runs SGLang's path. See [Kimi K3.1 on VR200](#kimi-k31-on-vr200) |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
 SGLang's standard path. Qwen3.5 also offers the explicit GDN prefill slot below. Their draft specs provide the DSpark proposal and the
@@ -302,6 +303,39 @@ The GLM-5.3 megakernel serves MTP with 3 draft steps (`--speculative-num-steps 3
 
 At TP8 the GLM-5.3 megakernel covers verify steps of up to 16 rows: 1 to 4 requests with 4 draft tokens, 1 or 2 with 6 (at TP4 up to 48 rows); larger steps run SGLang's path while its derived weight copies (about 20 GiB per GPU, logged at startup) still take KV-cache memory, so it helps little on high-concurrency servers, and the server warns when `--max-running-requests` is set above 8.
 
+### Kimi K3.1 on VR200
+
+The Kimi K3.1 megakernel serves the DFlash target verify step at TP16 on four VR200
+nodes of one NVLink domain (`sgl_nvidia_mega/kimi_k31`). Its Kimi K3 base, with the
+VR200 (SM107) kernel forms, is a self-contained copy in `sgl_nvidia_mega/kimi_k31/k3`:
+`sgl_nvidia_mega/kimi_k3` and the GB300 Kimi K3 path are unchanged. It needs an SGLang with the Kimi K3.1
+host changes (DSA attention backends, the DFlash speculative algorithm and the
+K3.1 megakernel binding) and the VR200 FlashInfer build of SGLang's CUDA 13 image.
+
+`recipes/kimi_k31_vr200/` holds the exact configuration of each published point:
+`env.<role>` (environment words) and `args.<role>` (server arguments), as served
+without site, launcher and benchmark-only words (the published measurements forced
+the InferenceX acceptance length with `SGLANG_SIMULATE_ACC_*`; serving must not set
+them). `launch.sh <point> <role>` starts one role on one node:
+
+| point | concurrency | topology | frontend |
+| --- | --- | --- | --- |
+| `c1` | 1 | one aggregated server, TP16 (4 nodes) | none |
+| `c8` | 8 | prefill TP8 (2 nodes, HiCache 80 GB) and megakernel decode TP16 (4 nodes) | SGLang router, `--pd-disaggregation --prefill-policy cache_aware` |
+| `c14` | 14 | as `c8` | Dynamo frontend, SGLang workers |
+| `c24` | 24 | as `c8` | as `c8` |
+| `c48` | 48 | as `c8`, HiCache 210 GB, decode up to 16 requests | Dynamo frontend, SGLang workers |
+
+On each node of a role (`NODE_RANK` 0 to 3 for TP16, 0 to 1 for the TP8 prefill):
+
+```bash
+TARGET_WEIGHTS=<Kimi-K3.1 checkpoint> DRAFTER_WEIGHTS=<DFlash drafter> \
+NODE_RANK=<rank> DIST_INIT_ADDR=<rank-0 host>:<port> \
+recipes/kimi_k31_vr200/launch.sh c8 decode
+```
+
+Every point runs the DFlash drafter with 8 draft tokens (`--speculative-num-draft-tokens 8`).
+
 ### Kimi K3 optional startup providers
 
 The hybrid runtime and DSpark interfaces are upstream in SGLang through
@@ -406,11 +440,15 @@ sgl-nvidia-mega/
 │   │   └── sm103/           # kernels and the build-time runner; no SGLang imports
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
 │   ├── glm5_3/            # GLM-5.3 and GLM-5.2: the same layout (spec, plan, runtime, boundary, attention, moe, logits, sm103)
-│   └── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   ├── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   └── kimi_k31/             # the Kimi K3.1 VR200 spec, its DSA attention, verify executor and kernels; k3/: its Kimi K3 base (VR200 forms)
 ├── benchmark/             # the static decode table behind the speed numbers
+├── recipes/kimi_k31_vr200/ # the published Kimi K3.1 VR200 points: environment words, server arguments, launcher
+├── tools/rubin_k31/       # Kimi K3.1 TP16 compile and CPU mutation checks
 └── test/
     ├── unit/              # plugin contracts and setup checks; selected CUDA metadata/graph cases
     ├── kernels/           # legacy standalone kernel tests; outside required contribution CI
+    │   └── k31_rubin/     # Kimi K3.1 VR200 kernel tests
     └── e2e/               # GPU: serving accuracy, KL, passkey and fail-stop, switch on and off
 ```
 
