@@ -410,30 +410,44 @@ sgl-nvidia-mega/
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
     ├── unit/              # plugin contracts and setup checks; selected CUDA metadata/graph cases
-    ├── kernels/           # GPU: each kernel against SGLang's or FlashInfer's op, fail-stop
+    ├── kernels/           # legacy standalone kernel tests; outside required contribution CI
     └── e2e/               # GPU: serving accuracy, KL, passkey and fail-stop, switch on and off
 ```
 
 ## Testing
 
+The contribution suite consists of unit tests and E2E tests. Each supported
+model/hardware configuration needs an accuracy test and a performance test
+against the same native SGLang baseline. See the
+[contributor guide](CONTRIBUTING.md#required-tests) for the comparison protocol
+and the distinction between required coverage and the initial CI rollout.
+
 ```bash
-pytest test/unit               # host tests plus CUDA cases when a compatible GPU is available
-pytest test/kernels            # DeepSeek-V4.1-Flash: 4 x GB300
-pytest test/e2e                # DeepSeek-V4.1-Flash: 4 x GB300, with SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH set
+python3 -m pytest test/unit -v -rfE
 ```
+
+GPU E2E test definitions live in this repository and run on SGLang's GPU CI
+infrastructure. A maintainer requests them with `run-ci-sglang` on the Mega PR.
+The initial workflow covers DeepSeek-V4.1-Flash on four GB300 GPUs; other
+model/hardware combinations require their own workflow coverage.
+
+Additional manual test coverage:
 
 The DeepSeek-V4.1-Flash TP8 + EP2 kernel tests (`test_deepseek_v41_moe_ep.py`, `test_deepseek_v41_hop_b.py`, `test_deepseek_v41_hops.py`, `test_deepseek_v41_draft_hop.py`, and `test_deepseek_v41_draft.py -k ranks`) run on both trays under a two-node torchrun (`--nnodes 2 --nproc-per-node 4 -m pytest <file> -s`).
 
 Qwen3.5 runs TP8, which spans two GB300 trays: its e2e tests read a server launched on them through `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` and the files its ranks log to (`SGLANG_NVIDIA_MEGAKERNEL_E2E_LOGS`, comma-separated).
 
-GLM-5.3 GPU and end-to-end suites are not yet part of these commands.
+GLM-5.3 GPU and end-to-end suites are not yet part of the initial CI workflow.
 The GLM-5.3 CPU config and SGLang contract checks are included in `test/unit`.
 Kimi K3 full-serving qualification is separate from these unit tests; the
-`test/kernels` and `test/e2e` commands above remain DeepSeek-V4.1-Flash suites.
+standalone DeepSeek-V4.1-Flash kernel tests remain outside required contribution CI.
 
 ## Contributing
 
-Open a pull request against `main`. The PR title follows `[Type] scope: title` (see `.github/pull_request_template.md`), and `pre-commit run --all-files` must pass.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md): merge prerequisite SGLang bindings
+through normal SGLang CI first, then validate the Mega PR through the label-based
+integration flow. The guide defines unit/E2E coverage, matched accuracy and
+performance comparisons, and the evidence to include in a PR.
 
 ## License
 

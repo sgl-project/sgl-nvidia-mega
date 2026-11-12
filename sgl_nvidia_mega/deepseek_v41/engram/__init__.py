@@ -36,6 +36,7 @@ SGLANG_READS = {
         "eps",
         "clamp_value",
         "layer_hash_index",
+        "image_token_id",
     ),
     "srt/models/deepseek_v4.py": ("engram_hasher", "engram", "config"),
     "srt/configs/deepseek_v41.py": ("vision_n_layers",),
@@ -145,13 +146,23 @@ def apply(layer, st) -> None:
         ids = st.hash_ids[:, engram.layer_hash_index]
         emb = engram.embed(ids, st.fb, cp_all_tokens=False)
         kv, _ = engram.wkv(emb.flatten(-2))
+        # Match Engram.forward's gate specialization even for text-only batches.
+        # Omitting its token IDs selects a different compiled kernel.
         out = engram_gate(
-            x, kv, engram.q_weight, engram.k_weight, engram.eps, engram.clamp_value
+            x,
+            kv,
+            engram.q_weight,
+            engram.k_weight,
+            engram.eps,
+            engram.clamp_value,
+            st.input_ids if engram.image_token_id is not None else None,
+            engram.image_token_id,
         )
-    # Only multimodal placeholders become image_token_id, so a text-only batch (every
-    # decode / verify graph among them) skips the full-residual select.
+    # The stock gate handles image rows itself. The prefetch still gates without
+    # token IDs, so only its multimodal batches need this separate select.
     if (
-        config.model_type == "deepseek_v41"
+        st.slots.engram_prefetch
+        and config.model_type == "deepseek_v41"
         and config.vision_n_layers > 0
         and st.fb.contains_mm_inputs()
     ):
