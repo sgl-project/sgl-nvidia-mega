@@ -19,6 +19,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs) | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py) |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
+| MiniMax-M3.1-Flash (NVFP4) | GB300 (SM103) | 4 | One request's 8-row DSpark target verify step, and its 7-row draft block |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
 SGLang's standard path. Qwen3.5 also offers the explicit GDN prefill slot below. Their draft specs provide the DSpark proposal and the
@@ -174,6 +175,12 @@ The TP4 split-K GEMMs (`ll.gemm`) run FlashInfer's split-K kernel (`mm_bf16(...,
 
 With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting only; a list without a slot another needs (`dnorm` needs `qkv_a_small_m_shared` and `hops`, `qkv_a_small_m_shared` needs `attention`, `draft_rowselect` needs `draft`) stops the server at startup, naming it. Slot `draft` needs embedding replication, which the flag turns on (SGLang sets `SGLANG_ENABLE_EMBED_REPLICATION` when it is unset), greedy draft acceptance and an SGLang whose EAGLE draft graph runners run a draft spec's capture check; the server stops at startup, naming each one that is missing (an explicit `SGLANG_ENABLE_EMBED_REPLICATION=0` too).
 
+### What a covered MiniMax-M3.1-Flash step runs
+
+The embedding and the three dense layers run SGLang's modules. Each of the 57 MoE layers is two persistent launches (`minimax_m31/sm103`): MegaAttention (input RMSNorm, the MXFP8 Q/K/V/index projection, head norms and RoPE, the NVFP4 cache writes, the indexer's top-16 pages, the sparse attention, the output projection with its TP4 all-reduce in an NVLink multicast mailbox, the residual add and the post-attention norm), then the token-parallel MoE (the router, the MXFP8 shared expert, the NVFP4 top-4 of 128 routed experts and the TP4 all-reduce). SGLang's final norm and logits processor close the step. The DSpark draft's block runs the draft backbone: the embedding, the five dense layers and the final norm in one cooperative launch; SGLang's draft head samples it. Prefill, plain decode and batches of more than one request run SGLang's standard path.
+
+The kernels read SGLang's weights, KV pages and step data in place, except the routed experts: the plugin keeps a copy (54.1 GiB a GPU) in its own layout, recovered from the `flashinfer_trtllm_routed` layout SGLang keeps for its own path.
+
 ### Design
 
 - **Built at load.** Buffers, kernels and tactics for every covered width are allocated and compiled when the model is loaded, before the KV cache is sized. Nothing is compiled or allocated inside a step.
@@ -182,7 +189,9 @@ With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_
   a deadline below SGLang's watchdog. A rank that misses it faults at address
   0x0, so no token from a failed step is returned. Kimi K3 validates SGLang's
   finite build deadline and compiles it into all six reachable TP8 remote-wait
-  paths; expiry likewise stores through address 0x0 and traps.
+  paths; expiry likewise stores through address 0x0 and traps. MiniMax-M3.1's
+  three kernels compile SGLang's deadline into every poll on another GPU and trap
+  when it expires.
 - **No silent fallback.** With `--enable-nvidia-megakernel`, an unsupported setup stops the server at startup, before the weights load, listing every reason; a model the loaded weights do not fit stops every rank after the load.
 
 ## Quick Start
@@ -206,6 +215,7 @@ With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_
   wheel trio and the private ABI used by its prepared kernels. The general
   dependency list above is not a promise of compatibility with arbitrary newer
   versions; see `sgl_nvidia_mega/kimi_k3/compat.py`.
+- MiniMax-M3.1-Flash: 4 x GB300, a CUDA toolkit (`nvcc`) >= 13.4 at `CUDA_HOME`, and the MSA kernels SGLang's MiniMax-M3.1 support imports
 
 ### Installation
 
@@ -301,6 +311,25 @@ On two trays (GB300 NVL72, Rubin VR NVL72), launch the same command on each tray
 The GLM-5.3 megakernel serves MTP with 3 draft steps (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`, as above) or 5 (`--speculative-num-steps 5 --speculative-num-draft-tokens 6`) at TP8, and 2 to 5 draft steps at TP4 (`--tp-size 4`); any other draft length stops the server at startup, naming the served values.
 
 At TP8 the GLM-5.3 megakernel covers verify steps of up to 16 rows: 1 to 4 requests with 4 draft tokens, 1 or 2 with 6 (at TP4 up to 48 rows); larger steps run SGLang's path while its derived weight copies (about 20 GiB per GPU, logged at startup) still take KV-cache memory, so it helps little on high-concurrency servers, and the server warns when `--max-running-requests` is set above 8.
+
+MiniMax-M3.1-Flash:
+
+```bash
+CUDA_HOME=/usr/local/cuda-13.4 SGLANG_FORCE_COARSE_WAR_BARRIER=1 \
+python -m sglang.launch_server \
+  --model-path MiniMaxAI/MiniMax-M3.1-Flash --trust-remote-code \
+  --tp 4 \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --page-size 128 \
+  --speculative-algorithm DSPARK --speculative-use-block-verification \
+  --speculative-num-steps 1 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7 \
+  --disable-attn-tp-gather \
+  --mem-fraction-static 0.8 \
+  --enable-nvidia-megakernel
+```
+
+MegaAttention keeps all 148 of its CTAs resident: `SGLANG_FORCE_COARSE_WAR_BARRIER=1` (or `--disable-overlap-schedule`) keeps the next batch's preparation kernels from running beside it, and the GPUs must not be shared.
 
 ### Kimi K3 optional startup providers
 
@@ -406,7 +435,8 @@ sgl-nvidia-mega/
 │   │   └── sm103/           # kernels and the build-time runner; no SGLang imports
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
 │   ├── glm5_3/            # GLM-5.3 and GLM-5.2: the same layout (spec, plan, runtime, boundary, attention, moe, logits, sm103)
-│   └── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   ├── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   └── minimax_m31/          # the MiniMax-M3.1 specs, verify and draft steps, weights and SM103 kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
     ├── unit/              # plugin contracts and setup checks; selected CUDA metadata/graph cases
@@ -436,6 +466,8 @@ Additional manual test coverage:
 The DeepSeek-V4.1-Flash TP8 + EP2 kernel tests (`test_deepseek_v41_moe_ep.py`, `test_deepseek_v41_hop_b.py`, `test_deepseek_v41_hops.py`, `test_deepseek_v41_draft_hop.py`, and `test_deepseek_v41_draft.py -k ranks`) run on both trays under a two-node torchrun (`--nnodes 2 --nproc-per-node 4 -m pytest <file> -s`).
 
 Qwen3.5 runs TP8, which spans two GB300 trays: its e2e tests read a server launched on them through `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` and the files its ranks log to (`SGLANG_NVIDIA_MEGAKERNEL_E2E_LOGS`, comma-separated).
+
+MiniMax-M3.1-Flash's suites (`test_minimax_m31_*`) run on 4 x GB300 with a CUDA 13.4 toolkit at `CUDA_HOME`; its serving tests launch the checkpoint at `SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH`.
 
 GLM-5.3 GPU and end-to-end suites are not yet part of the initial CI workflow.
 The GLM-5.3 CPU config and SGLang contract checks are included in `test/unit`.

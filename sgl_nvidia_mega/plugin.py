@@ -28,6 +28,12 @@ SPECS = (
     # the NextN draft (ModelConfig names a GLM draft's architecture this way)
     ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
     ("MuseSparkForConditionalGeneration", "sgl_nvidia_mega.muse_spark.spec:SPEC"),
+    # MiniMax-M3.1-Flash (NVFP4) and its DSpark draft
+    (
+        "MiniMaxM3SparseForConditionalGeneration",
+        "sgl_nvidia_mega.minimax_m31.spec:SPEC",
+    ),
+    ("DSparkMiniMaxDraftModel", "sgl_nvidia_mega.minimax_m31.draft:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
