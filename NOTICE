@@ -69,3 +69,42 @@ moe_x_kernels/custom_pipeline.py carries the same BSD-3-Clause notice. The TGV B
 and NOTICE are kept in components/include/LICENSE.flashinfer and NOTICE.flashinfer; the
 license texts that FlashInfer's NOTICE refers to (CUTLASS, FlashAttention-3, fmt, spdlog) are kept
 unchanged in components/include/licenses/, copied from FlashInfer v0.7.1.
+
+Portions of the Kimi K3 kernels are adapted from vLLM
+(https://github.com/vllm-project/vllm, Apache License 2.0, Copyright contributors
+to the vLLM project), commit 642c18d64c4cb6db3ded8fbe1786718cd4005fcb:
+sgl_nvidia_mega/kimi_k3/cutedsl/gemm/splitk_tmem8.py and splitk_tmem64.py
+build on vLLM's SplitKGemm (which vLLM adapted from FlashInfer
+v0.7.0.post1 dense_bf16_gemm_sm100_splitk.py); moe/wide_plan.py reuses methods
+of vLLM's ExpertsPlanKernel; and
+the vendored rubin/ package holds vLLM files, unmodified or modified, and NVIDIA
+files with portions adapted from vLLM. Each file names its origin in its header;
+THIRD_PARTY_NOTICES.txt lists them.
+
+Portions of the Kimi K3.1 code are adapted from other projects. Each file names its
+origin in its header, and THIRD_PARTY_NOTICES.txt lists the files and the terms:
+
+- sgl_nvidia_mega/kimi_k31/dsa/dg_logits.cuh is DeepGEMM's
+  deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh from sgl-deep-gemm
+  0.2.3.post2 with additions marked "K3.1:" (MIT License, Copyright (c) 2025
+  DeepSeek). The MIT License text is in THIRD_PARTY_NOTICES.txt.
+- sgl_nvidia_mega/kimi_k31/dsa/dg_include/deep_gemm/ holds unmodified copies of the
+  sgl-deep-gemm 0.2.3.post2 headers that dg_logits.cuh includes (MIT License,
+  Copyright (c) 2025 DeepSeek); dg_include/README.md names their origin.
+- sgl_nvidia_mega/kimi_k31/dsa/x47960/ holds a modified copy of SGLang's DeepSeek-V4
+  top-k kernels from public SGLang commit b2833196d8 (Apache License 2.0, Copyright
+  SGLang Team); its __init__.py lists the six local edits, each marked "k31 edit" in
+  the files. topk_v2_tkpush.cuh there is a second copy of topk_v2.cuh with further
+  NVIDIA additions marked "k31 TKPUSH", also listed in __init__.py. That code credits
+  vLLM's csrc/persistent_topk.cuh (Apache License 2.0, Copyright contributors to the
+  vLLM project) and FlashInfer's include/flashinfer/topk.cuh (Apache License 2.0).
+- The exact top-k merge in sgl_nvidia_mega/kimi_k31/dsa/tsi.cuh, and select_kth and
+  the (score, position) key in tsim.cuh and tsim_lean.cuh next to it, are adapted from
+  SGLang's python/sglang/kernels/jit/csrc/dsa/dcp_topk_merge.cuh at commit
+  f3532057e15f (Apache License 2.0).
+- sgl_nvidia_mega/kimi_k31/dsa/gvr2/ holds FlashInfer's gvr_2 top-k
+  (flashinfer/topk_varlen/kernels/gvr2_topk_{host,decode}.py, Apache License 2.0),
+  which FlashInfer ported from TensorRT-LLM pull request 17821 (Apache License 2.0,
+  Copyright (c) 2026 NVIDIA CORPORATION). The host file is unmodified; the decode
+  file carries an NVIDIA modification marked in the file. THIRD_PARTY_NOTICES.txt
+  names the exact FlashInfer revision.
