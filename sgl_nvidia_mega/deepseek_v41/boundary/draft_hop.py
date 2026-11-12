@@ -44,6 +44,11 @@ class DraftHop:
         # target, so the draft skips its hc_combine launch
         self.final_collapse = final_collapse
 
+    @property
+    def mailbox(self):
+        """The draft's ``AllReduceMHC`` (slot wo_b_publish_split publishes into it)."""
+        return self._hop
+
     def collect(self, partial, residual, post_mix, comb, pre, norm_weight, eps):
         """(updated streams, normed FFN input) of the TP-partial ``partial``."""
         return self._hop(partial, residual, post_mix, comb, pre, norm_weight, eps)

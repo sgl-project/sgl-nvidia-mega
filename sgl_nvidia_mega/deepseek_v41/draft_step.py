@@ -165,6 +165,11 @@ class DraftDecode(DraftProposal):
         if "draft_stage0_table" in slots:
             self._stage0_reason = _stage0_reason(stages, self._attn)
             self._stage0_wanted = not self._stage0_reason
+        # slot wo_b_publish_split: the stages' wo_b on muLLM's split-K kernel, publishing
+        # into the draft hop's mailbox (with the fused wo_a's MXFP8 rows)
+        self._wo_b_split = None
+        if hop is not None and "wo_b_publish_split" in slots and self._attn:
+            self._wo_b_split = _wo_b_split(stages, self._attn, hop)
         self.slot_states = draft_slots.states(self, slots)
         draft_slots.warn_declined(self.slot_states)
 
@@ -428,6 +433,31 @@ def _prenorm(slots) -> bool:
     if why := prenorm.reason():
         raise RuntimeError(f"NVIDIA megakernel: slot draft_prenorm: {why}")
     return True
+
+
+def _wo_b_split(stages, kernels, hop):
+    """Slot wo_b_publish_split on the draft: each stage whose wo_a is the fused kernel
+    gets the split publisher on the draft hop's mailbox (its wo_b repacked here); raises
+    when a stage's wo_b cannot be repacked (a load-time fact alike on every rank)."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.runner import SplitPublisher
+
+    split = SplitPublisher(hop.mailbox, "draft hop")
+    for stage in stages:
+        k = kernels.get(stage.layer_id)
+        if k is None or not k.wo_a:
+            continue
+        if why := split.add(stage.self_attn.wo_b):
+            raise RuntimeError(
+                f"NVIDIA megakernel: slot wo_b_publish_split, draft stage "
+                f"{stage.layer_id}: {why}"
+            )
+        kernels[stage.layer_id] = k._replace(wo_b_split=split)
+    if not len(split):
+        return None
+    logger.info(
+        "NVIDIA megakernel: slot wo_b_publish_split repacked %d draft wo_b", len(split)
+    )
+    return split
 
 
 # slot draft_embed before its first forward: SGLang attaches the target's embedding to

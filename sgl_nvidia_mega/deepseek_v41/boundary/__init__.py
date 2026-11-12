@@ -73,6 +73,7 @@ def build(model, ctx, group) -> Boundaries:
             hop_b_quad_trigger="hop_b_quad_trigger" in runtime.SLOTS,
             mbarrier_exchange="hop_mbar" in runtime.SLOTS,
             final_collapse="hop_final_collapse" in runtime.SLOTS,
+            wo_b_split="wo_b_publish_split" in runtime.SLOTS,
         )
     two_shot, two_shot_reason = None, "stock (slot off)"
     if "two_shot" in runtime.SLOTS:
