@@ -87,7 +87,7 @@ def _forward(built, stages, slots, name):
         "draft_final_collapse",
     ):
         return _boundary(built, stages, name)
-    if name in ("draft_moe", "draft_gate"):
+    if name in ("draft_moe", "draft_gate", "draft_shared_ll"):
         return _moe(built, name)
     if name == "draft_tail":
         return BUILT, "BF16 streams into hc_combine"
@@ -162,6 +162,15 @@ def _moe(built, name):
         return DECLINED, getattr(moe, "reason", "") or "no stage built"
     if name == "draft_moe":
         return BUILT, f"routed pair in stages {sorted(slots)}"
+    if name == "draft_shared_ll":
+        shared = sorted(i for i, s in slots.items() if s.shared is not None)
+        if not shared:
+            return DECLINED, moe.shared_reason or "no stage took it"
+        fold = any(slots[i].shared.fold is not None for i in shared)
+        return BUILT, (
+            f"shared expert gate_up on the low-latency GEMM in stages {shared}"
+            + (", SwiGLU folded" if fold else "")
+        )
     gated = sorted(i for i, s in slots.items() if s.gate)
     if not gated:
         return DECLINED, "the fast top-k applies to no stage"

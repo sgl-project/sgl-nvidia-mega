@@ -123,6 +123,7 @@ DRAFT_SLOTS = frozenset(
         "markov_tail",
         "draft_final_collapse",
         "draft_stage0_table",
+        "draft_shared_ll",
     }
 )
 # Slots that run only when listed, except those in DEFAULT_ON_SLOTS (draft_embed: the
@@ -208,7 +209,10 @@ DRAFT_SLOTS = frozenset(
 # the window K/V rows from a per-token table (draft_stage0.py; design derived from
 # TensorRT-LLM's DSpark stage-0 token table), filled by the live kernels at the first eager
 # forward and checked bit for bit per width before a step takes it (bitwise; ~1.1 GiB a
-# GPU at TP8)
+# GPU at TP8); draft_shared_ll: the draft stages' shared expert as slot shared_ll runs the
+# target's (gate_up on the low-latency GEMM, with shared_fold* folding the SwiGLU and
+# down_proj's quant; following muLLM's draft MoE; not bitwise: summation order, so the
+# draft's tokens may change, the target's verify stays exact)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -233,6 +237,7 @@ OPT_IN_SLOTS = (
     "markov_tail",
     "draft_final_collapse",
     "draft_stage0_table",
+    "draft_shared_ll",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -305,6 +310,8 @@ def slot_reasons() -> list[str]:
         ("markov_tail", "markov"),
         ("draft_final_collapse", "draft_hop"),
         ("draft_stage0_table", "draft_swapab"),
+        ("draft_shared_ll", "draft_moe"),
+        ("draft_shared_ll", "shared_ll"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),
