@@ -35,11 +35,11 @@ def test_the_slot_needs_gate_route(monkeypatch):
 
 
 def test_built_only_with_the_quant_kernel():
-    def bound(kernel):
+    def bound(kernel, router=None):
         gemm = SimpleNamespace(
             gate_route_kernel=object(), gemm2_pipe=None, gate_route_quant_kernel=kernel
         )
-        slot = SimpleNamespace(gemm=gemm, shared=None, gate=True)
+        slot = SimpleNamespace(gemm=gemm, shared=None, gate=True, router=router)
         return {
             "moe": SimpleNamespace(slots={3: slot}),
             "attention": {},
@@ -51,6 +51,25 @@ def test_built_only_with_the_quant_kernel():
     facts = SimpleNamespace(routed=True)
     assert runtime.built_slots({}, bound(object()), facts)["gate_route_quant"]
     assert not runtime.built_slots({}, bound(None), facts)["gate_route_quant"]
+    # slot gate_route_early: built where a layer's early router built
+    assert not runtime.built_slots({}, bound(object()), facts)["gate_route_early"]
+    assert runtime.built_slots({}, bound(object(), object()), facts)["gate_route_early"]
+
+
+def test_gate_route_early_is_opt_in_and_needs_gate_route(monkeypatch):
+    assert "gate_route_early" in runtime.OPT_IN_SLOTS
+    assert "gate_route_early" not in runtime.SHIPPED_SLOTS
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"moe", "gate", "gate_route_early"})
+    )
+    assert any(
+        "'gate_route_early' needs slot 'gate_route'" in r
+        for r in runtime.slot_reasons()
+    )
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"moe", "gate", "gate_route", "gate_route_early"})
+    )
+    assert not any("gate_route_early" in r for r in runtime.slot_reasons())
 
 
 class _Gemm:

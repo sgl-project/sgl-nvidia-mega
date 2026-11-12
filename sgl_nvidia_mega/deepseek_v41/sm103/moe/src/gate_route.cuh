@@ -18,7 +18,10 @@
 // PDL: dependents (GEMM1) launch at once and read the record after their own wait. The
 // static biases are read before this kernel's grid-dependency wait; the logits, the valid
 // row count and the token ids after it, as independent loads. No global access touches
-// the outputs before the wait.
+// the outputs before the wait. GATE_ROUTE_RELEASE moves that release (slot
+// gate_route_early, whose router launches this kernel early): 1 = right after the
+// grid-dependency wait, 2 = not at all (dependents launch at this grid's completion, as
+// TensorRT-LLM's one-cluster route); 0 (default) = at entry.
 //
 // kQuant (slot gate_route_quant): CTA r also writes row r of the routed input x as MXFP8
 // (route_quant.cuh, FlashInfer's linear-layout quant bit for bit), so GEMM1 reads it from
@@ -31,6 +34,10 @@
 #include "gate_topk.cuh"
 #include "route.cuh"
 #include "route_quant.cuh"
+
+#ifndef GATE_ROUTE_RELEASE
+#define GATE_ROUTE_RELEASE 0
+#endif
 
 namespace {
 
@@ -63,7 +70,9 @@ __device__ __forceinline__ void GateRoute(
   constexpr int kPasses = (route_quant::kFragments + kQuantThreads - 1) / kQuantThreads;
   static_assert(!kQuant || (kQuantThreads > 0 && kQuantThreads % 32 == 0 && route_quant::kFragments % 32 == 0),
                 "the quant needs whole warps beside warp 0");
+#if GATE_ROUTE_RELEASE == 0
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   DSV41_STAMP(0);
   __shared__ GateScratch<kExperts, kTopK> scratch;
   __shared__ route::Scratch route_scratch;
@@ -94,6 +103,9 @@ __device__ __forceinline__ void GateRoute(
   const float b_alt = bias_alt != nullptr ? bias_alt[e] : b_main;
 #endif
   asm volatile("griddepcontrol.wait;" ::: "memory");
+#if GATE_ROUTE_RELEASE == 1
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   DSV41_STAMP(1);
 #ifdef GATE_ROUTE_BIAS_AFTER_WAIT
   const float b_main = bias[e];
