@@ -50,6 +50,10 @@ FX_WARP_SPANS = 4  # kFxWarpSpans: a warp holds at most four 64-value spans
 # graph/cycle_batched.py): K / splits >= 128 * ceil(MAX_GROUPS / 4) with MAX_GROUPS = 6
 WO_B_SPLITS = 4
 _MIN_SPLIT_INPUTS = 128 * 2
+# A default start (no slot list) takes the slot only up to this many wo_b inputs per rank:
+# attention TP8's 1024, where it measured faster served; at TP4's 2048 it measured slower
+# (batch 1, greedy, fixed routing: +94 us per verify step against the low-latency GEMM)
+DEFAULT_MAX_INPUTS = 1024
 
 
 def splits(k: int) -> int:

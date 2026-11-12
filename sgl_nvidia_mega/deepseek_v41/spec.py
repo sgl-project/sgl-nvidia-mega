@@ -219,8 +219,15 @@ NUMERICS = Numerics(
             if {"attn_qkv_a", "draft_qkv_a_ll"} & SLOTS
             else {"attn.kv.max_abs": 0.0}
         ),
-        # wo_b's published partial, as FlashInfer's low-latency GEMM writes it
-        "wo_b.partial.max_abs": 0.0,
+        # wo_b's published partial, as FlashInfer's low-latency GEMM writes it; with slot
+        # wo_b_publish_split (a numerics change) muLLM's split-K FP8 projection against
+        # that GEMM on the same bytes, relative RMS (test_deepseek_v41_wo_b_split.py:
+        # 0 to 5e-5 at K 1024 and 2048, 1-8 rows; 1.64e-3 to 1.69e-3 against fp64 for both)
+        **(
+            {"wo_b.partial.rel": 5e-5}
+            if "wo_b_publish_split" in SLOTS
+            else {"wo_b.partial.max_abs": 0.0}
+        ),
         # the router's expert ids and weights, as moe_fused_gate picks them
         "gate.topk.max_abs": 0.0,
         # the prefetched Engram WKV rows, as SGLang's inline lookup + WKV writes them
@@ -266,6 +273,16 @@ NUMERICS = Numerics(
         # slot target_lm_head_mxfp8: the same check on the MXFP8 stream, whose weight is
         # the shard quantized (test_deepseek_v41_lm_head_mxfp8.py)
         "target_lm_head_mxfp8.logits.rel": 4e-2,
+        # slot attn_q_cluster (a numerics change): the query against attn_q_norm_gemm's
+        # pair on the same input, in BF16 ulps (test_deepseek_v41_q_cluster.py bounds it
+        # at 64; one of four runs reached 128 at 7 rows), and its error against fp64
+        # within 5 % of the pair's
+        "attn.q_cluster.bf16_ulp": 128,
+        "attn.q_cluster.rel_vs_pair_error": 1.05,
+        # slot attn_core_lean (opt-in, a numerics change): the core's output against an
+        # fp64 attention over the v41_new bytes it reads, relative RMS
+        # (test_deepseek_v41_core_lean.py: 0.0021 to 0.0023 measured)
+        "attn.core_lean.rel_fp64": 4e-3,
     },
 )
 

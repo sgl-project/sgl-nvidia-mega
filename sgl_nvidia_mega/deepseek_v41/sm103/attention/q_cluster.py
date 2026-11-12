@@ -43,6 +43,10 @@ CLUSTER = (SPLITS, 4, 1)  # two K splits of four 64-column tiles
 TILE_N = 64
 FIT_N = 4096  # the fit entry's width: 16 clusters of 8 run as 15
 FIT_TILES = 60
+# A default start (no slot list) takes the slot only up to this many local heads: attention
+# TP8's 8, where it measured faster served; at TP4's 16 it measured slower (batch 1,
+# greedy, fixed routing: +21 us per verify step)
+DEFAULT_MAX_HEADS = 8
 THREADS, FIT_THREADS = 256, 320
 
 

@@ -56,9 +56,10 @@ def test_built_only_with_the_quant_kernel():
     assert runtime.built_slots({}, bound(object(), object()), facts)["gate_route_early"]
 
 
-def test_gate_route_early_is_opt_in_and_needs_gate_route(monkeypatch):
-    assert "gate_route_early" in runtime.OPT_IN_SLOTS
-    assert "gate_route_early" not in runtime.SHIPPED_SLOTS
+def test_gate_route_early_runs_by_default_and_needs_gate_route(monkeypatch):
+    assert "gate_route_early" in runtime.DEFAULT_ON_SLOTS
+    assert "gate_route_early" in runtime.SHIPPED_SLOTS
+    assert "gate_route_early" not in runtime.OPT_IN_SLOTS
     monkeypatch.setattr(
         runtime, "SLOTS", frozenset({"moe", "gate", "gate_route_early"})
     )

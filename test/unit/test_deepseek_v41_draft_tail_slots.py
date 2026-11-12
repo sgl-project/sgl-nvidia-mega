@@ -23,10 +23,13 @@ SLOTS = ("markov_tail", "draft_final_collapse")
 
 
 @pytest.mark.parametrize("slot", SLOTS)
-def test_the_slots_are_opt_in_draft_slots(slot):
-    assert slot in runtime.OPT_IN_SLOTS
+def test_the_slots_are_draft_slots(slot):
     assert slot in runtime.DRAFT_SLOTS
-    assert slot not in runtime.SHIPPED_SLOTS
+    # markov_tail runs by default; draft_final_collapse has no resolved served gain
+    if slot == "markov_tail":
+        assert slot in runtime.DEFAULT_ON_SLOTS and slot not in runtime.OPT_IN_SLOTS
+    else:
+        assert slot in runtime.OPT_IN_SLOTS and slot not in runtime.SHIPPED_SLOTS
 
 
 @pytest.mark.parametrize(
@@ -35,7 +38,9 @@ def test_the_slots_are_opt_in_draft_slots(slot):
 def test_the_slots_need_their_prerequisite(monkeypatch, slot, needs):
     monkeypatch.setattr(runtime, "SLOTS", frozenset({slot}))
     assert any(f"'{slot}' needs slot '{needs}'" in r for r in runtime.slot_reasons())
-    monkeypatch.setattr(runtime, "SLOTS", frozenset({slot, needs, "draft_post", "draft"}))
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({slot, needs, "draft_post", "draft"})
+    )
     assert not any(slot in r for r in runtime.slot_reasons())
 
 

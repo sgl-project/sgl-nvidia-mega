@@ -17,10 +17,11 @@ from sgl_nvidia_mega.deepseek_v41 import draft_slots  # noqa: E402
 SLOT = "draft_shared_ll"
 
 
-def test_the_slot_is_an_opt_in_draft_slot():
-    assert SLOT in runtime.OPT_IN_SLOTS
+def test_the_slot_is_a_default_draft_slot_labelled_numerics():
+    assert SLOT in runtime.DEFAULT_ON_SLOTS
     assert SLOT in runtime.DRAFT_SLOTS
-    assert SLOT not in runtime.SHIPPED_SLOTS
+    assert SLOT in runtime.NUMERICS_CHANGE_SLOTS
+    assert SLOT not in runtime.OPT_IN_SLOTS
 
 
 @pytest.mark.parametrize("needs", ["draft_moe", "shared_ll"])
