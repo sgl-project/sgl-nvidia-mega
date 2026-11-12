@@ -156,6 +156,11 @@ DRAFT_SLOTS = frozenset(
 # input's MXFP8 quant (FlashInfer's linear-layout mxfp8_quantize bit for bit,
 # sm103/moe/src/route_quant.cuh), so the MoE half forks no routed-quant stream and the
 # top-k launches as the router's programmatic dependent, target and draft (bitwise);
+# gate_route_early: SGLang's tensor-core router GEMM (tiny_gemm_bf16's MMA kernel, on its
+# own schedule) rebuilt in the plugin (sm103/moe/src/router_mma.cu) to release that
+# launch once its weight loads are issued, not after its cluster reduction, so the
+# top-k's setup runs beside the GEMM; target and draft, bitwise (build checks the logits
+# against tiny_gemm_bf16);
 # markov_pdl: the draft's Markov chain launched as a programmatic dependent of the draft
 # LM head, loading its head tiles before the wait, the anchors staged before the LM head;
 # markov_lowlat: the Markov chain's low-latency exchange, converged pollers and acquire
@@ -201,6 +206,7 @@ OPT_IN_SLOTS = (
     "draft_lm_head_mxfp8",
     "swapab_h8",
     "wo_a_g1",
+    "gate_route_early",
     "markov_pdl",
     "attn_index_q_first",
     "attn_index_weights_bf16",
@@ -257,6 +263,7 @@ def slot_reasons() -> list[str]:
         ("gate_wide", "gate"),
         ("gate_route", "gate"),
         ("gate_route_quant", "gate_route"),
+        ("gate_route_early", "gate_route"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
         ("attn_indexer", "attn"),
@@ -414,6 +421,11 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         # slot gate_route_quant: that launch's build that quantizes the routed input
         "gate_route_quant": any(
             getattr(slot.gemm, "gate_route_quant_kernel", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
+        # slot gate_route_early: a layer's router GEMM built to release the top-k early
+        "gate_route_early": any(
+            getattr(slot, "router", None) is not None
             for slot in getattr(bound["moe"], "slots", {}).values()
         ),
         # slot gemm2_pipe: a layer's GEMM2 on the pipelined build
@@ -641,7 +653,8 @@ def build(model, ctx):
             f"NVIDIA megakernel: requested slots {missing} built at no width "
             f"(hop A: {facts.hop_a_reason or 'built'}; MoE: "
             f"{getattr(bound['moe'], 'reason', '') or 'built'}; shared_ll: "
-            f"{getattr(bound['moe'], 'shared_reason', '') or 'built'}; embedding: "
+            f"{getattr(bound['moe'], 'shared_reason', '') or 'built'}; early router: "
+            f"{getattr(bound['moe'], 'router_reason', '') or 'built'}; embedding: "
             f"{embed_reason or 'built'}; Engram prefetch: {engram.reason or 'built'})"
         )
     # the requested slots that serve: a slot built but not requested (hop_mbar,

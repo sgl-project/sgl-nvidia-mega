@@ -82,12 +82,17 @@ class _GateTopK(msgspec.Struct):
 class MoeSlot:
     """One MoE layer's routed-expert pair: the router's top-k (fast gate) and the
     routed experts, returning SGLang's deferred-finalize output; with slot shared_ll,
-    its shared expert on the low-latency GEMM (``shared``, else None)."""
+    its shared expert on the low-latency GEMM (``shared``, else None); with slot
+    gate_route_early, the router GEMM that releases the top-k once its weight loads are issued (``router``,
+    an ``EarlyRouter``, else None)."""
 
-    def __init__(self, mlp: torch.nn.Module, gemm, *, gate: bool, shared=None):
+    def __init__(
+        self, mlp: torch.nn.Module, gemm, *, gate: bool, shared=None, router=None
+    ):
         from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
 
         self.mlp, self.gemm, self.gate, self.shared = mlp, gemm, gate, shared
+        self.router = router
         config = mlp.topk.topk_config
         self.scale = (
             float(config.routed_scaling_factor)
@@ -131,6 +136,21 @@ class MoeSlot:
             router_logits, self.bias, self.scale, num_token_non_padded, alt, eps
         )
 
+    def early_router(self, x: torch.Tensor, input_ids_global, use_vision_topk: bool):
+        """Slot gate_route_early serves this call: the layer's early router (else None),
+        only where the one-launch top-k + route (gate_route) follows it, which reads the
+        logits after its PDL wait."""
+        if (
+            self.router is None
+            or not self.gate
+            or not self.router.serves(x)
+            or not self.gemm.serves_gate_route(
+                x.shape[0], input_ids_global if use_vision_topk else None
+            )
+        ):
+            return None
+        return self.router
+
     def quant_in_gate(
         self, x: torch.Tensor, input_ids_global, use_vision_topk: bool
     ) -> bool:
@@ -148,9 +168,17 @@ class MoeSlot:
             )
         )
 
-    def run(self, x: torch.Tensor, topk_output, pre_quant_input, quant_in_gate=False):
+    def run(
+        self,
+        x: torch.Tensor,
+        topk_output,
+        pre_quant_input,
+        quant_in_gate=False,
+        early=False,
+    ):
         """``quant_in_gate`` (``quant_in_gate``'s answer, no ``pre_quant_input``): the
-        top-k launch writes the routed input's MXFP8 (slot gate_route_quant)."""
+        top-k launch writes the routed input's MXFP8 (slot gate_route_quant); ``early``:
+        the early router (``early_router``) launched the logits (slot gate_route_early)."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
         )
@@ -189,6 +217,7 @@ class MoeSlot:
                 renormalize_epsilon=topk_output.eps,
                 **({"ids_out": self.ids_out} if self.ids_out is not None else {}),
                 **({"x": x} if quant_in_gate else {}),
+                early=early,
             )
             persistent = self.ids_out is not None
         else:
@@ -212,11 +241,13 @@ class MoeSlot:
 
 class Bound(msgspec.Struct):
     """``moe.build``'s result: the slot of each layer whose pair built, by layer id,
-    and why none was built ("" when built); why no shared expert took slot shared_ll."""
+    and why none was built ("" when built); why no shared expert took slot shared_ll;
+    why a layer's router did not take slot gate_route_early ("" when every one did)."""
 
     slots: dict = msgspec.field(default_factory=dict)
     reason: str = ""
     shared_reason: str = ""
+    router_reason: str = ""
 
 
 def shared_topk_slots(config) -> int:
@@ -289,6 +320,7 @@ def build_layers(
     widths=(),
     gate_route: bool | None = None,
     gate_route_quant: bool | None = None,
+    gate_route_early: bool | None = None,
     gemm2_pipe: bool = False,
     gemm2_registers: int = 0,
 ) -> Bound:
@@ -298,13 +330,16 @@ def build_layers(
     those layers too, or none takes it. ``gate_route`` (default: slot gate_route
     requested): the fast top-k and the route record in one launch at 1-8 rows;
     ``gate_route_quant`` (default: slot gate_route_quant requested): that launch also
-    quantizes the routed input."""
+    quantizes the routed input; ``gate_route_early`` (default: slot gate_route_early
+    requested): the router GEMM ahead of that launch releases it once its weight loads are issued."""
     from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
 
     if gate_route is None:
         gate_route = "gate_route" in SLOTS
     if gate_route_quant is None:
         gate_route_quant = "gate_route_quant" in SLOTS
+    if gate_route_early is None:
+        gate_route_early = "gate_route_early" in SLOTS
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
     )
@@ -345,6 +380,9 @@ def build_layers(
             slots[i] = MoeSlot(mlp, gemm, gate=gate)
     except Exception as e:  # gathered, then the slot is off on every rank
         reason, slots = f"{type(e).__name__}: {e}", {}
+    router_reason = (
+        _bind_router(slots) if gate_route_early and gate_route else "not requested"
+    )
     shared_reason = _bind_shared(slots, widths) if shared_ll else "not requested"
     shared = sorted(i for i, s in slots.items() if s.shared is not None)
     gathered = [None] * group.world_size
@@ -361,7 +399,37 @@ def build_layers(
         shared_reason = f"the ranks disagree on the shared_ll layers: {gathered}"
         for slot in slots.values():
             slot.shared = None
-    return Bound(slots=slots, reason=reason, shared_reason=shared_reason)
+    return Bound(
+        slots=slots,
+        reason=reason,
+        shared_reason=shared_reason,
+        router_reason=router_reason,
+    )
+
+
+def _bind_router(slots: dict) -> str:
+    """Slot gate_route_early on each built layer whose router takes it (one early router
+    per gate weight); why some did not ("" when all did). Bitwise either way, so the
+    ranks need not agree."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.router_mma import (
+        EarlyRouter,
+        gate_route_release,
+    )
+
+    skipped = {}
+    for i, slot in slots.items():
+        if not slot.gate or slot.gemm.gate_route_kernel is None:
+            skipped[i] = "no gate_route launch follows the router"
+            continue
+        try:
+            slot.router, why = EarlyRouter.build(slot.mlp.gate)
+            if slot.router is not None:
+                slot.gemm.bind_early_release(gate_route_release())
+        except Exception as e:
+            slot.router, why = None, f"{type(e).__name__}: {e}"
+        if why:
+            skipped[i] = why
+    return "; ".join(f"layer {i}: {why}" for i, why in sorted(skipped.items()))
 
 
 def _bind_shared(slots: dict, widths) -> str:

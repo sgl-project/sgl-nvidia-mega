@@ -538,6 +538,13 @@ class Chain:
     # ------------------------------------------------------------------ one half
     def half(self, layer, buf, variant, st):
         a = self.args
+        # "<variant>@<router>": this variant's router in place of --router (sglang, or
+        # mma / mma_early: slot gate_route_early's rebuild of SGLang's MMA router, at
+        # SGLang's release point / once its weight loads are issued); "<router>/<r>": the
+        # fused top-k releases GEMM1 at gate_route.cuh GATE_ROUTE_RELEASE r
+        variant, _, router_override = variant.partition("@")
+        router_override, _, route_release = router_override.partition("/")
+        route_release = int(route_release or 0)
         stream = torch.cuda.current_stream()
         s = stream.cuda_stream
         main = stream
@@ -558,7 +565,33 @@ class Chain:
         self.alt_stream.wait_stream(main)
         self.quant_stream.wait_stream(main)
         router = a.router if not (st and a.router == "sglang") else "replica"
-        if router == "sglang":
+        router = router_override or router
+        if router in ("mma", "mma_early"):
+            from sgl_nvidia_mega.deepseek_v41.sm103.moe import router_mma
+
+            warps, cluster, _ = router_mma.sglang_schedule(ROUTER_EXPERTS, HIDDEN)
+            kernel = router_mma.load_router_mma(
+                self.device.index,
+                ROUTER_EXPERTS,
+                HIDDEN,
+                warps,
+                cluster,
+                router == "mma_early",
+            )
+            reg._launch(
+                kernel,
+                (ROUTER_EXPERTS // 16 * cluster, 1, 1),
+                [
+                    _p(self.x),
+                    _p(layer.w),
+                    _p(buf["logits"]),
+                    ctypes.c_int64(HIDDEN),
+                    ctypes.c_uint32(ROWS),
+                ],
+                s,
+                cluster=(cluster, 1, 1) if cluster > 1 else None,
+            )
+        elif router == "sglang":
             from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 
             _tiny_gemm(tiny_gemm_bf16, self.x, layer.w, buf["logits"], a.router_max_m)
@@ -637,8 +670,13 @@ class Chain:
             if in_gate:
                 name = "gate_route_quant" + tag
                 quant_args = [_p(self.x), _p(x_q), _p(x_s)]
+            kernel = self.k[name]
+            if route_release and not st:
+                kernel = reg.load_gate_route(
+                    self.device.index, quant=in_gate, release=route_release
+                )
             reg._launch(
-                self.k[name],
+                kernel,
                 (ROWS, 1, 1),
                 gate_args
                 + [
@@ -947,6 +985,13 @@ def main():
         args_side = argparse.Namespace(**vars(args))
         args_side.side = [side]
         chain = Chain(args_side)
+        for v in args.variants:  # compile the GEMM1-release builds outside capture
+            release = int(v.partition("@")[2].partition("/")[2] or 0)
+            if release:
+                for quant in (False, True):
+                    reg.load_gate_route(
+                        chain.device.index, quant=quant, release=release
+                    )
         print(
             f"sms {chain.sms} local experts {chain.local} offset {chain.offset} side {side} "
             f"local distinct p50 {statistics.median(chain.local_distinct)} "

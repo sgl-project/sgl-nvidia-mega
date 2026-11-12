@@ -392,13 +392,18 @@ def load_gate_route(
     experts: int = GATE_TOPK_EXPERTS,
     top_k: int = GATE_TOPK_TOP_K,
     quant: bool = False,
+    release: int = 0,
 ) -> _Kernel:
     """The fused top-k + route kernel of the (experts, top_k) router (slot gate_route);
     with ``quant``, the build that also quantizes the routed input (slot gate_route_quant).
-    Built for the installed SGLang's router (``gate_reference``)."""
+    ``release`` (gate_route.cuh GATE_ROUTE_RELEASE): where it releases GEMM1, 0 at entry,
+    1 after its grid-dependency wait, 2 at its completion (behind slot gate_route_early's
+    router). Built for the installed SGLang's router (``gate_reference``)."""
     variants = GATE_ROUTE_QUANT_VARIANTS if quant else GATE_ROUTE_VARIANTS
     name, symbol = variants[(experts, top_k)]
     options = gate_topk_nvrtc_options(experts, top_k)
+    if release:
+        options += (f"-DGATE_ROUTE_RELEASE={release}",)
     device = torch.device("cuda", device_index)
     with torch.cuda.device(device):
         torch.zeros(1, device=device)
@@ -407,7 +412,7 @@ def load_gate_route(
         headers = {h: (SOURCE_DIR / h).read_text() for h in GATE_ROUTE_HEADERS}
         cubin = compile_source(
             source,
-            name,
+            name + (f"_r{release}" if release else ""),
             f"sm_{major}{minor}a",
             options,
             headers=headers,
@@ -610,6 +615,9 @@ class RoutedExpertGemm:
             and (self.router_experts, top_k) in GATE_ROUTE_QUANT_VARIANTS
             else None
         )
+        # slot gate_route_early: the builds above with GEMM1's release moved
+        # (bind_early_release), keyed by quant; empty without the slot
+        self.gate_route_early_kernels: dict = {}
         # route.cu flips bit 31 of this word on every launch.
         self.barrier = torch.zeros(1, dtype=torch.int32, device=w13.device)
         self._tensors = (
@@ -782,6 +790,7 @@ class RoutedExpertGemm:
         renormalize_epsilon: float = 0.0,
         ids_out: Optional[torch.Tensor] = None,
         x: Optional[torch.Tensor] = None,
+        early: bool = False,
     ):
         """``__call__`` from the router's fp32 logits: the router's gate_topk.cuh variant
         does moe_fused_gate's top-k (sqrtsoftplus via log1p, renormalized, scaled), then
@@ -794,6 +803,8 @@ class RoutedExpertGemm:
         one for runtime/bench.py's step stamps), else a new tensor.
         ``x``: the BF16 routed input [rows, HIDDEN] in place of ``x_quant`` / ``x_scale``
         (None): slot gate_route_quant's launch quantizes it (``serves_gate_route_quant``).
+        ``early``: slot gate_route_early's router launched the logits (it releases this
+        launch early), so the one-launch top-k runs its ``bind_early_release`` build.
         Returns (gemm2 rows, top-k weights, slot -> row, top-k ids)."""
         rows = logits.size(0)
         device = logits.device
@@ -837,10 +848,15 @@ class RoutedExpertGemm:
                 if x is not None
                 else []
             )
-            _launch(
+            kernel = (
                 self.gate_route_quant_kernel
                 if x is not None
-                else self.gate_route_kernel,
+                else self.gate_route_kernel
+            )
+            if early and self.gate_route_early_kernels:
+                kernel = self.gate_route_early_kernels[x is not None]
+            _launch(
+                kernel,
                 (rows, 1, 1),
                 gate_args
                 + [
@@ -857,6 +873,24 @@ class RoutedExpertGemm:
             _launch(self.gate_topk_kernel, (rows, 1, 1), gate_args, stream)
             permuted, record = self._route(ids, rows, ctas)
         return self._gemms(x_quant, x_scale, record, ctas), weights, permuted, ids
+
+    def bind_early_release(self, release: int) -> None:
+        """Slot gate_route_early: the one-launch top-k builds (with and without the
+        routed-input quant, where built) that release GEMM1 at ``release``
+        (``load_gate_route``), taken by ``gate_topk_and_gemms(early=True)``."""
+        if self.gate_route_kernel is None:
+            raise ValueError("slot gate_route_early needs the gate_route build")
+        device = self.clamp.device.index
+        kernels = {
+            False: load_gate_route(
+                device, self.router_experts, self.top_k, release=release
+            )
+        }
+        if self.gate_route_quant_kernel is not None:
+            kernels[True] = load_gate_route(
+                device, self.router_experts, self.top_k, quant=True, release=release
+            )
+        self.gate_route_early_kernels = kernels
 
     def serves_gate_route(self, rows: int, input_ids=None) -> bool:
         """Slot gate_route takes this call: 1-8 rows, and every launched row has a token
