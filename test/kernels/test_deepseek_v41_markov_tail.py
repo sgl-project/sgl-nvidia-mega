@@ -79,13 +79,17 @@ def _compare(device, group, rank: int, world: int, seed: int, lowlat: bool) -> d
             if rows > chains[True].max_rows:
                 continue
             sampled = any(t != 0.0 for t in temps[:rows])
-            base = torch.zeros(rows, STEPS, vocab_local, dtype=torch.bfloat16, device=device)
+            base = torch.zeros(
+                rows, STEPS, vocab_local, dtype=torch.bfloat16, device=device
+            )
             anchor = torch.zeros(rows, dtype=torch.int64, device=device)
             out = {}
             graphs = {}
             for tail, chain in chains.items():
                 out[tail] = dict(
-                    tokens=torch.full((MAX_BS, STEPS), -7, dtype=torch.int64, device=device),
+                    tokens=torch.full(
+                        (MAX_BS, STEPS), -7, dtype=torch.int64, device=device
+                    ),
                     cache=torch.zeros(MAX_BS, STEPS, VOCAB, device=device),
                     verify=torch.full(
                         (MAX_BS, STEPS + 1), -9, dtype=torch.int64, device=device
@@ -123,7 +127,7 @@ def _compare(device, group, rank: int, world: int, seed: int, lowlat: bool) -> d
                     block()
                 torch.cuda.current_stream(device).wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                with torch.cuda.graph(graph, stream=side):
                     block()
                 graphs[tail] = graph
             first = set()
@@ -131,7 +135,9 @@ def _compare(device, group, rank: int, world: int, seed: int, lowlat: bool) -> d
                 gen = torch.Generator(device=device).manual_seed(seed * 100_003 + i)
                 full = torch.randn(rows, STEPS, VOCAB, generator=gen, device=device) * 3
                 base.copy_(full[:, :, shard])
-                anchor.copy_(torch.randint(0, VOCAB, (rows,), generator=gen, device=device))
+                anchor.copy_(
+                    torch.randint(0, VOCAB, (rows,), generator=gen, device=device)
+                )
                 for tail in chains:
                     out[tail]["offset"].fill_(1000 + 7 * i)
                     graphs[tail].replay()
@@ -141,7 +147,9 @@ def _compare(device, group, rank: int, world: int, seed: int, lowlat: bool) -> d
                 bad |= not torch.equal(a["verify"], b["verify"])
                 bad |= not torch.equal(a["offset"], b["offset"])
                 bad |= sampled and not torch.equal(a["cache"], b["cache"])
-                bad |= not torch.equal(b["verify"][rows:], torch.full_like(b["verify"][rows:], -9))
+                bad |= not torch.equal(
+                    b["verify"][rows:], torch.full_like(b["verify"][rows:], -9)
+                )
                 if sampled:
                     bad |= int(b["offset"]) != 1000 + 7 * i + 1
                 counts["mismatch"] += int(bad)
@@ -167,7 +175,9 @@ def test_tail_refuses_outputs_without_the_build():
     chain = _make(None, 0, 1, w, w, lowlat=False, tail=False)
     with pytest.raises(AssertionError):
         chain.sample(
-            base_logits=torch.zeros(1, STEPS, VOCAB, dtype=torch.bfloat16, device=device),
+            base_logits=torch.zeros(
+                1, STEPS, VOCAB, dtype=torch.bfloat16, device=device
+            ),
             anchor_tokens=torch.zeros(1, dtype=torch.int64, device=device),
             temperatures=torch.zeros(MAX_BS, device=device),
             logits_cache=None,
@@ -202,6 +212,25 @@ def test_ranks_tail_is_the_chain_and_its_two_launches(ranks, lowlat):
     print(f"rank {rank} world {world} lowlat {lowlat}: {counts}", flush=True)
     assert counts["mismatch"] == 0, counts
     assert counts["distinct"] > counts["blocks"] // 4, counts
+
+
+@needs_gpu
+@pytest.mark.skipif(not _TORCHRUN, reason="runs on every rank of a torchrun job")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second local GPU")
+def test_ranks_graphs_capture_on_the_rank_device(ranks):
+    """torch.cuda.graph's default capture stream is created once per process, on the
+    device current at its first use: cuda:0 when the one-rank cases ran first. The
+    ranks' graphs capture on their own device whatever that stream's device is."""
+    device, group, rank, world = ranks
+    assert hasattr(torch.cuda.graph, "default_capture_stream")
+    saved = torch.cuda.graph.default_capture_stream
+    other = torch.device("cuda", (device.index + 1) % torch.cuda.device_count())
+    torch.cuda.graph.default_capture_stream = torch.cuda.Stream(other)
+    try:
+        counts = _compare(device, group, rank, world, seed=5, lowlat=False)
+    finally:
+        torch.cuda.graph.default_capture_stream = saved
+    assert counts["mismatch"] == 0, counts
 
 
 if __name__ == "__main__":
