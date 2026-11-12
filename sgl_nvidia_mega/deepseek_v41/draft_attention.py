@@ -24,6 +24,7 @@ import torch
 
 from sgl_nvidia_mega.deepseek_v41.attention import chain
 from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a as wo_a_kernel
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -169,6 +170,9 @@ class Kernels(NamedTuple):
     q_norm_gemm: bool = False
     # swap-AB merges its tiles in the kernel where it applies (slot attn_cluster_merge)
     cluster_merge: bool = False
+    # slot attn_core_lean: muLLM's one-launch window core on the v41_new pool, with the
+    # fused wo_a rotating by an identity
+    core_lean: bool = False
 
 
 def wo_a_applies(attn, one_group: bool = False) -> bool:
@@ -218,6 +222,11 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
             and chain.swapab_applies(attn, heads8="swapab_h8" in slots),
             kv_before_wait="draft_swapab" in slots and "kv_before_wait" in slots,
             cluster_merge="draft_swapab" in slots and "attn_cluster_merge" in slots,
+            core_lean="draft_swapab" in slots
+            and "attn_core_lean" in slots
+            and wo_a
+            and attn.n_local_heads == 8
+            and chain.swapab_applies(attn, heads8=True),
             qkv_a=(
                 FusedQkvA(attn.wq_a, attn.wkv, ll="draft_qkv_a_ll" in slots)
                 if fusable
@@ -276,6 +285,8 @@ def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
             wo_a_kernel.precompile(
                 min(max(rows), chain.WO_A_MAX_ROWS), groups=attn.n_local_groups
             )
+        if k.core_lean:
+            core_lean.precompile()
 
 
 def forward(attn, x, positions, fb, *, kernels: Kernels, view):
@@ -288,7 +299,15 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         return torch.zeros_like(x)
     pool = view.kv_pool
     rows = x.shape[0]
-    swapab = kernels.swapab and _swapab_takes(rows, fb, view)
+    lean = (
+        chain.core_lean_caches(attn, view, rows, model="draft")
+        if kernels.core_lean and chain.core_lean_takes(rows, fb, view)
+        else None
+    )
+    if lean is not None and lean.extra is not None:
+        lean = None
+    # the unroped query: swap-AB's or the lean core's
+    swapab = lean is not None or (kernels.swapab and _swapab_takes(rows, fb, view))
     q_padded = q_out = None
     if (
         pool.uniform_fp8
@@ -340,6 +359,22 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         kv = kv_and_store()
         q = _compute_q(attn, x, positions, q_out, qkv_a, kernels, swapab)
 
+    if lean is not None:
+        freqs = torch.view_as_real(attn.freqs_cis).flatten(-2)
+        o = chain.lean_decode(
+            attn,
+            lean,
+            q,
+            positions,
+            freqs,
+            early=kernels.kv_before_wait and store_joined,
+            model="draft",
+        )
+        return _wo_b(
+            attn,
+            _wo_a(attn, o, positions, fb, True, rope=core_lean.identity_rope(rows, o.device)),
+            kernels.wo_b_ll,
+        )
     if swapab:
         freqs = torch.view_as_real(attn.freqs_cis).flatten(-2)
         o = chain.sparse_decode(
@@ -413,8 +448,10 @@ def _compute_q(attn, x, positions, q_out, qkv_a, kernels: Kernels, swapab):
     return q_out
 
 
-def _wo_a(attn, o, positions, fb, fused: bool):
-    """The inverse RoPE + wo_a: fused into wo_b's MXFP8 rows, or SGLang's draft arm."""
+def _wo_a(attn, o, positions, fb, fused: bool, rope=None):
+    """The inverse RoPE + wo_a: fused into wo_b's MXFP8 rows, or SGLang's draft arm.
+    ``rope`` (slot attn_core_lean): the (freqs, positions) the fused kernel rotates by
+    instead of the layer's; no SGLang fallback then."""
     from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
@@ -428,14 +465,18 @@ def _wo_a(attn, o, positions, fb, fused: bool):
         and not get_forward().sp_active
         and 0 < o.shape[0] <= chain.WO_A_MAX_ROWS
     ):
+        if rope is None:
+            rope = (torch.view_as_real(attn.freqs_cis).flatten(1), positions)
         codes, scales = wo_a_kernel.fused_rope_wo_a(
             o.view(o.shape[0], attn.n_local_groups, -1),
             attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1),
-            torch.view_as_real(attn.freqs_cis).flatten(1),
-            positions,
+            rope[0],
+            rope[1],
             early_trigger=True,
         )
         return Mxfp8SwizzledInput(codes, scales)
+    if rope is not None:
+        raise RuntimeError("slot attn_core_lean needs the fused draft wo_a")
     rd = attn.rope_head_dim
     fused_rope_inplace(
         o[..., -rd:], None, attn.freqs_cis, positions=positions, inverse=True

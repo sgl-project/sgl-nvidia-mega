@@ -98,6 +98,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             cluster_merge="attn_cluster_merge" in SLOTS,
             q_cluster="attn_q_cluster" in SLOTS,
             wo_a_fp8="attn_wo_a_fp8" in SLOTS,
+            core_lean="attn_core_lean" in SLOTS,
         )
         if chain_on:
             ops0 = step_.chain[0]
@@ -121,6 +122,10 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
                 q_cluster_on=ops0.q_cluster,
                 wo_a_fp8_on=step_.wo_a_fp8_weight is not None,
             )
+            if step_.core_lean:
+                from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean
+
+                core_lean.precompile()
             kinds[_chain_kind(attn, step_)] += 1
     logger.info(
         "NVIDIA megakernel: attention step in %d layers (%s)%s",
@@ -166,8 +171,12 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
         parts.append("block selection after the attention")
     parts.append("wq_b low-latency 1-48" if step_.chain[0].wq_b_ll else "wq_b SGLang's")
     swapab = (
-        f"swap-AB 1-24 ({attn.n_local_heads} heads)" if step_.swapab else "no swap-AB"
+        f"swap-AB 1-24 ({attn.n_local_heads} heads, V4 KV layout only)"
+        if step_.swapab
+        else "no swap-AB"
     )
+    if step_.core_lean:
+        parts.append("muLLM's one-launch core 1-8 (v41_new KV layout only)")
     if step_.swapab and step_.kv_before_wait and step_.low_ratio:
         swapab += " (KV before the PDL wait)"
         if step_.index_after_wait:
@@ -214,6 +223,8 @@ def _runs_flashmla(st, view, rows: int, ratio: int) -> bool:
         return False
     step_ = st.bound["attention"].get(attn.layer_id)
     if step_ is not None and step_.takes_swapab(rows, st.fb, view):
+        return False
+    if step_ is not None and step_.lean_caches(rows, st.fb, view) is not None:
         return False
     return not sched_ahead.sglang_takes_swapab(attn, view, rows)
 

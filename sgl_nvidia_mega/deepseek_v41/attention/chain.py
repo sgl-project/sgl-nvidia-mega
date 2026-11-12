@@ -21,6 +21,7 @@ import torch
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 from sgl_nvidia_mega.deepseek_v41.attention import ops
 from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean as core_lean_kernel
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_cluster as q_cluster_kernel
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm, swapab
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a as wo_a_kernel
@@ -147,19 +148,109 @@ def fused_wo_a_applies(attn, one_group: bool = False) -> bool:
     )
 
 
+# KV layouts swap-AB declined for, by bytes per window token; each logged once
+_swapab_layout_declines: set[int] = set()
+
+
 def swapab_takes(rows: int, fb, view) -> bool:
     """This step's swap-AB conditions, from host state every rank shares: a decode or
-    verify step of 1-24 rows on the paged V4-layout window cache."""
+    verify step of 1-24 rows on the paged V4-layout window cache. Another layout
+    (``SGLANG_DSV4_KV_LAYOUT=v41_new``) declines, logged once: SGLang's attention runs."""
+    from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
+
+    mode = fb.forward_mode
+    pool = view.kv_pool
+    takes = (
+        0 < rows <= SWAPAB_MAX_ROWS
+        and (mode.is_decode() or mode.is_target_verify())
+        and isinstance(view.metadata.core_attn_metadata, DSV4AttnMetadata)
+        and pool.request_window is None
+    )
+    if not takes:
+        return False
+    width = pool.get_swa_key_bytes_per_token()
+    if width != swapab.LAYOUT.bytes_per_token:
+        if width not in _swapab_layout_declines:
+            _swapab_layout_declines.add(width)
+            logger.info(
+                "NVIDIA megakernel: swap-AB declines: the window KV cache holds %d bytes "
+                "per token (swap-AB reads the V4 layout's %d); SGLang's attention runs "
+                "where slot attn_core_lean does not",
+                width,
+                swapab.LAYOUT.bytes_per_token,
+            )
+        return False
+    return True
+
+
+def core_lean_takes(rows: int, fb, view) -> bool:
+    """Slot attn_core_lean's step conditions (host state every rank shares): a decode
+    or verify step of 1-8 rows on SGLang's v41_new window cache."""
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 
     mode = fb.forward_mode
     pool = view.kv_pool
     return (
-        0 < rows <= SWAPAB_MAX_ROWS
+        0 < rows <= core_lean_kernel.MAX_ROWS
         and (mode.is_decode() or mode.is_target_verify())
         and isinstance(view.metadata.core_attn_metadata, DSV4AttnMetadata)
         and pool.request_window is None
-        and pool.get_swa_key_bytes_per_token() == swapab.LAYOUT.bytes_per_token
+        and not pool.uniform_fp8
+        and pool.get_swa_key_bytes_per_token() == core_lean_kernel.WINDOW_ROW_BYTES
+    )
+
+
+# slot attn_core_lean: declines by reason (logged once each), and engaged calls by
+# (model, kind, rows) (the first of each logged)
+_core_lean_declines: set[str] = set()
+core_lean_captures: dict[tuple[str, str, int], int] = {}
+
+
+def core_lean_caches(attn, view, rows: int, model: str = "target"):
+    """The layer's caches for slot attn_core_lean, or None where the kernel cannot take
+    this call (logged once per reason)."""
+    caches = core_lean_kernel.Caches(*resolve_caches(attn, view, rows))
+    why = core_lean_kernel.reason(rows, attn.n_local_heads, caches)
+    if why:
+        key = f"{model} ratio {attn.compress_ratio}: {why}"
+        if key not in _core_lean_declines:
+            _core_lean_declines.add(key)
+            logger.info(
+                "NVIDIA megakernel: slot attn_core_lean declines %s (layer %d); "
+                "SGLang's attention runs",
+                key,
+                attn.layer_id,
+            )
+        return None
+    return caches
+
+
+def lean_decode(attn, caches, q, positions, freqs, *, early=False, model="target"):
+    """Slot attn_core_lean: the one-launch core (``sm103/attention/core_lean``) on the
+    unroped 8-head ``q``; its output is inverse-roped (wo_a takes ``identity_rope``)."""
+    rows = q.shape[0]
+    if torch.cuda.is_current_stream_capturing():
+        kind = "sparse" if caches.extra is not None else "window"
+        key = (model, kind, rows)
+        core_lean_captures[key] = core_lean_captures.get(key, 0) + 1
+        if core_lean_captures[key] == 1:
+            logger.info(
+                "NVIDIA megakernel: slot attn_core_lean serves the %s %s attention at %d "
+                "rows (first layer %d%s, SGLang's window store joined before the core)",
+                model,
+                kind,
+                rows,
+                attn.layer_id,
+                ", window indices before the PDL wait" if early else "",
+            )
+    return core_lean_kernel.core_lean(
+        q,
+        freqs,
+        positions,
+        attn._local_attn_sink(attn.n_local_heads),
+        caches,
+        attn.softmax_scale,
+        early=early,
     )
 
 
@@ -598,13 +689,23 @@ def wo_a_fp8_weight(attn):
 
 
 def wo_a(
-    attn, o, positions, fb, row_tiles: bool = False, *, fused=None, fp8_weight=None
+    attn,
+    o,
+    positions,
+    fb,
+    row_tiles: bool = False,
+    *,
+    fused=None,
+    fp8_weight=None,
+    rope=None,
 ):
     """The fused inverse RoPE + wo_a + MXFP8 with the early trigger, where SGLang's
     own step fuses them (``fused``: the build's ``fused_wo_a_applies``, default
     SGLang's choice); SGLang's arm otherwise. ``row_tiles`` (past 8 rows, for hop A's
     publishing wo_b only) writes the scales per 8-row tile: a ``RowTileMxfp8``.
-    ``fp8_weight`` (slot attn_wo_a_fp8): the kernel reads that form of wo_a."""
+    ``fp8_weight`` (slot attn_wo_a_fp8): the kernel reads that form of wo_a. ``rope``
+    (slot attn_core_lean): the (freqs, positions) the fused kernel rotates by in place of
+    the layer's (an identity for an already inverse-roped ``o``; no SGLang fallback)."""
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.runtime_context import get_forward
 
@@ -616,13 +717,17 @@ def wo_a(
         and not get_forward().sp_active
         and 0 < o.shape[0] <= WO_A_MAX_ROWS
     ):
+        if rope is not None:
+            raise RuntimeError("slot attn_core_lean needs the fused wo_a")
         return ops.wo_a(attn, o, positions, fb)
     o = o.view(o.shape[0], attn.n_local_groups, -1)
+    if rope is None:
+        rope = (torch.view_as_real(attn.freqs_cis).flatten(1), positions)
     codes, scales = wo_a_kernel.fused_rope_wo_a(
         o,
         attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1),
-        torch.view_as_real(attn.freqs_cis).flatten(1),
-        positions,
+        rope[0],
+        rope[1],
         early_trigger=True,
         row_tile_scales=row_tiles,
         fp8=fp8_weight,

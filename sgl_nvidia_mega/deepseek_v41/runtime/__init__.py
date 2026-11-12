@@ -184,7 +184,12 @@ DRAFT_SLOTS = frozenset(
 # on a stream at the device's highest priority; attn_index_early_trigger: the fused indexer
 # consumer lets the attention launch right after its PDL wait and the attention reads that
 # selection after its own wait; attn_defer_block_select: the candidate source's block
-# selection after the layer's attention, not beside it)
+# selection after the layer's attention, not beside it;
+# attn_core_lean: at 1-8 rows on attention TP8's 8 heads, muLLM's one-launch sparse
+# attention core (cluster merge with the sink and the inverse RoPE in the kernel) in
+# place of swap-AB + combine, target and draft, on SGLang's v41_new KV layout
+# (SGLANG_DSV4_KV_LAYOUT=v41_new; swap-AB reads only the V4 layout), a numerics change:
+# the V4.1 KV encodings, P in BF16, muLLM's split and merge order
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -204,6 +209,7 @@ OPT_IN_SLOTS = (
     "attn_wo_a_fp8",
     "attn_index_early_trigger",
     "attn_defer_block_select",
+    "attn_core_lean",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -302,6 +308,9 @@ def slot_reasons() -> list[str]:
         ("attn_index_early_trigger", "attn_indexer_fused"),
         ("attn_index_early_trigger", "kv_before_wait"),
         ("attn_defer_block_select", "attn_indexer"),
+        ("attn_core_lean", "attn"),
+        ("attn_core_lean", "swapab_h8"),
+        ("attn_core_lean", "wo_a_g1"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -555,6 +564,8 @@ def build(model, ctx):
             getattr(a, "wo_a_fp8_weight", None) is not None
             for a in bound["attention"].values()
         ),
+        # muLLM's one-launch core: 8 local heads with the fused wo_a
+        "attn_core_lean": any(a.core_lean for a in bound["attention"].values()),
         # the query's cluster launch: a chain with the low-latency wq_b, 1-8 rows
         "attn_q_cluster": any(w <= 8 for w in pctx.widths)
         and any(

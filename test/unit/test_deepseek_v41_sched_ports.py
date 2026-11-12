@@ -211,7 +211,7 @@ def test_the_step_flushes_after_the_attention(defer_flag):
     st = step_mod.AttentionStep.__new__(step_mod.AttentionStep)
     st.attn, st.kv_before_wait, st.index_after_wait = attn, True, True
     st.fused_wo_a, st.cluster_merge, st.freqs = False, False, None
-    st.wo_a_fp8_weight = None
+    st.wo_a_fp8_weight, st.core_lean = None, False
     plugin = SimpleNamespace(
         flush_blocks=lambda lid: order.append(("flush", lid)),
     )

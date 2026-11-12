@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from sgl_nvidia_mega.deepseek_v41.attention import chain, ops, prepare
+from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean as core_lean_kernel
 
 # The SGLang names this package reads, by file under the sglang package (``f(p)``: a
 # parameter); test/unit/test_contract.py pins them.
@@ -164,6 +165,7 @@ class AttentionStep:
         cluster_merge: bool = False,
         q_cluster: bool = False,
         wo_a_fp8: bool = False,
+        core_lean: bool = False,
     ):
         self.attn = attn
         # swap-AB gathers the KV before its PDL wait on the low-ratio prepare (slot
@@ -203,10 +205,21 @@ class AttentionStep:
         self.wo_a_fp8_weight = (
             chain.wo_a_fp8_weight(attn) if self.fused_wo_a and wo_a_fp8 else None
         )
+        # slot attn_core_lean: muLLM's one-launch core on attention TP8's 8 heads, fed by
+        # the unroped query and followed by the fused wo_a (which then rotates by an
+        # identity: the core's output is already inverse-roped)
+        self.core_lean = (
+            chain_ops
+            and core_lean
+            and chain.swapab_applies(attn, heads8=True)
+            and attn.n_local_heads == 8
+            and self.fused_wo_a
+            and attn.use_flashinfer_mxfp8_wo_b
+        )
         # fp32 [positions, 64]: cos, sin interleaved, as the swap-AB query RoPE reads them
         self.freqs = (
             torch.view_as_real(attn.freqs_cis).flatten(-2).contiguous()
-            if self.swapab
+            if self.swapab or self.core_lean
             else None
         )
 
@@ -274,6 +287,16 @@ class AttentionStep:
             and chain.swapab_takes(rows, fb, view)
         )
 
+    def lean_caches(self, rows: int, fb, view):
+        """Slot attn_core_lean: this step's caches where the core takes it, else None."""
+        if not (
+            self.core_lean
+            and self.chain is not None
+            and chain.core_lean_takes(rows, fb, view)
+        ):
+            return None
+        return chain.core_lean_caches(self.attn, view, rows)
+
     def run(self, x, positions, fb, x_quant=None, publish=None, *, view) -> Any:
         """The layer's TP-partial attention output (``mhc.AttnOutput``) for input
         ``x`` (``x_quant``: the same input as MXFP8); ``publish``: see ``ops.wo_b``."""
@@ -282,9 +305,32 @@ class AttentionStep:
         assert not view.kv_pool.uniform_fp8, "the uniform-FP8 pool"
         rows = x.shape[0]
         use_chain = self.chain is not None and rows <= chain.NORM_QUANT_MAX_ROWS
-        swapab = self.takes_swapab(rows, fb, view)
+        lean = self.lean_caches(rows, fb, view)
+        swapab = lean is None and self.takes_swapab(rows, fb, view)
         with attn.maybe_use_decode_attn_tp(fb):
             path = self._prepare_path(rows, fb)
+            if lean is not None:
+                # muLLM's core: the unroped 8-head query, every index read after the PDL
+                # wait but the window's, which the low-ratio prepare's joins allow before
+                q = path(attn, x, positions, fb, view, None, x_quant, self.chain[1])
+                early = self.kv_before_wait and path is prepare.low_ratio
+                o = chain.lean_decode(attn, lean, q, positions, self.freqs, early=early)
+                self._flush_blocks()
+                tiles = _publish_row_tiles(rows, publish)
+                return ops.wo_b(
+                    attn,
+                    chain.wo_a(
+                        attn,
+                        o,
+                        positions,
+                        fb,
+                        tiles,
+                        fused=fused,
+                        fp8_weight=self.wo_a_fp8_weight,
+                        rope=core_lean_kernel.identity_rope(rows, o.device),
+                    ),
+                    publish,
+                )
             if swapab:
                 # the attention ropes the 16-head query; no 64-head pad
                 q = path(attn, x, positions, fb, view, None, x_quant, self.chain[1])
