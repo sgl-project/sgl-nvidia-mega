@@ -293,7 +293,7 @@ def _check_forked_graph(device, chain, w1, w2, shard, base_dtype, g):
         forked_sample()
     torch.cuda.current_stream(device).wait_stream(side)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=side):
         forked_sample()
     for step_offset in (5, 6, 1 << 33):
         offset.fill_(step_offset)
@@ -368,7 +368,7 @@ def _compare_replays(device, group, rank: int, world: int, seed: int) -> dict:
                     block()
                 torch.cuda.current_stream(device).wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                with torch.cuda.graph(graph, stream=side):
                     block()
                 graphs[lowlat] = graph
             keeps = (temperatures[:rows] != 0).view(rows, 1, 1)
@@ -523,6 +523,28 @@ def test_ranks_lowlat_is_the_current_kernel_over_graph_replays(ranks):
     print(f"rank {rank} world {world}: {counts}", flush=True)
     assert counts["tokens"] == 0 and counts["logits"] == 0, counts
     assert counts["distinct"] > counts["blocks"] // 4, counts
+
+
+@needs_gpu
+@pytest.mark.skipif(not _TORCHRUN, reason="runs on every rank of a torchrun job")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second local GPU")
+def test_ranks_graphs_capture_on_the_rank_device(ranks):
+    """torch.cuda.graph's default capture stream is created once per process, on the
+    device current at its first use: cuda:0 when the one-rank cases ran first. The
+    ranks' graphs capture on their own device whatever that stream's device is."""
+    device, group, rank, world = ranks
+    assert hasattr(torch.cuda.graph, "default_capture_stream")
+    saved = torch.cuda.graph.default_capture_stream
+    other = torch.device("cuda", (device.index + 1) % torch.cuda.device_count())
+    torch.cuda.graph.default_capture_stream = torch.cuda.Stream(other)
+    try:
+        g = torch.Generator().manual_seed(7)
+        w1, w2 = _ternary(g, device, VOCAB, RANK), _ternary(g, device, VOCAB, RANK)
+        chain = _make(group, rank, world, w1, w2)
+        shard = slice(rank * VOCAB // world, (rank + 1) * VOCAB // world)
+        _check_forked_graph(device, chain, w1, w2, shard, torch.bfloat16, g)
+    finally:
+        torch.cuda.graph.default_capture_stream = saved
 
 
 if __name__ == "__main__":
