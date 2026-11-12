@@ -70,15 +70,17 @@ and NOTICE are kept in components/include/LICENSE.flashinfer and NOTICE.flashinf
 license texts that FlashInfer's NOTICE refers to (CUTLASS, FlashAttention-3, fmt, spdlog) are kept
 unchanged in components/include/licenses/, copied from FlashInfer v0.7.1.
 
-Portions of the Kimi K3 kernels are adapted from vLLM
-(https://github.com/vllm-project/vllm, Apache License 2.0, Copyright contributors
-to the vLLM project), commit 642c18d64c4cb6db3ded8fbe1786718cd4005fcb:
-sgl_nvidia_mega/kimi_k3/cutedsl/gemm/splitk_tmem8.py and splitk_tmem64.py
+Portions of the Kimi K3.1 copy of the Kimi K3 kernels (sgl_nvidia_mega/kimi_k31/k3/)
+are adapted from vLLM (https://github.com/vllm-project/vllm, Apache License 2.0,
+Copyright contributors to the vLLM project), commit
+642c18d64c4cb6db3ded8fbe1786718cd4005fcb:
+sgl_nvidia_mega/kimi_k31/k3/cutedsl/gemm/splitk_tmem8.py and splitk_tmem64.py
 build on vLLM's SplitKGemm (which vLLM adapted from FlashInfer
-v0.7.0.post1 dense_bf16_gemm_sm100_splitk.py); moe/wide_plan.py reuses methods
-of vLLM's ExpertsPlanKernel; and
-the vendored rubin/ package holds vLLM files, unmodified or modified, and NVIDIA
-files with portions adapted from vLLM. Each file names its origin in its header;
+v0.7.0.post1 dense_bf16_gemm_sm100_splitk.py);
+sgl_nvidia_mega/kimi_k31/k3/cutedsl/moe/wide_plan.py reuses methods of vLLM's
+ExpertsPlanKernel; and the vendored sgl_nvidia_mega/kimi_k31/k3/cutedsl/rubin/
+package holds vLLM files, unmodified or modified, and NVIDIA files with portions
+adapted from vLLM. Each file names its origin in its header;
 THIRD_PARTY_NOTICES.txt lists them.
 
 Portions of the Kimi K3.1 code are adapted from other projects. Each file names its
