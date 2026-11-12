@@ -159,11 +159,14 @@ def set_residual(st, residual) -> None:
     st.state = bs.hc
 
 
-def pre(layer, sublayer: str, st, aux=None):
+def pre(layer, sublayer: str, st, aux=None, need_input: bool = True):
     """The input of ``layer``'s ``sublayer`` ("attn"); sets ``st.x_quant``. With
-    ``aux``, appends the streams' mean (a DSpark capture layer)."""
+    ``aux``, appends the streams' mean (a DSpark capture layer). Without ``need_input``,
+    only opens the sublayer (the first attention of fresh streams; returns None)."""
     assert sublayer == "attn"
-    x, st.x_quant = st.bound["boundary"].pre(layer, "attn", _state(st), st.fb, aux)
+    x, st.x_quant = st.bound["boundary"].pre(
+        layer, "attn", _state(st), st.fb, aux, need_input=need_input
+    )
     return x
 
 

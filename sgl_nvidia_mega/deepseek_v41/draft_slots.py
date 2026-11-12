@@ -93,6 +93,13 @@ def _forward(built, stages, slots, name):
         return BUILT, "BF16 streams into hc_combine"
     if name == "draft_embed":
         return BUILT, "the target's whole table, bound at the first forward"
+    if name == "draft_stage0_table":
+        if not built._stage0_wanted:
+            return DECLINED, built._stage0_reason
+        return BUILT, (
+            "the first stage's query and K/V rows from a per-token table, filled and "
+            "checked at the first eager forward"
+        )
     return _attention(built, stages, slots, name)
 
 

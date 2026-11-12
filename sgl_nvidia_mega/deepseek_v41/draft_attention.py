@@ -289,16 +289,18 @@ def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
             core_lean.precompile()
 
 
-def forward(attn, x, positions, fb, *, kernels: Kernels, view):
-    """``DSparkAttention.forward(..., defer_all_reduce=True)`` with ``kernels``; ``view``:
-    the draft forward's ``ForwardView`` (its KV pool, metadata and attention)."""
-    from sglang.srt.model_executor.runner import get_is_capture_mode
-    from sglang.srt.models.deepseek_v4_dspark import _PAD_NUM_HEADS
+def query_and_kv(attn, x, kernels: Kernels):
+    """The swap-AB arm's query rows (wq_b's output, unroped: swap-AB ropes q as it loads
+    it) and the window K/V rows before the store's norm + RoPE, as ``forward`` computes
+    them from the attention input ``x`` (slot draft_stage0_table: its fill and check)."""
+    qkv_a = kernels.qkv_a(x) if kernels.qkv_a is not None else None
+    kv = attn.kv_proj_only(x) if qkv_a is None else kernels.qkv_a.kv(qkv_a)
+    return _compute_q(attn, x, None, None, qkv_a, kernels, True), kv
 
-    if fb.forward_mode.is_idle():
-        return torch.zeros_like(x)
-    pool = view.kv_pool
-    rows = x.shape[0]
+
+def _arm(attn, kernels: Kernels, rows: int, fb, view):
+    """(the lean core's caches or None, whether the query stays unroped): the lean core
+    and swap-AB rope q as they load it."""
     lean = (
         chain.core_lean_caches(attn, view, rows, model="draft")
         if kernels.core_lean and chain.core_lean_takes(rows, fb, view)
@@ -306,10 +308,41 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
     )
     if lean is not None and lean.extra is not None:
         lean = None
-    # the unroped query: swap-AB's or the lean core's
-    swapab = lean is not None or (kernels.swapab and _swapab_takes(rows, fb, view))
+    return lean, lean is not None or (kernels.swapab and _swapab_takes(rows, fb, view))
+
+
+def stage0_takes(attn, kernels: Optional[Kernels], rows: int, fb, view) -> bool:
+    """Whether this step's stage-0 attention can read the token table's rows: an arm
+    whose query is wq_b's rows unroped (swap-AB, or the lean core)."""
+    return (
+        kernels is not None
+        and not fb.forward_mode.is_idle()
+        and _arm(attn, kernels, rows, fb, view)[1]
+    )
+
+
+def forward(attn, x, positions, fb, *, kernels: Kernels, view, stage0=None):
+    """``DSparkAttention.forward(..., defer_all_reduce=True)`` with ``kernels``; ``view``:
+    the draft forward's ``ForwardView`` (its KV pool, metadata and attention).
+    ``stage0`` (slot draft_stage0_table, where ``stage0_takes``): ``(q, kv)`` gathered
+    from the token table in place of ``x``'s query and K/V kernels (``x`` is then None)."""
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from sglang.srt.models.deepseek_v4_dspark import _PAD_NUM_HEADS
+
+    if fb.forward_mode.is_idle():
+        return torch.zeros_like(x)
+    pool = view.kv_pool
+    ref = x if stage0 is None else stage0[1]
+    rows = ref.shape[0]
+    lean, swapab = _arm(attn, kernels, rows, fb, view)
+    if stage0 is not None and not swapab:
+        raise RuntimeError(
+            "slot draft_stage0_table: the step's arm ropes the query itself"
+        )
     q_padded = q_out = None
-    if (
+    if stage0 is not None:
+        pass  # the table's rows are the query
+    elif (
         pool.uniform_fp8
         and not attn.q_head_norm
         and attn.n_local_heads in (8, 16, 32, 64, 128)
@@ -317,15 +350,18 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         q_out = torch.empty(
             (rows, attn.n_local_heads, attn.head_dim),
             dtype=torch.float8_e4m3fn,
-            device=x.device,
+            device=ref.device,
         )
     elif attn.n_local_heads < _PAD_NUM_HEADS and not swapab:
         # swap-AB reads only the real heads, so its unroped q stays unpadded
-        q_padded = x.new_empty(rows, _PAD_NUM_HEADS, attn.head_dim)
+        q_padded = ref.new_empty(rows, _PAD_NUM_HEADS, attn.head_dim)
         q_out = q_padded[:, : attn.n_local_heads, :]
 
     def kv_and_store():
-        kv = attn.kv_proj_only(x) if qkv_a is None else kernels.qkv_a.kv(qkv_a)
+        if stage0 is not None:
+            kv = stage0[1]
+        else:
+            kv = attn.kv_proj_only(x) if qkv_a is None else kernels.qkv_a.kv(qkv_a)
         # DSparkAttention._store_block_kv (the SWA window; unified-KV declines at build)
         pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=attn.layer_id,
@@ -339,7 +375,13 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         return kv
 
     # the fused GEMM runs before the fork; the side stream takes its kv columns
-    qkv_a = kernels.qkv_a(x) if kernels.qkv_a is not None else None
+    qkv_a = kernels.qkv_a(x) if kernels.qkv_a is not None and stage0 is None else None
+
+    def query():
+        if stage0 is not None:
+            return stage0[0]
+        return _compute_q(attn, x, positions, q_out, qkv_a, kernels, swapab)
+
     # the KV store joined the attention's stream (a full graph edge), so swap-AB may
     # gather the KV before its PDL wait
     store_joined = False
@@ -352,12 +394,12 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         side.wait_stream(current)
         with torch.cuda.stream(side):
             kv = kv_and_store()
-        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels, swapab)
+        q = query()
         current.wait_stream(side)
         store_joined = True
     else:
         kv = kv_and_store()
-        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels, swapab)
+        q = query()
 
     if lean is not None:
         freqs = torch.view_as_real(attn.freqs_cis).flatten(-2)
@@ -372,7 +414,14 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         )
         return _wo_b(
             attn,
-            _wo_a(attn, o, positions, fb, True, rope=core_lean.identity_rope(rows, o.device)),
+            _wo_a(
+                attn,
+                o,
+                positions,
+                fb,
+                True,
+                rope=core_lean.identity_rope(rows, o.device),
+            ),
             kernels.wo_b_ll,
         )
     if swapab:

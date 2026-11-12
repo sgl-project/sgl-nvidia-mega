@@ -122,6 +122,7 @@ DRAFT_SLOTS = frozenset(
         "markov_lowlat",
         "markov_tail",
         "draft_final_collapse",
+        "draft_stage0_table",
     }
 )
 # Slots that run only when listed, except those in DEFAULT_ON_SLOTS (draft_embed: the
@@ -201,7 +202,13 @@ DRAFT_SLOTS = frozenset(
 # SGLang hands the proposal its verify ids, writes [anchor | draft tokens] there (the
 # add and SGLang's concat after the chain, bitwise); draft_final_collapse: with draft_hop,
 # the last draft stage's MoE post also writes the head's mHC collapse, so the draft
-# forward skips its hc_combine (bitwise)
+# forward skips its hc_combine (bitwise);
+# draft_stage0_table: the first draft stage's input norm, [wq_a; wkv] GEMM, q-LoRA norm
+# and wq_b are a function of each row's token id, so one launch gathers the query rows and
+# the window K/V rows from a per-token table (draft_stage0.py; design derived from
+# TensorRT-LLM's DSpark stage-0 token table), filled by the live kernels at the first eager
+# forward and checked bit for bit per width before a step takes it (bitwise; ~1.1 GiB a
+# GPU at TP8)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -225,6 +232,7 @@ OPT_IN_SLOTS = (
     "attn_core_lean",
     "markov_tail",
     "draft_final_collapse",
+    "draft_stage0_table",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -296,6 +304,7 @@ def slot_reasons() -> list[str]:
         ("markov_lowlat", "markov"),
         ("markov_tail", "markov"),
         ("draft_final_collapse", "draft_hop"),
+        ("draft_stage0_table", "draft_swapab"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),
