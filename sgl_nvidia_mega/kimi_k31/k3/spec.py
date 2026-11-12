@@ -152,12 +152,13 @@ def _call_option(
     return kwargs.get(name, args[index] if len(args) > index else default)
 
 
-class _Built:
+class _K3Built:
     """Top-level model-forward replacement for the exact decode shapes served."""
 
     draft_sampler = None
     # Megakernel API 2: no EAGLE entries, no graph variants of the host's runners.
     draft_loop = draft_extend = begin_draft_round = graph_variants = None
+    speculative_runtime_hooks = None  # no runtime-optimization hooks (SGLang reads the member unguarded)
 
     def __init__(self, model: Any, resources: Any, widths: tuple[int, ...]):
         from .executor import KimiK3MegakernelExecutor
@@ -220,13 +221,13 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
     """Bind typed SGLang-owned pools after allocation, before graph warmup."""
     if view.hybrid is None:
         raise ValueError("Kimi K3 megakernel requires a hybrid MLA/KDA pool")
-    cast(_Built, built).resources.bind(view.hybrid)
+    cast(_K3Built, built).resources.bind(view.hybrid)
     from . import preload
 
     preload.at_prepare()
 
 
-def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
+def _build(model: Any, hf_config: Any, context: BuildContext) -> _K3Built:
     if context.tokens_per_request != 1:
         raise ValueError("Kimi K3 megakernel serves one-token decode only")
     widths = tuple(width for width in context.widths if width in WIDTHS)
@@ -248,7 +249,7 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
         memory_before=_cuda_memory(),
         deadline_ns=deadline_ns,
     )
-    return _Built(model, resources, widths)
+    return _K3Built(model, resources, widths)
 
 
 SPEC = MegakernelSpec(

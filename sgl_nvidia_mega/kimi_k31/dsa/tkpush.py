@@ -21,6 +21,11 @@ from pathlib import Path
 
 import torch
 
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": ("is_arch_support_pdl", "load_jit", "make_cpp_args"),
+    "kernels/jit/utils/occupancy.py": ("NoSchedulableClustersError", "get_max_active_clusters"),
+}
+
 logger = logging.getLogger(__name__)
 
 HERE = Path(__file__).resolve().parent

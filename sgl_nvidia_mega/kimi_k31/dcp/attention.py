@@ -37,6 +37,12 @@ from .comm import BOTH, POLL, PUSH, DcpComm
 from .layout import PAGE, TOPK, padded_heads
 from sgl_nvidia_mega.kimi_k31.k3.cutedsl.mla.head_gate import head_gate
 
+SGLANG_READS = {
+    "kernels/ops/attention/dsa/paged_mqa_logits.py": ("_restore_row_stride",),
+    "kernels/ops/attention/dsv4/topk.py": ("topk_transform_paged_v2", "topk_transform_candidates_v2"),
+    "srt/layers/attention/dsa/dsa_dcp_sharded.py": ("_localize_compact_kernel",),
+}
+
 DCP_ENABLED = os.environ.get("K31MK_DCP", "0") == "1"
 
 

@@ -43,7 +43,7 @@ def test_folded_projection_keeps_live_stock_weights_and_is_idempotent():
         return base._coalesce_projection_storage(owner, spec, device_type="cpu")
 
     with (
-        patch.object(folded, "_LAYOUT", layout),
+        patch.object(folded, "layout", lambda heads: layout),  # the layout follows the local head count
         patch.object(folded, "_coalesce_projection_storage", side_effect=cpu_coalesce),
     ):
         packed = folded.coalesce_index_projection(attn)

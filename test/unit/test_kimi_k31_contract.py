@@ -12,6 +12,9 @@ import torch
 
 from sgl_nvidia_mega.kimi_k31.spec import SPEC, _config_disable_reasons
 
+# These contracts exercise the Kimi K3.1 host API (its decode / verify bindings): skip on an SGLang without it.
+pytest.importorskip("sglang.srt.megakernels.kimi_k31_decode_binding", reason="needs the Kimi K3.1 SGLang host changes")
+
 
 def _config(**dsa_overrides):
     dsa = dict(

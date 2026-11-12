@@ -18,10 +18,11 @@ logger = logging.getLogger(__name__)
 # SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "kernels/ops/attention/dsa/paged_mqa_logits.py": ("_restore_row_stride",),
-    "kernels/ops/attention/dsa/head_gate.py": ("indexer_q_quant_head_gate",),
     "kernels/ops/quantization/act_quant_triton.py": ("act_quant",),
     "kernels/ops/attention/dsv4/topk.py": ("topk_transform_paged_v2",),
 }
+# The QF head gate (K31MK_DSA_QF) reads a kernel of the Kimi K3.1 SGLang host changes; without it that path fails at import.
+SGLANG_OPTIONAL_READS = {"kernels/ops/attention/dsa/head_gate.py": ("indexer_q_quant_head_gate",)}
 
 # Index-q FP8 scale format: stock builds the K3.1 Indexer with scale_fmt="ue8m0" (models/deepseek_v2.py)
 SCALE_FMT = "ue8m0"

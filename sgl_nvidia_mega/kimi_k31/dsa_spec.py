@@ -4,15 +4,17 @@
 
 from sglang.srt.runtime_context import get_model
 
-from sgl_nvidia_mega.kimi_k31.k3.spec import WIDTHS, _Built, _deadline_ns
+from sgl_nvidia_mega.kimi_k31.k3.spec import WIDTHS, _K3Built, _deadline_ns
 
 from .dsa_executor import SparseDecodeExecutor
 
 # SGLang names this module reads (test/unit/test_contract.py pins them)
-SGLANG_READS = {"srt/runtime_context.py": ("get_model",)}
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_model", "get_parallel"),
+}
 
 
-class BuiltSparseDecode(_Built):
+class BuiltSparseDecode(_K3Built):
     tensor_binding_kind = 32
 
     def __init__(self, model, resources, widths):

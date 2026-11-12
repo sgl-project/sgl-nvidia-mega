@@ -20,7 +20,7 @@ from sgl_nvidia_mega.kimi_k31.k3.spec import (
 )
 from sgl_nvidia_mega.kimi_k31.k3.spec import (
     WIDTHS,
-    _Built,
+    _K3Built,
     _deadline_ns,
 )
 from sgl_nvidia_mega.kimi_k31.k3.spec import (
@@ -99,7 +99,13 @@ def _dcp_reasons(cfg: Any, spec: bool) -> list[str]:
     return []
 
 
+# The Kimi K3.1 host changes add the tensor-verify fields to SGLang's MegakernelSpec; without them the megakernel stays off.
+K31_HOST = "tensor_verify_binding_kind" in MegakernelSpec.__struct_fields__
+
+
 def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
+    if not K31_HOST:
+        return ["Kimi K3.1 needs an SGLang with the Kimi K3.1 host changes (MegakernelSpec has no tensor-verify fields)"]
     text = _text_config(hf_config)
     if getattr(cfg, "speculative_algorithm", None) is not None:
         from .verify_spec import config_disable_reasons
@@ -138,7 +144,7 @@ def _model_disable_reasons(model: Any, hf_config: Any) -> list[str]:
     return reasons
 
 
-class _BuiltK31(_Built):
+class _BuiltK31(_K3Built):
     def __init__(self, model: Any, resources: Any, widths: tuple[int, ...]):
         super().__init__(model, resources, widths)
         from sgl_nvidia_mega.kimi_k31.k3.executor import KimiK3MegakernelExecutor
@@ -249,8 +255,7 @@ SPEC: MegakernelSpec = msgspec.structs.replace(
     K3_SPEC,
     name="Kimi K3.1 packed-MXFP4 decode / TARGET_VERIFY Q8/Q16",
     features=_features(),
-    tensor_verify_binding_kind=31,
-    tensor_verify_build=_verify_build,
+    **({"tensor_verify_binding_kind": 31, "tensor_verify_build": _verify_build} if K31_HOST else {}),
     requires=msgspec.structs.replace(
         K3_SPEC.requires,
         server_args={

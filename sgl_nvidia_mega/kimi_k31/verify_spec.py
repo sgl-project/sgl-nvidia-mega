@@ -48,6 +48,7 @@ class BuiltK31Verify:
     tensor_binding_kind = 31
     draft_sampler = None
     draft_loop = draft_extend = begin_draft_round = graph_variants = None
+    speculative_runtime_hooks = None  # no runtime-optimization hooks (SGLang reads the member unguarded)
 
     def __init__(self, weights, deadline_s):
         from .verify_weights import WeightModel

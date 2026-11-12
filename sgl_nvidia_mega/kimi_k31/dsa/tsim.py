@@ -18,6 +18,10 @@ from pathlib import Path
 
 import torch
 
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": ("load_jit",),
+}
+
 WORLD = 16
 TOPK = 2048
 PAGE = 64

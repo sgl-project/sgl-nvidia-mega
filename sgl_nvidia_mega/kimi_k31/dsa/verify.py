@@ -39,6 +39,7 @@ SGLANG_READS = {
     "kernels/ops/attention/dsa/paged_mqa_logits.py": ("_restore_row_stride",),
     "kernels/ops/attention/dsv4/topk.py": ("topk_transform_paged_v2",),
     "kernels/ops/kvcache/dsa_fused_store_index_cache.py": ("fused_store_index_k_cache",),
+    "srt/runtime_context.py": ("get_parallel",),
 }
 
 

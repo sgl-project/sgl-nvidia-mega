@@ -20,6 +20,10 @@ import torch
 from ..dsa_binding import IndexDecodeStep
 from ..dsa_executor import SparseDecodeExecutor
 
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_model", "get_parallel"),
+}
+
 
 @dataclass(frozen=True)
 class DcpIndexStep(IndexDecodeStep):

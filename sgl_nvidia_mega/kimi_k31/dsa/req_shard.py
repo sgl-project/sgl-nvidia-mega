@@ -17,6 +17,11 @@ from types import SimpleNamespace
 
 import torch
 
+SGLANG_READS = {
+    "kernels/ops/attention/dsv4/topk.py": ("plan_topk_v2",),
+    "srt/distributed/device_communicators/triton_symm_mem_ag.py": ("_wait_signal_acquire", "_all_gather_kernel_inner"),
+}
+
 PAGE = 64
 TOPK = 2048
 # ``K31MK_DSA_REQ_SHARD_AG`` picks the all-gather: "nccl" (default) = the group's all_gather_into_tensor (SGLang's
@@ -344,7 +349,7 @@ def _device_group(group):
 def _multimem_module():
     """The host's multimem all-gather, refused unless its acquire carries the alias fence (the compliant form:
     acq_rel barriers + fence.proxy.alias after the acquire; host triton_symm_mem_ag.py)."""
-    from sglang.srt.distributed.device_communicators import triton_symm_mem_ag as mm
+    mm = __import__("importlib").import_module("sglang.srt.distributed.device_communicators.triton_symm_mem_ag")  # reads: SGLANG_READS
 
     src = getattr(mm._wait_signal_acquire, "src", "")
     if "fence.proxy.alias" not in src or "acq_rel" not in getattr(mm._all_gather_kernel_inner, "src", ""):

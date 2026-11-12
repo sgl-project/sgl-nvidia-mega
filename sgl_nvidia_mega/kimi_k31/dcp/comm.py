@@ -18,6 +18,10 @@ import torch
 
 from .layout import KIND_CAND, KIND_PART, KIND_Q, Geometry
 
+SGLANG_READS = {
+    "kernels/jit/utils/__init__.py": ("load_jit",),
+}
+
 DEADLINE_NS = int(float(os.environ.get("K31MK_DCP_DEADLINE_S", "10")) * 1e9)
 PUSH, POLL, BOTH = 1, 2, 3
 

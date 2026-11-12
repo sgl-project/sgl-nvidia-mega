@@ -177,7 +177,7 @@ def test_sparse_native_score_keeps_distinct_request_tables():
 def test_profile_scratch_is_fixed_and_request_capacity_selects_it():
     from sgl_nvidia_mega.kimi_k31.dsa import verify as module
     base=NS(prepare_cache=Mock())
-    def profile(_base,_weights,rows,_context):
+    def profile(_base,_weights,rows,_context,_tsi=None):  # PreparedSparseVerifyMla(base, weights, rows, context, tsi)
         return NS(selection=NS(rows=rows),prepare_cache=Mock(),run=Mock(return_value=rows),step=None)
     with patch.object(module,'PreparedSparseVerifyMla',side_effect=profile):
         core=module.MultiSparseVerifyMla(base,None,(8,16,32),10240)
@@ -192,7 +192,7 @@ def test_profile_scratch_is_fixed_and_request_capacity_selects_it():
 
 
 def test_host_graph_capacity_uses_padding_and_rejects_uncovered_batch():
-    from sglang.srt.megakernels.kimi_k31_verify_dsa_binding import K31SparseVerifyHostBinding
+    K31SparseVerifyHostBinding = pytest.importorskip("sglang.srt.megakernels.kimi_k31_verify_dsa_binding", reason="needs the Kimi K3.1 SGLang host changes").K31SparseVerifyHostBinding
     host=K31SparseVerifyHostBinding(None)
     built=NS(request_batches=(1,2,4),supports=lambda b,q,r:(b,q,r) in verify_keys(8,(1,2,4)))
     mode=NS(is_target_verify=lambda:True)
@@ -207,7 +207,7 @@ def test_host_graph_capacity_uses_padding_and_rejects_uncovered_batch():
 
 @pytest.mark.parametrize('b', [2, 4])
 def test_host_unrepeats_query_page_table_before_tensor_entry(b):
-    from sglang.srt.megakernels.kimi_k31_verify_dsa_binding import K31SparseVerifyHostBinding
+    K31SparseVerifyHostBinding = pytest.importorskip("sglang.srt.megakernels.kimi_k31_verify_dsa_binding", reason="needs the Kimi K3.1 SGLang host changes").K31SparseVerifyHostBinding
     from sglang.srt.model_executor import forward_context
     from sglang.srt.layers.attention.linear import utils
     from sglang.srt.model_executor.runner_utils import capture_mode

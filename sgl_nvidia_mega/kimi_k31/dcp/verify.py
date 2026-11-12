@@ -28,6 +28,10 @@ from ..dsa.indexer import IndexProjection, IndexWeights
 from ..dsa.verify import BuiltSparseVerify, SparseVerifyStep
 from ..verify_executor import K31VerifyExecutor
 
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_parallel",),
+}
+
 
 @dataclass(frozen=True)
 class _DcpRows:

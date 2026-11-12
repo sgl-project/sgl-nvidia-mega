@@ -26,7 +26,7 @@ def test_capture_width_and_slices_follow_metadata(count, monkeypatch):
         "sgl_nvidia_mega.kimi_k31.verify_executor.VerifyMlaIndexOverlap", Mock()
     )
     ids = tuple(range(0, 2 * count, 2))
-    consumers = {i: SimpleNamespace(bind_aux=Mock()) for i in range(93)}
+    consumers = {i: SimpleNamespace(bind_aux=Mock(), side_mixture=None) for i in range(93)}
     resources = SimpleNamespace(layers=(), before=consumers, final=consumers[92],
                                 feed_forward={},
                                 scratch={"hidden.0": torch.empty(8, 7168)})
@@ -59,7 +59,7 @@ def test_aux_feature_contract_is_bf16_and_dense(aux):
 
 
 def test_host_allocates_runtime_capture_width_and_freezes_order():
-    from sglang.srt.megakernels.kimi_k31_verify_binding import K31VerifyHostBinding
+    K31VerifyHostBinding = pytest.importorskip("sglang.srt.megakernels.kimi_k31_verify_binding", reason="needs the Kimi K3.1 SGLang host changes").K31VerifyHostBinding
 
     class Model(torch.nn.Module):
         def __init__(self):
