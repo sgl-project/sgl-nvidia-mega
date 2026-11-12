@@ -6,6 +6,10 @@
 // This file has been modified from its original version (up to 64 request rows, hoisted
 // step parameters, fail-stop waits). The host side is markov.py in this directory.
 //
+// The in-kernel phase stamps (MARKOV_STAMPS) follow the chain-stamp method of muLLM v0.4.1
+// (NVIDIA Corporation, Apache-2.0), and LoadAcquire (MARKOV_LOWLAT) matches muLLM's
+// acquire-load idiom for its exchange records.
+//
 // DSpark's sequential Markov sampling for up to 64 request rows, with the Markov
 // head sharded by vocabulary across the tensor-parallel ranks. Compiled with
 // NVRTC; the host defines
