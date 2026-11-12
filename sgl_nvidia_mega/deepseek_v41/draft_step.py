@@ -105,6 +105,11 @@ class DraftDecode(DraftProposal):
                 stages,
                 get_parallel().tp_group,
                 gate_topk="draft_gate" in slots,
+                # slot draft_shared_ll: the stages' shared expert on the low-latency
+                # GEMM (with the target's shared_fold slots, its gate_up folds the
+                # SwiGLU and down_proj's quant)
+                shared_ll="draft_shared_ll" in slots,
+                widths=self.widths,
                 **moe.gemm2_options(slots),
             )
         # slot draft_hop: the posts on the plugin's Lamport hop where SGLang has no
