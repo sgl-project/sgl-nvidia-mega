@@ -11,10 +11,11 @@ from typing import Any
 
 import msgspec
 
-# Slots described with the opt-in slots below that run by default: each is bitwise with
-# the path it replaces and measured faster served at batch 1. On a default start (no
-# SLOTS_ENV) one that has nothing to serve stays off instead of refusing the start;
-# listed in SLOTS_ENV it must build like any other slot.
+# Slots described with the opt-in slots below that run by default: each measured faster
+# served at batch 1 (a 95 % interval below zero) and passed the accuracy checks, and each
+# is bitwise with the path it replaces except those in NUMERICS_CHANGE_SLOTS. On a default
+# start (no SLOTS_ENV) one that has nothing to serve stays off instead of refusing the
+# start; listed in SLOTS_ENV it must build like any other slot.
 DEFAULT_ON_SLOTS = (
     "gate_route",
     "gate_route_quant",
@@ -30,6 +31,37 @@ DEFAULT_ON_SLOTS = (
     "markov_lowlat",
     "attn_q_norm_gemm",
     "attn_compressor_priority",
+    "gate_route_early",
+    "markov_tail",
+    "draft_stage0_table",
+    "engram_publish",
+    # numerics changes (NUMERICS_CHANGE_SLOTS)
+    "swapab_h8",
+    "wo_a_g1",
+    "target_lm_head",
+    "target_lm_head_mxfp8",
+    "attn_q_cluster",
+    "draft_shared_ll",
+    "wo_b_publish_split",
+)
+# The slots that are not bitwise with the path they replace (a different summation order
+# or encoding; the step's accuracy is checked with evals, not bit for bit)
+NUMERICS_CHANGE_SLOTS = frozenset(
+    {
+        "shared_ll",
+        "hc_prenorm",
+        "hop_b_wide",
+        "swapab_h8",
+        "wo_a_g1",
+        "target_lm_head",
+        "target_lm_head_mxfp8",
+        "draft_lm_head_mxfp8",
+        "attn_q_cluster",
+        "draft_shared_ll",
+        "wo_b_publish_split",
+        "attn_core_lean",
+        "hop_final_collapse",
+    }
 )
 # The kernel slots this package ships; with the megakernel on, all of them run. The
 # Engram prefetch needs SGLang's per-rank Engram host table (spec.REQUIREMENTS).
@@ -135,8 +167,8 @@ DRAFT_SLOTS = frozenset(
 # hop_mbar: the Lamport consumers' RMSNorm sums cross the cluster by st.async onto
 # mbarriers, not a cluster barrier, bitwise; hop_final_collapse: the last layer's hop B
 # also writes the head's mHC collapse, so the head runs only its RMSNorm (bitwise at
-# TP4; at attention TP8 + EP2 one DSpark proposal in 4183 verify steps differs, with the
-# same target outputs, so it is not in DEFAULT_ON_SLOTS);
+# TP4; not bitwise at attention TP8 + EP2, where one DSpark proposal in 4183 verify steps
+# differed and one prompt took an extra verify step, with the same target outputs);
 # attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
 # attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
 # one cluster launch, sm103/attention/reindex_select.py;
@@ -153,7 +185,7 @@ DRAFT_SLOTS = frozenset(
 # swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
 # on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
-# TP8 arm); no effect at TP4;
+# TP8 arm, so a numerics change against SGLang at TP8); no effect at TP4;
 # gate_route: the router's top-k and the routed pair's route
 # record in one cluster launch at 1-8 rows, target and draft (sm103/moe/src/gate_route.cuh;
 # bitwise with gate_topk + route); gate_route_quant: that launch also writes the routed
@@ -227,30 +259,20 @@ DRAFT_SLOTS = frozenset(
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
-    "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
     "hop_final_collapse",
-    "target_lm_head_mxfp8",
     "draft_lm_head_mxfp8",
-    "swapab_h8",
-    "wo_a_g1",
-    "gate_route_early",
     "markov_pdl",
     "attn_index_q_first",
     "attn_index_weights_bf16",
     "attn_cluster_merge",
-    "attn_q_cluster",
     "attn_wo_a_fp8",
     "attn_index_early_trigger",
     "attn_defer_block_select",
+    # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
     "attn_core_lean",
-    "markov_tail",
     "draft_final_collapse",
-    "draft_stage0_table",
-    "draft_shared_ll",
-    "wo_b_publish_split",
-    "engram_publish",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -268,6 +290,12 @@ def _requested_slots() -> frozenset:
 
 
 SLOTS = _requested_slots()
+
+
+def default_start() -> bool:
+    """No ``SLOTS_ENV``: the default slots, each left off where it has nothing to serve
+    (or, as wo_b_publish_split at TP4, where it measured slower)."""
+    return os.environ.get(SLOTS_ENV) is None
 
 
 def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
@@ -689,7 +717,7 @@ def build(model, ctx):
     # example hc_coeff_fused where the prenorm cannot run, as in batch-invariant mode)
     declined = (
         sorted(s for s in DEFAULT_ON_SLOTS if s in built and not built[s])
-        if os.environ.get(SLOTS_ENV) is None
+        if default_start()
         else []
     )
     moot.update(declined)

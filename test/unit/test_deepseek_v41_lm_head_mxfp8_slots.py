@@ -131,12 +131,15 @@ def _model():
     return SimpleNamespace(lm_head=head, logits_processor=proc)
 
 
-def test_the_slots_are_opt_in_and_need_their_low_m_heads(monkeypatch):
+def test_the_slots_need_their_low_m_heads(monkeypatch):
+    # the target's MXFP8 head runs by default; the draft's is measurement only
+    assert "target_lm_head_mxfp8" in runtime.DEFAULT_ON_SLOTS
+    assert "draft_lm_head_mxfp8" in runtime.OPT_IN_SLOTS
+    assert "draft_lm_head_mxfp8" not in runtime.SHIPPED_SLOTS
     for slot, needs in (
         ("target_lm_head_mxfp8", "target_lm_head"),
         ("draft_lm_head_mxfp8", "draft_lm_head"),
     ):
-        assert slot in runtime.OPT_IN_SLOTS and slot not in runtime.SHIPPED_SLOTS
         monkeypatch.setattr(runtime, "SLOTS", frozenset({slot}))
         assert any(f"needs slot {needs!r}" in r for r in runtime.slot_reasons())
     assert plan.MEASUREMENT_ONLY_SLOTS == {"draft_lm_head_mxfp8"}

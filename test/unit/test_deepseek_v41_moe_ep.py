@@ -43,6 +43,9 @@ def _build(layers):
             made.append(kwargs)
             self.gate_topk_kernel = None
             self.shared = None
+            # MoeSlot's stand-in below: no fast gate, so slot gate_route_early (on by
+            # default) binds no early router here
+            self.gate = False
 
     group = SimpleNamespace(world_size=1, cpu_group=None)
 

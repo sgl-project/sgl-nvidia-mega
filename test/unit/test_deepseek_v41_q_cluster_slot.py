@@ -14,11 +14,12 @@ from sgl_nvidia_mega.deepseek_v41.attention import chain
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_cluster as qc
 
 
-def test_the_slot_is_opt_in_and_needs_attn(monkeypatch):
+def test_the_slot_runs_by_default_and_needs_attn(monkeypatch):
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    assert "attn_q_cluster" in runtime.OPT_IN_SLOTS
-    assert "attn_q_cluster" not in runtime.SHIPPED_SLOTS
+    assert "attn_q_cluster" in runtime.DEFAULT_ON_SLOTS
+    assert "attn_q_cluster" in runtime.NUMERICS_CHANGE_SLOTS
+    assert "attn_q_cluster" not in runtime.OPT_IN_SLOTS
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"attn_q_cluster"}))
     assert any("needs slot 'attn'" in r for r in runtime.slot_reasons())
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"attn", "attn_q_cluster"}))
@@ -102,3 +103,21 @@ def test_rows_and_precedence_over_q_norm_gemm():
     assert launch.call_count == 1 and fused.call_count == 0
     assert launch.call_args.args[3] is ops.q_cluster_wq_b
     assert out.shape == (6, 8, 512)
+
+
+@pytest.mark.parametrize(
+    "listed, heads, takes",
+    [(False, 8, True), (False, 16, False), (True, 16, True)],
+    ids=["default_tp8", "default_tp4_left_off", "listed_tp4"],
+)
+def test_a_default_start_takes_it_at_attention_tp8_only(
+    monkeypatch, listed, heads, takes
+):
+    from sgl_nvidia_mega.deepseek_v41 import attention, runtime
+
+    if listed:
+        monkeypatch.setenv(runtime.SLOTS_ENV, "attn,attn_q_cluster")
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+    attn = SimpleNamespace(n_local_heads=heads)
+    assert attention._q_cluster_default_takes(attn) is takes

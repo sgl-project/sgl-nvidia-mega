@@ -11,9 +11,9 @@ from sgl_nvidia_mega.deepseek_v41 import engram, runtime
 from sgl_nvidia_mega.deepseek_v41.engram import prefetch as ep
 
 
-def test_the_slot_is_opt_in_and_needs_engram(monkeypatch):
-    assert "engram_publish" in runtime.OPT_IN_SLOTS
-    assert "engram_publish" not in runtime.SHIPPED_SLOTS
+def test_the_slot_runs_by_default_and_needs_engram(monkeypatch):
+    assert "engram_publish" in runtime.DEFAULT_ON_SLOTS
+    assert "engram_publish" not in runtime.OPT_IN_SLOTS
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"engram_publish"}))
     assert any("needs slot 'engram'" in r for r in runtime.slot_reasons())
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"engram", "engram_publish"}))

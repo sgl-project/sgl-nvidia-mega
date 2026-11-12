@@ -46,6 +46,23 @@ SGLANG_READS = {
 }
 
 
+def _q_cluster_default_takes(attn) -> bool:
+    """Slot attn_q_cluster on a default start (no slot list) only at attention TP8's
+    q_cluster.DEFAULT_MAX_HEADS local heads; listed, at every head count it takes."""
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_cluster
+
+    if not runtime.default_start() or attn.n_local_heads <= q_cluster.DEFAULT_MAX_HEADS:
+        return True
+    logger.info(
+        "NVIDIA megakernel: default slot attn_q_cluster left off: %d local heads (a "
+        "default start takes it up to %d)",
+        attn.n_local_heads,
+        q_cluster.DEFAULT_MAX_HEADS,
+    )
+    return False
+
+
 def build(model, ctx, group) -> dict[int, AttentionStep]:
     """Each covered layer's ``AttentionStep`` by layer id; the result is
     ``st.bound["attention"]``."""
@@ -53,6 +70,9 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
 
     m = model.model
     chain_on = "attn" in SLOTS
+    q_cluster_on = "attn_q_cluster" in SLOTS and _q_cluster_default_takes(
+        m.layers[m.start_layer].self_attn
+    )
     qkv_a_ll = chain_on and "attn_qkv_a" in SLOTS
     qkv_a_bf16 = qkv_a_ll and "attn_qkv_a_bf16" in SLOTS
     steps, skipped = {}, []
@@ -96,7 +116,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             index_q_first="attn_index_q_first" in SLOTS,
             index_weights_bf16="attn_index_weights_bf16" in SLOTS,
             cluster_merge="attn_cluster_merge" in SLOTS,
-            q_cluster="attn_q_cluster" in SLOTS,
+            q_cluster=q_cluster_on,
             wo_a_fp8="attn_wo_a_fp8" in SLOTS,
             core_lean="attn_core_lean" in SLOTS,
         )

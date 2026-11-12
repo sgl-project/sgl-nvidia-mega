@@ -25,10 +25,10 @@ from sgl_nvidia_mega.deepseek_v41.boundary import boundaries  # noqa: E402
 SLOT = "draft_stage0_table"
 
 
-def test_the_slot_is_an_opt_in_draft_slot():
-    assert SLOT in runtime.OPT_IN_SLOTS
+def test_the_slot_is_a_default_draft_slot():
+    assert SLOT in runtime.DEFAULT_ON_SLOTS
     assert SLOT in runtime.DRAFT_SLOTS
-    assert SLOT not in runtime.SHIPPED_SLOTS
+    assert SLOT not in runtime.OPT_IN_SLOTS
 
 
 def test_the_slot_needs_draft_swapab(monkeypatch):
