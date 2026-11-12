@@ -220,15 +220,30 @@ class Boundaries:
         """The state before layer 0: the embedding broadcast to the hc streams."""
         return BoundaryState(self._mhc.HcState(streams))
 
-    def pre(self, layer, kind: str, st: BoundaryState, forward_batch, aux=None):
+    def pre(
+        self,
+        layer,
+        kind: str,
+        st: BoundaryState,
+        forward_batch,
+        aux=None,
+        need_input: bool = True,
+    ):
         """The sublayer's input: (rows, MXFP8 rows or None). With ``aux`` (a DSpark
-        capture layer), also appends the streams' mean, on the stats stream."""
+        capture layer), also appends the streams' mean, on the stats stream. Without
+        ``need_input`` (slot draft_stage0_table: the first stage's attention reads its
+        rows from the token table), opens the sublayer without building its input, which
+        only the first sublayer of fresh streams may skip: (None, None)."""
         mhc = self._mhc
         attention = _attention(kind)
         if st.open is not None:
             raise RuntimeError("a sublayer is still open: its post did not run")
         state = st.hc
         streams = state.residual
+        if not need_input and not (
+            attention and state.pre is None and state.input is None
+        ):
+            raise RuntimeError("only a fresh stream's attention may skip its input")
         stream = (
             layer.hc_stats_stream
             if mhc.use_stats_stream(layer.hc_cfg, forward_batch, streams)
@@ -239,11 +254,18 @@ class Boundaries:
             aux.append(self._aux_mean(streams, stream, st))
         quantized = [] if attention and self._attn_mxfp8[layer.layer_id] else None
         hc = layer.attn_hc if attention else layer.ffn_hc
-        x = mhc.combine(hc, state, quantized)
+        x = mhc.combine(hc, state, quantized) if need_input else None
         stats = state.stats
         state.release()
         st.open = Open(streams, stats, stream)
         return x, (quantized[0] if quantized else None)
+
+    def stage_input(self, layer, streams: torch.Tensor):
+        """The attention input ``pre`` builds for ``layer`` from fresh ``streams``
+        [rows, hc, dim] (no carried pre-mix): the same combine call, without opening the
+        sublayer (slot draft_stage0_table's fill and check)."""
+        quantized = [] if self._attn_mxfp8[layer.layer_id] else None
+        return self._mhc.combine(layer.attn_hc, self._mhc.HcState(streams), quantized)
 
     def post(self, layer, kind: str, partial, st: BoundaryState) -> None:
         """Reduce the open sublayer's TP-partial output into the streams.
@@ -560,7 +582,9 @@ class Boundaries:
             and layer.layer_id == self._last_layer
         ):
             self._log_served(
-                "hop B final collapse" if hop is self.hop_a else "draft hop final collapse",
+                "hop B final collapse"
+                if hop is self.hop_a
+                else "draft hop final collapse",
                 rows,
             )
             updated, st.final_collapse = hop.finalize(

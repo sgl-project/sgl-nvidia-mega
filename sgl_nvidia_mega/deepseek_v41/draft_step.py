@@ -35,6 +35,8 @@ SGLANG_READS = {
         "_run_boundary_attention",
         "uses_own_vocab_modules",
         "attach_shared_modules",
+        # slot draft_stage0_table: the table's id range
+        "vocab_size",
     ),
     "srt/models/deepseek_v4.py": ("maybe_use_decode_attn_tp", "self_attn", "layer_id"),
     "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "hidden_states"),
@@ -150,6 +152,14 @@ class DraftDecode(DraftProposal):
         self._attn = draft_attention.build(stages, slots) if binding is not None else {}
         if self._attn and torch.cuda.is_available():
             draft_attention.precompile(stages, self._attn, self.widths)
+        # slot draft_stage0_table: allocated, filled and checked at the first eager forward
+        self._stage0 = None  # draft_stage0.Stage0Table once filled
+        self._stage0_reason = "not requested"
+        self._stage0_wanted = False
+        self._stage0_logged: set = set()
+        if "draft_stage0_table" in slots:
+            self._stage0_reason = _stage0_reason(stages, self._attn)
+            self._stage0_wanted = not self._stage0_reason
         self.slot_states = draft_slots.states(self, slots)
         draft_slots.warn_declined(self.slot_states)
 
@@ -261,13 +271,27 @@ class DraftDecode(DraftProposal):
             try:
                 x = self._embed(input_ids) if input_embeds is None else input_embeds
                 boundary.start(st, x)
+                # slot draft_stage0_table: the first stage's attention reads its rows
+                # from the token table where this step's width was checked
+                table = self._stage0_table(step.rows, input_ids, forward_batch, view)
                 # draft stages have no recorder layer indices
                 with get_global_expert_distribution_recorder().disable_this_region():
-                    for stage in lm.stages:
+                    for i, stage in enumerate(lm.stages):
                         st.layer_id = stage.layer_id
                         with st.exit:
-                            a_in = boundary.pre(stage, "attn", st)
-                            part = attention_step(stage, a_in, st, self._attn, view)
+                            if i == 0 and table is not None:
+                                boundary.pre(stage, "attn", st, need_input=False)
+                                part = attention_step(
+                                    stage,
+                                    None,
+                                    st,
+                                    self._attn,
+                                    view,
+                                    stage0=(table, input_ids),
+                                )
+                            else:
+                                a_in = boundary.pre(stage, "attn", st)
+                                part = attention_step(stage, a_in, st, self._attn, view)
                             m_in = boundary.post(stage, "attn", part, st)
                             out = moe.step(stage, m_in, st)
                             boundary.post(stage, "ffn", out, st)
@@ -277,12 +301,116 @@ class DraftDecode(DraftProposal):
             finally:
                 boundary.clear(st)
             if collapsed is not None:
-                return LogitsProcessorOutput(next_token_logits=None, hidden_states=collapsed)
+                return LogitsProcessorOutput(
+                    next_token_logits=None, hidden_states=collapsed
+                )
             streams = residual.flatten(1)
             if not self._tail_bf16:
                 streams = streams.float()
             x = sglang_ops.hc_combine(streams, pre, lm.hc_mult, residual.dtype)
             return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
+
+    def _stage0_table(self, rows, input_ids, fb, view):
+        """Slot draft_stage0_table: the table where this step's first attention takes it,
+        else None. Fills and checks it at the first eager forward (never in a capture: a
+        graph captured before the fill keeps the live chain)."""
+        if not self._stage0_wanted:
+            return None
+        stage = self.lm.stages[0]
+        kernels = self._attn.get(stage.layer_id)
+        if self._stage0 is None:
+            if torch.cuda.is_current_stream_capturing():
+                self._log_stage0(
+                    ("capture", rows),
+                    "NVIDIA megakernel: draft_stage0_table: a %d-row graph was captured "
+                    "before the table's fill; it keeps the live stage-0 chain",
+                    rows,
+                    warn=True,
+                )
+                return None
+            with stage.self_attn.maybe_use_decode_attn_tp(fb):
+                self._stage0 = self._fill_stage0(stage, kernels, input_ids)
+        table = self._stage0
+        with stage.self_attn.maybe_use_decode_attn_tp(fb):
+            takes = draft_attention.stage0_takes(
+                stage.self_attn, kernels, rows, fb, view
+            )
+        if rows not in table.checked or not takes:
+            return None
+        self._log_stage0(
+            ("served", rows),
+            "NVIDIA megakernel: draft_stage0_table serves %d rows",
+            rows,
+        )
+        return table
+
+    def _fill_stage0(self, stage, kernels, input_ids):
+        """Allocate the table, fill it from the live chain one request's rows a launch,
+        check it at the swap-AB widths, and keep the widths clean on every rank."""
+        from sglang.srt.runtime_context import get_parallel
+
+        from sgl_nvidia_mega.deepseek_v41 import draft_stage0
+        from sgl_nvidia_mega.deepseek_v41.attention import chain
+
+        attn = stage.self_attn
+        bound = self._bound["boundary"]
+        vocab = int(self.lm.config.vocab_size)
+        table = draft_stage0.Stage0Table(
+            vocab, attn.n_local_heads, attn.head_dim, input_ids.device
+        )
+
+        def rows_fn(ids):
+            # ids past the vocabulary embed as zeros (the table's row ``vocab``)
+            valid = ids < vocab
+            streams = self._embed(torch.where(valid, ids, torch.zeros_like(ids)))
+            streams = torch.where(
+                valid.view(-1, 1, 1), streams, torch.zeros_like(streams)
+            )
+            return draft_attention.query_and_kv(
+                attn, bound.stage_input(stage, streams), kernels
+            )
+
+        with torch.inference_mode():
+            seconds = draft_stage0.fill(table, rows_fn, self._tokens)
+            widths = [w for w in self.widths if w <= chain.SWAPAB_MAX_ROWS]
+            bad = draft_stage0.check(table, rows_fn, widths, extra=input_ids)
+        # a width any rank found a mismatch at keeps the live chain on every rank
+        counts = torch.tensor(
+            [bad[w] for w in widths], dtype=torch.int64, device=input_ids.device
+        )
+        torch.distributed.all_reduce(counts, group=get_parallel().tp_group.device_group)
+        table.checked = tuple(w for w, n in zip(widths, counts.tolist()) if n == 0)
+        logger.info(
+            "NVIDIA megakernel: draft_stage0_table filled %d ids x %d B = %.3f GiB in "
+            "%.1f s (%d rows a launch); check of %d tokens, mismatching elements by "
+            "width (all ranks) %s; served at %s rows",
+            vocab + 1,
+            table.nbytes // (vocab + 1),
+            table.nbytes / 2**30,
+            seconds,
+            self._tokens,
+            draft_stage0.CHECK_TOKENS,
+            dict(zip(widths, counts.tolist())),
+            list(table.checked) or "no",
+        )
+        return table
+
+    def _log_stage0(self, key, msg, *args, warn: bool = False) -> None:
+        if key in self._stage0_logged:
+            return
+        self._stage0_logged.add(key)
+        (logger.warning if warn else logger.info)(msg, *args)
+
+
+def _stage0_reason(stages, ported) -> str:
+    """Why slot draft_stage0_table cannot serve, or "": it needs the first stage's
+    attention ported with swap-AB (whose query is wq_b's rows unroped)."""
+    kernels = ported.get(stages[0].layer_id)
+    if kernels is None:
+        return "the first stage's attention is not ported (slot draft_attn)"
+    if not kernels.swapab:
+        return "the first stage's attention takes no swap-AB (slot draft_swapab)"
+    return ""
 
 
 def _prenorm(slots) -> bool:
@@ -341,13 +469,27 @@ def _shared_table(embed_tokens):
     return table
 
 
-def attention_step(stage, x, st, ported, view=None):
+def attention_step(stage, x, st, ported, view=None, stage0=None):
     """The draft stage's attention (``DSparkAttention.forward`` with the sum deferred to
     the post): the plugin's port with the stage's kernels over the draft forward's
-    ``view`` (the binding's ``ForwardView``), or SGLang's own call."""
+    ``view`` (the binding's ``ForwardView``), or SGLang's own call. ``stage0`` (slot
+    draft_stage0_table): ``(table, input_ids)``, the query and K/V rows gathered from the
+    token table in place of ``x``'s kernels."""
     attn = stage.self_attn
     with attn.maybe_use_decode_attn_tp(st.fb):
         kernels = ported.get(stage.layer_id)
+        if stage0 is not None:
+            from sgl_nvidia_mega.deepseek_v41 import draft_stage0
+
+            return draft_attention.forward(
+                attn,
+                None,
+                st.positions,
+                st.fb,
+                kernels=kernels,
+                view=view,
+                stage0=draft_stage0.gather(*stage0),
+            )
         if kernels is None:
             return stage._run_boundary_attention(x, st.positions, st.fb, st.x_quant)
         return draft_attention.forward(
