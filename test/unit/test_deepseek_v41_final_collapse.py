@@ -17,6 +17,7 @@ def _boundaries(final_collapse):
     b = boundaries.Boundaries.__new__(boundaries.Boundaries)
     b._mhc = SimpleNamespace(HcState=lambda *a: a)
     b.final_collapse, b._last_layer, b._served = final_collapse, 39, set()
+    b.draft_hop = None
     b._triplet = lambda hc, opened: ("pre", "post", "comb")
     calls = []
 
@@ -68,5 +69,7 @@ def test_the_slot_is_opt_in_and_needs_hop_b():
 
     assert "hop_final_collapse" in runtime.OPT_IN_SLOTS
     assert "hop_final_collapse" not in runtime.SHIPPED_SLOTS
-    assert "hop_mbar" in runtime.OPT_IN_SLOTS
-    assert "hop_mbar" not in runtime.SHIPPED_SLOTS
+    assert (
+        "hop_mbar" in runtime.DEFAULT_ON_SLOTS and "hop_mbar" in runtime.SHIPPED_SLOTS
+    )
+    assert "hop_mbar" not in runtime.OPT_IN_SLOTS

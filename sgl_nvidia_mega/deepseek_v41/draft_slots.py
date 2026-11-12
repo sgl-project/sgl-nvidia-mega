@@ -53,13 +53,23 @@ def warn_declined(table: dict[str, tuple[str, str]]) -> None:
             )
 
 
-_PROPOSAL = ("markov", "draft_lm_head")
+_PROPOSAL = ("markov", "draft_lm_head", "markov_pdl", "markov_lowlat", "markov_tail")
 
 
 def _proposal(built, name):
-    if name == "markov":
+    if name in ("markov", "markov_pdl", "markov_lowlat", "markov_tail"):
         if built.draft_sampler is None:
             return DECLINED, "SGLang's proposal"
+        if name == "markov_pdl":
+            return BUILT, "the chain a PDL dependent of the draft LM head"
+        if name == "markov_lowlat":
+            return BUILT, "the chain's low-latency exchange"
+        if name == "markov_tail":
+            return (
+                BUILT,
+                "the chain advances the noise offset, and writes the verify ids "
+                "where SGLang hands them over",
+            )
         return BUILT, "Markov chain in one kernel, built with the proposal's buffers"
     if not built.low_m:
         return DECLINED, "LM head SGLang's"
@@ -69,14 +79,27 @@ def _proposal(built, name):
 def _forward(built, stages, slots, name):
     if name == "draft":
         return BUILT, f"widths {list(built.widths)}"
-    if name in ("draft_post", "draft_hop", "draft_seam", "draft_prenorm"):
+    if name in (
+        "draft_post",
+        "draft_hop",
+        "draft_seam",
+        "draft_prenorm",
+        "draft_final_collapse",
+    ):
         return _boundary(built, stages, name)
-    if name in ("draft_moe", "draft_gate"):
+    if name in ("draft_moe", "draft_gate", "draft_shared_ll"):
         return _moe(built, name)
     if name == "draft_tail":
         return BUILT, "BF16 streams into hc_combine"
     if name == "draft_embed":
         return BUILT, "the target's whole table, bound at the first forward"
+    if name == "draft_stage0_table":
+        if not built._stage0_wanted:
+            return DECLINED, built._stage0_reason
+        return BUILT, (
+            "the first stage's query and K/V rows from a per-token table, filled and "
+            "checked at the first eager forward"
+        )
     return _attention(built, stages, slots, name)
 
 
@@ -85,6 +108,10 @@ def _boundary(built, stages, name):
     hop = bound.draft_hop
     if name == "draft_prenorm":
         return (BUILT, "DeepGEMM TF32") if bound.prenorm else (DECLINED, "not served")
+    if name == "draft_final_collapse":
+        if hop is None or not hop.final_collapse:
+            return DECLINED, f"no draft hop ({built._hop_reason})"
+        return BUILT, "the last stage's MoE post writes the head's collapse"
     if name == "draft_hop":
         if hop is None:
             from sgl_nvidia_mega.deepseek_v41.boundary import draft_hop
@@ -135,6 +162,15 @@ def _moe(built, name):
         return DECLINED, getattr(moe, "reason", "") or "no stage built"
     if name == "draft_moe":
         return BUILT, f"routed pair in stages {sorted(slots)}"
+    if name == "draft_shared_ll":
+        shared = sorted(i for i, s in slots.items() if s.shared is not None)
+        if not shared:
+            return DECLINED, moe.shared_reason or "no stage took it"
+        fold = any(slots[i].shared.fold is not None for i in shared)
+        return BUILT, (
+            f"shared expert gate_up on the low-latency GEMM in stages {shared}"
+            + (", SwiGLU folded" if fold else "")
+        )
     gated = sorted(i for i, s in slots.items() if s.gate)
     if not gated:
         return DECLINED, "the fast top-k applies to no stage"

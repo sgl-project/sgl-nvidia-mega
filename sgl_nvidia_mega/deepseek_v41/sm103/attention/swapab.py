@@ -22,6 +22,11 @@ HEAD_DIM = 512
 # after the wait, not after the loads: faster in 7 of 9 GB300 micro-bench cases at 6-24 rows.
 COMBINE_EARLY_TRIGGER = True
 SOFTMAX_SCALE = HEAD_DIM**-0.5
+# combine_counter: a row's tile CTAs wait for each other, so a launch takes it only when
+# every CTA fits on its own SM; past this deadline a waiting CTA traps instead of hanging
+FUSED_WAIT_DEADLINE_NS = 2_000_000_000
+# per-CTA %globaltimer stamps (bench only): [rows * tiles, STAMP_SLOTS] int64
+STAMP_SLOTS = 16
 
 
 @triton.jit
@@ -70,6 +75,97 @@ def _combine(
     tl.store(OUT + (b * H + h) * 512 + d, out)
 
 
+_SM_COUNT: dict = {}
+
+
+def fused_combine_fits(rows: int, tiles: int, device) -> bool:
+    """Whether a launch of ``rows`` x ``tiles`` CTAs can merge in the kernel: all of
+    them resident at once, one per SM."""
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    if index not in _SM_COUNT:
+        _SM_COUNT[index] = torch.cuda.get_device_properties(index).multi_processor_count
+    return rows * tiles <= _SM_COUNT[index]
+
+
+# Cluster merge (slot attn_cluster_merge): a row's tiles as one cluster of NT CTAs that
+# merge through distributed shared memory. Where it engages (GB300, attention half bench,
+# us per layer, 6 rows): 8 heads, low-ratio range (10 tiles) -1.2..-1.5; 16 heads +0.5..+1.2
+# (its 124 KB CTAs need ten free SMs of one GPC beside wq_b's 64 CTAs and launch late);
+# window only (2 tiles) +0.5..+0.7 (two CTAs merge all units). At most 8 rows: one wave.
+# Served (TP8 + EP2, batch 1, nsys): partial 8.6 vs 5.7 + combine 1.7, wo_a 2.6 vs 3.5 us
+# per low-ratio layer; no step gain.
+CLUSTER_HEADS = (8,)
+CLUSTER_MIN_TILES = 4
+CLUSTER_MAX_TILES = 16  # the hardware's largest (non-portable) cluster
+CLUSTER_MAX_ROWS = 8
+
+
+def cluster_merge_takes(rows: int, tiles: int, heads: int) -> bool:
+    """Whether ``cluster_merge`` merges a launch of ``rows`` x ``tiles`` CTAs on ``heads``
+    local heads in the kernel (elsewhere it keeps the separate combine)."""
+    return (
+        heads in CLUSTER_HEADS
+        and 0 < rows <= CLUSTER_MAX_ROWS
+        and CLUSTER_MIN_TILES <= tiles <= CLUSTER_MAX_TILES
+    )
+
+
+def cluster_merge_shape(tiles: int, heads: int) -> tuple[int, int, int]:
+    """(rounds, stats offset, exchange bytes) of a cluster merge: each CTA merges at
+    most ``rounds * 4`` of the row's ``heads * 4`` 128-column units."""
+    rounds = triton.cdiv(triton.cdiv(heads * 4, tiles), 4)
+    units = rounds * 4 * tiles * 128 * 4
+    return rounds, units, units + tiles * 16 * 4 * 2
+
+
+_CLUSTER_READY: dict = {}
+
+
+def _cluster_kernel(fn, args, kwargs, tiles: int, exchange: int):
+    """The compiled ``fn`` for these arguments, set to launch ``tiles``-CTA clusters
+    with ``exchange`` bytes of dynamic shared memory past the compiler's own; returns
+    (kernel, exchange offset). The compiler's shared memory does not depend on XOFF."""
+    kernel = fn.warmup(*args, grid=(1,), **kwargs)
+    kernel._init_handles()
+    ready = _CLUSTER_READY.get(id(kernel))
+    if ready is not None and ready[0] is kernel:
+        return kernel, ready[1]
+    from cuda.bindings import driver as cu
+
+    num_warps, num_ctas, shared = kernel.packed_metadata
+    assert num_ctas == 1, "the kernel is compiled for single-CTA launches"
+    xoff = -(-shared // 16) * 16
+    total = xoff + exchange
+    func = cu.CUfunction(kernel.function)
+    attrs = [
+        (cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, total)
+    ]
+    if tiles > 8:
+        attrs.append(
+            (
+                cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                1,
+            )
+        )
+    for attr, value in attrs:
+        (err,) = cu.cuFuncSetAttribute(func, attr, value)
+        assert err == cu.CUresult.CUDA_SUCCESS, f"cuFuncSetAttribute({attr}): {err}"
+    # Triton's launcher multiplies grid x by num_ctas and sets the cluster dimension
+    kernel.packed_metadata = (num_warps, tiles, total)
+    _CLUSTER_READY[id(kernel)] = (kernel, xoff)
+    return kernel, xoff
+
+
+def _launch_cluster(fn, rows, args, kwargs, tiles, exchange):
+    kernel, xoff = _cluster_kernel(fn, args, {**kwargs, "XOFF": 0}, tiles, exchange)
+    bound = dict(zip(fn.arg_names, args))
+    bound.update(kwargs, XOFF=xoff)
+    values = [bound[p.name] if p.name in bound else p.default for p in fn.params]
+    kernel[(rows, 1, 1)](*values)
+
+
 def _q_rope_kwargs(q_rope, b):
     freqs, positions = q_rope
     assert (
@@ -96,6 +192,12 @@ def swapab_attention(
     kv_before_wait=False,
     combine_entry_trigger=False,
     extra_after_wait=False,
+    combine_counter=None,
+    stage_before_wait=False,
+    stamps=None,
+    wait_deadline_ns=FUSED_WAIT_DEADLINE_NS,
+    cluster_merge=False,
+    force_cluster=False,
 ):
     """V4-layout attention on 16 (TP4) or 8 (TP8) heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
@@ -106,7 +208,19 @@ def swapab_attention(
     `extra_after_wait` (with `kv_before_wait`): only the window rows are gathered before
     the wait; the extra range's indices and lengths come from the PDL predecessor (the
     layer's top-k). `combine_entry_trigger` launches the combine's dependent at the
-    combine's entry."""
+    combine's entry.
+    `stage_before_wait` (with `kv_before_wait`; slot attn_prewait): 1 also loads the
+    query's RoPE row before the wait, 2 also stages the KV tile in shared memory.
+    `combine_counter` (int32 [>= rows], zero, owned by one call site) merges the tiles
+    inside the attention kernel when every CTA fits on its own SM: the narrow combine's
+    arithmetic, no second launch; not in the chain (its row barrier measured slower than
+    the second launch, benchmark/bench_deepseek_v41_attn_half.py). `stamps` (int64
+    [rows * tiles, STAMP_SLOTS]) records per-CTA %globaltimer phases for benchmarks.
+    `cluster_merge` (slot attn_cluster_merge; with `narrow_combine`, where
+    `cluster_merge_takes`): each row's tiles run as one cluster and merge through
+    distributed shared memory inside the attention kernel, bit for bit the narrow
+    combine, with no second launch; the kernel's dependents launch at its entry.
+    `force_cluster` (tests) merges in the cluster wherever the hardware allows."""
     from .swapab_gluon import partial_gluon  # Gluon imports only where it runs
 
     block = 64
@@ -135,7 +249,38 @@ def swapab_attention(
     maximum = torch.empty((b, nt, h), dtype=torch.float32, device=q.device)
     sums = torch.empty_like(maximum)
     out = torch.empty((b, h, 512), dtype=q.dtype, device=q.device)
-    partial_gluon[(b, nt)](
+    fused = (
+        combine_counter is not None
+        and narrow_combine
+        and fused_combine_fits(b, nt, q.device)
+    )
+    if fused:
+        assert combine_counter.dtype == torch.int32 and combine_counter.numel() >= b
+        st = triton.next_power_of_2(nt)
+        rounds = triton.cdiv(triton.cdiv(h * 4, nt), 4)
+        fused_kwargs = dict(
+            FUSED=True,
+            CNT=combine_counter,
+            SINK=sink,
+            OUT=out,
+            DEADLINE=wait_deadline_ns,
+            ST=st,
+            ROUNDS=rounds,
+        )
+    else:
+        fused_kwargs = {}
+    if stamps is not None:
+        assert stamps.dtype == torch.int64 and stamps.numel() >= b * nt * STAMP_SLOTS
+    cluster = (
+        cluster_merge
+        and narrow_combine
+        and not fused
+        and (
+            cluster_merge_takes(b, nt, h)
+            or (force_cluster and b <= CLUSTER_MAX_ROWS and nt <= CLUSTER_MAX_TILES)
+        )
+    )
+    args = (
         q,
         kv,
         extra_kv,
@@ -146,6 +291,8 @@ def swapab_attention(
         partial,
         maximum,
         sums,
+    )
+    kwargs = dict(
         QS=q.stride(0),
         QH=q.stride(-2),
         IS=indices.stride(0),
@@ -175,10 +322,32 @@ def swapab_attention(
         **({"HQ": h} if h != NUM_HEADS else {}),
         **(
             {"EXTRA_AFTER_WAIT": True}
-            if pdl and kv_before_wait and extra_after_wait and ne
+            if pdl and kv_before_wait and extra_after_wait and ne and not fused
             else {}
         ),
+        **(
+            {"STAGE_BEFORE_WAIT": int(stage_before_wait)}
+            if pdl and kv_before_wait and stage_before_wait
+            else {}
+        ),
+        **fused_kwargs,
+        **({"STAMPS": True, "STAMP": stamps} if stamps is not None else {}),
     )
+    if cluster:
+        rounds, xstats, exchange = cluster_merge_shape(nt, h)
+        kwargs.update(
+            CLUSTER=True,
+            SINK=sink,
+            OUT=out,
+            ST=triton.next_power_of_2(nt),
+            ROUNDS=rounds,
+            XSTATS=xstats,
+        )
+        _launch_cluster(partial_gluon, b, args, kwargs, nt, exchange)
+        return out
+    partial_gluon[(nt, b) if fused else (b, nt)](*args, **kwargs)
+    if fused:
+        return out
     bd = 64 if ne else 512
     combine_warps = 4
     if narrow_combine and ne:

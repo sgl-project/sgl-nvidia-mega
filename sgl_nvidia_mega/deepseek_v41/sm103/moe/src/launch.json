@@ -42,5 +42,32 @@
       "Y",
       "cta_words"
     ]
+  },
+  "gemm2_pipe": {
+    "symbol": "dsv41_routed_expert_gemm2",
+    "block": [
+      512,
+      1,
+      1
+    ],
+    "shared_memory_bytes": 182912,
+    "cluster_dimensions": null,
+    "use_pdl": true,
+    "function_attributes": [],
+    "parameters": [
+      "A",
+      "SFA",
+      "H",
+      "HS",
+      "route",
+      "Y",
+      "cta_words"
+    ],
+    "tensor_maps": [
+      "A",
+      "SFA",
+      "H"
+    ],
+    "opt_in": true
   }
 }

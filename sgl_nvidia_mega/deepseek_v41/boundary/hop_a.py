@@ -29,6 +29,11 @@ class HopA:
         pair), also stored into the mailbox; None when the GEMM cannot take them."""
         return self._runner.publish_wo_b(wo_b, o)
 
+    @property
+    def wo_b_split(self) -> bool:
+        """Slot wo_b_publish_split built: wo_b at 1-8 rows on muLLM's split-K kernel."""
+        return self._runner.split is not None
+
     def published(self, partial: torch.Tensor) -> bool:
         return self._runner.hop._published is partial
 
@@ -65,6 +70,7 @@ def build(
     hop_b_quad_trigger: bool = False,
     mbarrier_exchange: bool = False,
     final_collapse: bool = False,
+    wo_b_split: bool = False,
 ) -> tuple[Optional[HopA], str]:
     """(the hop, "") or (None, why not). Collective over the TP group: a failure on
     any rank raises on every rank; an unsupported wo_b leaves the hop off. ``hop_b``
@@ -73,8 +79,10 @@ def build(
     finalize's at its start; ``batch2`` (slot hop_a_batch2) adds 9-16 rows; ``hop_b_wide``
     runs hop B at every width up to plan.HOP_B_MAX_ROWS, not only hop A's;
     ``mbarrier_exchange`` (slot hop_mbar) and ``final_collapse`` (slot
-    hop_final_collapse, with ``hop_b``) are AllReduceMHC's, on every mailbox."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner
+    hop_final_collapse, with ``hop_b``) are AllReduceMHC's, on every mailbox;
+    ``wo_b_split`` (slot wo_b_publish_split) repacks every target layer's wo_b for muLLM's
+    split-K publishing projection at 1-8 rows."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner, SplitPublisher
 
     m = model.model
     cfg = model.config
@@ -113,6 +121,19 @@ def build(
             final_collapse=hop_b and final_collapse,
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
+        if wo_b_split and taken:
+            split = SplitPublisher(runner.hop, "hop A")
+            for i in range(m.start_layer, m.end_layer):
+                why = split.add(m.layers[i].self_attn.wo_b)
+                if why:
+                    raise ValueError(f"slot wo_b_publish_split, layer {i}: {why}")
+            runner.split = split
+            logger.info(
+                "NVIDIA megakernel: slot wo_b_publish_split repacked %d target wo_b "
+                "(%.1f MiB)",
+                len(split),
+                split.bytes() / 2**20,
+            )
         if hop_b and hop_b_quad_trigger:
             logger.info(
                 "NVIDIA megakernel: hop B finalize-publish triggers its consumer "

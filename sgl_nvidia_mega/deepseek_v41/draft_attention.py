@@ -24,6 +24,7 @@ import torch
 
 from sgl_nvidia_mega.deepseek_v41.attention import chain
 from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a as wo_a_kernel
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -165,6 +166,16 @@ class Kernels(NamedTuple):
     # swap-AB gathers the KV before its PDL wait where the store joined first (slot
     # kv_before_wait)
     kv_before_wait: bool = False
+    # slot attn_q_norm_gemm: at 1-8 rows the qfront norm + quant inside wq_b's GEMM
+    q_norm_gemm: bool = False
+    # swap-AB merges its tiles in the kernel where it applies (slot attn_cluster_merge)
+    cluster_merge: bool = False
+    # slot attn_core_lean: muLLM's one-launch window core on the v41_new pool, with the
+    # fused wo_a rotating by an identity
+    core_lean: bool = False
+    # slot wo_b_publish_split (with slot draft_hop): wo_b at 1-8 rows on muLLM's split-K
+    # kernel, publishing into the draft hop's mailbox (sm103.runner.SplitPublisher)
+    wo_b_split: Optional[object] = None
 
 
 def wo_a_applies(attn, one_group: bool = False) -> bool:
@@ -200,15 +211,25 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
             continue
         fusable = "draft_qkv_a" in slots and not qkv_a_fusable(attn.wq_a, attn.wkv)
         wo_a = "draft_wo_a" in slots and wo_a_applies(attn, "wo_a_g1" in slots)
+        qfront = (
+            "draft_qfront" in slots
+            and not attn.q_head_norm
+            and chain.wq_b_ll_applies(attn)
+        )
         kernels[stage.layer_id] = Kernels(
             # the chain's query kernels have no per-head norm
-            qfront="draft_qfront" in slots
-            and not attn.q_head_norm
-            and chain.wq_b_ll_applies(attn),
+            qfront=qfront,
+            q_norm_gemm=qfront and "attn_q_norm_gemm" in slots,
             wo_a=wo_a,
             swapab="draft_swapab" in slots
             and chain.swapab_applies(attn, heads8="swapab_h8" in slots),
             kv_before_wait="draft_swapab" in slots and "kv_before_wait" in slots,
+            cluster_merge="draft_swapab" in slots and "attn_cluster_merge" in slots,
+            core_lean="draft_swapab" in slots
+            and "attn_core_lean" in slots
+            and wo_a
+            and attn.n_local_heads == 8
+            and chain.swapab_applies(attn, heads8=True),
             qkv_a=(
                 FusedQkvA(attn.wq_a, attn.wkv, ll="draft_qkv_a_ll" in slots)
                 if fusable
@@ -225,6 +246,7 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
 
 def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
     """Compile the slots' kernels that do not depend on the KV pool, before capture."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm
     from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import (
         rmsnorm_mxfp8,
     )
@@ -255,25 +277,75 @@ def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
                     pdl=True,
                     row_tiles=r > mxfp8_ll.MAX_ROWS,
                 )
+            if k.q_norm_gemm:
+                q_norm_gemm.precompile(
+                    attn.wq_b.weight,
+                    rows,
+                    attn.q_norm.variance_epsilon,
+                    consumer=chain.wq_b_consumer(attn),
+                )
         if k.wo_a:
             wo_a_kernel.precompile(
                 min(max(rows), chain.WO_A_MAX_ROWS), groups=attn.n_local_groups
             )
+        if k.core_lean:
+            core_lean.precompile()
 
 
-def forward(attn, x, positions, fb, *, kernels: Kernels, view):
+def query_and_kv(attn, x, kernels: Kernels):
+    """The swap-AB arm's query rows (wq_b's output, unroped: swap-AB ropes q as it loads
+    it) and the window K/V rows before the store's norm + RoPE, as ``forward`` computes
+    them from the attention input ``x`` (slot draft_stage0_table: its fill and check)."""
+    qkv_a = kernels.qkv_a(x) if kernels.qkv_a is not None else None
+    kv = attn.kv_proj_only(x) if qkv_a is None else kernels.qkv_a.kv(qkv_a)
+    return _compute_q(attn, x, None, None, qkv_a, kernels, True), kv
+
+
+def _arm(attn, kernels: Kernels, rows: int, fb, view):
+    """(the lean core's caches or None, whether the query stays unroped): the lean core
+    and swap-AB rope q as they load it."""
+    lean = (
+        chain.core_lean_caches(attn, view, rows, model="draft")
+        if kernels.core_lean and chain.core_lean_takes(rows, fb, view)
+        else None
+    )
+    if lean is not None and lean.extra is not None:
+        lean = None
+    return lean, lean is not None or (kernels.swapab and _swapab_takes(rows, fb, view))
+
+
+def stage0_takes(attn, kernels: Optional[Kernels], rows: int, fb, view) -> bool:
+    """Whether this step's stage-0 attention can read the token table's rows: an arm
+    whose query is wq_b's rows unroped (swap-AB, or the lean core)."""
+    return (
+        kernels is not None
+        and not fb.forward_mode.is_idle()
+        and _arm(attn, kernels, rows, fb, view)[1]
+    )
+
+
+def forward(attn, x, positions, fb, *, kernels: Kernels, view, stage0=None):
     """``DSparkAttention.forward(..., defer_all_reduce=True)`` with ``kernels``; ``view``:
-    the draft forward's ``ForwardView`` (its KV pool, metadata and attention)."""
+    the draft forward's ``ForwardView`` (its KV pool, metadata and attention).
+    ``stage0`` (slot draft_stage0_table, where ``stage0_takes``): ``(q, kv)`` gathered
+    from the token table in place of ``x``'s query and K/V kernels (``x`` is then None)."""
     from sglang.srt.model_executor.runner import get_is_capture_mode
     from sglang.srt.models.deepseek_v4_dspark import _PAD_NUM_HEADS
 
     if fb.forward_mode.is_idle():
         return torch.zeros_like(x)
     pool = view.kv_pool
-    rows = x.shape[0]
-    swapab = kernels.swapab and _swapab_takes(rows, fb, view)
+    ref = x if stage0 is None else stage0[1]
+    rows = ref.shape[0]
+    lean, swapab = _arm(attn, kernels, rows, fb, view)
+    if stage0 is not None and not swapab:
+        raise RuntimeError(
+            "slot draft_stage0_table: the step's arm ropes the query itself"
+        )
     q_padded = q_out = None
-    if (
+    if stage0 is not None:
+        pass  # the table's rows are the query
+    elif (
         pool.uniform_fp8
         and not attn.q_head_norm
         and attn.n_local_heads in (8, 16, 32, 64, 128)
@@ -281,15 +353,18 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         q_out = torch.empty(
             (rows, attn.n_local_heads, attn.head_dim),
             dtype=torch.float8_e4m3fn,
-            device=x.device,
+            device=ref.device,
         )
     elif attn.n_local_heads < _PAD_NUM_HEADS and not swapab:
         # swap-AB reads only the real heads, so its unroped q stays unpadded
-        q_padded = x.new_empty(rows, _PAD_NUM_HEADS, attn.head_dim)
+        q_padded = ref.new_empty(rows, _PAD_NUM_HEADS, attn.head_dim)
         q_out = q_padded[:, : attn.n_local_heads, :]
 
     def kv_and_store():
-        kv = attn.kv_proj_only(x) if qkv_a is None else kernels.qkv_a.kv(qkv_a)
+        if stage0 is not None:
+            kv = stage0[1]
+        else:
+            kv = attn.kv_proj_only(x) if qkv_a is None else kernels.qkv_a.kv(qkv_a)
         # DSparkAttention._store_block_kv (the SWA window; unified-KV declines at build)
         pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=attn.layer_id,
@@ -303,7 +378,13 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         return kv
 
     # the fused GEMM runs before the fork; the side stream takes its kv columns
-    qkv_a = kernels.qkv_a(x) if kernels.qkv_a is not None else None
+    qkv_a = kernels.qkv_a(x) if kernels.qkv_a is not None and stage0 is None else None
+
+    def query():
+        if stage0 is not None:
+            return stage0[0]
+        return _compute_q(attn, x, positions, q_out, qkv_a, kernels, swapab)
+
     # the KV store joined the attention's stream (a full graph edge), so swap-AB may
     # gather the KV before its PDL wait
     store_joined = False
@@ -316,13 +397,37 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         side.wait_stream(current)
         with torch.cuda.stream(side):
             kv = kv_and_store()
-        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels.qfront, swapab)
+        q = query()
         current.wait_stream(side)
         store_joined = True
     else:
         kv = kv_and_store()
-        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels.qfront, swapab)
+        q = query()
 
+    if lean is not None:
+        freqs = torch.view_as_real(attn.freqs_cis).flatten(-2)
+        o = chain.lean_decode(
+            attn,
+            lean,
+            q,
+            positions,
+            freqs,
+            early=kernels.kv_before_wait and store_joined,
+            model="draft",
+        )
+        return _wo_b(
+            attn,
+            _wo_a(
+                attn,
+                o,
+                positions,
+                fb,
+                True,
+                rope=core_lean.identity_rope(rows, o.device),
+            ),
+            kernels.wo_b_ll,
+            kernels.wo_b_split,
+        )
     if swapab:
         freqs = torch.view_as_real(attn.freqs_cis).flatten(-2)
         o = chain.sparse_decode(
@@ -332,6 +437,7 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
             positions,
             freqs,
             kv_before_wait=kernels.kv_before_wait and store_joined,
+            cluster_merge=kernels.cluster_merge,
             model="draft",
         )
     else:
@@ -347,7 +453,12 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         )
     if o.shape[1] != attn.n_local_heads:
         o = o[:, : attn.n_local_heads, :]
-    return _wo_b(attn, _wo_a(attn, o, positions, fb, kernels.wo_a), kernels.wo_b_ll)
+    return _wo_b(
+        attn,
+        _wo_a(attn, o, positions, fb, kernels.wo_a),
+        kernels.wo_b_ll,
+        kernels.wo_b_split,
+    )
 
 
 def _swapab_takes(rows, fb, view) -> bool:
@@ -358,17 +469,21 @@ def _swapab_takes(rows, fb, view) -> bool:
     )
 
 
-def _compute_q(attn, x, positions, q_out, qkv_a, qfront, swapab):
+def _compute_q(attn, x, positions, q_out, qkv_a, kernels: Kernels, swapab):
     """``DSparkAttention._compute_q`` (fast-kernel arm), on the fused GEMM's q columns,
     the chain's query kernels, or unroped for swap-AB."""
     from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 
+    qfront = kernels.qfront
     if not (qfront or swapab or qkv_a is not None):
         return attn._compute_q(x, positions, q_out=q_out)
     q = qkv_a[:, : attn.q_lora_rank] if qkv_a is not None else attn.wq_a(x)[0]
     if qfront:
-        ops = chain.ChainOps(attn, rope_in_attention=swapab)
-        _, q = ops.normalize_q_lora(attn, q)
+        ops = chain.ChainOps(
+            attn, rope_in_attention=swapab, q_norm_gemm=kernels.q_norm_gemm
+        )
+        defer = ops.q_norm_gemm and ops.defers_norm(attn, q.shape[0])
+        _, q = ops.normalize_q_lora(attn, q, defer)
         return ops.compute_q_b(attn, q, positions, q_out)
     q, _ = attn.wq_b(attn.q_norm(q))
     q = q.view(-1, attn.n_local_heads, attn.head_dim)
@@ -391,8 +506,10 @@ def _compute_q(attn, x, positions, q_out, qkv_a, qfront, swapab):
     return q_out
 
 
-def _wo_a(attn, o, positions, fb, fused: bool):
-    """The inverse RoPE + wo_a: fused into wo_b's MXFP8 rows, or SGLang's draft arm."""
+def _wo_a(attn, o, positions, fb, fused: bool, rope=None):
+    """The inverse RoPE + wo_a: fused into wo_b's MXFP8 rows, or SGLang's draft arm.
+    ``rope`` (slot attn_core_lean): the (freqs, positions) the fused kernel rotates by
+    instead of the layer's; no SGLang fallback then."""
     from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
@@ -406,14 +523,18 @@ def _wo_a(attn, o, positions, fb, fused: bool):
         and not get_forward().sp_active
         and 0 < o.shape[0] <= chain.WO_A_MAX_ROWS
     ):
+        if rope is None:
+            rope = (torch.view_as_real(attn.freqs_cis).flatten(1), positions)
         codes, scales = wo_a_kernel.fused_rope_wo_a(
             o.view(o.shape[0], attn.n_local_groups, -1),
             attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1),
-            torch.view_as_real(attn.freqs_cis).flatten(1),
-            positions,
+            rope[0],
+            rope[1],
             early_trigger=True,
         )
         return Mxfp8SwizzledInput(codes, scales)
+    if rope is not None:
+        raise RuntimeError("slot attn_core_lean needs the fused draft wo_a")
     rd = attn.rope_head_dim
     fused_rope_inplace(
         o[..., -rd:], None, attn.freqs_cis, positions=positions, inverse=True
@@ -430,13 +551,19 @@ def _wo_a(attn, o, positions, fb, fused: bool):
     return o.reshape(o.shape[0], o.shape[1] * o.shape[2])
 
 
-def _wo_b(attn, o, ll: bool = False):
+def _wo_b(attn, o, ll: bool = False, split=None):
     """wo_b with the TP sum left to the stage's attention post, as SGLang's draft; with
     slot draft_wo_b_ll, the fused wo_a's MXFP8 rows on the low-latency GEMM at 1-8
-    rows (the target wo_b's shape and tactics)."""
+    rows (the target wo_b's shape and tactics); with ``split`` (slot
+    wo_b_publish_split), those rows on muLLM's split-K kernel, published into the draft
+    hop's mailbox, whose post then only collects."""
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
+    if split is not None and isinstance(o, Mxfp8SwizzledInput):
+        out = split(attn.wo_b, o)
+        if out is not None:
+            return mhc.AttnOutput(out)
     if (
         ll
         and isinstance(o, Mxfp8SwizzledInput)

@@ -134,10 +134,20 @@ def step(layer: torch.nn.Module, m_in: torch.Tensor, st) -> object:
 _FAST_GATE_SERVED: set = set()
 
 
-def _log_fast_gate(rows: int) -> None:
-    if rows not in _FAST_GATE_SERVED:
-        _FAST_GATE_SERVED.add(rows)
-        logger.info("NVIDIA megakernel: fast gate top-k serves %d rows", rows)
+def _log_fast_gate(
+    rows: int, fused: bool = False, quant: bool = False, early: bool = False
+) -> None:
+    if (rows, fused, quant, early) not in _FAST_GATE_SERVED:
+        _FAST_GATE_SERVED.add((rows, fused, quant, early))
+        logger.info(
+            "NVIDIA megakernel: fast gate top-k serves %d rows%s%s%s",
+            rows,
+            " with the route record in one launch (gate_route)" if fused else "",
+            " and the routed input's MXFP8 quant (gate_route_quant)" if quant else "",
+            " behind a router GEMM that releases it early (gate_route_early)"
+            if early
+            else "",
+        )
 
 
 # engagement of slot shared_ll, as above
@@ -244,10 +254,17 @@ def _dual_stream(
     bypass = fwd.flashinfer_trtllm_bypass
     current = torch.cuda.current_stream()
     pre_quant_input = None if bypass else mlp._maybe_quant_moe_input_once(x)
+    # slot gate_route_quant: the top-k launch quantizes the routed input, no quant stream
+    quant_in_gate = (
+        fast_gate
+        and pre_quant_input is None
+        and slot.quant_in_gate(x, input_ids_global, use_vision_topk)
+    )
     mlp.alt_stream.wait_stream(current)
     quant_routed = (
         not bypass
         and pre_quant_input is None
+        and not quant_in_gate
         and mlp._should_quant_routed_input_mxfp8(x)
     )
     if quant_routed:
@@ -261,9 +278,19 @@ def _dual_stream(
         else None
     )
 
+    early = None
     if fast_gate:
-        _log_fast_gate(x.shape[0])
-        router_logits = mlp.gate(x, None)
+        # slot gate_route_early: SGLang's router GEMM that releases the top-k early
+        early = slot.early_router(x, input_ids_global, use_vision_topk)
+        _log_fast_gate(
+            x.shape[0],
+            slot.gemm.serves_gate_route(
+                x.shape[0], input_ids_global if use_vision_topk else None
+            ),
+            quant_in_gate,
+            early is not None,
+        )
+        router_logits = early(x) if early is not None else mlp.gate(x, None)
         topk_output = slot.select(
             router_logits, input_ids_global, num_token_non_padded, use_vision_topk
         )
@@ -303,7 +330,13 @@ def _dual_stream(
         )
     )
     if slot is not None:
-        routed = slot.run(x, topk_output, routed_pre_quant)
+        routed = slot.run(
+            x,
+            topk_output,
+            routed_pre_quant,
+            quant_in_gate=quant_in_gate,
+            early=early is not None,
+        )
     elif deferred:
         routed = mlp.experts.forward_deferred_finalize(
             x, topk_output, pre_quant_input=routed_pre_quant

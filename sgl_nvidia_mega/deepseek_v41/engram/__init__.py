@@ -13,7 +13,10 @@ rows on a side stream, ``before_moe`` / ``before_layer`` run the prefetch's two
 main-stream all-reduces at its layers, and ``apply`` only gates. With slot
 ``prologue_fork``, ``fork`` runs the hashes and the prefetch's lookups on the Engram
 stream from the step start (they read only the step's inputs); the prefetch's two
-all-reduces stay on the main stream at their layers.
+all-reduces stay on the main stream at their layers. With slot ``engram_publish`` the
+second all-reduce is gone: each Engram layer's WKV columns are published into every
+rank's mailbox from the Engram stream and collected on the main stream at the layer
+(prefetch.py, exchange.py).
 """
 
 from __future__ import annotations
@@ -62,7 +65,8 @@ def build(model, ctx, group):
     if "engram" not in runtime.SLOTS:
         bound = Bound(None, "stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
     else:
-        bound = Bound(*prefetch.build(model, ctx, group))
+        publish = "engram_publish" in runtime.SLOTS
+        bound = Bound(*prefetch.build(model, ctx, group, publish=publish))
     if "prologue_fork" in runtime.SLOTS and model.model.engram_hasher is not None:
         stream = bound.prefetch.stream if bound.prefetch else torch.cuda.Stream()
         bound = bound._replace(stream=stream)
@@ -126,10 +130,13 @@ def before_moe(i: int, st) -> None:
 
 
 def before_layer(i: int, st) -> None:
-    """Layer ``i`` before its Engram: the prefetch's WKV gather."""
+    """Layer ``i`` before its Engram: the prefetch's WKV gather (with slot
+    engram_publish: a later layer's WKV columns, and an Engram layer's collect)."""
     if st.slots.engram_prefetch and st.hash_ids is not None:
         prefetch = st.bound["engram"].prefetch
-        if i == prefetch.gather_at:
+        if prefetch.exchange is not None:
+            prefetch.at_layer(i)
+        elif i == prefetch.gather_at:
             prefetch.gather()
 
 

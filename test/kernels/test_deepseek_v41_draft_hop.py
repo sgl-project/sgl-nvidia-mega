@@ -13,6 +13,10 @@ EP half, -1 on the other four); on 4 with every slot held.
   equal elements reported; and against a torch all-reduce + mHC post;
 - one draft step's six posts (three stages), back to back with each rank late in turn
   and replayed from a CUDA graph, bit for bit with the posts run one at a time.
+- slot draft_final_collapse: the last stage's MoE post on a mailbox built with the
+  collapse writes the same streams as the plain post and, bit for bit, the hc_combine
+  the draft forward runs on them (BF16 streams with draft_tail, FP32 without), eager
+  and replayed from a CUDA graph with late ranks.
 
 It registers its own SGLang one-shot plane, so it keeps its own process. Run with
 ``python test/kernels/test_deepseek_v41_draft_hop.py --num-gpu 4 -s``; at TP8 under a
@@ -306,6 +310,67 @@ def test_draft_steps_are_bitwise_stable_late_and_replayed(env):
             # eager posts between replays move the generation the graph starts from
             compare(run(plan[:1]), "eager between replays")
     torch.cuda.synchronize()
+
+
+@torch.inference_mode()
+def test_draft_final_collapse_is_the_draft_heads_hc_combine(env):
+    from sgl_nvidia_mega.deepseek_v41 import sglang_ops
+    from sgl_nvidia_mega.deepseek_v41.boundary import draft_hop
+
+    stage = SimpleNamespace(
+        hc_cfg=SimpleNamespace(hidden=HIDDEN, mult=HC),
+        self_attn=SimpleNamespace(
+            wo_b=SimpleNamespace(weight=torch.empty(1, device=env.device))
+        ),
+    )
+    tp = ps.get_tp_group()
+    hop = draft_hop.DraftHop(
+        draft_hop._mailbox(
+            stage, TOP_K, tp, deadline_s=30.0, max_rows=MAX_ROWS, final_collapse=True
+        ),
+        final_collapse=True,
+    )
+    assert hop.final_collapse
+
+    def last_post(inp):
+        args = (inp.gemm2, inp.weights, inp.idx, inp.shared)
+        args += (inp.residual, inp.post, inp.comb)
+        return hop.finalize(*args, inp.pre, None, 0.0, rows=inp.rows, collapse=True)
+
+    def check(streams, collapsed, inp, label):
+        want = _draft(env.hop, "moe", inp)[0]
+        assert _same(streams, want), label
+        flat = streams.flatten(1)
+        for tail in (flat, flat.float()):  # draft_tail on / off
+            head = sglang_ops.hc_combine(tail, inp.pre, HC, streams.dtype)
+            assert _same(collapsed, head), (label, tail.dtype)
+
+    for rows in ROWS:
+        inp = _inputs(rows, 700 + rows, env)
+        for i in range(3):  # cycle the generations, interleaved with the plain hop
+            if i == 1 and env.rank == rows % env.tp:
+                torch.cuda._sleep(20_000)
+            streams, collapsed = last_post(inp)
+            check(streams, collapsed, inp, (rows, i))
+    inp = _inputs(GAMMA, 777, env)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        captured = last_post(inp)
+    torch.cuda.current_stream().wait_stream(stream)
+    for replay in range(20):
+        fresh = _inputs(GAMMA, 800 + replay, env)
+        for name in ("gemm2", "shared", "residual", "post", "comb", "pre", "weights"):
+            getattr(inp, name).copy_(getattr(fresh, name))
+        inp.idx.copy_(fresh.idx)
+        if env.rank == replay % env.tp:
+            torch.cuda._sleep(20_000)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(*captured, inp, ("replay", replay))
+    torch.cuda.synchronize()
+    dist.barrier(group=env.cpu_group)
 
 
 if __name__ == "__main__":

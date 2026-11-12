@@ -39,6 +39,8 @@ class Runner:
         self.hop: Optional[all_reduce_mhc.AllReduceMHC] = None
         self.hop_wide: Optional[all_reduce_mhc.AllReduceMHC] = None
         self.publisher: Optional[PublishingMxfp8Linear] = None
+        # slot wo_b_publish_split: muLLM's split-K wo_b + publish, per layer's wo_b
+        self.split: Optional[SplitPublisher] = None
         self.moe: dict[int, RoutedExpertGemm] = {}
         self._inject_after = _fault_inject(rank, "hop_a")
         self._hop_calls = 0
@@ -156,6 +158,10 @@ class Runner:
                 "NVIDIA megakernel: injected hop_a fault on rank %d", self.rank
             )
             return out
+        if self.split is not None:
+            out = self.split(wo_b, o)
+            if out is not None:
+                return out
         return self.publisher(wo_b, prepared)
 
     def check_consumed(self) -> None:
@@ -172,3 +178,89 @@ class Runner:
         """The Lamport consumer of the published rows: (updated streams, normalized
         next input)."""
         return self.hop(partial, residual, post, comb, pre, norm_weight, norm_eps)
+
+
+class SplitPublisher:
+    """Slot wo_b_publish_split: wo_b at 1-8 rows on muLLM's split-K FP8 projection, which
+    publishes into ``all_reduce``'s mailbox itself (``sm103/attention/wo_b_split``). Holds
+    each layer's wo_b repacked once at build; a call it cannot serve returns None and the
+    caller keeps its own path."""
+
+    def __init__(self, all_reduce: all_reduce_mhc.AllReduceMHC, name: str) -> None:
+        self.all_reduce = all_reduce
+        self.name = name
+        self._packed: dict[int, object] = {}
+        self._served: set[int] = set()
+        self._declined: set[str] = set()
+
+    def add(self, linear: torch.nn.Module) -> str:
+        """Repack ``linear`` (SGLang's MXFP8 wo_b) for the kernel; returns why not, or ""."""
+        from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_b_split
+
+        scales = linear.weight_scale_inv_swizzled
+        if scales is None or linear.weight.shape[0] != self.all_reduce.hidden_size:
+            return "wo_b is not an MXFP8 linear of the hop's width"
+        try:
+            self._packed[id(linear)] = wo_b_split.pack(linear.weight, scales)
+        except ValueError as error:
+            return str(error)
+        wo_b_split.precompile(device_index=linear.weight.device.index)
+        return ""
+
+    def __len__(self) -> int:
+        return len(self._packed)
+
+    def bytes(self) -> int:
+        return sum(p.weight.numel() + p.scales.numel() for p in self._packed.values())
+
+    def __call__(self, linear: torch.nn.Module, o) -> Optional[torch.Tensor]:
+        """``linear``'s partial rows for ``o`` (the fused wo_a's MXFP8 pair), published
+        and marked on the hop; None where the kernel does not take them."""
+        from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_b_split
+
+        packed = self._packed.get(id(linear))
+        why = ""
+        if packed is None:
+            why = "a wo_b not repacked at build"
+        elif not isinstance(o, tuple) or len(o) != 2:
+            why = "a BF16 input (no fused wo_a)"
+        else:
+            rows = o[0].shape[0]
+            if not 1 <= rows <= min(wo_b_split.MAX_ROWS, self.all_reduce.capacity):
+                why = f"{rows} rows"
+            elif o[0].dim() != 2 or not o[0].is_contiguous():
+                why = "non-contiguous MXFP8 rows"
+        if why:
+            if why not in self._declined:
+                self._declined.add(why)
+                logger.info(
+                    "NVIDIA megakernel: slot wo_b_publish_split (%s) declines %s",
+                    self.name,
+                    why,
+                )
+            return None
+        codes, scales = o
+        hop = self.all_reduce
+        multicast, stage_state = hop.publish_target()
+        out = wo_b_split.wo_b_split(
+            codes,
+            scales.reshape(-1),
+            packed,
+            multicast=multicast,
+            stage_state=stage_state,
+            rank=hop.rank,
+            tp=hop.tp,
+            capacity=hop.capacity,
+        )
+        if rows not in self._served:
+            self._served.add(rows)
+            logger.info(
+                "NVIDIA megakernel: slot wo_b_publish_split (%s) serves wo_b at %d rows "
+                "(%d CTAs in clusters of %d)",
+                self.name,
+                rows,
+                wo_b_split.splits(codes.shape[1]) * out.shape[1] // wo_b_split.TILE_N,
+                wo_b_split.splits(codes.shape[1]),
+            )
+        hop.mark_published(out)
+        return out

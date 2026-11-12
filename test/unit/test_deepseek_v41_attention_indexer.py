@@ -53,6 +53,7 @@ def _plugin():
     p._served_rows, p._declined, p.compared, p.differ = set(), {}, 0, 0
     p._meta, p._serves, p._table = None, False, None
     p.fused, p._fused_logged, p._fused_now = False, set(), False
+    p.early_trigger, p.defer_blocks, p._pending = False, False, None
     return p
 
 
@@ -557,7 +558,8 @@ def test_the_fused_slot_needs_attn_indexer(monkeypatch):
         runtime, "SLOTS", frozenset({"attn", "attn_indexer", "attn_indexer_fused"})
     )
     assert runtime.slot_reasons() == []
-    assert "attn_indexer_fused" not in runtime.SHIPPED_SLOTS
+    for slot in ("attn_indexer_narrow", "attn_indexer_fused"):
+        assert slot in runtime.DEFAULT_ON_SLOTS and slot in runtime.SHIPPED_SLOTS
 
 
 @pytest.mark.parametrize(

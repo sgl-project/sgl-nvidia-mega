@@ -13,6 +13,8 @@ import logging
 import msgspec
 import torch
 
+from sgl_nvidia_mega.deepseek_v41.runtime import bench
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -59,6 +61,7 @@ SGLANG_READS = {
         "is_hash",
         "alt_stream",
         "num_fused_shared_experts",
+        "layer_id",
     ),
     "srt/configs/deepseek_v4.py": ("image_token_id",),
     "srt/models/deepseek_v4.py": ("mlp", "layers", "start_layer", "end_layer"),
@@ -79,12 +82,17 @@ class _GateTopK(msgspec.Struct):
 class MoeSlot:
     """One MoE layer's routed-expert pair: the router's top-k (fast gate) and the
     routed experts, returning SGLang's deferred-finalize output; with slot shared_ll,
-    its shared expert on the low-latency GEMM (``shared``, else None)."""
+    its shared expert on the low-latency GEMM (``shared``, else None); with slot
+    gate_route_early, the router GEMM that releases the top-k once its weight loads are issued (``router``,
+    an ``EarlyRouter``, else None)."""
 
-    def __init__(self, mlp: torch.nn.Module, gemm, *, gate: bool, shared=None):
+    def __init__(
+        self, mlp: torch.nn.Module, gemm, *, gate: bool, shared=None, router=None
+    ):
         from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
 
         self.mlp, self.gemm, self.gate, self.shared = mlp, gemm, gate, shared
+        self.router = router
         config = mlp.topk.topk_config
         self.scale = (
             float(config.routed_scaling_factor)
@@ -94,6 +102,11 @@ class MoeSlot:
         )
         self.bias = config.correction_bias_for_dtype(torch.float32) if gate else None
         self.eps = _RENORMALIZE_SUM_EPSILON
+        # benchmark only (runtime/bench.py): the layer's fixed routing, else None
+        self.fixed = bench.bind_fixed(mlp, gemm, self.bias, self.scale)
+        # benchmark only: the fast gate's ids in a buffer the step stamps can read
+        # after the graph's replay (None without them)
+        self.ids_out = bench.ids_buffer(gemm.max_rows, gemm.top_k, gemm.clamp.device)
 
     def select(
         self,
@@ -107,6 +120,8 @@ class MoeSlot:
                 f"NVIDIA megakernel: the fast gate cannot take router logits "
                 f"{router_logits.dtype} {tuple(router_logits.shape)}"
             )
+        if self.fixed is not None:
+            router_logits = self.fixed.router_logits(router_logits)
         alt, eps = None, 0.0
         if use_vision_topk:
             # vision routing: image tokens rank with the alternate bias
@@ -121,7 +136,49 @@ class MoeSlot:
             router_logits, self.bias, self.scale, num_token_non_padded, alt, eps
         )
 
-    def run(self, x: torch.Tensor, topk_output, pre_quant_input) -> object:
+    def early_router(self, x: torch.Tensor, input_ids_global, use_vision_topk: bool):
+        """Slot gate_route_early serves this call: the layer's early router (else None),
+        only where the one-launch top-k + route (gate_route) follows it, which reads the
+        logits after its PDL wait."""
+        if (
+            self.router is None
+            or not self.gate
+            or not self.router.serves(x)
+            or not self.gemm.serves_gate_route(
+                x.shape[0], input_ids_global if use_vision_topk else None
+            )
+        ):
+            return None
+        return self.router
+
+    def quant_in_gate(
+        self, x: torch.Tensor, input_ids_global, use_vision_topk: bool
+    ) -> bool:
+        """Slot gate_route_quant serves this call: the fast top-k's launch quantizes the
+        routed input itself, so the caller issues no routed-input quant."""
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            routed_hidden_size,
+        )
+
+        return (
+            self.gate
+            and routed_hidden_size(self.mlp.experts) == x.shape[-1]
+            and self.gemm.serves_gate_route_quant(
+                x.shape[0], input_ids_global if use_vision_topk else None, x
+            )
+        )
+
+    def run(
+        self,
+        x: torch.Tensor,
+        topk_output,
+        pre_quant_input,
+        quant_in_gate=False,
+        early=False,
+    ):
+        """``quant_in_gate`` (``quant_in_gate``'s answer, no ``pre_quant_input``): the
+        top-k launch writes the routed input's MXFP8 (slot gate_route_quant); ``early``:
+        the early router (``early_router``) launched the logits (slot gate_route_early)."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
         )
@@ -131,7 +188,14 @@ class MoeSlot:
 
         experts = self.mlp.experts
         ready = None
-        if pre_quant_input is not None:
+        if quant_in_gate:
+            if pre_quant_input is not None or not isinstance(topk_output, _GateTopK):
+                raise RuntimeError(
+                    "NVIDIA megakernel: slot gate_route_quant takes the fast top-k "
+                    "without a pre-quantized input"
+                )
+            x_q = x_s = None
+        elif pre_quant_input is not None:
             x_q, x_s, ready = pre_quant_input
         else:
             x_q, x_s = experts.quant_method.quantize_routed_input(
@@ -142,7 +206,7 @@ class MoeSlot:
             # the join would cost GEMM1 its PDL early launch
             torch.cuda.current_stream().wait_event(ready)
         if isinstance(topk_output, _GateTopK):
-            rows, weights, permuted, _ = self.gemm.gate_topk_and_gemms(
+            rows, weights, permuted, ids = self.gemm.gate_topk_and_gemms(
                 x_q,
                 x_s,
                 topk_output.router_logits,
@@ -151,11 +215,21 @@ class MoeSlot:
                 topk_output.num_valid,
                 alt=topk_output.alt,
                 renormalize_epsilon=topk_output.eps,
+                **({"ids_out": self.ids_out} if self.ids_out is not None else {}),
+                **({"x": x} if quant_in_gate else {}),
+                early=early,
             )
+            persistent = self.ids_out is not None
         else:
-            rows, weights, permuted = self.gemm(
-                x_q, x_s, topk_output.topk_ids, topk_output.topk_weights
-            )
+            ids, w = topk_output.topk_ids, topk_output.topk_weights
+            # SGLang's top-k ids live in the graph's pool: the stamps read only a
+            # fixed table there
+            persistent = self.fixed is not None
+            if self.fixed is not None:
+                ids, w = self.fixed.topk(ids, w)
+            rows, weights, permuted = self.gemm(x_q, x_s, ids, w)
+        if persistent:
+            bench.note_ids(ids, self.mlp.layer_id, self.gemm.router_experts)
         return FlashInferTrtllmDeferredFinalizeOutput(
             gemm2_out=rows,
             expert_weights=weights,
@@ -167,11 +241,13 @@ class MoeSlot:
 
 class Bound(msgspec.Struct):
     """``moe.build``'s result: the slot of each layer whose pair built, by layer id,
-    and why none was built ("" when built); why no shared expert took slot shared_ll."""
+    and why none was built ("" when built); why no shared expert took slot shared_ll;
+    why a layer's router did not take slot gate_route_early ("" when every one did)."""
 
     slots: dict = msgspec.field(default_factory=dict)
     reason: str = ""
     shared_reason: str = ""
+    router_reason: str = ""
 
 
 def shared_topk_slots(config) -> int:
@@ -184,6 +260,10 @@ def shared_topk_slots(config) -> int:
 
 def gate_applies(mlp: torch.nn.Module) -> bool:
     """The DSV4.1 router gate_topk.cu reproduces bit for bit."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
+        warp_bias_layout_ok,
+    )
+
     config = mlp.topk.topk_config
     bias_vl = getattr(mlp.gate, "e_score_correction_bias_vl", None)
     return (
@@ -196,6 +276,8 @@ def gate_applies(mlp: torch.nn.Module) -> bool:
         and config.custom_routing_function is None
         and config.correction_bias is not None
         and (bias_vl is None or bias_vl.dtype == torch.float32)
+        # SGLang's warp router takes these biases (else it falls back to Triton)
+        and warp_bias_layout_ok(config.correction_bias, bias_vl)
     )
 
 
@@ -206,23 +288,58 @@ def expert_offset(experts: torch.nn.Module) -> int:
 
 
 def build(
-    model: torch.nn.Module, group, *, gate_topk: bool, shared_ll=False, widths=()
+    model: torch.nn.Module,
+    group,
+    *,
+    gate_topk: bool,
+    shared_ll=False,
+    widths=(),
+    gemm2_pipe: bool = False,
+    gemm2_registers: int = 0,
 ) -> Bound:
     """A routed-expert GEMM pair per MoE layer; every rank agrees, or none is built."""
     m = model.model
     layers = [m.layers[i] for i in range(m.start_layer, m.end_layer)]
     return build_layers(
-        layers, group, gate_topk=gate_topk, shared_ll=shared_ll, widths=widths
+        layers,
+        group,
+        gate_topk=gate_topk,
+        shared_ll=shared_ll,
+        widths=widths,
+        gemm2_pipe=gemm2_pipe,
+        gemm2_registers=gemm2_registers,
     )
 
 
 def build_layers(
-    layers, group, *, gate_topk: bool, shared_ll: bool = False, widths=()
+    layers,
+    group,
+    *,
+    gate_topk: bool,
+    shared_ll: bool = False,
+    widths=(),
+    gate_route: bool | None = None,
+    gate_route_quant: bool | None = None,
+    gate_route_early: bool | None = None,
+    gemm2_pipe: bool = False,
+    gemm2_registers: int = 0,
 ) -> Bound:
     """``build`` over a list of decoder layers (the target's, or the draft's stages),
     keyed by ``layer_id``. With ``shared_ll``, each built layer's shared expert on the
     low-latency GEMM where it applies, compiled for ``widths``; every rank agrees on
-    those layers too, or none takes it."""
+    those layers too, or none takes it. ``gate_route`` (default: slot gate_route
+    requested): the fast top-k and the route record in one launch at 1-8 rows;
+    ``gate_route_quant`` (default: slot gate_route_quant requested): that launch also
+    quantizes the routed input; ``gate_route_early`` (default: slot gate_route_early
+    requested): the router GEMM ahead of that launch releases it once its weight loads are issued."""
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
+    if gate_route is None:
+        gate_route = "gate_route" in SLOTS
+    if gate_route_quant is None:
+        gate_route_quant = "gate_route_quant" in SLOTS
+    if gate_route_early is None:
+        gate_route_early = "gate_route_early" in SLOTS
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
     )
@@ -254,11 +371,18 @@ def build_layers(
                 gate_topk=gate_topk,
                 router_experts=experts.num_experts,
                 expert_offset=expert_offset(experts),
+                gate_route=gate_route,
+                gate_route_quant=gate_route_quant,
+                gemm2_pipe=gemm2_pipe,
+                gemm2_registers=gemm2_registers,
             )
             gate = gate_topk and gemm.gate_topk_kernel is not None and gate_applies(mlp)
             slots[i] = MoeSlot(mlp, gemm, gate=gate)
     except Exception as e:  # gathered, then the slot is off on every rank
         reason, slots = f"{type(e).__name__}: {e}", {}
+    router_reason = (
+        _bind_router(slots) if gate_route_early and gate_route else "not requested"
+    )
     shared_reason = _bind_shared(slots, widths) if shared_ll else "not requested"
     shared = sorted(i for i, s in slots.items() if s.shared is not None)
     gathered = [None] * group.world_size
@@ -275,7 +399,37 @@ def build_layers(
         shared_reason = f"the ranks disagree on the shared_ll layers: {gathered}"
         for slot in slots.values():
             slot.shared = None
-    return Bound(slots=slots, reason=reason, shared_reason=shared_reason)
+    return Bound(
+        slots=slots,
+        reason=reason,
+        shared_reason=shared_reason,
+        router_reason=router_reason,
+    )
+
+
+def _bind_router(slots: dict) -> str:
+    """Slot gate_route_early on each built layer whose router takes it (one early router
+    per gate weight); why some did not ("" when all did). Bitwise either way, so the
+    ranks need not agree."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.router_mma import (
+        EarlyRouter,
+        gate_route_release,
+    )
+
+    skipped = {}
+    for i, slot in slots.items():
+        if not slot.gate or slot.gemm.gate_route_kernel is None:
+            skipped[i] = "no gate_route launch follows the router"
+            continue
+        try:
+            slot.router, why = EarlyRouter.build(slot.mlp.gate)
+            if slot.router is not None:
+                slot.gemm.bind_early_release(gate_route_release())
+        except Exception as e:
+            slot.router, why = None, f"{type(e).__name__}: {e}"
+        if why:
+            skipped[i] = why
+    return "; ".join(f"layer {i}: {why}" for i, why in sorted(skipped.items()))
 
 
 def _bind_shared(slots: dict, widths) -> str:

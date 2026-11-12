@@ -6,6 +6,10 @@
 // This file has been modified from its original version (up to 64 request rows, hoisted
 // step parameters, fail-stop waits). The host side is markov.py in this directory.
 //
+// The in-kernel phase stamps (MARKOV_STAMPS) follow the chain-stamp method of muLLM v0.4.1
+// (NVIDIA Corporation, Apache-2.0), and LoadAcquire (MARKOV_LOWLAT) matches muLLM's
+// acquire-load idiom for its exchange records.
+//
 // DSpark's sequential Markov sampling for up to 64 request rows, with the Markov
 // head sharded by vocabulary across the tensor-parallel ranks. Compiled with
 // NVRTC; the host defines
@@ -75,6 +79,23 @@ using i64 = long long;
 #ifndef MARKOV_DIRECT
 #error "MARKOV_DIRECT must be defined"
 #endif
+// 1: the narrow kernel's low-latency exchange (slot markov_lowlat): each poller warp
+// reconverges after its spin before the shuffle reductions, and on the publishing step a
+// poller acquires the records with ld.acquire.sys instead of a system fence.
+#ifndef MARKOV_LOWLAT
+#define MARKOV_LOWLAT 0
+#endif
+// 1: the narrow kernel takes a trailing `stamps` pointer and thread 0 of every CTA
+// records (%globaltimer, %clock64) pairs at phase boundaries (instrumentation only).
+#ifndef MARKOV_STAMPS
+#define MARKOV_STAMPS 0
+#endif
+// Slot markov_tail: the chain also writes SGLang's verify ids [anchor | draft tokens]
+// (when given) and advances its draft-noise offset (when given), the two launches
+// that followed it.
+#ifndef MARKOV_TAIL
+#define MARKOV_TAIL 0
+#endif
 
 namespace {
 
@@ -119,6 +140,10 @@ static_assert(kThreads == kMaxSteps * kWideRows, "the wide kernel clears row_bes
 // A 16-row tile of logits is this many 16-byte vectors of this many elements.
 constexpr int kVectorElements = 16 / static_cast<int>(sizeof(CACHE_T));
 constexpr int kTileVectors = 16 / kVectorElements;
+
+// Without a programmatic launch this returns at once; with one (markov_pdl) it waits for
+// the producer grid. Nothing written by an earlier graph node is read before it.
+__device__ __forceinline__ void GridDependencyWait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 
 // Pull one embedding row (512 bytes) into L2.
 __device__ __forceinline__ void PrefetchRowL2(const __nv_bfloat16* row) {
@@ -184,10 +209,43 @@ __device__ __forceinline__ u64 LoadRecord(const u64* address) {
   return value;
 }
 
+__device__ __forceinline__ u64 LoadAcquire(const u64* address) {
+  u64 value;
+  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
+  return value;
+}
+
 __device__ __forceinline__ u64 GlobalTimer() {
   u64 t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   return t;
+}
+
+// Phase stamps (MARKOV_STAMPS): u64 pairs (globaltimer, clock64) at
+// stamps[((launch % kStampRing) * gridDim.x + cta) * kStampSlots + slot]. Slots: 0 entry,
+// 1 prologue done, 2 steps done, 3 epilogue done, 4 kernel entry (before the head
+// tiles load), 5 head tiles in registers; step s at 8 + 8 s + phase with phases
+// 0 start, 1 warp 0's tiles done, 2 CTA reduction done, 3 key posted (fold: the arrival
+// ticket returned), 4 last awaited record seen (max over the CTA's pollers), 5 decision
+// in shared memory, 6 next embedding in shared memory, 7 fold only: the rank's post (last CTA).
+constexpr int kStampSlots = 80;
+constexpr int kStampRing = 16;
+__device__ __forceinline__ u64 Clock64() {
+  u64 t;
+  asm volatile("mov.u64 %0, %%clock64;" : "=l"(t));
+  return t;
+}
+// clock64 only (cheap); StampTimedAt also reads %globaltimer (costly, for calibration
+// and cross-CTA times).
+__device__ __forceinline__ void StampAt(u64* row, int slot) {
+  if (row != nullptr) row[2 * slot + 1] = Clock64();
+}
+__device__ __forceinline__ void StampTimedAt(u64* row, int slot) {
+  if (row != nullptr) {
+    const u64 c = Clock64();
+    row[2 * slot] = GlobalTimer();
+    row[2 * slot + 1] = c;
+  }
 }
 
 // A missed wait deadline: store to address 0x0, then trap (the plugin's fail-stop).
@@ -294,7 +352,15 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
     const u64* __restrict__ peers,                  // [world] peer buffer bases
     u32* control,                                   // local control words
     int rank, int world, int vocab_local, int rows, int max_rows, i64 timeout_ns,
-    i64 mailbox_offset) {  // bytes from a peer buffer's base to the direct-exchange mailbox
+    i64 mailbox_offset  // bytes from a peer buffer's base to the direct-exchange mailbox
+#if MARKOV_TAIL
+    , i64* verify_ids, i64 verify_stride  // [rows, STEPS + 1] (row stride), or null
+    , i64* noise_offset                   // the draft-noise counter, or null
+#endif
+#if MARKOV_STAMPS
+    , u64* stamps
+#endif
+    ) {
   __shared__ __align__(16) __nv_bfloat16 embedding[kMaxRows][kRankDim];
   __shared__ unsigned long long warp_best[kWarps][kMaxRows];
 #if MARKOV_DIRECT
@@ -307,6 +373,47 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
   // Request-state row (-1 inert) and temperature (0 when inert) of [step][request row].
   __shared__ int s_req[kMaxSteps][kMaxRows];
   __shared__ float s_temp[kMaxSteps][kMaxRows];
+#if MARKOV_STAMPS
+  // (globaltimer, clock64) of the step's last awaited record (CTA maximum).
+  __shared__ unsigned long long s_seen[2];
+  u64* stamp_row = nullptr;  // thread 0's
+#define STAMP(slot)                                  \
+  do {                                               \
+    if (threadIdx.x == 0) StampAt(stamp_row, (slot)); \
+  } while (0)
+#define STAMP_TIMED(slot)                                 \
+  do {                                                    \
+    if (threadIdx.x == 0) StampTimedAt(stamp_row, (slot)); \
+  } while (0)
+// The CTA's last poller warp to see its records (clock64): every lane of a warp
+// calls it once the warp's waits returned.
+#define STAMP_SEEN(active)                                                        \
+  do {                                                                            \
+    if (__any_sync(0xffffffffu, (active)) && lane == 0) {                         \
+      atomicMax(&s_seen[1], static_cast<unsigned long long>(Clock64()));          \
+    }                                                                             \
+  } while (0)
+#define STAMP_SEEN_STORE(slot)                     \
+  do {                                             \
+    if (threadIdx.x == 0 && stamp_row != nullptr) { \
+      stamp_row[2 * (slot)] = s_seen[0];           \
+      stamp_row[2 * (slot) + 1] = s_seen[1];       \
+    }                                              \
+  } while (0)
+#else
+#define STAMP(slot) \
+  do {              \
+  } while (0)
+#define STAMP_TIMED(slot) \
+  do {                    \
+  } while (0)
+#define STAMP_SEEN(active) \
+  do {                     \
+  } while (0)
+#define STAMP_SEEN_STORE(slot) \
+  do {                         \
+  } while (0)
+#endif
 
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -321,6 +428,13 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
   // MMA column 2t + col of this lane's accumulators is request row 2t + col.
   const bool active[2] = {2 * t < rows, 2 * t + 1 < rows};
 
+#if MARKOV_STAMPS
+  u64 entry_g = 0, entry_c = 0;
+  if (threadIdx.x == 0) {
+    entry_c = Clock64();
+    entry_g = GlobalTimer();
+  }
+#endif
   uint4 lo[kChunks], hi[kChunks];
   if (first_tile < tiles) LoadTile(lo, hi, head, first_tile, lane);
 
@@ -344,11 +458,20 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
       }
     }
   };
-  load_inputs(0);
-
+  // The launch counter is this kernel's own (an earlier, completed launch wrote it).
   if (threadIdx.x == 0) {
     s_count = *reinterpret_cast<volatile u32*>(&control[kCountWord + blockIdx.x]);
+#if MARKOV_STAMPS
+    if (stamps != nullptr) {
+      stamp_row = stamps + (static_cast<i64>(s_count % kStampRing) * gridDim.x + blockIdx.x) * kStampSlots * 2;
+      stamp_row[2 * 4] = entry_g;
+      stamp_row[2 * 4 + 1] = entry_c;
+    }
+#endif
   }
+  STAMP_TIMED(0);
+  GridDependencyWait();
+  load_inputs(0);
 #if MARKOV_DIRECT
   if (threadIdx.x < kMaxSteps * kMaxRows) (&row_best[0][0])[threadIdx.x] = 0ull;
 #endif
@@ -369,6 +492,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
     reinterpret_cast<uint4*>(embedding[warp])[lane] = value;
   }
   __syncthreads();
+  STAMP(1);
   // Uniform over the grid and the ranks (the inputs are replicated).
   bool keeps = false;
   for (int i = lane; i < rows * STEPS; i += 32) {
@@ -389,6 +513,11 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
 #pragma unroll 1
   for (int step = 0; step < STEPS; ++step) {
     const bool last_step = step + 1 == STEPS;
+    STAMP(8 + 8 * step);
+#if MARKOV_STAMPS
+    // The previous step's readers passed a barrier since.
+    if (threadIdx.x < 2) s_seen[threadIdx.x] = 0ull;
+#endif
     float temp[2];
 #pragma unroll
     for (int col = 0; col < 2; ++col) temp[col] = active[col] ? s_temp[step][2 * t + col] : 0.0F;
@@ -459,6 +588,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
         __syncwarp();
       }
     }
+    STAMP(8 + 8 * step + 1);
     if (step + 1 < STEPS) load_inputs(step + 1);
 
     // Each request row's best key over the warp (lanes sharing t), then the CTA.
@@ -475,6 +605,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
       warp_best[warp][2 * t + 1] = best[1];
     }
     __syncthreads();
+    STAMP(8 + 8 * step + 2);
     // Only the last step's records publish logits stored to peers.
     const bool publish = last_step && launch_keeps;
 #if MARKOV_DIRECT
@@ -488,15 +619,24 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
       }
       // Lane L posts row L % max_rows to rank L / max_rows. Rows past `rows` carry the
       // zero key so that every slot is rewritten on every launch of its parity.
+#if MARKOV_LOWLAT
+      // (world * max_rows may exceed a warp: 8 ranks x 8 rows)
+      for (int pair = lane; pair < world * max_rows; pair += 32) {
+        const int dest = pair / max_rows;
+        const int r = pair - dest * max_rows;
+        const u64 mine = __shfl_sync(__activemask(), key, r);
+#else
       const int dest = lane / max_rows;
       const int r = lane - dest * max_rows;
       const u64 mine = __shfl_sync(0xffffffffu, key, r);
       if (lane < world * max_rows) {
+#endif
         if (publish) __threadfence_system();
         u64* const box = reinterpret_cast<u64*>(PeerBase(peers, dest) + mailbox_offset);
         StoreRecord(box + (step_blocks + rank * ctas + static_cast<int>(blockIdx.x)) * max_rows + r,
                     (mine << kTagBits) | tag);
       }
+      STAMP_TIMED(8 + 8 * step + 3);
     }
     {
       const u64* const box = reinterpret_cast<const u64*>(PeerBase(peers, rank) + mailbox_offset) + step_blocks * max_rows;
@@ -514,7 +654,21 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
           if (polls && r < rows && (got[r] & kTagMask) != tag) pending |= 1u << r;
         }
         if (pending != 0u) AwaitBlock(slot, got, pending, tag, timeout_ns);
+#if MARKOV_LOWLAT
+        __syncwarp();
+#endif
+        STAMP_SEEN(polls);
+#if MARKOV_LOWLAT
+        // Acquire the peers' staged logits: the records' writers fenced before them.
+        if (publish && polls) {
+#pragma unroll
+          for (int r = 0; r < kMaxRows; ++r) {
+            if (r < rows) (void)LoadAcquire(slot + r);
+          }
+        }
+#else
         if (publish && polls) __threadfence_system();
+#endif
 #pragma unroll
         for (int r = 0; r < kMaxRows; ++r) {
           if (r >= rows) break;
@@ -528,8 +682,16 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
       }
     }
     __syncthreads();
+    STAMP(8 + 8 * step + 5);
+    STAMP_SEEN_STORE(8 + 8 * step + 4);
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(row_best[step][threadIdx.x]);
+#if MARKOV_TAIL
+      if (verify_ids != nullptr) {
+        verify_ids[threadIdx.x * verify_stride + 1 + step] = KeyIndex(row_best[step][threadIdx.x]);
+        if (step == 0) verify_ids[threadIdx.x * verify_stride] = input_ids[threadIdx.x * query_per_row];
+      }
+#endif
     }
     if (step + 1 < STEPS) {
       if (warp < rows) {
@@ -537,6 +699,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
             embed_table + static_cast<i64>(KeyIndex(row_best[step][warp])) * kRankDim)[lane];
       }
       __syncthreads();
+      STAMP(8 + 8 * step + 6);
     }
 #else
     if (warp == 0) {
@@ -558,7 +721,57 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
         }
         last = atomicAdd(arrivals + step, 1u) == static_cast<u32>(ctas - 1);
       }
+      STAMP_TIMED(8 + 8 * step + 3);
       last = __shfl_sync(0xffffffffu, last, 0);
+#if MARKOV_LOWLAT
+      // Pairs (request row, rank) = pass * 32 + lane: 8 ranks x 8 rows take two passes.
+      // Every row slot up to max_rows is posted (rows past `rows` carry the zero key) so
+      // each slot is rewritten on every launch of its parity.
+      if (last) {
+        if (lane == 0) __threadfence();
+        __syncwarp();
+        u64 rank_key = 0ull;
+        if (lane < rows) rank_key = atomicExch(combine + step * kMaxRows + lane, 0ull);
+        if (lane == 0) atomicExch(arrivals + step, 0u);
+        // Only the last step's record must publish (system scope) the pushed logits.
+        if (publish) __threadfence_system();
+        for (int pass = 0; pass * 32 < max_rows * world; ++pass) {
+          const int pair = pass * 32 + lane;
+          const int r = pair / world;
+          const int other_rank = pair - r * world;
+          const u64 mine = __shfl_sync(0xffffffffu, rank_key, r & 31);
+          const i64 record = ((static_cast<i64>(parity) * kMaxSteps + step) * kMaxRows + r) * kMaxRanks;
+          if (pair < max_rows * world) {
+            StoreRecord(reinterpret_cast<u64*>(PeerBase(peers, other_rank)) + record + rank, (mine << kTagBits) | tag);
+          }
+        }
+        STAMP_TIMED(8 + 8 * step + 7);
+      }
+      for (int pass = 0; pass * 32 < rows * world; ++pass) {
+        const int pair = pass * 32 + lane;
+        const int r = pair / world;
+        const int other_rank = pair - r * world;
+        const bool exchanging = pair < rows * world;
+        const i64 record = ((static_cast<i64>(parity) * kMaxSteps + step) * kMaxRows + r) * kMaxRanks;
+        u64 global = 0ull;
+        if (exchanging) global = AwaitRecord(records + record + other_rank, tag, timeout_ns);
+        __syncwarp();
+        STAMP_SEEN(exchanging);
+        if (exchanging) {
+          if (publish) {
+            (void)LoadAcquire(records + record + other_rank);
+          } else if (!last_step && global != 0ull) {
+            PrefetchRowL2(embed_table + static_cast<i64>(KeyIndex(global)) * kRankDim);
+          }
+        }
+        // world divides 32, so a row's records sit in aligned lanes of one pass.
+        for (int offset = 1; offset < world; offset <<= 1) {
+          const u64 other = __shfl_xor_sync(0xffffffffu, global, offset);
+          global = other > global ? other : global;
+        }
+        if (exchanging && other_rank == 0) winner[r] = global;
+      }
+#else
       // Lane L handles request row L / world and rank L % world.
       const int r = lane / world;
       const int other_rank = lane - r * world;
@@ -583,10 +796,14 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
           if (publish) __threadfence_system();
           StoreRecord(reinterpret_cast<u64*>(PeerBase(peers, other_rank)) + record + rank, (mine << kTagBits) | tag);
         }
+        STAMP_TIMED(8 + 8 * step + 7);
       }
       u64 global = 0ull;
       if (exchanging) {
         global = AwaitRecord(records + record + other_rank, tag, timeout_ns);
+      }
+      STAMP_SEEN(exchanging);
+      if (exchanging) {
         if (publish) {
           __threadfence_system();
         } else if (!last_step && global != 0ull) {
@@ -600,18 +817,29 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
         global = other > global ? other : global;
       }
       if (exchanging && other_rank == 0) winner[r] = global;
+#endif
     }
     __syncthreads();
+    STAMP(8 + 8 * step + 5);
+    STAMP_SEEN_STORE(8 + 8 * step + 4);
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(winner[threadIdx.x]);
+#if MARKOV_TAIL
+      if (verify_ids != nullptr) {
+        verify_ids[threadIdx.x * verify_stride + 1 + step] = KeyIndex(winner[threadIdx.x]);
+        if (step == 0) verify_ids[threadIdx.x * verify_stride] = input_ids[threadIdx.x * query_per_row];
+      }
+#endif
     }
     if (step + 1 < STEPS && warp < rows) {
       reinterpret_cast<uint4*>(embedding[warp])[lane] =
           reinterpret_cast<const uint4*>(embed_table + static_cast<i64>(KeyIndex(winner[warp])) * kRankDim)[lane];
     }
     __syncthreads();
+    STAMP(8 + 8 * step + 6);
 #endif
   }
+  STAMP(2);
 
   // The peers' shards are in this rank's staging buffer: copy them into the cache.
   if (launch_keeps) {
@@ -635,9 +863,17 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
       *reinterpret_cast<uint4*>(logits_cache + req_state * cache_stride0 + step * cache_stride1 + element) = v;
     }
   }
+  STAMP_TIMED(3);
   // This thread read the counter at launch start; the next launch is stream-ordered.
   if (threadIdx.x == 0) control[kCountWord + blockIdx.x] = s_count + 1u;
+#if MARKOV_TAIL
+  if (noise_offset != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *noise_offset += 1;
+#endif
 }
+#undef STAMP
+#undef STAMP_TIMED
+#undef STAMP_SEEN
+#undef STAMP_SEEN_STORE
 
 #if !MARKOV_DIRECT
 // 9 to 64 request rows, rank-local fold only. Each warp keeps its one 16-row W2
@@ -650,7 +886,11 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
     int query_per_row, const i32* idx_mapping, const float* temperature, const float* noise, CACHE_T* logits_cache,
     i64 cache_stride0, i64 cache_stride1, i64* draft_tokens, i64 draft_stride, const u64* __restrict__ peers,
     u32* control, int rank, int world, int vocab_local, int rows, int max_rows, i64 timeout_ns,
-    i64 mailbox_offset) {  // bytes from a peer buffer's base to this kernel's records
+    i64 mailbox_offset  // bytes from a peer buffer's base to this kernel's records
+#if MARKOV_TAIL
+    , i64* verify_ids, i64 verify_stride, i64* noise_offset
+#endif
+    ) {
   __shared__ __align__(16) __nv_bfloat16 embedding[kWideRows][kRankDim];
   __shared__ unsigned long long row_best[kMaxSteps][kWideRows];
   __shared__ unsigned long long rank_key[kWideRows];
@@ -690,11 +930,11 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
   };
   float base[2][2] = {{0.0F, 0.0F}, {0.0F, 0.0F}};
   float gumbel[2][2] = {{0.0F, 0.0F}, {0.0F, 0.0F}};
-  load_group(0, 0, base, gumbel);
-
   if (threadIdx.x == 0) {
     s_count = *reinterpret_cast<volatile u32*>(&control[kWideCountWord + blockIdx.x]);
   }
+  GridDependencyWait();
+  load_group(0, 0, base, gumbel);
   (&row_best[0][0])[threadIdx.x] = 0ull;
   for (int r = warp; r < kWideRows; r += kWarps) {
     uint4 value = make_uint4(0u, 0u, 0u, 0u);
@@ -868,6 +1108,12 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
     __syncthreads();
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(winner[threadIdx.x]);
+#if MARKOV_TAIL
+      if (verify_ids != nullptr) {
+        verify_ids[threadIdx.x * verify_stride + 1 + step] = KeyIndex(winner[threadIdx.x]);
+        if (step == 0) verify_ids[threadIdx.x * verify_stride] = input_ids[threadIdx.x * query_per_row];
+      }
+#endif
     }
     if (step + 1 < STEPS) {
       for (int r = warp; r < rows; r += kWarps) {
@@ -901,5 +1147,8 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
   }
   // This thread read the counter at launch start; the next launch is stream-ordered.
   if (threadIdx.x == 0) control[kWideCountWord + blockIdx.x] = s_count + 1u;
+#if MARKOV_TAIL
+  if (noise_offset != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *noise_offset += 1;
+#endif
 }
 #endif  // !MARKOV_DIRECT

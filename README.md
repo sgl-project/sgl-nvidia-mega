@@ -98,7 +98,53 @@ The step is the plugin's own code over the weights SGLang loaded (`deepseek_v41/
 | Engram prefetch (`engram`) | 1–8 (batch 1) | Every Engram layer's lookup and WKV quarter on a side stream; their two all-reduces on the main stream (SGLang's TP group) |
 | Attention and MoE all-reduce + mHC post + next norm (`two_shot`) | 49–384 | Two-shot exchange: each rank sends row t only to its owner rank (t mod the TP size), which sums the partials in rank order and sends the row back; the MoE post also folds the top-k finalize and the shared-expert add, and quantizes the next input to MXFP8 where SGLang's fused post does |
 
-With the megakernel on, the default 40 slots run: the ones above, the attention chain, hop B's triggers, and the DSpark draft step's 17 slots (`draft_hop` among them, which acts at TP8 only). `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting; empty runs every step function's stock code. The opt-in slots run only when listed there: `target_lm_head` (the target's LM head on the low-M kernel at 1-8 rows), `lm_head_pinned_tactic` (both low-M LM heads on one fixed tactic per row count, untuned), `target_lm_head_mxfp8` (with `target_lm_head`: the target's LM head at 1-8 rows streams an MXFP8 copy of the vocabulary shard, E4M3 codes and UE8M0 scales of 32 columns, quantized at load; it changes the verifier's logits and is gated on evals, not bitwise), `draft_lm_head_mxfp8` (with `draft_lm_head`: the DSpark draft's LM head at 1-8 rows on the same copy; **measurement only**: the released checkpoint ships one BF16 `head.weight` that the target and the draft share, and InferenceX's review rules forbid a draft head below the checkpoint's precision, so this slot is never a serving setting; `plan.MEASUREMENT_ONLY_SLOTS`), `hop_b_quad_trigger` (hop B's finalize-publish launches its consumer right after its own wait, batch 1 only), `hop_mbar` (the Lamport consumers' RMSNorm sums cross the cluster by `st.async` onto mbarriers instead of a cluster barrier, bitwise), `hop_final_collapse` (the last layer's hop B also writes the head's mHC collapse, so the head runs only its RMSNorm, bitwise), `shared_fold` (with `shared_ll`: the shared expert's gate_up epilogue writes the clamped SwiGLU, so `silu_and_mul_clamp` does not launch; bitwise), `shared_fold_quant` (with `shared_fold`: it also writes `down_proj`'s MXFP8 input, so `down_proj` does not quantize; bitwise), `shared_fold_early_release` (with `shared_fold_quant`: that GEMM releases `down_proj`'s FlashInfer cute-dsl GEMM at its loads instead of after its stores; refused for another `down_proj` GEMM or an unchecked FlashInfer), `hop_b_cap16`, `draft_embed`, and at attention TP8 `swapab_h8` (swap-AB on the 8 local heads, target and draft) and `wo_a_g1` (the fused wo_a on the 1 local group), which replace SGLang's FlashMLA and einsum there; listing `sm148` there admits the 148 SMs of a B300 instead of the 152 required otherwise.
+With the megakernel on, the default 65 slots run (`runtime.SHIPPED_SLOTS`): the ones above, the attention chain, hop B's triggers, the DSpark draft step's slots (`draft_hop` among them, which acts at TP8 only), and the 25 slots in the first table below (`runtime.DEFAULT_ON_SLOTS`). Each of those 25 measured faster served at batch 1 (a 95 % interval below zero) and passed the accuracy checks; the ones marked **numerics change** are not bitwise with the path they replace (`runtime.NUMERICS_CHANGE_SLOTS`) and are checked with evals instead. On a default start one of them with nothing to serve stays off (and `attn_q_cluster` and `wo_b_publish_split` stay off at TP4, where they measured slower), and the startup summary names it under "default slots left off".
+
+`SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) replaces the default list, for turning slots off, tests and bisecting; empty runs every step function's stock code. To turn one default slot off, list the default slots without it, for example:
+
+```bash
+export SGLANG_NVIDIA_MEGAKERNEL_SLOTS=$(python -c "from sgl_nvidia_mega.deepseek_v41.runtime import SHIPPED_SLOTS as s; print(','.join(x for x in s if x != 'wo_b_publish_split'))")
+```
+
+To run only the bitwise default slots, also leave out every name in `runtime.NUMERICS_CHANGE_SLOTS`. A slot listed explicitly must build, and a listed slot whose prerequisite is missing refuses the start.
+
+Default-on slots (DeepSeek-V4.1-Flash):
+
+| Slot | Numerics | What it does | Origin |
+| --- | --- | --- | --- |
+| `gate_route` | bitwise | The router's top-k and the routed pair's route record in one cluster launch at 1-8 rows, target and draft | own |
+| `gate_route_quant` | bitwise | With `gate_route`: that launch also writes the routed input's MXFP8 quant (FlashInfer's linear-layout `mxfp8_quantize` bit for bit), so the MoE half forks no routed-quant stream and the top-k launches as the router's programmatic dependent | own |
+| `gate_route_early` | bitwise | With `gate_route`: SGLang's tensor-core router GEMM, rebuilt from its `tiny_mma` kernel on SGLang's own schedule, releases the top-k once its weight loads are issued instead of after its cluster reduction; checked against `tiny_gemm_bf16` at build | SGLang kernel; release point as TensorRT-LLM's router GEMM |
+| `gemm2_pipe` | bitwise | The routed GEMM2, target and draft, on a pipelined prelude build of the same kernel | derived from muLLM |
+| `shared_fold`, `shared_fold_quant`, `shared_fold_early_release` | bitwise | With `shared_ll`: the shared expert's gate_up epilogue writes the clamped SwiGLU and `down_proj`'s MXFP8 input, and releases `down_proj`'s GEMM at its loads | own |
+| `hop_mbar` | bitwise | The Lamport consumers' RMSNorm sums cross the cluster by `st.async` onto mbarriers | own |
+| `attn_indexer_narrow`, `attn_indexer_fused` | bitwise (ties: in-order pick) | Slot `attn_indexer` at the swap-AB widths too, and the candidate consumers' logits + top-k at 1-8 rows in one cluster launch | own |
+| `prologue_fork`, `hc_coeff_fused` | bitwise | The Engram hashes forked at the step start; the prenorm's mHC coefficients in one launch | own |
+| `attn_q_norm_gemm` | bitwise | q_norm + MXFP8 quant inside the low-latency wq_b GEMM at 1-8 rows where no indexer reads q_lora | own |
+| `attn_compressor_priority` | bitwise | The compressor layers' compressor on a stream at the device's highest priority | derived from muLLM |
+| `markov_lowlat` | bitwise | The draft's Markov chain with converged pollers and acquire loads in its exchange, the direct exchange to 4 rows at TP4 and 2 at TP8 | own; acquire idiom as muLLM's |
+| `markov_tail` | bitwise | The Markov chain also advances the draft-noise offset, and writes the verify ids `[anchor \| draft tokens]` when SGLang hands them over (an SGLang-side switch that is not upstream yet; without it only the offset add goes) | own |
+| `draft_stage0_table` | bitwise | The first draft stage's query and K/V rows gathered in one launch from a per-token table, filled by the live kernels at the first eager forward and checked bit for bit per width; about 1.1 GiB per GPU at TP8 and about 20 s at startup | design derived from TensorRT-LLM |
+| `engram_publish` | bitwise | With the Engram prefetch, each Engram layer's WKV columns go into every rank's mailbox as tagged words and the main stream collects them at the layer, in place of the all-reduce of zero-padded rows at layer 1 | derived from muLLM |
+| `swapab_h8`, `wo_a_g1` | **numerics change** at TP8 | At attention TP8: swap-AB on the 8 local heads and the fused wo_a on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum (bitwise with the TP4 kernels on the same heads, not with SGLang's TP8 path); no effect at TP4 | own |
+| `target_lm_head`, `target_lm_head_mxfp8` | **numerics change** | The target's LM head at 1-8 rows on the low-M kernel, streaming an MXFP8 copy of the vocabulary shard (E4M3 codes, UE8M0 scales of 32 columns, quantized at load) | own |
+| `attn_q_cluster` | **numerics change** | q_lora norm + MXFP8 quant + wq_b in one cluster launch at 1-8 rows where no indexer reads q_lora (a different RMS order, an FP8 `mma.sync` k-block fold); a default start takes it at attention TP8 only (8 local heads; at TP4 it measured +21 us per step slower), listed it runs at TP4 too | derived from muLLM |
+| `wo_b_publish_split` | **numerics change** | wo_b at 1-8 rows as a cluster split-K FP8 projection whose epilogue publishes into hop A's mailbox (and, with `draft_hop`, the draft hop's), in place of the publishing low-latency GEMM (a different FP32 summation order); a default start takes it at attention TP8 only (1024 wo_b inputs per rank; at TP4 it measured +94 us per step slower), listed it runs at TP4 too | derived from muLLM |
+| `draft_shared_ll` | **numerics change** (draft only) | The draft stages' shared expert on the low-latency GEMM with the folded epilogue, as `shared_ll` runs the target's; the draft's proposals may change, the target's verify does not | design as muLLM's draft MoE |
+
+Opt-in slots (run only when listed):
+
+| Slot | Numerics | What it does | Why it is not on by default |
+| --- | --- | --- | --- |
+| `attn_core_lean` | **numerics change** | At attention TP8, 1-8 rows: a one-launch sparse attention core (cluster merge with the sink and the inverse RoPE in the kernel) in place of swap-AB + combine, target and draft, on SGLang's `v41_new` KV layout (V4.1 KV encodings, P in BF16, its own split and merge order); needs `swapab_h8` and `wo_a_g1`; derived from muLLM | It needs `SGLANG_DSV4_KV_LAYOUT=v41_new`, a server-wide SGLang setting the plugin does not choose. Under `v41_new` swap-AB declines, so TP4 and verify widths above 8 rows run SGLang's attention, which is much slower there; set the variable only for attention-TP8 batch-1 serving |
+| `draft_final_collapse` | bitwise | With `draft_hop`: the last draft stage's MoE post also writes the head's mHC collapse | No resolved served gain |
+| `hop_final_collapse` | bitwise at TP4; **not bitwise at TP8** | The last layer's hop B also writes the head's mHC collapse, so the head runs only its RMSNorm | At attention TP8 + EP2 it changed one DSpark proposal in 4183 verify steps: target outputs identical, one prompt took one extra verify step |
+| `attn_cluster_merge`, `attn_index_q_first`, `attn_index_weights_bf16`, `attn_wo_a_fp8`, `attn_index_early_trigger`, `attn_defer_block_select`, `markov_pdl` | bitwise (`attn_wo_a_fp8`: where its FP8 recovery is exact, checked per layer) | Swap-AB's tile merge in the CTA cluster; the index query ahead of wq_b; BF16 index head weights made beside the head weights; wo_a streamed as E4M3; the attention launched right after the fused indexer's wait; the block selection after the attention; the Markov chain as a PDL dependent of the draft LM head | No resolved served gain |
+| `lm_head_pinned_tactic` | untuned tactics | Both low-M LM heads on one fixed tactic per row count | Measurement aid |
+| `draft_lm_head_mxfp8` | **measurement only** | With `draft_lm_head`: the draft's LM head on the MXFP8 copy | The checkpoint ships one BF16 `head.weight` shared by the target and the draft, and InferenceX's review rules forbid a draft head below the checkpoint's precision (`plan.MEASUREMENT_ONLY_SLOTS`) |
+| `hop_b_quad_trigger`, `hop_b_cap16`, `draft_embed` | bitwise | Hop B's consumer launched right after the finalize-publish's wait; hop B's row tiles at 9-16 rows only; the draft's tokens from the target's gathered table | No served gain shown (`hop_b_cap16`: +16 us on the batch-1 verify graph) |
+
+Listing `sm148` admits the 148 SMs of a B300 instead of the 152 required otherwise.
 
 Qwen3.5 (`qwen3_5/runtime`) runs the same way: per layer the stage boundary (`boundary/`), the GatedDeltaNet or the attention (`gdn/`, `attention/`) and the MoE (`moe/`), each with a stock implementation that reproduces SGLang's verify step bit for bit. It reads the running forward's metadata and pools through SGLang's EAGLE binding (`sglang.srt.kernel_plugins.nvidia.eagle_binding`). With the megakernel enabled, its shape-bounded bitwise paths run by default. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` overrides that policy for testing and bisecting; an empty value runs the stock paths.
 
@@ -240,7 +286,7 @@ The three environment variables are required by the DeepSeek-V4.1 spec; without 
 On two GB300 trays of one NVLink domain the spec admits one more layout: attention TP8 with the MoE at TP4 x EP2 (`--tp 8 --ep-size 2`). Each EP half holds 192 of the 384 routed experts and the shared expert is split over all 8 ranks, as SGLang loads them; every other (tp, ep) pair, TP4 over several nodes, a non-trivial expert placement and `SGLANG_SHARED_EXPERT_TP1` are refused at startup. The recommended launch, on each tray (`--node-rank 0` and `1`):
 
 ```bash
-SGLANG_NVIDIA_MEGAKERNEL_SLOTS=$(python -c "from sgl_nvidia_mega.deepseek_v41.runtime import SHIPPED_SLOTS as s; print(','.join(s + ('swapab_h8', 'wo_a_g1')))") \
+SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1 \
 SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample \
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 NCCL_CUMEM_ENABLE=1 NCCL_MNNVL_ENABLE=1 \
@@ -255,9 +301,18 @@ python -m sglang.launch_server \
   --enable-nvidia-megakernel
 ```
 
-The variable lists the shipped slots plus the two TP8 attention slots, since a value replaces the shipped list rather than extending it. Each rank keeps its own Engram host table (`per_rank`), as at TP4.
+The default slot list serves this layout; `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1` turns on SGLang's own DSpark runtime optimizations for megakernel serving (fused accept tail, deferred draft KV store and others in SGLang's `environ.py`); the TP8 numbers in this README were measured with it. Each rank keeps its own Engram host table (`per_rank`), as at TP4.
 
-`swapab_h8` and `wo_a_g1` are opt-in because they change the arithmetic against stock SGLang at TP8, which runs the decode attention as FlashMLA with the 8 local heads padded to 64 and wo_a as inverse RoPE, a BF16 einsum and wo_b's MXFP8 quantize. The two slots run TP4's kernels instead: swap-AB on the 8 local heads and the fused wo_a on the 1 local group, each bit for bit the TP4 kernel on the same heads or group. The fused wo_a writes the same MXFP8 codes as stock TP8 at 1 and 6 rows; at 16 rows 0.012 % of codes move by at most one eighth of a block step. GSM8K with the two slots matched stock TP8. Without them TP8 still serves, on SGLang's FlashMLA and einsum, at about 4.0 ms per verify step instead of 3.2 ms (one request, DSpark acceptance length forced to 3.51).
+`swapab_h8` and `wo_a_g1` change the arithmetic against stock SGLang at TP8, which runs the decode attention as FlashMLA with the 8 local heads padded to 64 and wo_a as inverse RoPE, a BF16 einsum and wo_b's MXFP8 quantize. The two slots run TP4's kernels instead: swap-AB on the 8 local heads and the fused wo_a on the 1 local group, each bit for bit the TP4 kernel on the same heads or group. The fused wo_a writes the same MXFP8 codes as stock TP8 at 1 and 6 rows; at 16 rows 0.012 % of codes move by at most one eighth of a block step. GSM8K with the two slots matched stock TP8. Without them TP8 still serves, on SGLang's FlashMLA and einsum, at about 4.0 ms per verify step instead of 3.2 ms (one request, DSpark acceptance length forced to 3.51).
+
+For attention-TP8 serving at batch 1 the opt-in `attn_core_lean` saves about 130 us per verify step more. It needs SGLang's `v41_new` KV layout, a server-wide setting the plugin does not choose, so add both to the launch above:
+
+```bash
+SGLANG_DSV4_KV_LAYOUT=v41_new \
+SGLANG_NVIDIA_MEGAKERNEL_SLOTS=$(python -c "from sgl_nvidia_mega.deepseek_v41.runtime import SHIPPED_SLOTS as s; print(','.join(s + ('attn_core_lean',)))") \
+```
+
+Under `v41_new` swap-AB declines (it reads only the V4 layout), so verify steps above 8 rows run SGLang's attention and are much slower; do not set it for batched serving or at TP4.
 
 SGLang fuses its all-reduce + mHC posts only at TP2 and TP4. At TP8 the target's posts run on the plugin's hops (hop A, hop B and the two-shot) and the draft's posts on a Lamport mailbox of their own (slot `draft_hop`, shipped; it builds nothing at TP4). At startup the draft logs each requested draft slot as built, declined (with the reason) or not needed.
 

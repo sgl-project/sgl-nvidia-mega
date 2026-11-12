@@ -19,10 +19,16 @@ from sgl_nvidia_mega.deepseek_v41.moe.step import step
 logger = logging.getLogger(__name__)
 
 
+def gemm2_options(slots) -> dict:
+    """The routed GEMM2 build the slots ask for (slot gemm2_pipe)."""
+    return dict(gemm2_pipe="gemm2_pipe" in slots)
+
+
 def build(model, ctx, group) -> routed.Bound:
     """The routed-expert GEMM pair of every MoE layer (slot ``moe``; slot ``gate``:
     its fast top-k); the result is ``st.bound["moe"]``."""
     from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.router_mma import gate_route_release
 
     if "moe" not in SLOTS:
         return routed.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
@@ -32,18 +38,23 @@ def build(model, ctx, group) -> routed.Bound:
         gate_topk="gate" in SLOTS,
         shared_ll="shared_ll" in SLOTS,
         widths=ctx.widths,
+        **gemm2_options(SLOTS),
     )
     logger.info(
         "NVIDIA megakernel: DeepSeek-V4.1 MoE: routed experts on the GEMM pair in %d "
         "layers, fast gate in %d, shared expert on the low-latency GEMM in %d (%s; "
-        "shared_ll: %s)",
+        "shared_ll: %s); early router (gate_route_early, top-k releases GEMM1 at "
+        "GATE_ROUTE_RELEASE %d) in %d (%s)",
         len(bound.slots),
         sum(s.gate for s in bound.slots.values()),
         sum(s.shared is not None for s in bound.slots.values()),
         bound.reason or "built",
         bound.shared_reason or "built",
+        gate_route_release(),
+        sum(s.router is not None for s in bound.slots.values()),
+        bound.router_reason or "built",
     )
     return bound
 
 
-__all__ = ["build", "step"]
+__all__ = ["build", "gemm2_options", "step"]

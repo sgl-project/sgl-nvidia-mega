@@ -11,6 +11,58 @@ from typing import Any
 
 import msgspec
 
+# Slots described with the opt-in slots below that run by default: each measured faster
+# served at batch 1 (a 95 % interval below zero) and passed the accuracy checks, and each
+# is bitwise with the path it replaces except those in NUMERICS_CHANGE_SLOTS. On a default
+# start (no SLOTS_ENV) one that has nothing to serve stays off instead of refusing the
+# start; listed in SLOTS_ENV it must build like any other slot.
+DEFAULT_ON_SLOTS = (
+    "gate_route",
+    "gate_route_quant",
+    "gemm2_pipe",
+    "hop_mbar",
+    "attn_indexer_narrow",
+    "attn_indexer_fused",
+    "shared_fold",
+    "shared_fold_quant",
+    "shared_fold_early_release",
+    "prologue_fork",
+    "hc_coeff_fused",
+    "markov_lowlat",
+    "attn_q_norm_gemm",
+    "attn_compressor_priority",
+    "gate_route_early",
+    "markov_tail",
+    "draft_stage0_table",
+    "engram_publish",
+    # numerics changes (NUMERICS_CHANGE_SLOTS)
+    "swapab_h8",
+    "wo_a_g1",
+    "target_lm_head",
+    "target_lm_head_mxfp8",
+    "attn_q_cluster",
+    "draft_shared_ll",
+    "wo_b_publish_split",
+)
+# The slots that are not bitwise with the path they replace (a different summation order
+# or encoding; the step's accuracy is checked with evals, not bit for bit)
+NUMERICS_CHANGE_SLOTS = frozenset(
+    {
+        "shared_ll",
+        "hc_prenorm",
+        "hop_b_wide",
+        "swapab_h8",
+        "wo_a_g1",
+        "target_lm_head",
+        "target_lm_head_mxfp8",
+        "draft_lm_head_mxfp8",
+        "attn_q_cluster",
+        "draft_shared_ll",
+        "wo_b_publish_split",
+        "attn_core_lean",
+        "hop_final_collapse",
+    }
+)
 # The kernel slots this package ships; with the megakernel on, all of them run. The
 # Engram prefetch needs SGLang's per-rank Engram host table (spec.REQUIREMENTS).
 SHIPPED_SLOTS = (
@@ -75,6 +127,7 @@ SHIPPED_SLOTS = (
     # SGLang's top-k releases its dependents before it writes (bitwise). The window KV
     # store also releases before it stores; its rows are still gathered before the wait
     "kv_before_wait",
+    *DEFAULT_ON_SLOTS,
 )
 # the draft's slots, which build with the draft spec
 DRAFT_SLOTS = frozenset(
@@ -97,17 +150,25 @@ DRAFT_SLOTS = frozenset(
         "draft_prenorm",
         "draft_qkv_a_ll",
         "draft_wo_b_ll",
+        "markov_pdl",
+        "markov_lowlat",
+        "markov_tail",
+        "draft_final_collapse",
+        "draft_stage0_table",
+        "draft_shared_ll",
     }
 )
-# Slots that run only when listed (draft_embed: the draft's tokens from the target's
-# gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
+# Slots that run only when listed, except those in DEFAULT_ON_SLOTS (draft_embed: the
+# draft's tokens from the target's gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
 # lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
 # hop_mbar: the Lamport consumers' RMSNorm sums cross the cluster by st.async onto
 # mbarriers, not a cluster barrier, bitwise; hop_final_collapse: the last layer's hop B
-# also writes the head's mHC collapse, so the head runs only its RMSNorm, bitwise;
+# also writes the head's mHC collapse, so the head runs only its RMSNorm (bitwise at
+# TP4; not bitwise at attention TP8 + EP2, where one DSpark proposal in 4183 verify steps
+# differed and one prompt took an extra verify step, with the same target outputs);
 # attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
 # attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
 # one cluster launch, sm103/attention/reindex_select.py;
@@ -124,26 +185,94 @@ DRAFT_SLOTS = frozenset(
 # swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
 # on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
-# TP8 arm); no effect at TP4)
+# TP8 arm, so a numerics change against SGLang at TP8); no effect at TP4;
+# gate_route: the router's top-k and the routed pair's route
+# record in one cluster launch at 1-8 rows, target and draft (sm103/moe/src/gate_route.cuh;
+# bitwise with gate_topk + route); gate_route_quant: that launch also writes the routed
+# input's MXFP8 quant (FlashInfer's linear-layout mxfp8_quantize bit for bit,
+# sm103/moe/src/route_quant.cuh), so the MoE half forks no routed-quant stream and the
+# top-k launches as the router's programmatic dependent, target and draft (bitwise);
+# gate_route_early: SGLang's tensor-core router GEMM (tiny_gemm_bf16's MMA kernel, on its
+# own schedule) rebuilt in the plugin (sm103/moe/src/router_mma.cu) to release that
+# launch once its weight loads are issued, not after its cluster reduction, so the
+# top-k's setup runs beside the GEMM; target and draft, bitwise (build checks the logits
+# against tiny_gemm_bf16);
+# markov_pdl: the draft's Markov chain launched as a programmatic dependent of the draft
+# LM head, loading its head tiles before the wait, the anchors staged before the LM head;
+# markov_lowlat: the Markov chain's low-latency exchange, converged pollers and acquire
+# loads, the direct exchange to 4 rows at world 4 and 2 at world 8, the narrow kernel to
+# 8 rows at every world; bitwise);
+# attn_q_norm_gemm: at 1-8 rows the q_lora norm + MXFP8 quant inside wq_b's GEMM in
+# the layers without an indexer, target and draft (sm103/attention/q_norm_gemm.py;
+# bitwise; 0-0.5 us a layer); attn_index_q_first: the plugin indexer's index query
+# (wq_b, RoPE + pack) on the main stream and wq_b on the second, so the index chain does
+# not wait for the SMs wq_b and the attention hold (bitwise); attn_index_weights_bf16:
+# the index head weights the BF16 scorers read made beside the head weights, not cast
+# before the logits (bitwise); attn_cluster_merge: swap-AB merges a row's tiles through its
+# CTA cluster's shared memory instead of the separate combine (swapab.cluster_merge_takes:
+# 8 heads, the low-ratio range, 1-8 rows), target and draft, bitwise; faster in the
+# attention-half bench, no step gain served at TP8 batch 1; gemm2_pipe: the routed
+# GEMM2, target and draft, on muLLM's reference-pipeline + prelude build of the same
+# kernel (bitwise); attn_q_cluster: at 1-8 rows the q_lora norm + MXFP8 quant + wq_b in
+# one cluster launch in the target's layers without an indexer
+# (sm103/attention/q_cluster.py, ahead of attn_q_norm_gemm), a numerics change:
+# a different RMS order and the FP8 mma.sync k-block fold in place of FlashInfer's GEMM;
+# attn_wo_a_fp8: the target's fused wo_a streams wo_a as E4M3 with 32x32 UE8M0 scales
+# (half the bytes), recovered from SGLang's BF16 wo_a and widened exactly in shared memory;
+# bitwise where the recovery is exact, which build checks per layer;
+# scheduling switches derived from muLLM (NVIDIA Corporation, Apache-2.0), all bitwise (the same
+# kernels on the same inputs): attn_compressor_priority: the compressor layers' compressor
+# on a stream at the device's highest priority; attn_index_early_trigger: the fused indexer
+# consumer lets the attention launch right after its PDL wait and the attention reads that
+# selection after its own wait; attn_defer_block_select: the candidate source's block
+# selection after the layer's attention, not beside it;
+# attn_core_lean: at 1-8 rows on attention TP8's 8 heads, muLLM's one-launch sparse
+# attention core (cluster merge with the sink and the inverse RoPE in the kernel) in
+# place of swap-AB + combine, target and draft, on SGLang's v41_new KV layout
+# (SGLANG_DSV4_KV_LAYOUT=v41_new; swap-AB reads only the V4 layout), a numerics change:
+# the V4.1 KV encodings, P in BF16, muLLM's split and merge order;
+# markov_tail: the Markov chain's kernel also advances the draft-noise offset and, when
+# SGLang hands the proposal its verify ids, writes [anchor | draft tokens] there (the
+# add and SGLang's concat after the chain, bitwise); draft_final_collapse: with draft_hop,
+# the last draft stage's MoE post also writes the head's mHC collapse, so the draft
+# forward skips its hc_combine (bitwise);
+# draft_stage0_table: the first draft stage's input norm, [wq_a; wkv] GEMM, q-LoRA norm
+# and wq_b are a function of each row's token id, so one launch gathers the query rows and
+# the window K/V rows from a per-token table (draft_stage0.py; design derived from
+# TensorRT-LLM's DSpark stage-0 token table), filled by the live kernels at the first eager
+# forward and checked bit for bit per width before a step takes it (bitwise; ~1.1 GiB a
+# GPU at TP8); draft_shared_ll: the draft stages' shared expert as slot shared_ll runs the
+# target's (gate_up on the low-latency GEMM, with shared_fold* folding the SwiGLU and
+# down_proj's quant; following muLLM's draft MoE; not bitwise: summation order, so the
+# draft's tokens may change, the target's verify stays exact);
+# wo_b_publish_split: at 1-8 rows wo_b on muLLM's cluster split-K FP8 projection whose
+# epilogue publishes into the hop's mailbox (sm103/attention/wo_b_split.py), on hop A in
+# place of the publishing low-latency GEMM and, with slot draft_hop, on the draft stages
+# in place of the low-latency GEMM + the hop's publish kernel, a numerics change: each
+# k-block's FP8 mma.sync product folded into FP32 with its scales in muLLM's split order;
+# engram_publish: with the Engram prefetch, each Engram layer's WKV columns go from the
+# Engram stream into every rank's mailbox as tagged words (muLLM's Engram publish) and
+# the main stream collects the layer's rows at its gate, in place of the zero-padded
+# rows' all-reduce at the first Engram layer; a later Engram layer's columns start at
+# the layer 4 before it (muLLM's late-layer schedule), off layer 1's path (engram/exchange.py;
+# bitwise: SGLang's whole WKV GEMM bit for bit)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
-    "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
-    "hop_mbar",
     "hop_final_collapse",
-    "attn_indexer_narrow",
-    "attn_indexer_fused",
-    "target_lm_head_mxfp8",
     "draft_lm_head_mxfp8",
-    "shared_fold",
-    "shared_fold_quant",
-    "shared_fold_early_release",
-    "prologue_fork",
-    "hc_coeff_fused",
-    "swapab_h8",
-    "wo_a_g1",
+    "markov_pdl",
+    "attn_index_q_first",
+    "attn_index_weights_bf16",
+    "attn_cluster_merge",
+    "attn_wo_a_fp8",
+    "attn_index_early_trigger",
+    "attn_defer_block_select",
+    # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
+    "attn_core_lean",
+    "draft_final_collapse",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -161,6 +290,12 @@ def _requested_slots() -> frozenset:
 
 
 SLOTS = _requested_slots()
+
+
+def default_start() -> bool:
+    """No ``SLOTS_ENV``: the default slots, each left off where it has nothing to serve
+    (or, as wo_b_publish_split at TP4, where it measured slower)."""
+    return os.environ.get(SLOTS_ENV) is None
 
 
 def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
@@ -189,6 +324,9 @@ def slot_reasons() -> list[str]:
         ("shared_fold_quant", "shared_fold"),
         ("shared_fold_early_release", "shared_fold_quant"),
         ("gate_wide", "gate"),
+        ("gate_route", "gate"),
+        ("gate_route_quant", "gate_route"),
+        ("gate_route_early", "gate_route"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
         ("attn_indexer", "attn"),
@@ -208,6 +346,13 @@ def slot_reasons() -> list[str]:
         ("draft_lm_head", "markov"),
         ("target_lm_head_mxfp8", "target_lm_head"),
         ("draft_lm_head_mxfp8", "draft_lm_head"),
+        ("markov_pdl", "markov"),
+        ("markov_lowlat", "markov"),
+        ("markov_tail", "markov"),
+        ("draft_final_collapse", "draft_hop"),
+        ("draft_stage0_table", "draft_swapab"),
+        ("draft_shared_ll", "draft_moe"),
+        ("draft_shared_ll", "shared_ll"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),
@@ -228,6 +373,21 @@ def slot_reasons() -> list[str]:
         ("hc_coeff_fused", "hc_prenorm"),
         ("swapab_h8", "attn"),
         ("wo_a_g1", "attn"),
+        ("attn_q_norm_gemm", "attn"),
+        ("attn_index_q_first", "attn_indexer"),
+        ("attn_index_weights_bf16", "attn_indexer"),
+        ("attn_cluster_merge", "attn"),
+        ("attn_q_cluster", "attn"),
+        ("attn_wo_a_fp8", "attn"),
+        ("attn_compressor_priority", "attn"),
+        ("attn_index_early_trigger", "attn_indexer_fused"),
+        ("attn_index_early_trigger", "kv_before_wait"),
+        ("attn_defer_block_select", "attn_indexer"),
+        ("attn_core_lean", "attn"),
+        ("attn_core_lean", "swapab_h8"),
+        ("attn_core_lean", "wo_a_g1"),
+        ("wo_b_publish_split", "hop_a"),
+        ("engram_publish", "engram"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -299,7 +459,18 @@ def model_disable_reasons(model) -> list[str]:
 
 def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
     """Each shipped slot: whether its build serves at least one width."""
+    folds = [
+        getattr(slot.shared, "fold", None)
+        for slot in getattr(bound["moe"], "slots", {}).values()
+        if slot.shared is not None
+    ]
+    folds = [fold for fold in folds if fold is not None]
     return {
+        # slots shared_fold*: a shared expert's gate_up folds the SwiGLU (and the quant,
+        # and releases down_proj early); a fold that steps aside leaves them unbuilt
+        "shared_fold": bool(folds),
+        "shared_fold_quant": any(fold.buffers is not None for fold in folds),
+        "shared_fold_early_release": any(fold.early_release for fold in folds),
         "hop_a": any(s.hop_a for s in slots.values()),
         "moe": facts.routed,
         # the MoE build's own result: a layer's fast top-k may fail to build alone
@@ -312,6 +483,29 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
             for slot in getattr(bound["moe"], "slots", {}).values()
         ),
         "engram": bound["engram"].prefetch is not None,
+        # slot engram_publish: the prefetch built on the mailbox exchange
+        "engram_publish": getattr(bound["engram"].prefetch, "exchange", None)
+        is not None,
+        # slot gate_route: a layer's fast top-k built with the route record in one launch
+        "gate_route": any(
+            getattr(slot.gemm, "gate_route_kernel", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
+        # slot gate_route_quant: that launch's build that quantizes the routed input
+        "gate_route_quant": any(
+            getattr(slot.gemm, "gate_route_quant_kernel", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
+        # slot gate_route_early: a layer's router GEMM built to release the top-k early
+        "gate_route_early": any(
+            getattr(slot, "router", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
+        # slot gemm2_pipe: a layer's GEMM2 on the pipelined build
+        "gemm2_pipe": any(
+            getattr(slot.gemm, "gemm2_pipe", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
         "target_lm_head": bound.get("logits") is not None,
         "target_lm_head_mxfp8": getattr(
             getattr(bound.get("logits"), "quant_method", None), "mxfp8", None
@@ -338,12 +532,15 @@ def build(model, ctx):
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
     from sgl_nvidia_mega.deepseek_v41.boundary import prenorm
-    from sgl_nvidia_mega.deepseek_v41.runtime import embedding
+    from sgl_nvidia_mega.deepseek_v41.runtime import bench, embedding
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
         PACKAGES,
         MegakernelDecode,
     )
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention.swapab import CLUSTER_HEADS
 
+    # benchmark-only switches: refused without simulated acceptance, before any build
+    bench.setup()
     group = get_parallel().tp_group
     if not ctx.widths:
         raise RuntimeError(
@@ -437,6 +634,65 @@ def build(model, ctx):
             and a.chain[0].indexer.fused
             for a in bound["attention"].values()
         ),
+        # the in-cluster merge takes swap-AB on 8 local heads only (attention TP8)
+        "attn_cluster_merge": any(
+            getattr(a, "cluster_merge", False) and a.attn.n_local_heads in CLUSTER_HEADS
+            for a in bound["attention"].values()
+        ),
+        # the norm inside wq_b's GEMM: a chain with the low-latency wq_b, 1-8 rows
+        "attn_q_norm_gemm": any(w <= 8 for w in pctx.widths)
+        and any(
+            a.chain is not None and a.chain[1].q_norm_gemm
+            for a in bound["attention"].values()
+        ),
+        "attn_wo_a_fp8": any(
+            getattr(a, "wo_a_fp8_weight", None) is not None
+            for a in bound["attention"].values()
+        ),
+        # muLLM's one-launch core: 8 local heads with the fused wo_a
+        "attn_core_lean": any(a.core_lean for a in bound["attention"].values()),
+        # muLLM's split-K wo_b + publish: hop A built with every target wo_b repacked
+        "wo_b_publish_split": hop is not None and hop.wo_b_split,
+        # the query's cluster launch: a chain with the low-latency wq_b, 1-8 rows
+        "attn_q_cluster": any(w <= 8 for w in pctx.widths)
+        and any(
+            a.chain is not None and a.chain[1].q_cluster
+            for a in bound["attention"].values()
+        ),
+        "attn_index_q_first": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].index_q_first
+            for a in bound["attention"].values()
+        ),
+        # a compressor layer's chain runs its compressor on the high-priority stream
+        "attn_compressor_priority": any(
+            a.chain is not None and a.chain[0].compressor_stream is not None
+            for a in bound["attention"].values()
+        ),
+        # the fused consumer built, and swap-AB reading its selection after the wait
+        "attn_index_early_trigger": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].indexer.fused
+            and a.chain[0].indexer.early_trigger
+            and a.index_after_wait
+            for a in bound["attention"].values()
+        ),
+        # the plugin indexer takes a candidate source
+        "attn_defer_block_select": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].indexer.defer_blocks
+            and getattr(a.attn.indexer, "is_candidate_source", False)
+            for a in bound["attention"].values()
+        ),
+        "attn_index_weights_bf16": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].index_weights_bf16
+            for a in bound["attention"].values()
+        ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
         "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)
         and any(
@@ -452,6 +708,19 @@ def build(model, ctx):
         if any(a.swapab and a.low_ratio for a in bound["attention"].values())
         else {"kv_before_wait"}
     )
+    # likewise attn_cluster_merge without 8 local heads (attention TP4)
+    if not any(
+        a.attn.n_local_heads in CLUSTER_HEADS for a in bound["attention"].values()
+    ):
+        moot.add("attn_cluster_merge")
+    # a default start leaves off the default-on slots with nothing to serve here (for
+    # example hc_coeff_fused where the prenorm cannot run, as in batch-invariant mode)
+    declined = (
+        sorted(s for s in DEFAULT_ON_SLOTS if s in built and not built[s])
+        if default_start()
+        else []
+    )
+    moot.update(declined)
     # every package's build agrees across ranks, so this raises on every rank alike
     missing = sorted(name for name in (SLOTS & built.keys()) - moot if not built[name])
     if missing:
@@ -459,12 +728,17 @@ def build(model, ctx):
             f"NVIDIA megakernel: requested slots {missing} built at no width "
             f"(hop A: {facts.hop_a_reason or 'built'}; MoE: "
             f"{getattr(bound['moe'], 'reason', '') or 'built'}; shared_ll: "
-            f"{getattr(bound['moe'], 'shared_reason', '') or 'built'}; embedding: "
+            f"{getattr(bound['moe'], 'shared_reason', '') or 'built'}; early router: "
+            f"{getattr(bound['moe'], 'router_reason', '') or 'built'}; embedding: "
             f"{embed_reason or 'built'}; Engram prefetch: {engram.reason or 'built'})"
         )
+    # the requested slots that serve: a slot built but not requested (hop_mbar,
+    # hop_b_quad_trigger follow from hop A / hop B) does not run, so it is not listed
+    active = sorted(name for name, on in built.items() if on and name in SLOTS)
     summary = (
-        f"slots {sorted(name for name, on in built.items() if on) or 'none (stock)'}; "
-        f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
+        f"slots {active or 'none (stock)'}; "
+        + (f"default slots left off {declined}; " if declined else "")
+        + f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
         f"{[w for w, x in slots.items() if x.fast_gate]} rows, Engram prefetch at "
         f"{[w for w, x in slots.items() if x.engram_prefetch]} rows "
         f"({engram.reason or 'built, checked bit for bit'}); boundary: "
@@ -475,6 +749,7 @@ def build(model, ctx):
                 for k, v in pctx.copies.items()
             }
         )
+        + bench.fixed_summary()
     )
     return MegakernelDecode(
         model, slots, bound, widths=pctx.widths, summary=summary, binding=ctx.binding

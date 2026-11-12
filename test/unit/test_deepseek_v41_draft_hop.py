@@ -79,8 +79,8 @@ def tp8():
 def test_tp8_builds_the_draft_mailbox_at_the_draft_top_k(tp8):
     made = []
 
-    def mailbox(stage, top_k, group, deadline_s, max_rows):
-        made.append((stage.layer_id, top_k, deadline_s, max_rows))
+    def mailbox(stage, top_k, group, deadline_s, max_rows, final_collapse=False):
+        made.append((stage.layer_id, top_k, deadline_s, max_rows, final_collapse))
         return SimpleNamespace(capacity=max_rows)
 
     with (
@@ -92,7 +92,8 @@ def test_tp8_builds_the_draft_mailbox_at_the_draft_top_k(tp8):
             [_stage(43), _stage(44), _stage(45)], deadline_s=2.5, max_rows=48
         )
     assert why == "" and hop.capacity == 48
-    assert made == [(43, 3, 2.5, 48)]
+    assert made == [(43, 3, 2.5, 48, False)]
+    assert not hop.final_collapse
 
 
 def test_tp8_declines_a_stage_off_sglangs_fuse_gate(tp8):
@@ -143,16 +144,19 @@ def _mhc(calls):
 class _Hop:
     capacity = 48
 
-    def __init__(self, calls):
+    def __init__(self, calls, final_collapse=False):
         self.calls = calls
+        self.final_collapse = final_collapse
 
     def collect(self, partial, *rest):
         self.calls.append(("collect", partial.shape[0]))
         return "streams", "normed"
 
-    def finalize(self, *args, rows, mxfp8_out=None):
-        self.calls.append(("finalize", rows, args[7:10]))
-        return "streams", None
+    def finalize(self, *args, rows, mxfp8_out=None, collapse=False):
+        self.calls.append(
+            ("finalize", rows, args[7:10]) + (("collapse",) if collapse else ())
+        )
+        return "streams", "collapsed" if collapse else None
 
 
 def _boundaries(calls, hop):
@@ -160,6 +164,7 @@ def _boundaries(calls, hop):
     b._mhc = _mhc(calls)
     b.hop_a = b.two_shot = None
     b.hop_b, b.cross_layer, b.prenorm = False, True, False
+    b.final_collapse = False
     b.draft_hop = hop
     b._mhc_fusions = True
     b._served = set()
@@ -168,6 +173,7 @@ def _boundaries(calls, hop):
     }
     b._attn_next = {7: None}
     b._next_layer, b.row_tile_layers = {}, frozenset()
+    b._last_layer = 7
     b._mix_stats = lambda hc, streams, stream: ("pre", "post", "comb")
     return b
 
@@ -234,6 +240,27 @@ def test_both_draft_posts_take_the_hop_at_tp8(fused_gate, rows):
     assert st.hc == ("state", "streams", "pre")
     # the residual-only finalize: no pre, no norm (the draft attention takes no MXFP8)
     assert calls == [("collect", rows), ("finalize", rows, (None, None, 0.0))]
+
+
+@pytest.mark.parametrize("rows", [5, 45])
+def test_the_last_stage_moe_post_writes_the_collapse_with_the_slot(fused_gate, rows):
+    """Slot draft_final_collapse: the last stage's MoE post asks the hop for the
+    collapse (pre kept, no norm) and leaves it on the state; the attention post, and a
+    hop built without it, do not."""
+    for built in (False, True):
+        calls = []
+        b = _boundaries(calls, _Hop(calls, final_collapse=built))
+        layer = _layer()
+        st = _open(b, rows)
+        b.post(layer, "attn", _AttnOutput(torch.zeros(rows, 4)), st)
+        st = _open(b, rows)
+        b.post(layer, "ffn", _moe_out(rows), st)
+        if built:
+            assert calls[-1] == ("finalize", rows, ("pre", None, 0.0), "collapse")
+            assert st.final_collapse == "collapsed"
+        else:
+            assert calls[-1] == ("finalize", rows, (None, None, 0.0))
+            assert st.final_collapse is None
 
 
 def test_past_the_mailbox_or_off_the_finalize_the_post_stays_sglangs(fused_gate):
@@ -393,3 +420,17 @@ def test_the_proposal_only_draft_reports_its_slots():
 
     built = DraftProposal(None, deadline_s=1.0, slots=frozenset({"markov"}))
     assert "draft slots: markov built" in built.summary()
+
+
+def test_the_markov_chain_slots_are_reported_with_the_proposal():
+    slots = frozenset({"markov", "markov_pdl", "markov_lowlat"})
+    table = draft_slots.states(_built(), slots)
+    assert {name: state for name, (state, _) in table.items()} == {
+        "markov": draft_slots.BUILT,
+        "markov_lowlat": draft_slots.BUILT,
+        "markov_pdl": draft_slots.BUILT,
+    }
+    built = _built()
+    built.draft_sampler = None
+    assert table.keys() == draft_slots.states(built, slots).keys()
+    assert draft_slots.states(built, slots)["markov_pdl"][0] == draft_slots.DECLINED
