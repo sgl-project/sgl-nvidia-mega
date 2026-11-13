@@ -12,7 +12,7 @@ valid in decode graph replays), and lets its dependents launch right after the w
 kC per request count: the largest kC <= KC_MAX whose clusters all fit on the device at once (runtime occupancy query of
 the instantiation), or MUSE_VR_SWA_T_KC ("R:kC,..."). Covers 8 query tokens per request, 8 query heads per KV head,
 2 KV heads per rank, head_dim 64, e4m3 Q/K/V, page size 128, bf16 output, a sliding window, at most 256 requests.
-Numerics: CT-5 class C3 vs full_attn_wide windowed (same per-tile arithmetic; different piece boundaries).
+Numerics vs full_attn_wide windowed: the same per-tile arithmetic, different piece boundaries.
 """
 
 from __future__ import annotations
