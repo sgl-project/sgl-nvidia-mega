@@ -25,6 +25,16 @@ unless the function it wraps is the pinned FlashInfer function object and the wo
 (``MUSE_VR_NVFP4_KV_PREFILL_BF16_OUT`` on). With ``nvfp4_kv`` enabled and no composition (``prefill_dq`` off), the
 component is refused at boot. Per-request routing is refused in the composed form.
 
+Mode ``MUSE_VR_XATTN_B_MODE=dump`` (diagnostics only; needs ``MUSE_VR_XATTN_B_DUMP_DIR``, an existing directory): the op is
+never called; every call runs the stock function, and a call the op would serve is saved with its inputs (query, each
+request's K / V pages, lengths, scales) and the stock output, one file per call, at most ``MUSE_VR_XATTN_B_DUMP_MAX``
+(default 16) per process, every ``MUSE_VR_XATTN_B_DUMP_EVERY``-th eligible call (default 1), on the device index in
+``MUSE_VR_XATTN_B_DUMP_DEVICE`` (default 0), so the op, the stock call and a float64 reference can be compared offline on
+served inputs. With ``MUSE_VR_XATTN_B_DUMP_BINCAP`` = n > 0 the cap and the stride apply per bin instead: a call goes to
+the bin of its largest new-token count, its smallest cached prefix and its request count (DUMP_BINS edges), and each bin
+saves its 1st, (1 + EVERY)-th, ... eligible call up to n files (DUMP_MAX still bounds the total). The copies to host
+synchronize the stream: never use it in a timed run.
+
 Load-time charge. ``prepare`` builds the op's kernels and grows its split scratch to the cap right after the target's
 weights load, i.e. before SGLang sizes the KV pool, so the pool is smaller by that much. ``MUSE_VR_XATTN_B_DEFER_PREPARE=1``
 (default 0) moves the same ``prepare`` call: the load hook only records the device (count ``prepare_deferred``) and a BEFORE
@@ -65,6 +75,13 @@ PFA_OPTS = tuple(
 _state: dict = {
     "engaged": None,
     "prev_ctx": None,
+    "mode": "kernel",
+    "dump_dir": None,
+    "dump_max": 16,
+    "dump_every": 1,
+    "dump_device": 0,
+    "dump_seen": 0,
+    "dump_n": 0,
     "route": False,
     "compose": False,
     "composed": False,
@@ -77,6 +94,8 @@ T_GRAPHS = "sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs"
 _call: contextvars.ContextVar = contextvars.ContextVar(
     "muse_vr_xattn_b_call", default=None
 )
+# dump-mode bins: new tokens (largest request), cached prefix (smallest request), requests per call
+DUMP_BINS = {"new": (64, 1025, 8193), "prefix": (111616, 166000), "requests": (2, 5)}
 
 
 def _context_attn(*args, **kwargs):
@@ -89,6 +108,16 @@ def _context_attn(*args, **kwargs):
         or kwargs.get("return_lse", False)
     ):
         return _state["prev_ctx"](*args, **kwargs)
+    if _state["mode"] == "dump":
+        out = _state["prev_ctx"](*args, **kwargs)
+        try:
+            _dump(call, kwargs, out)
+        except Exception as e:  # noqa: BLE001 - diagnostics never change the served result
+            bed.count(NAME, "dump:error")
+            logger.warning(
+                "muse_vr_plugin: %s dump error (%s: %s)", NAME, type(e).__name__, e
+            )
+        return out
     from . import extend_attn_b as xb
 
     try:
@@ -204,6 +233,117 @@ def _route(call, kwargs, serve):
         _state["prev_ctx"](**sub)
         a = b
     return out
+
+
+def _dump(call, kwargs, out) -> None:
+    """Dump mode: save one call the op would serve (inputs + the stock output; host copies, the output is not modified)."""
+    import os
+
+    import torch
+
+    from . import extend_attn_b as xb
+    from .extend_attn_b import plan
+
+    if (
+        call.capturing or torch.cuda.is_current_stream_capturing()
+    ):  # never copy to host inside a graph capture
+        return
+    q = kwargs["query"]
+    k_cache, v_cache = kwargs["kv_cache"]
+    if q.device.index != _state["dump_device"]:
+        return
+    hq = int(q.shape[1])
+    if plan.decline_reason(call, hq, xb._num_sms(q.device.index)) is not None:
+        return
+    n = _state["dump_n"]
+    if n >= _state["dump_max"]:
+        bed.count(NAME, "dump:over_max")
+        return
+    cap = _state.get("dump_bincap", 0)
+    if cap > 0:
+        b = tuple(
+            sum(v >= e for e in DUMP_BINS[k])
+            for k, v in (
+                ("new", max(call.new_lens)),
+                ("prefix", min(call.prefix_lens)),
+                ("requests", len(call.new_lens)),
+            )
+        )
+        seen = _state.setdefault("dump_bin_seen", {})
+        saved = _state.setdefault("dump_bin_saved", {})
+        seen[b] = seen.get(b, 0) + 1
+        if (seen[b] - 1) % _state["dump_every"] or saved.get(b, 0) >= cap:
+            return
+        saved[b] = saved.get(b, 0) + 1
+        bin_tag = "_b%d%d%d" % b
+    else:
+        _state["dump_seen"] += 1
+        if (_state["dump_seen"] - 1) % _state["dump_every"]:
+            return
+        bin_tag = ""
+    page = int(k_cache.shape[2])
+    rows, table = [], []
+    for r, (t, c) in enumerate(zip(call.new_lens, call.prefix_lens)):
+        npg = (t + c + page - 1) // page
+        table.append(list(range(len(rows), len(rows) + npg)))
+        rows.extend(int(v) for v in kwargs["block_tables"][r, :npg].tolist())
+    width = max(len(x) for x in table)
+    table += [[0]] * max(
+        0, int(kwargs["block_tables"].shape[0]) - len(table)
+    )  # padded request slots (never read)
+    bt = torch.tensor(
+        [x + [x[-1]] * (width - len(x)) for x in table], dtype=torch.int32
+    )
+    idx = torch.tensor(rows, dtype=torch.long, device=k_cache.device)
+    rec = {
+        "call": {
+            "new_lens": list(call.new_lens),
+            "prefix_lens": list(call.prefix_lens),
+            "layer_id": call.layer_id,
+        },
+        "n": n,
+        "pid": os.getpid(),
+        "page": page,
+        "bin": bin_tag[2:] or None,
+        "scalars": {
+            k: v
+            for k, v in kwargs.items()
+            if isinstance(v, (int, float, bool, str)) or v is None
+        },
+        "dtypes": {
+            "q": str(q.dtype),
+            "k": str(k_cache.dtype),
+            "v": str(v_cache.dtype),
+            "out": str(out.dtype),
+        },
+        "shapes": {
+            "q": list(q.shape),
+            "k_pages": [len(rows), *k_cache.shape[1:]],
+            "out": list(out.shape),
+        },
+        "served_strides": {
+            "k": list(k_cache.stride()),
+            "v": list(v_cache.stride()),
+        },  # the pages below are contiguous
+        "q": q.contiguous().view(torch.uint8).cpu(),
+        "k_pages": k_cache[idx].contiguous().view(torch.uint8).cpu(),
+        "v_pages": v_cache[idx].contiguous().view(torch.uint8).cpu(),
+        "block_tables": bt,
+        "seq_lens": kwargs["seq_lens"].cpu(),
+        "cum_seq_lens_q": kwargs["cum_seq_lens_q"].cpu(),
+        "cum_seq_lens_kv": kwargs["cum_seq_lens_kv"].cpu()
+        if torch.is_tensor(kwargs.get("cum_seq_lens_kv"))
+        else None,
+        "out": out.cpu(),
+    }
+    torch.save(
+        rec,
+        os.path.join(
+            _state["dump_dir"], f"xb{n:04d}_p{os.getpid()}_l{call.layer_id}{bin_tag}.pt"
+        ),
+    )
+    _state["dump_n"] = n + 1
+    bed.count(NAME, "dump:saved")
 
 
 def _extend_call(backend, layer, forward_batch):
@@ -412,6 +552,34 @@ def engage() -> bool:
         return False
     import os
 
+    mode = os.environ.get("MUSE_VR_XATTN_B_MODE", "kernel")
+    if mode not in ("kernel", "dump"):
+        bed.report(
+            NAME, False, reason=f"MUSE_VR_XATTN_B_MODE {mode!r} not kernel / dump"
+        )
+        _state["engaged"] = False
+        return False
+    if mode == "dump":
+        d = os.environ.get("MUSE_VR_XATTN_B_DUMP_DIR", "")
+        try:
+            mx = int(os.environ.get("MUSE_VR_XATTN_B_DUMP_MAX", "16"))
+            ev = int(os.environ.get("MUSE_VR_XATTN_B_DUMP_EVERY", "1"))
+            dv = int(os.environ.get("MUSE_VR_XATTN_B_DUMP_DEVICE", "0"))
+            bc = int(os.environ.get("MUSE_VR_XATTN_B_DUMP_BINCAP", "0"))
+        except ValueError:
+            mx = ev = dv = bc = -1
+        if not d or not os.path.isdir(d) or mx < 1 or ev < 1 or dv < 0 or bc < 0:
+            bed.report(
+                NAME,
+                False,
+                reason="dump mode needs an existing DUMP_DIR, DUMP_MAX >= 1, DUMP_EVERY >= 1",
+            )
+            _state["engaged"] = False
+            return False
+        _state.update(
+            dump_dir=d, dump_max=mx, dump_every=ev, dump_device=dv, dump_bincap=bc
+        )
+    _state["mode"] = mode
     _state["route"] = os.environ.get("MUSE_VR_XATTN_B_ROUTE", "0") == "1"
     defer = os.environ.get("MUSE_VR_XATTN_B_DEFER_PREPARE", "0").strip()
     preq = os.environ.get("MUSE_VR_XATTN_B_PREP_REQUESTS", "4").strip()

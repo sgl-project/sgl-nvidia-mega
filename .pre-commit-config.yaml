@@ -1,4 +1,6 @@
 default_stages: [pre-commit, pre-push, manual]
+# TensorRT-LLM's files stay as received (components/vendor/README.md)
+exclude: ^sgl_nvidia_mega/muse_spark/components/vendor/trtllm_ab93b78/
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

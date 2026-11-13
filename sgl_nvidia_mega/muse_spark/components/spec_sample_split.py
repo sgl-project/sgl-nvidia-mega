@@ -22,7 +22,9 @@ The stock loop takes the first tile with a match and its first matching index, w
 of the row, so the result is the same token for the same inputs. The block-verification variant, positional calls,
 other dtypes or layouts, CPU tensors and CUDA-graph capture use the stock function. (SGLang's hook registry also
 rebinds other modules' imports of the same function; they get the same treatment.) ``tests/test_spec_sample_split.py`` checks bitwise equality of every
-output buffer against the stock kernel over the served shapes and times both.
+output buffer against the stock kernel over the served shapes and times both. ``MUSE_VR_SPEC_SAMPLE_SPLIT_SHADOW=1``
+(debug) also runs the stock kernel on copies of the output buffers on every call and tallies bitwise matches with
+``bed.shadow_result``.
 """
 
 # The two Triton kernels below are derived from SGLang (https://github.com/sgl-project/sglang), Apache License 2.0;
@@ -588,6 +590,10 @@ def chain_speculative_sampling(original, *args, **kwargs):
         return original(*args, **kwargs)
     bs = kwargs["candidates"].shape[0]
     bed.count(NAME, f"split:bs={bs}")
+    shadow = bed.flag(NAME + "_shadow") and not torch.cuda.is_current_stream_capturing()
+    if shadow:  # debug: the stock kernel on copies of the output buffers, compared bit for bit (host sync)
+        outs = ("predicts", "accept_index", "accept_token_num")
+        ref = dict(kwargs, **{k: kwargs[k].clone() for k in outs})
     split_chain_speculative_sampling(
         kwargs["predicts"],
         kwargs["accept_index"],
@@ -599,6 +605,9 @@ def chain_speculative_sampling(original, *args, **kwargs):
         kwargs["target_probs"],
         kwargs["draft_probs"],
     )
+    if shadow:
+        original(**ref)
+        bed.shadow_result(NAME, all(torch.equal(ref[k], kwargs[k]) for k in outs))
     return None
 
 

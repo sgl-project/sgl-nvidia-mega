@@ -1,0 +1,7 @@
+{
+ "format": "table[local_experts][num_tokens] = [tile_N, config] for FlashInfer's trtllm-gen NVFP4 routed MoE (Muse Spark expert shape)",
+ "entries_32_to_256": "chosen with bench/bench_moe_tactics.py: a screen of every candidate tactic, then an interleaved confirmation on routing captured from a served benchmark run (synthetic acceptance); kept only if faster than the fallback there and no slower (within 1 %) on uniform random routing",
+ "entries_8_to_24": "chosen with bench/bench_moe_tactics.py --candidates-only at 8, 16 and 24 tokens: the fastest bitwise candidate on captured routing that is also within 1 % of the fallback on uniform random routing (each within run-to-run spread of the fallback or faster), so the choice at these sizes no longer depends on a per-node autotune cache",
+ "outputs": "every entry gave expert outputs bitwise identical to the default tactic (tests/test_moe_tactic.py --gpu)",
+ "table": {"64": {"8": [8, 53], "16": [8, 31], "24": [16, 57], "32": [32, 63], "40": [32, 53], "48": [32, 53], "56": [16, 110], "64": [32, 46], "80": [32, 46], "96": [32, 53], "112": [32, 62], "128": [32, 62], "144": [32, 62], "160": [32, 62], "176": [32, 62], "192": [32, 62], "208": [32, 62], "224": [32, 62], "240": [32, 46], "256": [32, 46]}}
+}
