@@ -19,6 +19,12 @@ imported. Run them against every supported SGLang and nightly against main. The
 GLM-5.3 package reads SGLang's megakernel DSA binding view, and its draft spec
 SGLang's draft capture check marker; against an SGLang without them, those reads and
 pins are skipped, naming each.
+A read or mirror that needs an SGLang change newer than the unit job's pin names it in
+the module's ``SGLANG_REQUIRES``: ``{"pattern:name": "sglang#N"}`` for a read, and
+``{mirror key: ("sglang#N", (digests before it, ...))}`` for a mirror. Where the
+installed SGLang lacks the change (the name is absent, or the function still has a
+digest from before it), the entry is skipped, naming the change; otherwise it is
+checked as usual, so a present but different entry still fails.
 """
 
 import ast
@@ -125,9 +131,17 @@ def test_sglang_provides_what_the_plugin_reads(path):
     assert not required.keys() & optional.keys(), (
         "contract cannot be both required and optional"
     )
+    requires = _declared(path, "SGLANG_REQUIRES")
     for pattern, names in (required | optional).items():
         files = _files(pattern)
         if not files and pattern in optional:
+            continue
+        if not files and all(f"{pattern}:{n}" in requires for n in names):
+            unchecked += [
+                f"{_id(path)} reads {pattern}:{n}, which needs "
+                f"{requires[f'{pattern}:{n}']}"
+                for n in names
+            ]
             continue
         assert files, f"{_id(path)}: no file matches {pattern}"
         provided = frozenset().union(*map(_provided, files))
@@ -141,10 +155,18 @@ def test_sglang_provides_what_the_plugin_reads(path):
         if skipped:
             unchecked.append(f"{reason}: {_id(path)} reads {sorted(skipped)}")
             names = [n for n in names if n not in skipped]
-        missing += [
-            f"{pattern}: {n}"
+        absent = [
+            n
             for n in names
             if not any(alternative in provided for alternative in n.split("|"))
+        ]
+        unchecked += [
+            f"{_id(path)} reads {pattern}:{n}, which needs {requires[f'{pattern}:{n}']}"
+            for n in absent
+            if f"{pattern}:{n}" in requires
+        ]
+        missing += [
+            f"{pattern}: {n}" for n in absent if f"{pattern}:{n}" not in requires
         ]
     assert not missing, (
         f"SGLang no longer provides what {_id(path)} reads; repair it and its "
@@ -434,12 +456,38 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
     files = sorted(ROOT.glob(pattern))
     assert len(files) == 1, f"{_id(path)}: {pattern} matches {len(files)} files"
     got = mirror_digest(files[0], qualname)
+    change, before = _declared(path, "SGLANG_REQUIRES").get(key, (None, ()))
+    if change and got in before:
+        pytest.skip(
+            f"{_id(path)} mirrors {key} as of {change}; this SGLang predates it"
+        )
     assert got is not None, f"{_id(path)}: SGLang no longer defines {key}"
     assert got in ((digest,) if isinstance(digest, str) else digest), (
         f"SGLang changed {key}, whose body {_id(path)} mirrors: re-read it, update "
         f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
         "supported SGLangs differ)"
     )
+
+
+REQUIRERS = [
+    p for p in sorted(PACKAGE.rglob("*.py")) if _declared(p, "SGLANG_REQUIRES")
+]
+
+
+@pytest.mark.parametrize("path", REQUIRERS, ids=_id)
+def test_every_requirement_names_one_of_the_modules_reads_or_mirrors(path):
+    reads = _declared(path) | _declared(path, "SGLANG_OPTIONAL_READS")
+    entries = {f"{p}:{n}" for p, names in reads.items() for n in names}
+    mirrors = _mirrors(path)
+    for key, need in _declared(path, "SGLANG_REQUIRES").items():
+        if key in mirrors:
+            change, before = need
+            pinned = mirrors[key]
+            pinned = (pinned,) if isinstance(pinned, str) else pinned
+            assert change.startswith("sglang") and not set(before) & set(pinned), key
+        else:
+            assert key in entries, f"{_id(path)}: SGLANG_REQUIRES names no read {key}"
+            assert isinstance(need, str) and need.startswith("sglang"), key
 
 
 def _built_classes() -> dict:
