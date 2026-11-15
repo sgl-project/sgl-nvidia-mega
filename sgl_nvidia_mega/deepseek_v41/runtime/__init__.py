@@ -15,7 +15,9 @@ import msgspec
 # served at batch 1 (a 95 % interval below zero) and passed the accuracy checks, and each
 # is bitwise with the path it replaces except those in NUMERICS_CHANGE_SLOTS. On a default
 # start (no SLOTS_ENV) one that has nothing to serve stays off instead of refusing the
-# start; listed in SLOTS_ENV it must build like any other slot.
+# start; listed in SLOTS_ENV it must build like any other slot. markov_shard_logits and
+# moe_balanced act only when SGLang asks for them (step_logits_shard_only; its balanced
+# expert storage), and otherwise leave the step as it was.
 DEFAULT_ON_SLOTS = (
     "gate_route",
     "gate_route_quant",
@@ -35,6 +37,9 @@ DEFAULT_ON_SLOTS = (
     "markov_tail",
     "draft_stage0_table",
     "engram_publish",
+    "attn_indexer_logits_q6",
+    "gemm2_reg_pool",
+    "markov_shard_logits",
     # numerics changes (NUMERICS_CHANGE_SLOTS)
     "swapab_h8",
     "wo_a_g1",
@@ -43,6 +48,7 @@ DEFAULT_ON_SLOTS = (
     "attn_q_cluster",
     "draft_shared_ll",
     "wo_b_publish_split",
+    "moe_balanced",
 )
 # The slots that are not bitwise with the path they replace (a different summation order
 # or encoding; the step's accuracy is checked with evals, not bit for bit)
@@ -284,12 +290,9 @@ OPT_IN_SLOTS = (
     "attn_wo_a_fp8",
     # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
     "attn_core_lean",
-    "markov_shard_logits",
     "draft_final_collapse",
+    # no resolved served gain alone (its gain needs SGLang-side draft-metadata changes)
     "draft_stage0_first",
-    "moe_balanced",
-    "attn_indexer_logits_q6",
-    "gemm2_reg_pool",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)

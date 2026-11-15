@@ -16,6 +16,7 @@ NUMERICS_DEFAULT_ON = {
     "attn_q_cluster",
     "draft_shared_ll",
     "wo_b_publish_split",
+    "moe_balanced",
 }
 
 
@@ -23,8 +24,8 @@ def test_the_default_on_slots_are_shipped_and_not_opt_in():
     on = set(runtime.DEFAULT_ON_SLOTS)
     assert on <= set(runtime.SHIPPED_SLOTS)
     assert not on & set(runtime.OPT_IN_SLOTS)
-    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 25
-    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 65
+    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 29
+    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 69
 
 
 def test_the_shipped_list_needs_no_opt_in_slot(monkeypatch):
@@ -42,6 +43,9 @@ def test_the_numerics_changing_default_slots_are_labelled():
         "draft_stage0_table",
         "engram_publish",
         "gemm2_pipe",
+        "attn_indexer_logits_q6",
+        "gemm2_reg_pool",
+        "markov_shard_logits",
     ):
         assert slot in on and slot not in runtime.NUMERICS_CHANGE_SLOTS
     assert runtime.NUMERICS_CHANGE_SLOTS <= set(
@@ -67,6 +71,8 @@ def test_the_numerics_changing_default_slots_are_labelled():
         # untuned tactics; measurement only
         "lm_head_pinned_tactic",
         "draft_lm_head_mxfp8",
+        # no resolved served gain alone
+        "draft_stage0_first",
     ],
 )
 def test_the_remaining_slots_stay_opt_in(slot):
