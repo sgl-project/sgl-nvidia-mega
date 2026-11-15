@@ -287,6 +287,39 @@ def expert_offset(experts: torch.nn.Module) -> int:
     return experts.moe_ep_rank * experts.num_local_experts
 
 
+def layer_weights(experts: torch.nn.Module, method, deal: bool):
+    """The pair's (w13, w13 scales, w2, w2 scales), SwiGLU clamp, expert offset and deal
+    group (-1: none). Under SGLang's balanced expert storage (every routed expert held,
+    ``balanced_expert_storage``) slot moe_balanced deals each step's experts over the
+    expert-parallel groups and the pair takes all of them; without the slot it takes the
+    rank's EP window of the storage, as without that storage."""
+    weights = (
+        experts.w13_weight,
+        experts.w13_weight_scale_inv,
+        experts.w2_weight,
+        experts.w2_weight_scale_inv,
+    )
+    clamp = method._gemm1_clamp_limit_tensor
+    if not getattr(experts, "balanced_expert_storage", False):
+        return weights, clamp, expert_offset(experts), -1
+    if not deal:
+        return (
+            tuple(experts.expert_window(w) for w in weights),
+            clamp,
+            expert_offset(experts),
+            -1,
+        )
+    if experts.moe_ep_size != 2 or int(weights[0].size(0)) != experts.num_experts:
+        raise ValueError(
+            f"slot moe_balanced deals over two expert-parallel groups holding all "
+            f"{experts.num_experts} experts, got EP {experts.moe_ep_size} and "
+            f"{weights[0].size(0)} held"
+        )
+    # one SwiGLU limit for every expert (SGLang fills the window's tensor with it)
+    clamp = clamp.repeat(experts.moe_ep_size)
+    return weights, clamp, 0, int(experts.moe_ep_rank)
+
+
 def build(
     model: torch.nn.Module,
     group,
@@ -340,6 +373,7 @@ def build_layers(
         gate_route_quant = "gate_route_quant" in SLOTS
     if gate_route_early is None:
         gate_route_early = "gate_route_early" in SLOTS
+    deal = "moe_balanced" in SLOTS
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
     )
@@ -360,17 +394,16 @@ def build_layers(
                 raise ValueError(f"layer {i}: experts on {type(method).__name__}")
             if mlp.alt_stream is None or mlp.num_fused_shared_experts:
                 continue  # SGLang's dual-stream order does not apply
+            weights, clamp, offset, deal_group = layer_weights(experts, method, deal)
             gemm = RoutedExpertGemm(
-                experts.w13_weight,
-                experts.w13_weight_scale_inv,
-                experts.w2_weight,
-                experts.w2_weight_scale_inv,
-                method._gemm1_clamp_limit_tensor,
+                *weights,
+                clamp,
                 top_k=experts.top_k,
                 max_rows=SERVED_MAX_ROWS,
                 gate_topk=gate_topk,
                 router_experts=experts.num_experts,
-                expert_offset=expert_offset(experts),
+                expert_offset=offset,
+                deal_group=deal_group,
                 gate_route=gate_route,
                 gate_route_quant=gate_route_quant,
                 gemm2_pipe=gemm2_pipe,

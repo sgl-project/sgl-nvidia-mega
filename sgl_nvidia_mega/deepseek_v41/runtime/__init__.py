@@ -61,6 +61,7 @@ NUMERICS_CHANGE_SLOTS = frozenset(
         "wo_b_publish_split",
         "attn_core_lean",
         "hop_final_collapse",
+        "moe_balanced",
     }
 )
 # The kernel slots this package ships; with the megakernel on, all of them run. The
@@ -252,7 +253,13 @@ DRAFT_SLOTS = frozenset(
 # the main stream collects the layer's rows at its gate, in place of the zero-padded
 # rows' all-reduce at the first Engram layer; a later Engram layer's columns start at
 # the layer 4 before it (muLLM's late-layer schedule), off layer 1's path (engram/exchange.py;
-# bitwise: SGLang's whole WKV GEMM bit for bit)
+# bitwise: SGLang's whole WKV GEMM bit for bit);
+# moe_balanced: with SGLang's balanced expert storage (every rank holds its MoE-TP slice
+# of all routed experts, SGLANG_OPT_MOE_BALANCED_EXPERT_STORAGE), the route record deals
+# each step's distinct experts, in id order, to the two expert-parallel groups in turn
+# (muLLM's balanced groups), so each group runs half of them whatever the routing; a
+# numerics change: the experts' partial sums meet at hop B in another grouping
+# (without the slot the pair reads the rank's EP window of that storage, bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -268,6 +275,7 @@ OPT_IN_SLOTS = (
     "attn_core_lean",
     "markov_shard_logits",
     "draft_final_collapse",
+    "moe_balanced",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -380,6 +388,7 @@ def slot_reasons() -> list[str]:
         ("attn_core_lean", "wo_a_g1"),
         ("wo_b_publish_split", "hop_a"),
         ("engram_publish", "engram"),
+        ("moe_balanced", "moe"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -478,6 +487,11 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         # slot engram_publish: the prefetch built on the mailbox exchange
         "engram_publish": getattr(bound["engram"].prefetch, "exchange", None)
         is not None,
+        # slot moe_balanced: a layer's pair built to deal the step's experts
+        "moe_balanced": any(
+            getattr(slot.gemm, "deal_group", -1) >= 0
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
         # slot gate_route: a layer's fast top-k built with the route record in one launch
         "gate_route": any(
             getattr(slot.gemm, "gate_route_kernel", None) is not None

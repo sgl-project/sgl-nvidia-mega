@@ -38,6 +38,8 @@ HIDDEN = 5120
 SLICE = 576
 PADDED = 640
 MAX_EXPERTS = 384
+# slot moe_balanced: expert-parallel groups the route kernels deal a step's experts over
+DEAL_GROUPS = 2
 MAX_TOP_K = 8
 TILE = 8
 MAX_ROWS = 8
@@ -531,9 +533,13 @@ class RoutedExpertGemm:
         gemm2_registers: int = 0,
         gate_route: bool = False,
         gate_route_quant: bool = False,
+        deal_group: int = -1,
     ):
         """``router_experts``: the router's expert count (default: the local ones);
         ``expert_offset``: the router id of local expert 0 (expert parallelism);
+        ``deal_group`` (0 or 1, slot moe_balanced; -1 off): the rank holds all the
+        router's experts and serves the step's distinct experts dealt to its group of
+        two expert-parallel groups (route.cuh, "Balanced dealing");
         ``gate_route`` (with ``gate_topk``): at 1-8 rows the top-k and the route record
         in one launch (gate_route.cuh); ``gate_route_quant`` (with ``gate_route``): that
         launch also quantizes the routed input (``gate_topk_and_gemms(x=...)``);
@@ -560,6 +566,21 @@ class RoutedExpertGemm:
                 f"{self.expert_offset + self.experts}) are outside the router's "
                 f"{self.router_experts}"
             )
+        self.deal_group = int(deal_group)
+        if self.deal_group >= 0 and (
+            self.deal_group >= DEAL_GROUPS
+            or self.expert_offset != 0
+            or self.experts != self.router_experts
+        ):
+            raise ValueError(
+                f"balanced dealing needs all {self.router_experts} experts and a group "
+                f"below {DEAL_GROUPS}, got {self.experts} experts from "
+                f"{self.expert_offset}, group {self.deal_group}"
+            )
+        # the route kernels' expert_offset argument: negative selects the dealing
+        self.route_offset = (
+            -1 - self.deal_group if self.deal_group >= 0 else self.expert_offset
+        )
         self.top_k = top_k
         self.max_rows = max_rows
         self.kernels = load_kernels(w13.device.index)
@@ -681,7 +702,7 @@ class RoutedExpertGemm:
                     ctypes.c_int32(rows),
                     ctypes.c_int32(top_k),
                     ctypes.c_int32(self.experts),
-                    ctypes.c_int32(self.expert_offset),
+                    ctypes.c_int32(self.route_offset),
                 ],
                 stream,
             )
@@ -697,7 +718,7 @@ class RoutedExpertGemm:
                     ctypes.c_int32(rows),
                     ctypes.c_int32(top_k),
                     ctypes.c_int32(self.experts),
-                    ctypes.c_int32(self.expert_offset),
+                    ctypes.c_int32(self.route_offset),
                 ],
                 stream,
             )
@@ -818,7 +839,7 @@ class RoutedExpertGemm:
                     _pointer(permuted),
                     _pointer(record),
                     ctypes.c_int32(self.experts),
-                    ctypes.c_int32(self.expert_offset),
+                    ctypes.c_int32(self.route_offset),
                 ]
                 + extra,
                 stream,
@@ -883,7 +904,7 @@ class RoutedExpertGemm:
             ctypes.c_int32(rows),
             ctypes.c_int32(self.top_k),
             ctypes.c_int32(self.experts),
-            ctypes.c_int32(self.expert_offset),
+            ctypes.c_int32(self.route_offset),
         ]
         if rows > MAX_ROWS:
             _launch(self.route_wide, (1, 1, 1), common + sizes, stream)
