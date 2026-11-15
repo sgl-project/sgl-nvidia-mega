@@ -259,7 +259,10 @@ DRAFT_SLOTS = frozenset(
 # each step's distinct experts, in id order, to the two expert-parallel groups in turn
 # (muLLM's balanced groups), so each group runs half of them whatever the routing; a
 # numerics change: the experts' partial sums meet at hop B in another grouping
-# (without the slot the pair reads the rank's EP window of that storage, bitwise)
+# (without the slot the pair reads the rank's EP window of that storage, bitwise);
+# attn_indexer_logits_q6: with attn_indexer, the full paged index logits of 5-7 rows a
+# request on DeepGEMM's kernel with the request's rows in one Q block, so the index K
+# streams once per step, not once per 4 rows (sm103/attention/paged_logits_q6.py; bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -276,6 +279,7 @@ OPT_IN_SLOTS = (
     "markov_shard_logits",
     "draft_final_collapse",
     "moe_balanced",
+    "attn_indexer_logits_q6",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -389,6 +393,7 @@ def slot_reasons() -> list[str]:
         ("wo_b_publish_split", "hop_a"),
         ("engram_publish", "engram"),
         ("moe_balanced", "moe"),
+        ("attn_indexer_logits_q6", "attn_indexer"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -674,6 +679,13 @@ def build(model, ctx):
         # a compressor layer's chain runs its compressor on the high-priority stream
         "attn_compressor_priority": any(
             a.chain is not None and a.chain[0].compressor_stream is not None
+            for a in bound["attention"].values()
+        ),
+        # the plugin indexer runs the full paged logits on one Q block per request
+        "attn_indexer_logits_q6": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].indexer.logits_q6
             for a in bound["attention"].values()
         ),
         "attn_index_weights_bf16": any(

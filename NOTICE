@@ -27,8 +27,9 @@ names its origin in its header.
 
 Portions are adapted from DeepGEMM (https://github.com/deepseek-ai/DeepGEMM): the
 K-split body of sgl_nvidia_mega/deepseek_v41/sm103/src/hc_coeff.cu follows its
-sm100_tf32_hc_prenorm_gemm kernel (MIT License, Copyright (c) 2025 DeepSeek; the full
-notice is kept in that file).
+sm100_tf32_hc_prenorm_gemm kernel, and sgl_nvidia_mega/deepseek_v41/sm103/attention/src/
+paged_logits_q6.cu follows its legacy sm100_paged_mqa_logits kernel and scheduler (MIT
+License, Copyright (c) 2025 DeepSeek; the full notice is kept in each file).
 
 Portions are adapted from muLLM (NVIDIA Corporation, Apache-2.0): the DeepSeek-V4.1
 routed-expert GEMM2 pipeline build in sgl_nvidia_mega/deepseek_v41/sm103/moe/src/

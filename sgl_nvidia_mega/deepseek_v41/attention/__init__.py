@@ -82,6 +82,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
         indexer.StepIndexer(
             model.config,
             fused="attn_indexer_fused" in SLOTS,
+            logits_q6="attn_indexer_logits_q6" in SLOTS,
         )
         if chain_on and "attn_indexer" in SLOTS
         else None
