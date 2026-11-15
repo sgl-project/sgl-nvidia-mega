@@ -59,12 +59,28 @@ PARAMETERS = {
 }
 # Slot gemm2_pipe (opt-in): GEMM2 as muLLM's reference-pipeline + prelude build of the
 # same kernel (gemm2_pipe.cu), bit for bit
-# the default GEMM2's. ``gemm2_registers`` (no slot): that build at
+# the default GEMM2's. ``gemm2_registers`` (slot gemm2_reg_pool): that build at
 # GEMM2_POOL_REGISTERS registers per thread (__maxnreg__; muLLM's register pool), so a
 # CTA holds 48 K of the SM's 64 K registers and a dependent's CTA can land beside it.
-# Bitwise, but within noise in the routed-MoE bench, where nothing lands beside GEMM2;
-# kept for an in-model A/B against the MoE post's consumer.
+# Bitwise: the same code with fewer registers and no spill. The kernel's setmaxnreg split
+# (4 warps up to 192, 12 down to 48) needs 84 per thread on average; under that the
+# epilogue's increase never completes.
 GEMM2_POOL_REGISTERS = 96
+
+
+def kernel_registers(kernel: _Kernel) -> tuple[int, int]:
+    """(registers per thread, local memory bytes per thread: spills) of a loaded kernel."""
+    cu = _driver()
+    attr = cu.CUfunction_attribute
+    (regs,) = _check(
+        cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_NUM_REGS, kernel.function),
+        "cuFuncGetAttribute(NUM_REGS)",
+    )
+    (local,) = _check(
+        cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel.function),
+        "cuFuncGetAttribute(LOCAL_SIZE_BYTES)",
+    )
+    return int(regs), int(local)
 
 
 def compile_source(source, name, arch, options=NVRTC_OPTIONS, headers=None) -> bytes:
@@ -631,6 +647,8 @@ class RoutedExpertGemm:
         self.gemm2_maps = (_weight_map(w2, HIDDEN, PADDED, 2), _scale_map(w2_scale, 1))
         if gemm2_registers and not gemm2_pipe:
             raise ValueError("the GEMM2 register pool is a build of the pipeline GEMM2")
+        # slot gemm2_reg_pool: the cap this layer's GEMM2 was built at (0: none)
+        self.gemm2_registers = int(gemm2_registers) if gemm2_pipe else 0
         self.gemm2_pipe = (
             load_gemm2_pipe(w13.device.index, int(gemm2_registers))
             if gemm2_pipe

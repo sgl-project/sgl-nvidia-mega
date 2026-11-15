@@ -157,7 +157,8 @@ def test_register_count(target_layer, build):
     )
     want = reg.GEMM2_POOL_REGISTERS if build == "pool" else 128
     assert regs <= want, regs
-    print(f"gemm2 {build}: {regs} registers per thread")
+    regs, spill = reg.kernel_registers(pair[1].gemm2_pipe)
+    print(f"gemm2 {build}: {regs} registers, {spill} spill bytes per thread")
 
 
 @needs_moe

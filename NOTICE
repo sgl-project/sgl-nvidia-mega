@@ -46,11 +46,11 @@ markov.cu follow muLLM's chain-stamp method, and its acquire load of the exchang
 (slot markov_lowlat) matches muLLM's idiom; slot markov_shard_logits keeps the draft
 step logits sharded per rank as muLLM keeps its draft distribution. The draft stages'
 shared expert on the low-latency GEMM (slot draft_shared_ll) follows muLLM's draft MoE
-design, and the dealing rule of slot moe_balanced (a step's distinct experts dealt to the
-two expert-parallel groups in turn) follows muLLM's balanced expert groups; no muLLM
-source is copied for these three. (Apache License 2.0, Copyright (c) 2026 NVIDIA
-CORPORATION &
-AFFILIATES.) Each adapted file names its origin in its header.
+design; the dealing rule of slot moe_balanced (a step's distinct experts dealt to the
+two expert-parallel groups in turn) follows muLLM's balanced expert groups; slot
+gemm2_reg_pool builds the routed GEMM2 under a register cap as muLLM's register pool
+does. No muLLM source is copied for these four. (Apache License 2.0, Copyright (c) 2026
+NVIDIA CORPORATION & AFFILIATES.) Each adapted file names its origin in its header.
 
 Portions are derived from TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM): the
 DSpark draft's stage-0 token table in sgl_nvidia_mega/deepseek_v41/draft_stage0.py (the

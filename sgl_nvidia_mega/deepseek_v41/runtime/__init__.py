@@ -267,7 +267,10 @@ DRAFT_SLOTS = frozenset(
 # (without the slot the pair reads the rank's EP window of that storage, bitwise);
 # attn_indexer_logits_q6: with attn_indexer, the full paged index logits of 5-7 rows a
 # request on DeepGEMM's kernel with the request's rows in one Q block, so the index K
-# streams once per step, not once per 4 rows (sm103/attention/paged_logits_q6.py; bitwise)
+# streams once per step, not once per 4 rows (sm103/attention/paged_logits_q6.py; bitwise);
+# gemm2_reg_pool: with gemm2_pipe, that GEMM2 (target and draft) capped at 96 registers per
+# thread (muLLM's register pool), so a co-running kernel's CTA can land beside it (bitwise:
+# the same code, fewer registers)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -286,6 +289,7 @@ OPT_IN_SLOTS = (
     "draft_stage0_first",
     "moe_balanced",
     "attn_indexer_logits_q6",
+    "gemm2_reg_pool",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -401,6 +405,7 @@ def slot_reasons() -> list[str]:
         ("engram_publish", "engram"),
         ("moe_balanced", "moe"),
         ("attn_indexer_logits_q6", "attn_indexer"),
+        ("gemm2_reg_pool", "gemm2_pipe"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -522,6 +527,11 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
         # slot gemm2_pipe: a layer's GEMM2 on the pipelined build
         "gemm2_pipe": any(
             getattr(slot.gemm, "gemm2_pipe", None) is not None
+            for slot in getattr(bound["moe"], "slots", {}).values()
+        ),
+        # slot gemm2_reg_pool: a layer's pipelined GEMM2 built under the register cap
+        "gemm2_reg_pool": any(
+            getattr(slot.gemm, "gemm2_registers", 0) > 0
             for slot in getattr(bound["moe"], "slots", {}).values()
         ),
         "target_lm_head": bound.get("logits") is not None,

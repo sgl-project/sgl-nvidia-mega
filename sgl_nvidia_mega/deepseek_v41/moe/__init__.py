@@ -20,8 +20,31 @@ logger = logging.getLogger(__name__)
 
 
 def gemm2_options(slots) -> dict:
-    """The routed GEMM2 build the slots ask for (slot gemm2_pipe)."""
-    return dict(gemm2_pipe="gemm2_pipe" in slots)
+    """The routed GEMM2 build the slots ask for (slot gemm2_pipe; slot gemm2_reg_pool:
+    that build capped at GEMM2_POOL_REGISTERS per thread)."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
+        GEMM2_POOL_REGISTERS,
+    )
+
+    pipe = "gemm2_pipe" in slots
+    registers = GEMM2_POOL_REGISTERS if pipe and "gemm2_reg_pool" in slots else 0
+    return dict(gemm2_pipe=pipe, gemm2_registers=registers)
+
+
+def gemm2_pool_summary(bound: routed.Bound) -> str:
+    """The register-pool GEMM2 as built: its cap, registers and spill bytes per thread."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
+        kernel_registers,
+    )
+
+    gemms = [s.gemm for s in bound.slots.values() if s.gemm.gemm2_registers]
+    if not gemms:
+        return "off"
+    regs, local = kernel_registers(gemms[0].gemm2_pipe)
+    return (
+        f"cap {gemms[0].gemm2_registers} in {len(gemms)} layers, {regs} registers "
+        f"and {local} spill bytes per thread"
+    )
 
 
 def build(model, ctx, group) -> routed.Bound:
@@ -54,7 +77,13 @@ def build(model, ctx, group) -> routed.Bound:
         sum(s.router is not None for s in bound.slots.values()),
         bound.router_reason or "built",
     )
+    if "gemm2_reg_pool" in SLOTS:
+        logger.info(
+            "NVIDIA megakernel: DeepSeek-V4.1 MoE: GEMM2 register pool "
+            "(gemm2_reg_pool): %s",
+            gemm2_pool_summary(bound),
+        )
     return bound
 
 
-__all__ = ["build", "gemm2_options", "step"]
+__all__ = ["build", "gemm2_options", "gemm2_pool_summary", "step"]
