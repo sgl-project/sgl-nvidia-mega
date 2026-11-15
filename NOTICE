@@ -42,9 +42,11 @@ exchange.cu and its later-layer schedule, and the scheduling switch behind slot
 attn_compressor_priority. The
 in-kernel phase stamps of the DSpark Markov chain in sgl_nvidia_mega/deepseek_v41/sm103/
 markov.cu follow muLLM's chain-stamp method, and its acquire load of the exchange records
-(slot markov_lowlat) matches muLLM's idiom. The draft stages' shared expert on the
-low-latency GEMM (slot draft_shared_ll) follows muLLM's draft MoE design; no muLLM source
-is copied for it. (Apache License 2.0, Copyright (c) 2026 NVIDIA CORPORATION &
+(slot markov_lowlat) matches muLLM's idiom; slot markov_shard_logits keeps the draft
+step logits sharded per rank as muLLM keeps its draft distribution. The draft stages'
+shared expert on the low-latency GEMM (slot draft_shared_ll) follows muLLM's draft MoE
+design; no muLLM source is copied for these two. (Apache License 2.0, Copyright (c) 2026
+NVIDIA CORPORATION &
 AFFILIATES.) Each adapted file names its origin in its header.
 
 Portions are derived from TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM): the

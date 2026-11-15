@@ -96,6 +96,13 @@ using i64 = long long;
 #ifndef MARKOV_TAIL
 #define MARKOV_TAIL 0
 #endif
+// Slot markov_shard_logits: each rank keeps only its own shard's step logits in its
+// cache, as muLLM keeps its draft distribution. No peer staging stores, no publishing
+// fence or acquire, no epilogue copy; built only when the caller's accept reads only
+// the own shard (SGLang's step_logits_shard_only).
+#ifndef MARKOV_SHARD_LOGITS
+#define MARKOV_SHARD_LOGITS 0
+#endif
 
 namespace {
 
@@ -575,7 +582,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
           const i64 element = vocab_offset + tile * 16 + vector * kVectorElements;
           *reinterpret_cast<uint4*>(logits_cache + req_state * cache_stride0 + step * cache_stride1 + element) = v;
           const i64 staged = staging_parity + static_cast<i64>(r * STEPS + step) * vocab + element;
-          for (int peer = 0; peer < world; ++peer) {
+          for (int peer = 0; peer < (MARKOV_SHARD_LOGITS ? 0 : world); ++peer) {
             if (peer == rank) continue;
             *reinterpret_cast<uint4*>(reinterpret_cast<CACHE_T*>(PeerBase(peers, peer)) + staged) = v;
           }
@@ -602,7 +609,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
     __syncthreads();
     STAMP(8 + 8 * step + 2);
     // Only the last step's records publish logits stored to peers.
-    const bool publish = last_step && launch_keeps;
+    const bool publish = last_step && launch_keeps && !MARKOV_SHARD_LOGITS;
 #if MARKOV_DIRECT
     // Mailbox blocks [parity][step][source rank][cta], each max_rows records.
     const i64 step_blocks = (static_cast<i64>(parity) * STEPS + step) * world * ctas;
@@ -837,7 +844,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
   STAMP(2);
 
   // The peers' shards are in this rank's staging buffer: copy them into the cache.
-  if (launch_keeps) {
+  if (launch_keeps && !MARKOV_SHARD_LOGITS) {
     const int vectors = vocab_local * static_cast<int>(sizeof(CACHE_T)) / 16;
     const int per_row_step = (world - 1) * vectors;
     const int total = rows * STEPS * per_row_step;
@@ -1006,7 +1013,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
             const i64 element = vocab_offset + tile * 16 + vector * kVectorElements;
             *reinterpret_cast<uint4*>(logits_cache + req_state * cache_stride0 + step * cache_stride1 + element) = v;
             const i64 staged = staging_parity + static_cast<i64>(r * STEPS + step) * vocab + element;
-            for (int peer = 0; peer < world; ++peer) {
+            for (int peer = 0; peer < (MARKOV_SHARD_LOGITS ? 0 : world); ++peer) {
               if (peer == rank) continue;
               *reinterpret_cast<uint4*>(reinterpret_cast<CACHE_T*>(PeerBase(peers, peer)) + staged) = v;
             }
@@ -1039,7 +1046,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
     __syncthreads();
 
     // Only the last step's records publish logits stored to peers.
-    const bool publish = last_step && launch_keeps;
+    const bool publish = last_step && launch_keeps && !MARKOV_SHARD_LOGITS;
     const i64 step_records = (static_cast<i64>(parity) * kMaxSteps + step) * kWideRows * kMaxRanks;
     if (warp == 0) {
       for (int r = lane; r < rows; r += 32) {
@@ -1118,7 +1125,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
     }
   }
 
-  if (launch_keeps) {
+  if (launch_keeps && !MARKOV_SHARD_LOGITS) {
     const int vectors = vocab_local * static_cast<int>(sizeof(CACHE_T)) / 16;
     const int per_row_step = (world - 1) * vectors;
     const int total = rows * STEPS * per_row_step;

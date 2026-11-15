@@ -328,6 +328,7 @@ class ShardedMarkov:
         stamps: bool = False,
         lowlat: bool = False,
         tail: bool = False,
+        shard_logits: bool = False,
         extra_defines: tuple[str, ...] = (),
     ):
         device = embed_weight.device
@@ -336,6 +337,10 @@ class ShardedMarkov:
         self.tail = tail
         if tail:
             extra_defines = tuple(extra_defines) + ("-DMARKOV_TAIL=1",)
+        # slot markov_shard_logits: the cache keeps only this rank's columns
+        self.shard_logits = shard_logits
+        if shard_logits:
+            extra_defines = tuple(extra_defines) + ("-DMARKOV_SHARD_LOGITS=1",)
         reason = unsupported_reason(
             world=world,
             vocab_size=vocab_size,
@@ -549,7 +554,8 @@ class ShardedMarkov:
     ) -> None:
         """Draft tokens of every row into ``draft_tokens`` [rows, num_steps] and, when
         ``logits_cache`` [>= rows, num_steps, vocab] is given, the full-vocab step logits
-        of every row at a nonzero temperature (temperature-0 rows are left untouched);
+        of every row at a nonzero temperature (with ``shard_logits`` only this rank's
+        columns), temperature-0 rows are left untouched;
         without it every row is argmaxed. The noise must be drawn already.
 
         Built with ``tail`` only: ``verify_ids`` [>= rows, num_steps + 1] int64 also gets

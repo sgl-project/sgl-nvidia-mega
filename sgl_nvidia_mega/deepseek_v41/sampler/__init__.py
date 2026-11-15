@@ -208,11 +208,14 @@ def build_steps(
     step_logits: Optional[torch.Tensor],
     step_temperatures: torch.Tensor,
     verify_ids: Optional[torch.Tensor] = None,
+    step_logits_shard_only: bool = False,
 ) -> dict:
     """The per-batch-size steps over SGLang's buffers; collective over the TP group, so
     every rank runs it. ``verify_ids`` [max_bs, gamma + 1] (SGLang's
     SGLANG_OPT_DSV41_DSPARK_PLUGIN_VERIFY_IDS): each step writes its rows' [anchor |
-    draft tokens] there, in the chain's launch with slot markov_tail. Raises on every rank when any rank cannot run the chain, or
+    draft tokens] there, in the chain's launch with slot markov_tail. ``step_logits_shard_only``:
+    SGLang reads only this rank's columns of ``step_logits``; with slot markov_shard_logits the
+    chain then keeps only those. Raises on every rank when any rank cannot run the chain, or
     when the ranks would serve different sizes (their graphs would wait on each other)."""
     from sglang.srt.runtime_context import get_parallel
 
@@ -256,6 +259,7 @@ def build_steps(
         keeps_logits=not greedy_draft,
         lowlat="markov_lowlat" in SLOTS,
         tail="markov_tail" in SLOTS,
+        shard_logits=step_logits_shard_only and "markov_shard_logits" in SLOTS,
     )
     if verify_ids is not None:
         assert verify_ids.dtype == torch.int64 and verify_ids.is_contiguous()
@@ -303,7 +307,8 @@ def build_steps(
         LM_HEAD_MAX_ROWS,
         " (MXFP8 stream at 1-8)" if lm_head.mxfp8 is not None else "",
         (", low-latency exchange" if chain.lowlat else "")
-        + (", chain writes the tail" if chain.tail else ""),
+        + (", chain writes the tail" if chain.tail else "")
+        + (", shard-only step logits" if chain.shard_logits else ""),
         chain.timeout_ns / 1e9,
         (free_before - torch.cuda.mem_get_info()[0]) / 2**20,
     )

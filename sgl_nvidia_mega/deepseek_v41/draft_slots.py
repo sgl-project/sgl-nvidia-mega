@@ -53,11 +53,17 @@ def warn_declined(table: dict[str, tuple[str, str]]) -> None:
             )
 
 
-_PROPOSAL = ("markov", "draft_lm_head", "markov_lowlat", "markov_tail")
+_PROPOSAL = (
+    "markov",
+    "draft_lm_head",
+    "markov_lowlat",
+    "markov_tail",
+    "markov_shard_logits",
+)
 
 
 def _proposal(built, name):
-    if name in ("markov", "markov_lowlat", "markov_tail"):
+    if name in _PROPOSAL and name != "draft_lm_head":
         if built.draft_sampler is None:
             return DECLINED, "SGLang's proposal"
         if name == "markov_lowlat":
@@ -67,6 +73,12 @@ def _proposal(built, name):
                 BUILT,
                 "the chain advances the noise offset, and writes the verify ids "
                 "where SGLang hands them over",
+            )
+        if name == "markov_shard_logits":
+            return (
+                BUILT,
+                "shard-only step logits only where SGLang passes step_logits_shard_only; "
+                "the proposal's build line says whether it did",
             )
         return BUILT, "Markov chain in one kernel, built with the proposal's buffers"
     if not built.low_m:

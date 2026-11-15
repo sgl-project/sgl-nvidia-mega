@@ -152,6 +152,7 @@ DRAFT_SLOTS = frozenset(
         "draft_wo_b_ll",
         "markov_lowlat",
         "markov_tail",
+        "markov_shard_logits",
         "draft_final_collapse",
         "draft_stage0_table",
         "draft_shared_ll",
@@ -226,9 +227,12 @@ DRAFT_SLOTS = frozenset(
 # the V4.1 KV encodings, P in BF16, muLLM's split and merge order;
 # markov_tail: the Markov chain's kernel also advances the draft-noise offset and, when
 # SGLang hands the proposal its verify ids, writes [anchor | draft tokens] there (the
-# add and SGLang's concat after the chain, bitwise); draft_final_collapse: with draft_hop,
-# the last draft stage's MoE post also writes the head's mHC collapse, so the draft
-# forward skips its hc_combine (bitwise);
+# add and SGLang's concat after the chain, bitwise); markov_shard_logits: when SGLang asks
+# for it (its vocab-parallel fused accept reads only the own draft columns), each rank keeps
+# only its shard of the step logits: no peer staging, no publishing fence, no epilogue copy
+# (the draft logits stay sharded per rank as in muLLM; the kept values bitwise);
+# draft_final_collapse: with draft_hop, the last draft stage's MoE post also writes the
+# head's mHC collapse, so the draft forward skips its hc_combine (bitwise);
 # draft_stage0_table: the first draft stage's input norm, [wq_a; wkv] GEMM, q-LoRA norm
 # and wq_b are a function of each row's token id, so one launch gathers the query rows and
 # the window K/V rows from a per-token table (draft_stage0.py; design derived from
@@ -262,6 +266,7 @@ OPT_IN_SLOTS = (
     "attn_wo_a_fp8",
     # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
     "attn_core_lean",
+    "markov_shard_logits",
     "draft_final_collapse",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
@@ -338,6 +343,7 @@ def slot_reasons() -> list[str]:
         ("draft_lm_head_mxfp8", "draft_lm_head"),
         ("markov_lowlat", "markov"),
         ("markov_tail", "markov"),
+        ("markov_shard_logits", "markov"),
         ("draft_final_collapse", "draft_hop"),
         ("draft_stage0_table", "draft_swapab"),
         ("draft_shared_ll", "draft_moe"),
