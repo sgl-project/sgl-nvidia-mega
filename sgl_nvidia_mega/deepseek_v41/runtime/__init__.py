@@ -156,6 +156,7 @@ DRAFT_SLOTS = frozenset(
         "markov_shard_logits",
         "draft_final_collapse",
         "draft_stage0_table",
+        "draft_stage0_first",
         "draft_shared_ll",
     }
 )
@@ -243,6 +244,10 @@ DRAFT_SLOTS = frozenset(
 # target's (gate_up on the low-latency GEMM, with shared_fold* folding the SwiGLU and
 # down_proj's quant; following muLLM's draft MoE; not bitwise: summation order, so the
 # draft's tokens may change, the target's verify stays exact);
+# draft_stage0_first: with draft_stage0_table, the first stage's attention (gather, window
+# store, core, wo_a, wo_b) is issued from the token ids ahead of the embedding, whose lookup,
+# hc broadcast and the stage's mHC coefficients run on a side stream joined at the stage's
+# attention post (bitwise: same kernels on the same inputs);
 # wo_b_publish_split: at 1-8 rows wo_b on muLLM's cluster split-K FP8 projection whose
 # epilogue publishes into the hop's mailbox (sm103/attention/wo_b_split.py), on hop A in
 # place of the publishing low-latency GEMM and, with slot draft_hop, on the draft stages
@@ -278,6 +283,7 @@ OPT_IN_SLOTS = (
     "attn_core_lean",
     "markov_shard_logits",
     "draft_final_collapse",
+    "draft_stage0_first",
     "moe_balanced",
     "attn_indexer_logits_q6",
 )
@@ -358,6 +364,7 @@ def slot_reasons() -> list[str]:
         ("markov_shard_logits", "markov"),
         ("draft_final_collapse", "draft_hop"),
         ("draft_stage0_table", "draft_swapab"),
+        ("draft_stage0_first", "draft_stage0_table"),
         ("draft_shared_ll", "draft_moe"),
         ("draft_shared_ll", "shared_ll"),
         ("kv_before_wait", "attn"),

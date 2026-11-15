@@ -103,6 +103,13 @@ def _forward(built, stages, slots, name):
         return BUILT, "BF16 streams into hc_combine"
     if name == "draft_embed":
         return BUILT, "the target's whole table, bound at the first forward"
+    if name == "draft_stage0_first":
+        if not built._stage0_wanted:
+            return DECLINED, built._stage0_reason
+        return BUILT, (
+            "the first stage's attention issued ahead of the embedding, which runs on a "
+            "side stream joined at its post"
+        )
     if name == "draft_stage0_table":
         if not built._stage0_wanted:
             return DECLINED, built._stage0_reason

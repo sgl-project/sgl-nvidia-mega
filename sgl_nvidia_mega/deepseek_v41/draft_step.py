@@ -165,6 +165,8 @@ class DraftDecode(DraftProposal):
         if "draft_stage0_table" in slots:
             self._stage0_reason = _stage0_reason(stages, self._attn)
             self._stage0_wanted = not self._stage0_reason
+        self._stage0_first = self._stage0_wanted and "draft_stage0_first" in slots
+        self._stage0_stream = None
         # slot wo_b_publish_split: the stages' wo_b on muLLM's split-K kernel, publishing
         # into the draft hop's mailbox (with the fused wo_a's MXFP8 rows)
         self._wo_b_split = None
@@ -279,18 +281,34 @@ class DraftDecode(DraftProposal):
         # benchmark only (runtime/bench.py): the draft step's stamps, when requested
         with bench.forward("draft", positions):
             try:
-                x = self._embed(input_ids) if input_embeds is None else input_embeds
-                boundary.start(st, x)
                 # slot draft_stage0_table: the first stage's attention reads its rows
                 # from the token table where this step's width was checked
                 table = self._stage0_table(step.rows, input_ids, forward_batch, view)
+                # slot draft_stage0_first: the embedding and the first stage's mHC
+                # coefficients on a side stream, the stage's attention ahead of them
+                side = (
+                    self._stage0_side()
+                    if table is not None and input_embeds is None
+                    else None
+                )
+                if side is not None:
+                    main = torch.cuda.current_stream()
+                    side.wait_stream(main)
+                    with torch.cuda.stream(side):
+                        x = self._embed(input_ids)
+                        boundary.start(st, x)
+                        boundary.pre(lm.stages[0], "attn", st, need_input=False)
+                else:
+                    x = self._embed(input_ids) if input_embeds is None else input_embeds
+                    boundary.start(st, x)
                 # draft stages have no recorder layer indices
                 with get_global_expert_distribution_recorder().disable_this_region():
                     for i, stage in enumerate(lm.stages):
                         st.layer_id = stage.layer_id
                         with st.exit:
                             if i == 0 and table is not None:
-                                boundary.pre(stage, "attn", st, need_input=False)
+                                if side is None:
+                                    boundary.pre(stage, "attn", st, need_input=False)
                                 part = attention_step(
                                     stage,
                                     None,
@@ -299,6 +317,9 @@ class DraftDecode(DraftProposal):
                                     view,
                                     stage0=(table, input_ids),
                                 )
+                                if side is not None:
+                                    x.record_stream(main)
+                                    main.wait_stream(side)
                             else:
                                 a_in = boundary.pre(stage, "attn", st)
                                 part = attention_step(stage, a_in, st, self._attn, view)
@@ -319,6 +340,14 @@ class DraftDecode(DraftProposal):
                 streams = streams.float()
             x = sglang_ops.hc_combine(streams, pre, lm.hc_mult, residual.dtype)
             return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
+
+    def _stage0_side(self):
+        """Slot draft_stage0_first: the side stream of the embedding, or None."""
+        if not self._stage0_first:
+            return None
+        if self._stage0_stream is None:
+            self._stage0_stream = torch.cuda.Stream()
+        return self._stage0_stream
 
     def _stage0_table(self, rows, input_ids, fb, view):
         """Slot draft_stage0_table: the table where this step's first attention takes it,
