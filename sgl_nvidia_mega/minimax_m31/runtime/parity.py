@@ -105,10 +105,15 @@ def _fields(out) -> str:
     items = (
         ((f.name, getattr(out, f.name)) for f in dataclasses.fields(out))
         if dataclasses.is_dataclass(out)
-        else vars(out).items() if hasattr(out, "__dict__") else ()
+        else vars(out).items()
+        if hasattr(out, "__dict__")
+        else ()
     )
-    return ", ".join(
-        f"{k}={tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__}"
-        for k, v in items
-        if v is not None
-    ) or "nothing"
+    return (
+        ", ".join(
+            f"{k}={tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__}"
+            for k, v in items
+            if v is not None
+        )
+        or "nothing"
+    )
