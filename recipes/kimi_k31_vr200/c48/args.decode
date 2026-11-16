@@ -1,0 +1,52 @@
+# Kimi K3.1 on VR200, c48 published point, decode role: server arguments, one per line, as served; replace the <...> placeholders.
+--model-path <TARGET_WEIGHTS>
+--nnodes 4
+--node-rank <NODE_RANK>
+--dist-init-addr <DIST_INIT_ADDR>
+--trust-remote-code
+--dtype bfloat16
+--language-only
+--tp-size 16
+--dp-size 1
+--dcp-size 1
+--ep-size 1
+--kv-cache-dtype fp8_e4m3
+--page-size 64
+--moe-runner-backend flashinfer_mxfp4
+--mamba-ssm-dtype float32
+--cuda-graph-backend-decode full
+--mem-fraction-static 0.88
+--random-seed 42
+--reasoning-parser kimi_k3
+--tool-call-parser kimi_k3
+--decode-log-interval 1
+--enable-metrics
+--attention-backend dsa
+--dsa-prefill-backend trtllm
+--dsa-decode-backend trtllm
+--context-length 1048576
+--chunked-prefill-size 16384
+--max-prefill-tokens 16384
+--mamba-track-interval 256
+--mamba-max-states-per-path 2
+--enable-cache-report
+--max-running-requests 16
+--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+--speculative-algorithm DFLASH
+--speculative-draft-model-path <DRAFTER_WEIGHTS>
+--speculative-num-draft-tokens 8
+--speculative-draft-kv-cache-dtype fp8_e4m3
+--speculative-draft-model-quantization unquant
+--speculative-draft-window-size 1024
+--speculative-draft-attention-backend triton
+--mamba-radix-cache-strategy extra_buffer
+--enable-linear-replayssm-spec
+--enable-nvidia-megakernel
+--max-mamba-cache-size 96
+--linear-attn-prefill-backend ptx_kda
+--min-free-slots-delay 1
+--disaggregation-decode-extra-slots 4
+--stream-interval 1
+--disaggregation-mode decode
+--disaggregation-transfer-backend mooncake
+--request-plane tcp
