@@ -47,7 +47,7 @@ from .shape_policy import MAX_ROWS, mla_max_seq_len, prepared_widths
 if TYPE_CHECKING:
     from .dcp_resources import DcpBuildOptions
 
-PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
+PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.sm103"
 _MAX_BATCH = MAX_ROWS
 
 

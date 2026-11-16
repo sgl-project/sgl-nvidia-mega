@@ -108,13 +108,13 @@ def test_deadline_rejects_nonfinite_nonpositive_and_out_of_range_values(seconds)
 
 def test_exact_six_reachable_tp8_remote_poll_definitions_fail_stop():
     definitions = (
-        ("cutedsl/common/mailbox.py", ("poll",)),
-        ("cutedsl/common/twoshot.py", ("reduce",)),
-        ("cutedsl/oproj/consumer.py", ("OprojConsumer", "poll_sum")),
-        ("cutedsl/moe/tail.py", ("MoeTail", "poll")),
-        ("cutedsl/moe/tail.py", ("WaveMoeTail", "settle")),
+        ("sm103/common/mailbox.py", ("poll",)),
+        ("sm103/common/twoshot.py", ("reduce",)),
+        ("sm103/oproj/consumer.py", ("OprojConsumer", "poll_sum")),
+        ("sm103/moe/tail.py", ("MoeTail", "poll")),
+        ("sm103/moe/tail.py", ("WaveMoeTail", "settle")),
         (
-            "cutedsl/moe/small_batch/front_tp8.py",
+            "sm103/moe/small_batch/front_tp8.py",
             ("MoeFrontTP8", "kernel"),
         ),
     )
@@ -126,16 +126,16 @@ def test_exact_six_reachable_tp8_remote_poll_definitions_fail_stop():
 
 def test_local_and_dormant_waits_are_not_instrumented():
     definitions = (
-        ("cutedsl/common/primitives.py", ("wait",)),
-        ("cutedsl/common/primitives.py", ("wait_phase_zero_cluster",)),
-        ("cutedsl/common/primitives.py", ("wait_tmem",)),
-        ("cutedsl/moe/tail.py", ("MoeTail", "front")),
-        ("cutedsl/moe/tail.py", ("WaveMoeTail", "poll_rows")),
+        ("sm103/common/primitives.py", ("wait",)),
+        ("sm103/common/primitives.py", ("wait_phase_zero_cluster",)),
+        ("sm103/common/primitives.py", ("wait_tmem",)),
+        ("sm103/moe/tail.py", ("MoeTail", "front")),
+        ("sm103/moe/tail.py", ("WaveMoeTail", "poll_rows")),
         (
-            "cutedsl/moe/small_batch/front_tp16.py",
+            "sm103/moe/small_batch/front_tp16.py",
             ("MoeFrontTP16", "poll_flag"),
         ),
-        ("cutedsl/moe/experts.py", ("ExpertsKernel", "poll_hidden")),
+        ("sm103/moe/experts.py", ("ExpertsKernel", "poll_hidden")),
     )
     for relative, qualname in definitions:
         node = _definition(relative, *qualname)
@@ -145,17 +145,17 @@ def test_local_and_dormant_waits_are_not_instrumented():
 
 def test_deadline_is_part_of_every_reachable_compiler_and_constructor_key():
     definitions = (
-        ("cutedsl/oproj/prepared.py", ("compile_oproj",)),
-        ("cutedsl/oproj/consumer.py", ("OprojConsumer", "__init__")),
-        ("cutedsl/attn_res/prepared.py", ("compile_consumer",)),
-        ("cutedsl/attn_res/kernel.py", ("ClusterAttnRes", "__init__")),
-        ("cutedsl/moe/front.py", ("compile_route",)),
-        ("cutedsl/moe/front.py", ("RouteSitu", "__init__")),
-        ("cutedsl/moe/tail_runtime.py", ("compile_tail",)),
-        ("cutedsl/moe/tail.py", ("MoeTail", "__init__")),
-        ("cutedsl/moe/tail.py", ("WaveMoeTail", "__init__")),
+        ("sm103/oproj/prepared.py", ("compile_oproj",)),
+        ("sm103/oproj/consumer.py", ("OprojConsumer", "__init__")),
+        ("sm103/attn_res/prepared.py", ("compile_consumer",)),
+        ("sm103/attn_res/kernel.py", ("ClusterAttnRes", "__init__")),
+        ("sm103/moe/front.py", ("compile_route",)),
+        ("sm103/moe/front.py", ("RouteSitu", "__init__")),
+        ("sm103/moe/tail_runtime.py", ("compile_tail",)),
+        ("sm103/moe/tail.py", ("MoeTail", "__init__")),
+        ("sm103/moe/tail.py", ("WaveMoeTail", "__init__")),
         (
-            "cutedsl/moe/small_batch/front_tp8.py",
+            "sm103/moe/small_batch/front_tp8.py",
             ("MoeFrontTP8", "__init__"),
         ),
     )
@@ -174,35 +174,35 @@ def test_deadline_is_forwarded_across_every_reachable_host_compile_chain():
         ("providers.py", ("build_resources",), "SmallBatchChain", 1, 1),
         ("providers.py", ("build_resources",), "for_target", 2, 2),
         (
-            "cutedsl/oproj/prepared.py",
+            "sm103/oproj/prepared.py",
             ("PreparedOproj", "__init__"),
             "compile_oproj",
             1,
             1,
         ),
         (
-            "cutedsl/attn_res/prepared.py",
+            "sm103/attn_res/prepared.py",
             ("PreparedAttnRes", "_compile"),
             "compile_consumer",
             1,
             1,
         ),
         (
-            "cutedsl/moe/front.py",
+            "sm103/moe/front.py",
             ("SharedFront", "__init__"),
             "compile_route",
             2,
             2,
         ),
         (
-            "cutedsl/moe/tail_runtime.py",
+            "sm103/moe/tail_runtime.py",
             ("MoeTailWeights", "__init__"),
             "compile_tail",
             1,
             1,
         ),
         (
-            "cutedsl/moe/small_batch/chain.py",
+            "sm103/moe/small_batch/chain.py",
             ("SmallBatchChain", "__init__"),
             "compile_tail",
             2,
