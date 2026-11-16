@@ -19,7 +19,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs) | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py) |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
-| MiniMax-M3.1-Flash (NVFP4) | GB300 (SM103) | 4 | One request's 8-row DSpark target verify step, and its 7-row draft block |
+| MiniMax-M3.1-Flash (NVFP4) | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 16 requests (8 to 128 rows, 8 a request) in one server: one request on the plugin's kernels, 2 to 16 on SGLang's step code with two bitwise MoE slots; and one request's 7-row draft block |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
 SGLang's standard path. Qwen3.5 also offers the explicit GDN prefill slot below. Their draft specs provide the DSpark proposal and the
@@ -177,9 +177,17 @@ With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_
 
 ### What a covered MiniMax-M3.1-Flash step runs
 
-The embedding and the three dense layers run SGLang's modules. Each of the 57 MoE layers is two persistent launches (`minimax_m31/sm103`): MegaAttention (input RMSNorm, the MXFP8 Q/K/V/index projection, head norms and RoPE, the NVFP4 cache writes, the indexer's top-16 pages, the sparse attention, the output projection with its TP4 all-reduce in an NVLink multicast mailbox, the residual add and the post-attention norm), then the token-parallel MoE (the router, the MXFP8 shared expert, the NVFP4 top-4 of 128 routed experts and the TP4 all-reduce). SGLang's final norm and logits processor close the step. The DSpark draft's block runs the draft backbone: the embedding, the five dense layers and the final norm in one cooperative launch; SGLang's draft head samples it. Prefill, plain decode and batches of more than one request run SGLang's standard path.
+One spec covers the DSpark verify steps of 1 to 16 requests (8 rows a request, so widths of 8 to 128 rows), each width with its own slots (`minimax_m31/plan.py`); the startup line names them, e.g. `slots by width 8: mega; 16-128: moe_nofill, moe_swap`:
 
-The kernels read SGLang's weights, KV pages and step data in place, except the routed experts: the plugin keeps a copy (54.1 GiB a GPU) in its own layout, recovered from the `flashinfer_trtllm_routed` layout SGLang keeps for its own path.
+| Slot | Widths | What it runs | Numerics |
+| --- | --- | --- | --- |
+| `mega` | 8 rows (one request) | The embedding and the three dense layers run SGLang's modules. Each of the 57 MoE layers is two persistent launches (`minimax_m31/sm103`): MegaAttention (input RMSNorm, the MXFP8 Q/K/V/index projection, head norms and RoPE, the NVFP4 cache writes, the indexer's top-16 pages, the sparse attention, the output projection with its TP4 all-reduce in an NVLink multicast mailbox, the residual add and the post-attention norm), then the token-parallel MoE (the router, the MXFP8 shared expert, the NVFP4 top-4 of 128 routed experts and the TP4 all-reduce). SGLang's final norm and logits processor close the step | tolerance (`minimax_m31/spec.py`) |
+| `moe_nofill` | 16 to 128 rows (8 too without `mega`) | The stock executor (SGLang's modules in SGLang's order, never through a model or layer `forward`); each MoE layer's routed experts quantize their per-token NVFP4 input into buffers built once, without the chain's fill launch and allocations | bitwise |
+| `moe_swap` | `moe_nofill`'s widths | `moe_nofill`'s MoE with the routed chain on the main stream (the FFN-input boundary kernel's PDL successor) and the shared expert on the alternate stream | bitwise |
+
+With no slot at a width the stock executor runs SGLang's forward call for call. The DSpark draft's block at one request runs the draft backbone: the embedding, the five dense layers and the final norm in one cooperative launch; SGLang's draft head samples it; larger draft batches run SGLang's draft. Prefill, plain decode and verify steps of more than 16 requests run SGLang's standard path.
+
+The kernels read SGLang's weights, KV pages and step data in place, except the routed experts of slot `mega`: the plugin keeps a copy (54.1 GiB a GPU) in its own layout, recovered from the `flashinfer_trtllm_routed` layout SGLang keeps for its own path, built only while `mega` is requested.
 
 ### Design
 
@@ -325,11 +333,14 @@ python -m sglang.launch_server \
   --speculative-num-steps 1 --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7 \
   --disable-attn-tp-gather \
+  --max-running-requests 16 --cuda-graph-max-bs-decode 16 \
   --mem-fraction-static 0.8 \
   --enable-nvidia-megakernel
 ```
 
-MegaAttention keeps all 148 of its CTAs resident: `SGLANG_FORCE_COARSE_WAR_BARRIER=1` (or `--disable-overlap-schedule`) keeps the next batch's preparation kernels from running beside it, and the GPUs must not be shared.
+One server serves 1 to 16 concurrent requests: the decode CUDA graphs of batch 1 run slot `mega`, those of batches 2 to 16 the stock executor with `moe_nofill` and `moe_swap`; graphs of larger batches, if captured, run SGLang's forward. MegaAttention keeps all 148 of its CTAs resident: `SGLANG_FORCE_COARSE_WAR_BARRIER=1` (or `--disable-overlap-schedule`) keeps the next batch's preparation kernels from running beside it, and the GPUs must not be shared.
+
+All three slots run with the flag alone. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) replaces that list for tests and bisecting: `moe_nofill,moe_swap` serves every width bitwise without the routed-expert copy, and an empty value runs SGLang's step code at every width; an unknown slot or `moe_swap` without `moe_nofill` stops the server at startup, naming it. The checks of slot `mega`'s kernels (the CUDA toolkit, the config fields and the context length they are built for, `SGLANG_FORCE_COARSE_WAR_BARRIER`) apply only while it is requested.
 
 ### Kimi K3 optional startup providers
 
@@ -436,7 +447,7 @@ sgl-nvidia-mega/
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
 │   ├── glm5_3/            # GLM-5.3 and GLM-5.2: the same layout (spec, plan, runtime, boundary, attention, moe, logits, sm103)
 │   ├── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
-│   └── minimax_m31/          # the MiniMax-M3.1 specs, verify and draft steps, weights and SM103 kernels
+│   └── minimax_m31/          # the MiniMax-M3.1 specs, plan, runtime (stock executor, slot mega), moe slots, draft step, weights and SM103 kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
     ├── unit/              # plugin contracts and setup checks; selected CUDA metadata/graph cases
@@ -467,7 +478,7 @@ The DeepSeek-V4.1-Flash TP8 + EP2 kernel tests (`test_deepseek_v41_moe_ep.py`, `
 
 Qwen3.5 runs TP8, which spans two GB300 trays: its e2e tests read a server launched on them through `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` and the files its ranks log to (`SGLANG_NVIDIA_MEGAKERNEL_E2E_LOGS`, comma-separated).
 
-MiniMax-M3.1-Flash's suites (`test_minimax_m31_*`) run on 4 x GB300 with a CUDA 13.4 toolkit at `CUDA_HOME`; its serving tests launch the checkpoint at `SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH`.
+MiniMax-M3.1-Flash's suites (`test_minimax_m31_*`) run on 4 x GB300 with a CUDA 13.4 toolkit at `CUDA_HOME`; its serving tests launch the checkpoint at `SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH`. Its composition check (`SGLANG_NVIDIA_MEGAKERNEL_PARITY=1`, eager decode steps) logs one `NVIDIA megakernel parity` line per covered step: at slot `mega`'s width the logits' difference against the spec's tolerances (`... target logits rows=8 max_abs=... rel=... min_cosine=... top1=... max_kl=...`), at every other width the bitwise check (`... target_verify rows=N logits_max_abs=0 (rel 0.00e+00, 0.00% differ) hidden_max_abs=...`).
 
 GLM-5.3 GPU and end-to-end suites are not yet part of the initial CI workflow.
 The GLM-5.3 CPU config and SGLang contract checks are included in `test/unit`.
