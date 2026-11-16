@@ -193,10 +193,13 @@ The SGLang workflow introduced in
 [SGLang #49642](https://github.com/sgl-project/sglang/pull/49642) runs on four
 GB300 GPUs. Since [SGLang #50641](https://github.com/sgl-project/sglang/pull/50641)
 it selects from `test/e2e/ci_models.yaml`. Today that selects
-DeepSeek-V4.1-Flash:
+DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash:
 
 - `test/e2e/test_deepseek_v41_server.py`: serving accuracy.
 - `test/e2e/test_deepseek_v41_switch.py`: eager stock-path numerical parity.
+- `test/e2e/test_minimax_m31_server.py`: serving accuracy at 1 and 16 requests at
+  a time, and eager parity (8-row steps within their tolerances, 16-128-row steps
+  bitwise).
 
 Qwen3.5 is listed but skipped: its tests need TP8, eight GB300 GPUs on one host.
 

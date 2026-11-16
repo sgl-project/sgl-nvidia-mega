@@ -16,3 +16,9 @@ qwen3_5:
   gpus: 8
   tests:
     - test_qwen3_5_stock_parity.py
+
+minimax_m31:
+  gpu: GB300
+  gpus: 4
+  tests:
+    - test_minimax_m31_server.py
