@@ -47,7 +47,7 @@ SGLANG_READS = {
     ),
     "srt/runtime_context.py": ("get_parallel", '"tp_group"', '"attn_tp_size"'),
     "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
-    "srt/utils/common.py": (
+    "srt/layers/dp_attention.py|srt/utils/common.py": (
         "get_cuda_graph_batch_size_alignment",
         "require_attn_tp_gather",
     ),
@@ -133,10 +133,16 @@ LINEARS = (
 def _row_alignment() -> int:
     """The row multiple a captured draft step pads to: SGLang captures only the batch
     sizes whose rows divide by it."""
-    from sglang.srt.utils.common import (
-        get_cuda_graph_batch_size_alignment,
-        require_attn_tp_gather,
-    )
+    try:
+        from sglang.srt.layers.dp_attention import (
+            get_cuda_graph_batch_size_alignment,
+            require_attn_tp_gather,
+        )
+    except ImportError:  # SGLang before the helpers moved out of srt/utils/common.py
+        from sglang.srt.utils.common import (
+            get_cuda_graph_batch_size_alignment,
+            require_attn_tp_gather,
+        )
 
     # the dense DSpark draft is DP-local, so only the attention-TP gather applies
     return get_cuda_graph_batch_size_alignment(
