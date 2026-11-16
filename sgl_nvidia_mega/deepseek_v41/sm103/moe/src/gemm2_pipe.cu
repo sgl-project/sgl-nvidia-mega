@@ -5,9 +5,10 @@
 //
 // DeepSeek-V4.1 low-batch routed-expert GEMM2, reference-pipeline build with the
 // prelude: the same rows = h W2^T (BF16) per routed expert, 128 x 8 tiles, 5-stage
-// weight ring streamed before the grid wait, as gemm2.cu, bit for bit. Derived
-// from muLLM v0.4.1 (NVIDIA Corporation, Apache-2.0), its generated GEMM2 build
-// (pipe, prelude, stages 5) with its symbols renamed:
+// weight ring streamed before the grid wait, as gemm2.cu, bit for bit. gemm2_pipe.cu
+// is a source maintained by hand in this repository, derived from muLLM v0.4.1
+// (NVIDIA Corporation, Apache-2.0; see NOTICE): muLLM's GEMM2 build (pipe, prelude,
+// stages 5) with its symbols renamed.
 // - pipe: one TMA warp loads the weights and their scales, one warp the intermediate
 //   (a TMA tensor map, H) and its scales (cp.async), both on one full barrier per
 //   stage; the MMA warp copies the scales to tensor memory itself (tcgen05.cp), so the
