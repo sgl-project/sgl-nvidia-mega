@@ -194,14 +194,15 @@ class TestParity(_Server):
     EXTRA_ARGS = ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
 
     def test_the_covered_steps_stay_within_the_declared_tolerances(self):
-        # the workload the tolerances were measured on, then 16 requests at a time for
-        # the 16-128-row steps
+        # the workload the tolerances were measured on, one request at a time; its
+        # lines are read before the 16-128-row workload below adds 8-row steps of its own
         for row in _questions(20):
             _ask(self.url, row)
+        sequential = self.log_text()
         with ThreadPoolExecutor(16) as pool:
             list(pool.map(lambda row: _ask(self.url, row), _questions(32)))
         lines = {"target logits": [], "draft hidden": []}
-        for what, *values in PARITY_LINE.findall(self.log_text()):
+        for what, *values in PARITY_LINE.findall(sequential):
             lines[what].append([float(v) for v in values])
         target, block = lines["target logits"], lines["draft hidden"]
         self.assertGreater(len(target), 100)
