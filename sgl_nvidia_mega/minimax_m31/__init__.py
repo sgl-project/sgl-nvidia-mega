@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax-M3.1-Flash megakernel: the target's spec (``spec``) and its covered verify
-step (``runtime``, operands from ``weights``), the DSpark draft's spec (``draft``) and
-step (``draft_step``), and the SM103 kernels (``sm103``): MegaAttention, the
-token-parallel MoE and the draft backbone."""
+"""MiniMax-M3.1-Flash megakernel: the target's spec (``spec``), its per-width slot
+plan (``plan``) and covered verify steps (``runtime``) of one to sixteen requests, the
+DSpark draft's spec (``draft``) and step (``draft_step``), and the SM103 kernels
+(``sm103``): MegaAttention, the token-parallel MoE and the draft backbone.
+
+At one request (8 rows) slot ``mega`` runs every MoE layer on MegaAttention and the
+token-parallel MoE (operands from ``weights``). At 2-16 requests (16-128 rows) the
+step runs SGLang's own modules in SGLang's order (``attention``, ``boundary``,
+``logits``) with the bitwise MoE slots ``moe_nofill`` and ``moe_swap`` (``moe``)."""
 
 # Fixed by the kernels; per TP4 rank unless noted
 TP = 4
 ROWS = 8  # one request's eight verify rows
+MAX_REQUESTS = 16  # the covered verify steps: 1-16 requests
+MAX_ROWS = MAX_REQUESTS * ROWS  # 128 rows
 DRAFT_ROWS = 7  # one request's draft block: the bonus token and six mask tokens
 DRAFT_LAYERS = 5
 PAGE = 128

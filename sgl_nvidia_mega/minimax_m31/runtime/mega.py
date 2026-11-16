@@ -3,7 +3,8 @@
 # Adapted from SGLang (Apache-2.0, SGLang Team):
 # python/sglang/srt/models/minimax_m3_vl.py (MiniMaxM3SparseForConditionalGeneration.forward) and
 # python/sglang/srt/models/minimax_m3.py (MiniMaxM3Model.forward).
-"""The covered verify step of MiniMax-M3.1: one request's eight DSpark verify rows.
+"""Slot ``mega``: the covered verify step of one request (eight DSpark verify rows) on
+MegaAttention and the token-parallel MoE.
 
 The embedding and the dense layers run SGLang's modules; their residual stream is
 handed to the first MoE layer. Every MoE layer is two launches: MegaAttention (the
@@ -14,7 +15,12 @@ close the step.
 
 The attention reads SGLang's step data in place: the positions and cache slots of the
 forward batch, the KV length and page table of the MSA-v1 decode plan (refreshed
-before every replay) and the layer's NVFP4 KV pages, which it also writes."""
+before every replay) and the layer's NVFP4 KV pages, which it also writes.
+
+Not bitwise: the kernels' FP8 / NVFP4 rounding and summation orders differ from
+SGLang's (``spec.NUMERICS`` states the tolerances). ``runtime.executor`` runs
+``MegaStep.run`` at the widths the plan gives slot mega, and its parity check
+(``runtime.parity.log_parity``) under ``SGLANG_NVIDIA_MEGAKERNEL_PARITY``."""
 
 from __future__ import annotations
 
@@ -22,32 +28,20 @@ import logging
 
 import torch
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
-
 from sgl_nvidia_mega.minimax_m31 import PAGE, ROWS, weights
 from sgl_nvidia_mega.minimax_m31.sm103 import host
 from sgl_nvidia_mega.minimax_m31.sm103.attention import mega_attention
 from sgl_nvidia_mega.minimax_m31.sm103.moe import token_parallel as tp_moe
-from sgl_nvidia_mega.minimax_m31.spec import parity, serves_this_step, text_config
+from sgl_nvidia_mega.minimax_m31.spec import text_config
 
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
-        "Step",
-        "mode",
-        "rows",
         "view",
         "widths",
         "deadline_s",
-        "draft_sampler",
-        "summary",
-        "plan",
-        "forward",
     ),
     "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "metadata",
@@ -56,8 +50,6 @@ SGLANG_READS = {
     ),
     "srt/runtime_context.py": ("get_parallel", '"tp_group"'),
     "srt/models/minimax_m3_vl.py": (
-        "forward(get_embedding)",
-        "forward(pp_proxy_tensors)",
         "is_mrope_enabled",
         "capture_aux_hidden_states",
         "_is_layer_to_capture",
@@ -88,15 +80,7 @@ SGLANG_READS = {
         "export",
     ),
     "srt/layers/layer_boundary/residual/add_norm.py": ("is_plain_add",),
-    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
-        "is_target_verify",
-    ),
-    "srt/model_executor/forward_batch_info.py": (
-        "forward_mode",
-        "batch_size",
-        "positions",
-        "out_cache_loc",
-    ),
+    "srt/model_executor/forward_batch_info.py": ("positions", "out_cache_loc"),
     "srt/layers/attention/minimax_sparse_nvfp4_backend.py": ("msa_v1_decode_plan",),
     "srt/layers/attention/minimax_sparse_ops/msa_plan.py": (
         "page_table",
@@ -126,7 +110,8 @@ def _moe_layers(lm) -> list[int]:
 
 
 def model_disable_reasons(model, hf_config) -> list[str]:
-    """What the server arguments do not show: the layer loop and the operands."""
+    """What the server arguments do not show for slot mega: the layer loop and the
+    operands."""
     lm = model.model
     layers = _moe_layers(lm)
     if not layers:
@@ -146,19 +131,11 @@ def model_disable_reasons(model, hf_config) -> list[str]:
     return reasons
 
 
-class VerifyStep:
-    """One rank's covered verify step: the operands, the kernels and their workspaces,
-    built at load; the attention's cache and step bindings, made at the first covered
-    forward (SGLang sizes the KV cache after the build)."""
-
-    # the target offers no draft sampler (BuiltMegakernel)
-    draft_sampler = None
-    # no EAGLE entries, graph variants or speculative runtime hooks (BuiltMegakernel)
-    draft_loop = None
-    draft_extend = None
-    begin_draft_round = None
-    graph_variants = None
-    speculative_runtime_hooks = None
+class MegaStep:
+    """One rank's slot mega: the operands (the routed experts copied into the kernels'
+    layout, about 1 GiB a layer), the kernels and their workspaces, built at load; the
+    attention's cache and step bindings, made at the first covered forward (SGLang
+    sizes the KV cache after the build)."""
 
     def __init__(self, model, hf_config, ctx):
         from sglang.srt.runtime_context import get_parallel
@@ -168,7 +145,6 @@ class VerifyStep:
                 f"MiniMax-M3.1 megakernel: the widths {list(ctx.widths)} miss one "
                 f"request's {ROWS} verify rows"
             )
-        self.widths = (ROWS,)
         self.model, self.lm = model, model.model
         self.layer_ids = _moe_layers(self.lm)
         self.first_moe = self.layer_ids[0]
@@ -242,18 +218,6 @@ class VerifyStep:
             f"MoE on layers {self.layer_ids[0]}-{self.layer_ids[-1]}"
         )
 
-    def plan(
-        self, input_ids, forward_batch, get_embedding=False, pp_proxy_tensors=None
-    ) -> Step | None:
-        """The step if this forward is covered, else None (SGLang's forward runs)."""
-        if get_embedding or pp_proxy_tensors is not None:
-            return None
-        if not forward_batch.forward_mode.is_target_verify():
-            return None
-        if int(input_ids.shape[0]) != ROWS or int(forward_batch.batch_size) != 1:
-            return None
-        return Step(mode="target_verify", rows=ROWS) if serves_this_step() else None
-
     def _bind(self, view, forward_batch) -> None:
         """Bind the attention to the KV pool and the step data this forward reads;
         host only, and again only when SGLang hands other tensors."""
@@ -319,28 +283,9 @@ class VerifyStep:
         self.attention = host.agree(self.cpu_group, bind, "binding MegaAttention")
         self._bound = key
 
-    def forward(
-        self,
-        step,
-        original,
-        input_ids,
-        positions,
-        forward_batch,
-        get_embedding=False,
-        pp_proxy_tensors=None,
-    ):
-        """``MiniMaxM3SparseForConditionalGeneration.forward`` for a covered step
-        (``original``: the model's own forward, for the parity check)."""
-        if parity() and not torch.cuda.is_current_stream_capturing():
-            want = original(
-                input_ids, positions, forward_batch
-            ).next_token_logits.clone()
-            got = self._forward(step, input_ids, positions, forward_batch)
-            log_parity("target logits", want, got.next_token_logits)
-            return got
-        return self._forward(step, input_ids, positions, forward_batch)
-
-    def _forward(self, step, input_ids, positions, forward_batch):
+    def run(self, step, input_ids, positions, forward_batch):
+        """``MiniMaxM3SparseForConditionalGeneration.forward`` for a step slot mega
+        serves (one request's eight rows)."""
         from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
@@ -388,24 +333,3 @@ class VerifyStep:
         return model.logits_processor(
             input_ids, hidden, model.lm_head, forward_batch, aux
         )
-
-
-def log_parity(what: str, want: torch.Tensor, got: torch.Tensor) -> None:
-    """SGLang's rows against the megakernel's on one eager step (the parity switch)."""
-    want, got = want.float(), got.float()
-    diff = (want - got).abs().max()
-    cosine = torch.nn.functional.cosine_similarity(want, got, dim=-1).min()
-    top1 = (want.argmax(-1) == got.argmax(-1)).float().mean()
-    log_p, log_q = want.log_softmax(-1), got.log_softmax(-1)
-    kl = (log_p.exp() * (log_p - log_q)).sum(-1).max()
-    logger.info(
-        "NVIDIA megakernel parity %s rows=%d max_abs=%.4g rel=%.3g min_cosine=%.6f "
-        "top1=%.3f max_kl=%.4g",
-        what,
-        want.shape[0],
-        diff.item(),
-        (diff / want.abs().max().clamp_min(1e-30)).item(),
-        cosine.item(),
-        top1.item(),
-        kl.item(),
-    )

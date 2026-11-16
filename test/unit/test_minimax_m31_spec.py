@@ -142,3 +142,37 @@ def test_the_attention_scales_are_tiled_128x4():
         *map(torch.arange, got.shape)
     ).tolist():
         assert got[rb, c4, r32, r4, c] == scale[rb * 128 + r4 * 32 + r32, c4 * 4 + c]
+
+
+def test_one_spec_covers_1_to_16_requests():
+    """Verify steps of 8 rows a request, up to 16 requests, on megakernel API v2."""
+    assert spec.SPEC.max_rows == 128
+    assert spec.SPEC.api_version == 2
+    assert spec.SPEC.requires.server_args["speculative_num_draft_tokens"] == {8}
+
+
+@pytest.mark.parametrize(
+    "slots, want",
+    [
+        ({"hop_mxfp8"}, "unknown slot 'hop_mxfp8'"),
+        ({"moe_swap"}, "slot 'moe_swap' needs slot 'moe_nofill'"),
+    ],
+)
+def test_a_slot_list_refusal_names_it(slots, want):
+    with patch.object(spec, "SLOTS", frozenset(slots)):
+        assert want in _refusal()
+
+
+def test_slot_megas_checks_apply_only_with_it():
+    """MegaAttention's checks (the config it is built for, the persistent grid's
+    residency) refuse a server only while slot mega is requested."""
+    off = {"SGLANG_FORCE_COARSE_WAR_BARRIER": False}
+    assert "SGLANG_FORCE_COARSE_WAR_BARRIER=1" in _refusal(env=off)
+    assert "config.hidden_size 4096" in _refusal(text=dict(hidden_size=4096))
+    with patch.object(spec, "SLOTS", frozenset({"moe_nofill", "moe_swap"})):
+        assert _refusal(env=off) == ""
+        assert _refusal(text=dict(hidden_size=4096)) == ""
+        # the checks of every slot list still apply
+        assert "no MoE layer" in _refusal(text=dict(moe_layer_freq=[0] * 6))
+    with patch.object(spec, "SLOTS", frozenset()):
+        assert _refusal(env=off) == ""

@@ -2,16 +2,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The MiniMax-M3.1 megakernel's spec: the setups it serves and its build.
 
-SGLang checks the requirements at argument resolution and the model at load
+One spec serves DSpark verify steps of 1-16 requests (8 rows a request, 8-128 rows) in
+one server: slot mega at one request, SGLang's step code with the bitwise MoE slots
+moe_nofill and moe_swap at 2-16 (``plan``, ``runtime``). SGLang checks the
+requirements at argument resolution and the model at load
 (``sglang.kernels.plugin_kernels.nvidia``); an unsupported setup stops the server on
-every rank, listing every reason. This module stays light: SGLang imports it in the
-launcher.
+every rank, listing every reason. The checks of slot mega's kernels (their toolchain,
+the config fields they are built for, the context their page tables hold, the
+persistent grid's residency) apply while it is requested. This module stays light:
+SGLang imports it in the launcher.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
+from pathlib import Path
 
 try:
     from sglang.kernels.plugin_kernels.nvidia.spec import (
@@ -33,12 +40,14 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_nvidia_mega.minimax_m31 import (
     HF_CONFIG,
     MAX_CONTEXT,
+    MAX_ROWS,
     PAGE,
     ROWS,
     SPARSE_CONFIG,
     SPARSE_OFF,
     TP,
 )
+from sgl_nvidia_mega.minimax_m31.runtime import BITWISE_SLOTS, SLOTS, slot_reasons
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -104,12 +113,13 @@ def serves_this_step() -> bool:
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     tp_sizes=frozenset({TP}),
-    # MegaAttention's persistent grid, all of it resident (the MoE takes 144)
-    resident_blocks=148,
+    # slot mega: MegaAttention's persistent grid, all of it resident (the MoE takes 144)
+    resident_blocks=148 if "mega" in SLOTS else 0,
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=frozenset({"full", "disabled"} if parity() else {"full"}),
     server_args={
-        # one request's eight-row DSpark verify: the MoE kernel's fixed rows
+        # DSpark verify steps of eight rows a request (slot mega: the MoE kernel's
+        # fixed rows); 1-16 requests a step
         "speculative_algorithm": frozenset({"DSPARK"}),
         "speculative_num_draft_tokens": frozenset({ROWS}),
         "page_size": frozenset({PAGE}),
@@ -122,7 +132,7 @@ REQUIREMENTS = Requirements(
     },
 )
 
-# The covered step's logits against SGLang's forward on the same eager step
+# Slot mega's step's logits against SGLang's forward on the same eager step
 # (SGLANG_NVIDIA_MEGAKERNEL_PARITY=1; 835 verify steps of the first 20 GSM8K replies as
 # test/e2e/test_minimax_m31_server.py asks them, on 4 x GB300), measured with about 15%
 # headroom. Per step: the largest |difference| over the largest |logit|, its median and
@@ -134,16 +144,25 @@ REQUIREMENTS = Requirements(
 # forward moves as far from itself when only its embedding moves by one BF16 ulp (argmax
 # agreement 95.6% either way). GSM8K (100, greedy) and the mean accept length matched
 # SGLang's (0.97 / 0.97, 4.37 / 4.34)
-NUMERICS = Numerics(
-    kind=NumericsKind.TOLERANCE,
-    tolerances={
-        "verify.logits.rel.p50": 0.12,
-        "verify.logits.rel.p99": 0.3,
-        "verify.logits.top1": 0.94,
-        "verify.logits.kl.p50": 0.052,
-        "verify.logits.kl.p99": 1.15,
-    },
-)
+MEGA_TOLERANCES = {
+    "verify.logits.rel.p50": 0.12,
+    "verify.logits.rel.p99": 0.3,
+    "verify.logits.top1": 0.94,
+    "verify.logits.kl.p50": 0.052,
+    "verify.logits.kl.p99": 1.15,
+}
+
+
+def _numerics(slots: frozenset = SLOTS) -> Numerics:
+    """TOLERANCE with slot mega (its steps' tolerances above), else BITWISE: the stock
+    executor runs SGLang's modules in SGLang's order, and the other slots
+    (runtime.BITWISE_SLOTS) run SGLang's kernels with SGLang's arguments."""
+    if slots <= BITWISE_SLOTS:
+        return Numerics(kind=NumericsKind.BITWISE)
+    return Numerics(kind=NumericsKind.TOLERANCE, tolerances=MEGA_TOLERANCES)
+
+
+NUMERICS = _numerics()
 
 
 def text_config(hf_config):
@@ -156,23 +175,115 @@ def scaled_rope(config) -> bool:
     return scaling.get("rope_type", scaling.get("type", "default")) != "default"
 
 
-def toolchain_reasons() -> list[str]:
-    """The kernels' build toolchain: the CUDA Python bindings and nvcc 13.4 or newer."""
-    if importlib.util.find_spec("cuda.bindings") is None:
-        return ["needs the CUDA Python bindings"]
-    from sgl_nvidia_mega.minimax_m31.sm103 import nvcc
+def _has_module(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:  # a dotted name whose parent package is absent
+        return False
 
-    reason = nvcc.why_not(nvcc.QMUL4_VERSION)
-    return [reason] if reason else []
+
+def toolchain_reasons(slots: frozenset = SLOTS) -> list[str]:
+    """The requested slots' toolchains, by import spec only: slot mega's kernels build
+    with the CUDA Python bindings and nvcc 13.4 or newer; slot moe_nofill launches
+    FlashInfer's CuTe-DSL quantize (FlashInfer, CuTe DSL)."""
+    reasons = []
+    if "mega" in slots:
+        if not _has_module("cuda.bindings"):
+            reasons.append("needs the CUDA Python bindings")
+        else:
+            from sgl_nvidia_mega.minimax_m31.sm103 import nvcc
+
+            reason = nvcc.why_not(nvcc.QMUL4_VERSION)
+            reasons += [reason] if reason else []
+    if "moe_nofill" in slots:
+        reasons += [
+            f"slot moe_nofill needs {what}"
+            for module, what in (
+                ("flashinfer", "FlashInfer"),
+                ("cutlass", "CuTe DSL (nvidia-cutlass-dsl)"),
+            )
+            if not _has_module(module)
+        ]
+    return reasons
+
+
+# Slot moe_nofill launches FlashInfer's per-token NVFP4 kernel through these names of
+# flashinfer/quantization/kernels/nvfp4_quantize.py (FlashInfer 0.7.4), read here from
+# the installed source without importing it; moe_nofill.config_reasons checks them again
+# at build, on the imported module, with the kernel getter's parameters
+FLASHINFER_NAMES = (
+    "_get_compiled_kernel_nvfp4_per_token",
+    "SF_LAYOUT_LINEAR",
+    "_env_flag_enabled",
+    "resolve_nvfp4_4over6",
+    "_per_token_cta_threads",
+    "get_device_sm_count",
+    "_MAX_THREADS_PER_BLOCK",
+)
+FLASHINFER_QUANTIZE = "quantization/kernels/nvfp4_quantize.py"
+
+
+def _top_level_names(path: Path) -> frozenset:
+    """The names a module defines, assigns or imports at its top level (ast)."""
+    names = set()
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names.update(t.id for t in targets if isinstance(t, ast.Name))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+    return frozenset(names)
+
+
+def flashinfer_api_reasons(slots: frozenset = SLOTS) -> list[str]:
+    """The FlashInfer names slot moe_nofill launches through ([] when it is not
+    requested, or FlashInfer is absent, which ``toolchain_reasons`` names)."""
+    found = (
+        importlib.util.find_spec("flashinfer")
+        if "moe_nofill" in slots and _has_module("flashinfer")
+        else None
+    )
+    if found is None or found.origin is None:
+        return []
+    path = Path(found.origin).parent / FLASHINFER_QUANTIZE
+    provided = _top_level_names(path) if path.is_file() else frozenset()
+    return [
+        f"FlashInfer's {FLASHINFER_QUANTIZE} has no {name} (slot moe_nofill)"
+        for name in FLASHINFER_NAMES
+        if name not in provided
+    ]
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    """The checks ``REQUIREMENTS`` cannot state: nested HF fields, derived values and the
-    toolchain."""
+    """The checks ``REQUIREMENTS`` cannot state: the requested slots, nested HF fields,
+    derived values and the toolchains."""
+    reasons = (
+        slot_reasons(SLOTS) + toolchain_reasons(SLOTS) + flashinfer_api_reasons(SLOTS)
+    )
+    if cfg.quantization not in (None, "minimax_m3_nvfp4"):
+        reasons.append(
+            f"--quantization {cfg.quantization!r}: the kernels read the minimax_m3_nvfp4 "
+            "checkpoint (MXFP8 attention, NVFP4 experts)"
+        )
+    if (cfg.speculative_eagle_topk or 1) > 1:
+        reasons.append("tree verify (--speculative-eagle-topk > 1) is not supported")
+    text = text_config(hf_config)
+    moe = getattr(text, "moe_layer_freq", None) or []
+    if not any(moe):
+        reasons.append("config.moe_layer_freq has no MoE layer")
+    if "mega" in SLOTS:
+        reasons += mega_config_reasons(cfg, text)
+    return reasons
+
+
+def mega_config_reasons(cfg, text) -> list[str]:
+    """Slot mega's checks: the config fields its kernels are built for, the context
+    their page tables hold and the persistent grid's residency."""
     from sglang.srt.environ import envs
 
-    reasons = toolchain_reasons()
-    text = text_config(hf_config)
+    reasons = []
     for key, want in HF_CONFIG.items():
         value = getattr(text, key, None)
         if value != want:
@@ -194,17 +305,10 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append("MSA-v1 index compression is not supported")
     moe = getattr(text, "moe_layer_freq", None) or []
     freq = sparse.get("sparse_attention_freq") or [0] * len(moe)
-    if not any(moe):
-        reasons.append("config.moe_layer_freq has no MoE layer")
-    elif len(freq) != len(moe) or not all(f for f, m in zip(freq, moe) if m):
+    if any(moe) and (
+        len(freq) != len(moe) or not all(f for f, m in zip(freq, moe) if m)
+    ):
         reasons.append("every MoE layer must be an MSA sparse attention layer")
-    if cfg.quantization not in (None, "minimax_m3_nvfp4"):
-        reasons.append(
-            f"--quantization {cfg.quantization!r}: the kernels read the minimax_m3_nvfp4 "
-            "checkpoint (MXFP8 attention, NVFP4 experts)"
-        )
-    if (cfg.speculative_eagle_topk or 1) > 1:
-        reasons.append("tree verify (--speculative-eagle-topk > 1) is not supported")
     context = cfg.context_length or getattr(text, "max_position_embeddings", 0)
     if context and context > MAX_CONTEXT:
         reasons.append(
@@ -235,7 +339,7 @@ def _model_disable_reasons(model, hf_config) -> list[str]:
 def _build(model, hf_config, ctx):
     from sgl_nvidia_mega.minimax_m31 import runtime
 
-    return runtime.VerifyStep(model, hf_config, ctx)
+    return runtime.build(model, hf_config, ctx)
 
 
 SPEC = MegakernelSpec(
@@ -243,7 +347,7 @@ SPEC = MegakernelSpec(
     requires=REQUIREMENTS,
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     numerics=NUMERICS,
-    max_rows=ROWS,
+    max_rows=MAX_ROWS,
     build=_build,
     api_version=API_VERSION,
     model_disable_reasons=_model_disable_reasons,
