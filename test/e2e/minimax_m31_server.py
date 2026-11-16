@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The MiniMax-M3.1-Flash servers the serving tests launch: GB300, TP4, DSpark (verify
-steps of 8 rows a request, draft blocks of 7). The megakernel switch is set per launch,
-so a test can launch the normal path too."""
+steps of 8 rows a request, draft blocks of 7), 1-16 running requests in one server. The
+megakernel switch is set per launch, so a test can launch the normal path too."""
 
 import os
 
@@ -34,7 +34,9 @@ ARGS = [
     "7",
     "--disable-attn-tp-gather",
     "--max-running-requests",
-    "8",
+    "16",
+    "--cuda-graph-max-bs-decode",
+    "16",
     "--mem-fraction-static",
     "0.8",
     "--reasoning-parser",

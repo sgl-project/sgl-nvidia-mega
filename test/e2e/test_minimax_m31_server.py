@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax-M3.1-Flash with --enable-nvidia-megakernel on GB300, TP4, DSpark. Requests run
-one at a time, so every verify step (8 rows) and draft block (7 rows) runs the plugin:
-- GSM8K through the chat API (100 questions, greedy), for gross failures;
+"""MiniMax-M3.1-Flash with --enable-nvidia-megakernel on GB300, TP4, DSpark, one server for
+1-16 running requests. One request at a time runs the 8-row verify step (slot mega) and
+the 7-row draft block; concurrent requests run the 16-128-row verify steps (slots
+moe_nofill and moe_swap):
+- GSM8K through the chat API (100 questions, greedy) one at a time and 16 at a time, for
+  gross failures;
 - passkey retrieval from 13K tokens, where the sparse attention selects 16 pages of 103;
 - with SGLANG_NVIDIA_MEGAKERNEL_PARITY=1 and eager decode steps, each covered step's
-  logits and each draft block's rows against SGLang's forward on the same step, within
-  the tolerances the target and draft specs declare.
+  logits and each draft block's rows against SGLang's forward on the same step: the
+  8-row steps and the draft blocks within the tolerances the specs declare, the 16-128-row
+  steps bitwise.
 
 SGLANG_NVIDIA_MEGAKERNEL_E2E_URL runs the serving tests against a server that is already
 up, so the same checks also score the switch-off arm."""
@@ -17,6 +21,7 @@ import re
 import statistics
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -43,6 +48,11 @@ NUMBER = re.compile(r"-?\d[\d,]*\.?\d*")
 PARITY_LINE = re.compile(
     r"NVIDIA megakernel parity (target logits|draft hidden) rows=\d+ max_abs=\S+ "
     r"rel=(\S+) min_cosine=(\S+) top1=(\S+) max_kl=(\S+)"
+)
+# the bitwise widths (16-128 rows): logits and hidden states against SGLang's forward
+BITWISE_LINE = re.compile(
+    r"NVIDIA megakernel parity target_verify rows=(\d+) logits_max_abs=(\S+)"
+    r".*? hidden_max_abs=(\S+)"
 )
 
 
@@ -85,14 +95,16 @@ def _ask(url, row):
     )
 
 
-def _gsm8k_accuracy(url, n):
-    correct = 0
-    for row in _questions(n):
-        reply = _ask(url, row)
-        want = float(row["answer"].split("####")[-1].strip().replace(",", ""))
-        found = NUMBER.findall(reply)
-        correct += bool(found) and float(found[-1].replace(",", "").rstrip(".")) == want
-    return correct / n
+def _correct(url, row):
+    reply = _ask(url, row)
+    want = float(row["answer"].split("####")[-1].strip().replace(",", ""))
+    found = NUMBER.findall(reply)
+    return bool(found) and float(found[-1].replace(",", "").rstrip(".")) == want
+
+
+def _gsm8k_accuracy(url, n, threads=1):
+    with ThreadPoolExecutor(threads) as pool:
+        return sum(pool.map(lambda row: _correct(url, row), _questions(n))) / n
 
 
 def _quantile(values, q):
@@ -136,6 +148,9 @@ class TestMegakernelVerify(_Server):
     def test_gsm8k(self):
         self.assertGreater(_gsm8k_accuracy(self.url, 100), GSM8K_BOUND)
 
+    def test_gsm8k_16_requests_at_a_time(self):
+        self.assertGreater(_gsm8k_accuracy(self.url, 100, threads=16), GSM8K_BOUND)
+
     def test_passkey_at_13k_tokens(self):
         rng = random.Random(1)
         filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. "
@@ -158,12 +173,16 @@ class TestMegakernelVerify(_Server):
             self.assertIn(str(key), r.json()["choices"][0]["text"])
 
     @unittest.skipIf(URL, "reads the server's own log")
-    def test_both_specs_run_the_batch_1_graphs(self):
+    def test_the_specs_run_their_decode_graphs(self):
         text = self.log_text()
-        for name in (spec.SPEC.name, draft.SPEC.name):
+        # the verify spec every captured batch size up to 16, the draft spec batch 1
+        for name, sizes in (
+            (spec.SPEC.name, r"\[1, 2, [\d, ]*16\]"),
+            (draft.SPEC.name, r"\[1\]"),
+        ):
             self.assertRegex(
                 text, rf"NVIDIA megakernel: {re.escape(name)} runs the decode graphs "
-                r"of batch sizes \[1\]",
+                rf"of batch sizes {sizes}",
             )  # fmt: skip
 
 
@@ -175,9 +194,12 @@ class TestParity(_Server):
     EXTRA_ARGS = ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
 
     def test_the_covered_steps_stay_within_the_declared_tolerances(self):
-        # the workload the tolerances were measured on
+        # the workload the tolerances were measured on, then 16 requests at a time for
+        # the 16-128-row steps
         for row in _questions(20):
             _ask(self.url, row)
+        with ThreadPoolExecutor(16) as pool:
+            list(pool.map(lambda row: _ask(self.url, row), _questions(32)))
         lines = {"target logits": [], "draft hidden": []}
         for what, *values in PARITY_LINE.findall(self.log_text()):
             lines[what].append([float(v) for v in values])
@@ -205,6 +227,16 @@ class TestParity(_Server):
             if (v < bound[k] if k in lower else v > bound[k])
         }
         self.assertEqual(failed, {}, f"measured {measured}")
+        # SGLang's own output holds no logits on an occasional step (n/a): not compared
+        wide = [
+            (int(rows), logits, hidden)
+            for rows, logits, hidden in BITWISE_LINE.findall(self.log_text())
+            if int(rows) > 8 and logits != "n/a"
+        ]
+        self.assertGreater(len({rows for rows, _, _ in wide}), 1)
+        self.assertEqual(
+            [line for line in wide if line[1:] != ("0", "0")], [], "not bitwise"
+        )
 
 
 if __name__ == "__main__":
