@@ -60,6 +60,15 @@ def log_bitwise(step, want, got, *, control: bool) -> None:
     diffs = [
         max_abs(a, b) for a, b in zip(want, (got.next_token_logits, got.hidden_states))
     ]
+    if all(a is None for a in want):
+        # SGLang's forward produced neither: name what the output does hold
+        logger.info(
+            "NVIDIA megakernel parity %s rows=%d: SGLang's output %s holds %s",
+            step.mode,
+            step.rows,
+            type(got).__name__,
+            _fields(got),
+        )
     logger.info(
         "NVIDIA megakernel parity%s %s rows=%d logits_max_abs=%s hidden_max_abs=%s",
         " control" if control else "",
@@ -85,3 +94,21 @@ def max_abs(a, b) -> str:
         f"{d.max().item():.3g} (rel {(d.max() / peak).item():.2e}, "
         f"{(d > 0).float().mean().item():.2%} differ)"
     )
+
+
+def _fields(out) -> str:
+    """The non-None tensor fields of a forward output, with their shapes."""
+    import dataclasses
+
+    import torch
+
+    items = (
+        ((f.name, getattr(out, f.name)) for f in dataclasses.fields(out))
+        if dataclasses.is_dataclass(out)
+        else vars(out).items() if hasattr(out, "__dict__") else ()
+    )
+    return ", ".join(
+        f"{k}={tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__}"
+        for k, v in items
+        if v is not None
+    ) or "nothing"
