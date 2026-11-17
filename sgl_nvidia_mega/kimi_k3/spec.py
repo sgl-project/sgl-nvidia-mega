@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103, TP8 and API v2.
+"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103 (and GB200/SM100, B300 with sm148), TP8 and API v2.
 
 Registered builds use TRTLLM MLA with DCP off. The plugin flag does not enable
 DSpark: explicit fixed speculation selects target verification, leaving draft
@@ -48,6 +48,7 @@ except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
         Step,
     )
 
+from .shape_policy import resident_blocks
 from .shape_policy import (
     DECODE_WIDTHS,
     VERIFY_QUERIES,
@@ -433,9 +434,10 @@ def build_with_capture_widths(
 SPEC = MegakernelSpec(
     name="Kimi K3 packed-MXFP4",
     requires=Requirements(
-        isas=frozenset({"sm_103"}),
+        # sm_100: GB200/B200; the kernels JIT for the live arch (sm_100a), no kernel change
+        isas=frozenset({"sm_100", "sm_103"}),
         tp_sizes=frozenset({8}),
-        resident_blocks=152,
+        resident_blocks=resident_blocks(),  # 152, or 148 with "sm148" in SGLANG_NVIDIA_MEGAKERNEL_SLOTS
         dtypes=frozenset({"bfloat16"}),
         decode_graph_backends=frozenset({"full"}),
         server_args={
