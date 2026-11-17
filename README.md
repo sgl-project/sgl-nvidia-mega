@@ -446,7 +446,8 @@ sgl-nvidia-mega/
 │   │   └── sm103/           # kernels and the build-time runner; no SGLang imports
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
 │   ├── glm5_3/            # GLM-5.3 and GLM-5.2: the same layout (spec, plan, runtime, boundary, attention, moe, logits, sm103)
-│   ├── kimi_k3/              # the Kimi K3 spec, adapter, executor and CuTe DSL kernels
+│   ├── kimi_k3/              # the Kimi K3 spec, adapter and executor
+│   │   └── sm103/            # GB300 CuTe DSL kernels and their launchers
 │   └── minimax_m31/          # the MiniMax-M3.1 specs, plan, runtime (stock executor, slot mega), moe slots, draft step, weights and SM103 kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/

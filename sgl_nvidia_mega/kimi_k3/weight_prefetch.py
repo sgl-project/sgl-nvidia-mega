@@ -124,8 +124,8 @@ class PreparedWeightRanges:
     def __init__(self, weights, *, byte_cap=0, grid=32, carveout=None, priority=False):
         from cuda.bindings import driver as cuda
 
-        from .cutedsl.common.host import _checked, resolve_kernel, to_cute
-        from .cutedsl.common.prefetch import compile_kernel
+        from .sm103.common.host import _checked, resolve_kernel, to_cute
+        from .sm103.common.prefetch import compile_kernel
 
         self.weights, self.ranges = range_plan(weights, byte_cap)
         if not self.ranges:

@@ -54,7 +54,7 @@ def _pool_tensor(name, tensor, *, dtype, shape, device):
 
 
 def _kda_type():
-    from .cutedsl.kda.prepared import PreparedKda
+    from .sm103.kda.prepared import PreparedKda
 
     return PreparedKda
 

@@ -164,7 +164,7 @@ class TestKimiK3Contract(unittest.TestCase):
             self.assertEqual(reason, "")
             self.assertFalse(
                 any(
-                    name.startswith("sgl_nvidia_mega.kimi_k3.cutedsl")
+                    name.startswith("sgl_nvidia_mega.kimi_k3.sm103")
                     for name in sys.modules
                 )
             )
@@ -328,7 +328,7 @@ class TestKimiK3Contract(unittest.TestCase):
         import sgl_nvidia_mega
 
         package_root = Path(sgl_nvidia_mega.__file__).resolve().parent
-        frozen_root = package_root / "kimi_k3/cutedsl"
+        frozen_root = package_root / "kimi_k3/sm103"
         paths = sorted(frozen_root.rglob("*.py"))
         self.assertEqual(len(paths), 43)
         digest = hashlib.sha256()

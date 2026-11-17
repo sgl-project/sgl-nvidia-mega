@@ -42,7 +42,7 @@ the Lamport all-reduce primitives and the low-latency all-reduce (Apache License
 that publishes into the all-reduce mailbox (BSD-3-Clause, Copyright (c) 2026
 NVIDIA CORPORATION & AFFILIATES; the full notice is kept in that file). Each
 adapted file names its origin in its header. The Kimi K3 split-K GEMM in
-sgl_nvidia_mega/kimi_k3/cutedsl/gemm/splitk.py is adapted from FlashInfer's
+sgl_nvidia_mega/kimi_k3/sm103/gemm/splitk.py is adapted from FlashInfer's
 flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at v0.7.0.post1
 (Apache License 2.0). FlashInfer's NOTICE file reads:
 
