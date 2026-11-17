@@ -338,6 +338,12 @@ together or establish arbitrary workload, long-context ON or performance coverag
 adapter-facing alternative to `SPEC.build`. The registered build remains
 unchanged; no CLI or environment setting automatically enables this policy.
 
+Separately, [SGLang #49376](https://github.com/sgl-project/sglang/pull/49376)
+automatically bounds `BuildContext.widths` by the resolved request limit for
+eligible fixed-q6/TP8/DCP-off configurations before calling `SPEC.build`.
+That policy retains reachable specialized eager widths, keeps full preparation
+when a safe bound is unavailable, and does not invoke this optional API.
+
 Call the alternative on every TP rank, passing the usual model, HF config and
 `BuildContext`, plus keyword `capture_token_rows`. `None` preserves the existing
 width policy. A tuple selects baseline token rows `1–8,16,32,64` plus the supplied

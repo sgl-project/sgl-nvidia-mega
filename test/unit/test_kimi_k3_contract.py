@@ -279,6 +279,42 @@ class TestKimiK3Contract(unittest.TestCase):
                     )
                 )
 
+    def test_native_admission_enforces_declared_graph_backends(self):
+        from sglang.srt.kernel_plugins.nvidia import binding
+
+        from sgl_nvidia_mega.kimi_k3.spec import SPEC
+
+        cfg = SimpleNamespace(
+            **{
+                key: next(iter(values))
+                for key, values in SPEC.requires.server_args.items()
+            },
+            tp_size=8,
+            watchdog_timeout=300,
+            context_length=8192,
+            speculative_algorithm=None,
+        )
+        hf_config = SimpleNamespace(
+            **SPEC.requires.hf_config,
+            architectures=["KimiK3ForConditionalGeneration"],
+            max_position_embeddings=1048576,
+        )
+        with (
+            patch.object(binding, "find_spec", return_value=(SPEC, "")),
+            patch.object(binding, "features_in_use", return_value=set()),
+        ):
+            for backend in ("full", "disabled", "breakable"):
+                with self.subTest(backend=backend):
+                    cfg.cuda_graph_config = SimpleNamespace(
+                        decode=SimpleNamespace(backend=backend)
+                    )
+                    _, reasons = binding.megakernel_disable_reasons(
+                        cfg=cfg, hf_config=hf_config, isa="sm_103"
+                    )
+                    self.assertEqual(len(reasons), 0 if backend == "full" else 1)
+                    if reasons:
+                        self.assertIn("decode CUDA graphs", reasons[0])
+
     def test_configuration_and_loaded_model_refusals_are_named(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
             _config_disable_reasons,
@@ -286,16 +322,13 @@ class TestKimiK3Contract(unittest.TestCase):
         )
 
         cfg = SimpleNamespace(
-            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
             context_length=8192,
             speculative_algorithm=None,
         )
         hf_config = SimpleNamespace(max_position_embeddings=1048576)
         self.assertEqual(_config_disable_reasons(cfg, hf_config), [])
         cfg.context_length = 262145
-        cfg.cuda_graph_config.decode.backend = "disabled"
         reasons = _config_disable_reasons(cfg, hf_config)
-        self.assertTrue(any("FULL" in reason for reason in reasons))
         self.assertTrue(any("1..262144" in reason for reason in reasons))
 
         class PackedMXFP4Method:
