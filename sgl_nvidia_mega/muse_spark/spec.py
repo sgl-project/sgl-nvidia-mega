@@ -93,7 +93,9 @@ REQUIREMENTS = Requirements(
         # uniform verify steps of batch x draft block
         "speculative_algorithm": frozenset({"DFLASH"}),
         "moe_runner_backend": frozenset({"flashinfer_trtllm"}),
-        "moe_a2a_backend": frozenset({"flashinfer"}),
+        # SGLang names the FlashInfer NVLink one-sided all-to-all
+        # "flashinfer_nvlink_one_sided"; older SGLang names it "flashinfer"
+        "moe_a2a_backend": frozenset({"flashinfer", "flashinfer_nvlink_one_sided"}),
         "attention_backend": frozenset({"trtllm_mha"}),
         # the boundary reduction the ar_attn_boundary slot replaces
         "disable_attn_tp_gather": frozenset({True}),

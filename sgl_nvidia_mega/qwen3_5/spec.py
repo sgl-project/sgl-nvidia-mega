@@ -96,7 +96,11 @@ REQUIREMENTS = Requirements(
         "speculative_eagle_topk": frozenset({1}),
         # SGLang's EAGLE entries serve a chain without rejection sampling
         "speculative_use_rejection_sampling": frozenset({False}),
-        "moe_a2a_backend": frozenset({"none", "flashinfer"}),
+        # SGLang names the FlashInfer NVLink one-sided all-to-all
+        # "flashinfer_nvlink_one_sided"; older SGLang names it "flashinfer"
+        "moe_a2a_backend": frozenset(
+            {"none", "flashinfer", "flashinfer_nvlink_one_sided"}
+        ),
         # the deferred MoE finalize the boundary takes (the measured TP8 setup)
         "moe_runner_backend": frozenset({"flashinfer_trtllm", "flashinfer_cutedsl"}),
         "flashinfer_allreduce_fusion_backend": frozenset({None, "cutedsl"}),
