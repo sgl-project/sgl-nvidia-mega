@@ -134,9 +134,13 @@ def launch(
     stream: int,
     *,
     cooperative: bool = False,
+    dependent: bool = False,
 ) -> None:
-    """One launch without programmatic dependent launch (the kernels do not wait on a
-    predecessor's grid), each parameter passed as its bytes; graph-capturable."""
+    """One launch, each parameter passed as its bytes; graph-capturable. Without
+    programmatic dependent launch unless ``dependent`` (the cooperative kernels do not
+    wait on a predecessor's grid): a dependent kernel may start before the stream's
+    previous kernel ends, and reads that kernel's output only after its own
+    ``griddepcontrol.wait``."""
     cu = driver()
     addresses = (ctypes.c_void_p * len(parameters))(
         *(ctypes.addressof(p) for p in parameters)
@@ -151,6 +155,13 @@ def launch(
         attribute = cu.CUlaunchAttribute()
         attribute.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_COOPERATIVE
         attribute.value.cooperative = 1
+        attributes.append(attribute)
+    if dependent:
+        attribute = cu.CUlaunchAttribute()
+        attribute.id = (
+            cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+        )
+        attribute.value.programmaticStreamSerializationAllowed = 1
         attributes.append(attribute)
     config.attrs = attributes
     config.numAttrs = len(attributes)
