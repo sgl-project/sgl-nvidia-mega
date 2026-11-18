@@ -29,7 +29,10 @@ and the head) and its DSpark draft block follow SGLang's own model code (Apache 
 slots moe_nofill and moe_swap (SGLang's MoE, FusedMoE deferred-finalize and FlashInfer
 TRT-LLM MoE runner code); moe_nofill's launch of FlashInfer's per-token NVFP4 quantize
 follows FlashInfer's host code (Apache License 2.0, Copyright (c) 2025 by FlashInfer
-team). Each adapted file names its origin in its header.
+team). Its DSpark Markov chain kernel (sgl_nvidia_mega/minimax_m31/sm103/draft/markov.cu,
+as deepseek_v41/sm103/markov.cu) is modified from the vLLM project's (Apache License
+2.0, Copyright contributors to the vLLM project). Each adapted file names its origin in
+its header.
 
 Portions are adapted from DeepGEMM (https://github.com/deepseek-ai/DeepGEMM): the
 K-split body of sgl_nvidia_mega/deepseek_v41/sm103/src/hc_coeff.cu follows its
