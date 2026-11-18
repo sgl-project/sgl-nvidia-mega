@@ -4,9 +4,8 @@
 layer its own weights and KV cache, over a CUDA graph of ``--layers`` layers.
 
   wqkv_a (low-latency MXFP8) -> q_norm + MXFP8 -> wq_b (low-latency) -> swap-AB partial
-  (PDL, RoPE in the kernel, KV before the wait) -> narrow combine (arm fused:
-  merged in the attention kernel at a global counter; arm cluster: merged through the
-  row's cluster, slot attn_cluster_merge; arm prewait: slot attn_prewait) -> fused inverse RoPE + wo_a + MXFP8 ->
+  (PDL, RoPE in the kernel, KV before the wait) -> narrow combine (arm cluster: merged
+  through the row's cluster, slot attn_cluster_merge) -> fused inverse RoPE + wo_a + MXFP8 ->
   wo_b (the low-latency GEMM; hop A's publish + all-reduce + mHC is not on one GPU)
 
 Each row reads a 128-token window plus 512 compressed tokens (index_topk) out of a
@@ -81,9 +80,6 @@ class Layer:
         ).to(torch.int32)[:, None, :]
         self.ei_src = self.ei.clone()
         self.sink = torch.randn(heads, device="cuda")
-        self.counter = torch.zeros(
-            swapab.WIDE_MAX_BATCH, dtype=torch.int32, device="cuda"
-        )
 
 
 class Chain:
@@ -110,7 +106,6 @@ class Chain:
         wo_a.precompile(rows, groups=heads // 8)
 
     def run(self, arm="base", stamps=None):
-        fused = arm == "fused"
         window = self.kind == "window"
         rows, x = self.rows, self.x
         main = torch.cuda.current_stream()
@@ -137,8 +132,6 @@ class Chain:
                 q_rope=(self.freqs, self.pos),
                 kv_before_wait=True,
                 combine_entry_trigger=True,
-                combine_counter=L.counter if fused else None,
-                stage_before_wait={"prewait": 1, "prewait2": 2}.get(arm, 0),
                 stamps=None if stamps is None else stamps[i],
                 cluster_merge=arm == "cluster",
                 force_cluster=arm == "cluster",
@@ -326,7 +319,7 @@ def main():
     ap.add_argument("--layers", type=int, default=24)
     ap.add_argument("--replays", type=int, default=30)
     ap.add_argument("--repeats", type=int, default=5)
-    ap.add_argument("--arms", default="base,prewait")
+    ap.add_argument("--arms", default="base,cluster")
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--stamps", action="store_true")
     a = ap.parse_args()

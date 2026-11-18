@@ -351,28 +351,21 @@ def build_layers(
     gate_topk: bool,
     shared_ll: bool = False,
     widths=(),
-    gate_route: bool | None = None,
-    gate_route_quant: bool | None = None,
-    gate_route_early: bool | None = None,
     gemm2_pipe: bool = False,
     gemm2_registers: int = 0,
 ) -> Bound:
     """``build`` over a list of decoder layers (the target's, or the draft's stages),
     keyed by ``layer_id``. With ``shared_ll``, each built layer's shared expert on the
     low-latency GEMM where it applies, compiled for ``widths``; every rank agrees on
-    those layers too, or none takes it. ``gate_route`` (default: slot gate_route
-    requested): the fast top-k and the route record in one launch at 1-8 rows;
-    ``gate_route_quant`` (default: slot gate_route_quant requested): that launch also
-    quantizes the routed input; ``gate_route_early`` (default: slot gate_route_early
-    requested): the router GEMM ahead of that launch releases it once its weight loads are issued."""
+    those layers too, or none takes it. Slot gate_route: the fast top-k and the route
+    record in one launch at 1-8 rows; slot gate_route_quant: that launch also quantizes
+    the routed input; slot gate_route_early: the router GEMM ahead of that launch
+    releases it once its weight loads are issued."""
     from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
 
-    if gate_route is None:
-        gate_route = "gate_route" in SLOTS
-    if gate_route_quant is None:
-        gate_route_quant = "gate_route_quant" in SLOTS
-    if gate_route_early is None:
-        gate_route_early = "gate_route_early" in SLOTS
+    gate_route = "gate_route" in SLOTS
+    gate_route_quant = "gate_route_quant" in SLOTS
+    gate_route_early = "gate_route_early" in SLOTS
     deal = "moe_balanced" in SLOTS
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,

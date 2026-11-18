@@ -22,9 +22,6 @@ HEAD_DIM = 512
 # after the wait, not after the loads: faster in 7 of 9 GB300 micro-bench cases at 6-24 rows.
 COMBINE_EARLY_TRIGGER = True
 SOFTMAX_SCALE = HEAD_DIM**-0.5
-# combine_counter: a row's tile CTAs wait for each other, so a launch takes it only when
-# every CTA fits on its own SM; past this deadline a waiting CTA traps instead of hanging
-FUSED_WAIT_DEADLINE_NS = 2_000_000_000
 # per-CTA %globaltimer stamps (bench only): [rows * tiles, STAMP_SLOTS] int64
 STAMP_SLOTS = 16
 
@@ -73,20 +70,6 @@ def _combine(
     out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
     out = out.to(OUT.dtype.element_ty)
     tl.store(OUT + (b * H + h) * 512 + d, out)
-
-
-_SM_COUNT: dict = {}
-
-
-def fused_combine_fits(rows: int, tiles: int, device) -> bool:
-    """Whether a launch of ``rows`` x ``tiles`` CTAs can merge in the kernel: all of
-    them resident at once, one per SM."""
-    index = torch.device(device).index
-    if index is None:
-        index = torch.cuda.current_device()
-    if index not in _SM_COUNT:
-        _SM_COUNT[index] = torch.cuda.get_device_properties(index).multi_processor_count
-    return rows * tiles <= _SM_COUNT[index]
 
 
 # Cluster merge (slot attn_cluster_merge): a row's tiles as one cluster of NT CTAs that
@@ -192,10 +175,7 @@ def swapab_attention(
     kv_before_wait=False,
     combine_entry_trigger=False,
     extra_after_wait=False,
-    combine_counter=None,
-    stage_before_wait=False,
     stamps=None,
-    wait_deadline_ns=FUSED_WAIT_DEADLINE_NS,
     cluster_merge=False,
     force_cluster=False,
 ):
@@ -208,13 +188,7 @@ def swapab_attention(
     `extra_after_wait` (with `kv_before_wait`): only the window rows are gathered before
     the wait; the extra range's indices and lengths come from the PDL predecessor (the
     layer's top-k). `combine_entry_trigger` launches the combine's dependent at the
-    combine's entry.
-    `stage_before_wait` (with `kv_before_wait`; slot attn_prewait): 1 also loads the
-    query's RoPE row before the wait, 2 also stages the KV tile in shared memory.
-    `combine_counter` (int32 [>= rows], zero, owned by one call site) merges the tiles
-    inside the attention kernel when every CTA fits on its own SM: the narrow combine's
-    arithmetic, no second launch; not in the chain (its row barrier measured slower than
-    the second launch, benchmark/bench_deepseek_v41_attn_half.py). `stamps` (int64
+    combine's entry. `stamps` (int64
     [rows * tiles, STAMP_SLOTS]) records per-CTA %globaltimer phases for benchmarks.
     `cluster_merge` (slot attn_cluster_merge; with `narrow_combine`, where
     `cluster_merge_takes`): each row's tiles run as one cluster and merge through
@@ -249,32 +223,11 @@ def swapab_attention(
     maximum = torch.empty((b, nt, h), dtype=torch.float32, device=q.device)
     sums = torch.empty_like(maximum)
     out = torch.empty((b, h, 512), dtype=q.dtype, device=q.device)
-    fused = (
-        combine_counter is not None
-        and narrow_combine
-        and fused_combine_fits(b, nt, q.device)
-    )
-    if fused:
-        assert combine_counter.dtype == torch.int32 and combine_counter.numel() >= b
-        st = triton.next_power_of_2(nt)
-        rounds = triton.cdiv(triton.cdiv(h * 4, nt), 4)
-        fused_kwargs = dict(
-            FUSED=True,
-            CNT=combine_counter,
-            SINK=sink,
-            OUT=out,
-            DEADLINE=wait_deadline_ns,
-            ST=st,
-            ROUNDS=rounds,
-        )
-    else:
-        fused_kwargs = {}
     if stamps is not None:
         assert stamps.dtype == torch.int64 and stamps.numel() >= b * nt * STAMP_SLOTS
     cluster = (
         cluster_merge
         and narrow_combine
-        and not fused
         and (
             cluster_merge_takes(b, nt, h)
             or (force_cluster and b <= CLUSTER_MAX_ROWS and nt <= CLUSTER_MAX_TILES)
@@ -322,15 +275,9 @@ def swapab_attention(
         **({"HQ": h} if h != NUM_HEADS else {}),
         **(
             {"EXTRA_AFTER_WAIT": True}
-            if pdl and kv_before_wait and extra_after_wait and ne and not fused
+            if pdl and kv_before_wait and extra_after_wait and ne
             else {}
         ),
-        **(
-            {"STAGE_BEFORE_WAIT": int(stage_before_wait)}
-            if pdl and kv_before_wait and stage_before_wait
-            else {}
-        ),
-        **fused_kwargs,
         **({"STAMPS": True, "STAMP": stamps} if stamps is not None else {}),
     )
     if cluster:
@@ -345,9 +292,7 @@ def swapab_attention(
         )
         _launch_cluster(partial_gluon, b, args, kwargs, nt, exchange)
         return out
-    partial_gluon[(nt, b) if fused else (b, nt)](*args, **kwargs)
-    if fused:
-        return out
+    partial_gluon[(b, nt)](*args, **kwargs)
     bd = 64 if ne else 512
     combine_warps = 4
     if narrow_combine and ne:

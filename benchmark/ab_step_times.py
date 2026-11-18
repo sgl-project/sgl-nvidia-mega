@@ -337,15 +337,6 @@ def _assign_passes(d: Path, rows) -> None:
         r["pass"] = which[r["req"]]
 
 
-def _mean_se(xs):
-    import numpy as np
-
-    xs = np.asarray(xs, dtype=float)
-    if len(xs) < 2:
-        return float(xs.mean()) if len(xs) else float("nan"), float("nan")
-    return float(xs.mean()), float(xs.std(ddof=1) / np.sqrt(len(xs)))
-
-
 def _tq(dof: float) -> float:
     """The two-sided 95 % t quantile."""
     from math import isfinite
