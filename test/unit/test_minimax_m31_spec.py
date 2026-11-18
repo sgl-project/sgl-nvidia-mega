@@ -156,11 +156,30 @@ def test_one_spec_covers_1_to_16_requests():
     [
         ({"hop_mxfp8"}, "unknown slot 'hop_mxfp8'"),
         ({"moe_swap"}, "slot 'moe_swap' needs slot 'moe_nofill'"),
+        ({"draft_lm_head"}, "slot 'draft_lm_head' needs slot 'markov'"),
     ],
 )
 def test_a_slot_list_refusal_names_it(slots, want):
     with patch.object(spec, "SLOTS", frozenset(slots)):
         assert want in _refusal()
+
+
+def test_the_draft_slots_checks_apply_only_with_them():
+    """Slot markov ships: the documented setup runs it. The draft's slots replace
+    SGLang's folded DSpark proposal, so a server without it is refused while one is
+    requested; draft_lm_head (opt-in) also refuses SGLang's own quantized draft LM
+    head, which slot markov alone runs."""
+    assert "markov" in spec.SLOTS and "draft_lm_head" not in spec.SLOTS
+    unfolded = {"SGLANG_DSPARK_FOLDED_PROPOSAL": False}
+    assert "SGLANG_DSPARK_FOLDED_PROPOSAL is off" in _refusal(env=unfolded)
+    assert _refusal(speculative_dspark_lm_head_dtype="mxfp8") == ""
+    with patch.object(spec, "SLOTS", spec.SLOTS | {"draft_lm_head"}):
+        assert _refusal() == ""
+        assert "--speculative-dspark-lm-head-dtype mxfp8" in _refusal(
+            speculative_dspark_lm_head_dtype="mxfp8"
+        )
+    with patch.object(spec, "SLOTS", spec.SLOTS - {"markov"}):
+        assert _refusal(env=unfolded) == ""
 
 
 def test_slot_megas_checks_apply_only_with_it():
