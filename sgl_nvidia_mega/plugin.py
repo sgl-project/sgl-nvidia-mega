@@ -34,6 +34,10 @@ SPECS = (
         "sgl_nvidia_mega.minimax_m31.spec:SPEC",
     ),
     ("DSparkMiniMaxDraftModel", "sgl_nvidia_mega.minimax_m31.draft:SPEC"),
+    # Kimi K3.1: the DFlash target verify step and the sparse decode step
+    ("KimiK31ForConditionalGeneration", "sgl_nvidia_mega.kimi_k31.spec:SPEC"),
+    # the Kimi K3.1 DFlash2 draft: its decoder layers on the megakernel chain
+    ("DFlash2DraftModel", "sgl_nvidia_mega.kimi_k31.draft.serving:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check

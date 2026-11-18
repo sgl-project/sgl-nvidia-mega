@@ -17,7 +17,8 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | DeepSeek-V4.1-Flash | GB300 (SM103); 148-SM B300 (SM103) with `sm148` | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request); on B300, speed was measured at one request only, serving passed a GSM8K canary at client concurrency 12 and 16 with decode CUDA graphs up to batch 16 (DSpark block 5), and larger batches and other block sizes rely on the kernel tests |
 | DeepSeek-V4.1-Flash | GB300 (SM103) | 8, with the MoE at TP4 x EP2 (two trays, one NVLink domain) | The same verify widths and the DSpark draft step; served and measured at one request (DSpark block 5); larger batches rely on the world-8 kernel tests. See [TP8 + EP2](#deepseek-v41-flash-at-tp8--ep2) |
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
-| Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs) | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py) |
+| Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs); 148-SM B300 (SM103) and B200/GB200 (SM100) with `sm148` | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py). The 148-SM admission has no TP8 serving validation yet; the same gate was validated on Kimi K3.1 at TP16 on GB200 |
+| Kimi K3.1 (packed MXFP4) | GB300 (SM103) | 16 (one NVLink domain); 8 | DFlash target verify steps of 8 rows a request (7 drafted tokens and the anchor) at 1 to 8 requests, without DCP or with DCP equal to TP, also as the decode role of a PD-disaggregated deployment; the DFlash2 draft decoder layers at one request. Served and measured end to end at TP16, one request. See [Kimi K3.1 on GB300](#kimi-k31-on-gb300) |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
 | MiniMax-M3.1-Flash (NVFP4) | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 16 requests (8 to 128 rows, 8 a request) in one server: one request on the plugin's kernels, 2 to 16 on SGLang's step code with two bitwise MoE slots; one request's 7-row draft block; and the draft proposal's Markov chain at 1 to 16 requests |
 
@@ -214,7 +215,7 @@ The kernels read SGLang's weights, KV pages and step data in place, except the r
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.3), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
 - DeepSeek-V4.1-Flash: 4 x GB300, or 4 x 148-SM B300 (SM103) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`; at TP8 + EP2, 8 x GB300 on two trays of one NVLink domain
 - Qwen3.5: 8 x GB300, two trays of one NVLink domain
-- Kimi K3: 8 x GB300 (SM103, 152 SMs), BF16, context length up to 262144 within the
+- Kimi K3: 8 x GB300 (SM103, 152 SMs), or 8 x 148-SM B300 (SM103) or B200 (SM100) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (for Kimi K3 it only lowers the SM floor), BF16, context length up to 262144 within the
   native model limit, TP8, DP1 and DCP off,
   FP8 E4M3 KV cache with page size 64, `trtllm_mla` for prefill and decode,
   `flashinfer_mxfp4` with default precision, and full decode CUDA graphs
@@ -346,6 +347,20 @@ One server serves 1 to 16 concurrent requests: the decode CUDA graphs of batch 1
 
 The four shipped slots (`mega`, `moe_nofill`, `moe_swap` and the draft's `markov`) run with the flag alone. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) replaces that list: `mega,moe_nofill,moe_swap,markov,draft_lm_head` adds the opt-in `draft_lm_head` and `mega,moe_nofill,moe_swap,markov,lm_head_mxfp8` the opt-in `lm_head_mxfp8`; for tests and bisecting, `mega,moe_nofill,moe_swap` keeps SGLang's draft proposal, `moe_nofill,moe_swap` also serves every width bitwise without the routed-expert copy, and an empty value runs SGLang's step code at every width; an unknown slot, `moe_swap` without `moe_nofill`, `draft_lm_head` without `markov` or `lm_head_mxfp8` without `mega` stops the server at startup, naming it, and so does `lm_head_mxfp8` beside `--enable-fp32-lm-head` (it replaces the BF16 projection) or on a head SGLang projects another way (LoRA, a quantized or FP32 head), named at load. The draft's slots replace SGLang's folded DSpark proposal: the server stops at startup with `SGLANG_DSPARK_FOLDED_PROPOSAL=0` or `SGLANG_DSPARK_OPT_INT8_MARKOV_WALK=1`, with `draft_lm_head` beside `--speculative-dspark-lm-head-dtype` (SGLang's own quantized draft LM head, which `markov` alone runs), and at its first step after graph capture if the proposal never asked the draft spec for its sampler. The checks of slot `mega`'s kernels (the CUDA toolkit, the config fields and the context length they are built for, `SGLANG_FORCE_COARSE_WAR_BARRIER`) apply only while it is requested.
 
+### Kimi K3.1 on GB300
+
+The Kimi K3.1 megakernel (`sgl_nvidia_mega/kimi_k31`) runs the DFlash target verify
+step and, behind `SGLANG_K31_DRAFT_MK`, the DFlash2 draft's decoder layers. It needs
+an SGLang with the Kimi K3.1 host bindings (sgl-project/sglang#48414); on an older
+SGLang its spec refuses every configuration with that reason. It builds on its own
+copy of the Kimi K3 base (`kimi_k31/k3` and its kernels in `kimi_k31/sm103/k3`), so
+`sgl_nvidia_mega/kimi_k3` and the Kimi K3 path are unchanged.
+
+`kimi_k31/k3/default_scope.py` turns a set of tuned options on by default only in
+the configuration they were measured in: TP16, no DCP, 8 draft tokens and
+`--max-running-requests 1`. Elsewhere an unset option keeps its other default, and
+a set environment variable always wins.
+
 ### Kimi K3 optional startup providers
 
 The hybrid runtime and DSpark interfaces are upstream in SGLang through
@@ -381,6 +396,12 @@ together or establish arbitrary workload, long-context ON or performance coverag
 `sgl_nvidia_mega.kimi_k3.spec.build_with_capture_widths` is an explicit
 adapter-facing alternative to `SPEC.build`. The registered build remains
 unchanged; no CLI or environment setting automatically enables this policy.
+
+Separately, [SGLang #49376](https://github.com/sgl-project/sglang/pull/49376)
+automatically bounds `BuildContext.widths` by the resolved request limit for
+eligible fixed-q6/TP8/DCP-off configurations before calling `SPEC.build`.
+That policy retains reachable specialized eager widths, keeps full preparation
+when a safe bound is unavailable, and does not invoke this optional API.
 
 Call the alternative on every TP rank, passing the usual model, HF config and
 `BuildContext`, plus keyword `capture_token_rows`. `None` preserves the existing
@@ -452,6 +473,10 @@ sgl-nvidia-mega/
 │   ├── glm5_3/            # GLM-5.3 and GLM-5.2: the same layout (spec, plan, runtime, boundary, attention, moe, logits, sm103)
 │   ├── kimi_k3/              # the Kimi K3 spec, adapter and executor
 │   │   └── sm103/            # GB300 CuTe DSL kernels and their launchers
+│   ├── kimi_k31/             # the Kimi K3.1 spec, verify/decode bindings and the DSA verify step
+│   │   ├── draft/            # the DFlash2 draft spec
+│   │   ├── k3/               # the Kimi K3 base the K3.1 megakernel builds on
+│   │   └── sm103/            # GB300 kernels: the draft layers, DSA JIT kernels and the K3 base kernels
 │   └── minimax_m31/          # the MiniMax-M3.1 specs, plan, runtime (stock executor, slot mega), moe slots, draft step and sampler, weights and SM103 kernels
 ├── benchmark/             # the static decode table behind the speed numbers
 └── test/
