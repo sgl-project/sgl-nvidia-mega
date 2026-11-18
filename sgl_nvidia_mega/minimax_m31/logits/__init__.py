@@ -66,10 +66,13 @@ SGLANG_READS = {
 # The SGLang functions slot lm_head_mxfp8's stand-in is routed by, by the digest of
 # their code (test/unit/test_contract.py recomputes them on the installed SGLang):
 # the stand-in replaces the last branch of _compute_lm_head's "normal linear layer"
-# (the BF16 torch.matmul on lm_head.weight.T), which head_reasons checks SGLang takes
+# (the BF16 torch.matmul on lm_head.weight.T), which head_reasons checks SGLang takes.
+# The second digest is SGLang with a split-K Triton head for gfx1250 inside the
+# FP32-output branch, which head_reasons refuses: the mirrored branch is unchanged
 SGLANG_MIRRORS = {
     "srt/layers/logits_processor.py:LogitsProcessor._compute_lm_head": (
-        "b4fe8c96270053f7"
+        "b4fe8c96270053f7",
+        "d6485ed1c8a88abe",
     ),
     "srt/layers/logits_processor.py:should_apply_lm_head_quant_method": (
         "5699b58992f22e41"
