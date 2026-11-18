@@ -329,6 +329,7 @@ MiniMax-M3.1-Flash:
 
 ```bash
 CUDA_HOME=/usr/local/cuda-13.4 SGLANG_FORCE_COARSE_WAR_BARRIER=1 \
+SGLANG_PLUGINS=nvidia_megakernel \
 python -m sglang.launch_server \
   --model-path MiniMaxAI/MiniMax-M3.1-Flash --trust-remote-code \
   --tp 4 \
@@ -342,6 +343,8 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.8 \
   --enable-nvidia-megakernel
 ```
+
+`SGLANG_PLUGINS=nvidia_megakernel` (SGLang's general-plugin whitelist) is needed where MSA's own SGLang plugin is installed too, as in SGLang's cu134 image: SGLang gives `--enable-nvidia-megakernel` to that plugin for this architecture when it is loaded, and the whitelist keeps it unloaded, so this package's specs serve the flag.
 
 One server serves 1 to 16 concurrent requests: the decode CUDA graphs of batch 1 run slot `mega`, those of batches 2 to 16 the stock executor with `moe_nofill` and `moe_swap`; graphs of larger batches, if captured, run SGLang's forward. MegaAttention keeps all 148 of its CTAs resident: `SGLANG_FORCE_COARSE_WAR_BARRIER=1` (or `--disable-overlap-schedule`) keeps the next batch's preparation kernels from running beside it, and the GPUs must not be shared.
 
@@ -508,7 +511,12 @@ The DeepSeek-V4.1-Flash TP8 + EP2 kernel tests (`test_deepseek_v41_moe_ep.py`, `
 
 Qwen3.5 runs TP8, which spans two GB300 trays: its e2e tests read a server launched on them through `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` and the files its ranks log to (`SGLANG_NVIDIA_MEGAKERNEL_E2E_LOGS`, comma-separated).
 
-MiniMax-M3.1-Flash's suites (`test_minimax_m31_*`) run on 4 x GB300 with a CUDA 13.4 toolkit at `CUDA_HOME`; its serving tests launch the checkpoint at `SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH`. Its composition check (`SGLANG_NVIDIA_MEGAKERNEL_PARITY=1`, eager decode steps) logs one `NVIDIA megakernel parity` line per covered step: at slot `mega`'s width the logits' difference against the spec's tolerances (`... target logits rows=8 max_abs=... rel=... min_cosine=... top1=... max_kl=...`), at every other width the bitwise check (`... target_verify rows=N logits_max_abs=0 (rel 0.00e+00, 0.00% differ) hidden_max_abs=...`). The draft's Markov chain has its own kernel test (`test/kernels/test_minimax_m31_markov.py -s`: one GPU, then four) and, on a server, a probe: `SGLANG_NVIDIA_MEGAKERNEL_MARKOV_PARITY=1` runs SGLang's proposal beside the plugin's inside each captured draft graph and logs, per rank every 30 s, the tokens and kept logits that differ against the declared bound (`NVIDIA megakernel: Markov parity rank N: ...`).
+MiniMax-M3.1-Flash's suites (`test_minimax_m31_*`) run on 4 x GB300 on one host in SGLang's cu134 image, which carries the MSA kernels SGLang's MiniMax-M3.1 support imports at SGLang's pinned commit (no other SGLang branch is needed); the server compiles the package's kernels when it loads, so it needs the CUDA 13.4 toolkit's `nvcc` then (`CUDA_HOME`). Its e2e tests are a matched pair against native SGLang, the same launch without `--enable-nvidia-megakernel`: each launches the baseline, runs the workload and tears it down, then launches the candidate on the same GPUs with the same arguments and environment (they set `SGLANG_PLUGINS=nvidia_megakernel` on both arms) and runs the same workload; `SGLANG_NVIDIA_MEGAKERNEL_E2E_URL` is not read, since a running server is one arm only. Both launch the checkpoint at `SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH` and fail unless the candidate's log shows the megakernel active on every rank and running its decode graphs, and the baseline's log no megakernel line.
+
+- `test_minimax_m31_acc.py` (accuracy): chat GSM8K, greedy, real speculative acceptance, the same questions one at a time (the fused path) and 16 at a time (the 16-128-row steps), and three pass keys at 13K tokens. The rule is paired and has no absolute score: with b the questions only the baseline answers correctly and c those only the candidate does, the candidate passes when b - c <= max(2, ceil(2 * sqrt(b + c))), a one-sided sign test at about two standard deviations of the discordant count; it must also retrieve every pass key the baseline retrieves. `SGLANG_NVIDIA_MEGAKERNEL_E2E_GSM8K_QUESTIONS` (default 200) and `SGLANG_NVIDIA_MEGAKERNEL_E2E_GSM8K_QUESTIONS_16` set the question counts.
+- `test_minimax_m31_perf.py` (performance): `benchmark/static_table.py` at 8K / 1K with `SGLANG_SIMULATE_ACC_LEN=3.95` on both arms (measurement only: it fixes the accepted length), at concurrency 1 (the fused path) and the fallback widths 2 and 16 (`SGLANG_NVIDIA_MEGAKERNEL_E2E_PERF_CONCURRENCY`), one untimed pass and then 3 timed passes an arm on fresh prompt seeds (`SGLANG_NVIDIA_MEGAKERNEL_E2E_PERF_PASSES`). At concurrency 1 the candidate's slowest pass must beat the baseline's fastest pass; at a fallback width the candidate's mean must not be below the baseline's by more than the larger of 3% and the sum of the two arms' pass-to-pass spreads (half the range over the mean).
+
+Both log a table of the two arms' results, their difference and the verdict; `test/unit/test_minimax_m31_e2e_verdicts.py` checks the rules on CPU. `test_minimax_m31_parity.py` supplements the accuracy test with the composition check (`SGLANG_NVIDIA_MEGAKERNEL_PARITY=1`, eager decode steps), which logs one `NVIDIA megakernel parity` line per covered step: at slot `mega`'s width the logits' difference against the spec's tolerances (`... target logits rows=8 max_abs=... rel=... min_cosine=... top1=... max_kl=...`), at every other width the bitwise check (`... target_verify rows=N logits_max_abs=0 (rel 0.00e+00, 0.00% differ) hidden_max_abs=...`). The draft's Markov chain has its own kernel test (`test/kernels/test_minimax_m31_markov.py -s`: one GPU, then four) and, on a server, a probe: `SGLANG_NVIDIA_MEGAKERNEL_MARKOV_PARITY=1` runs SGLang's proposal beside the plugin's inside each captured draft graph and logs, per rank every 30 s, the tokens and kept logits that differ against the declared bound (`NVIDIA megakernel: Markov parity rank N: ...`).
 
 GLM-5.3 GPU and end-to-end suites are not yet part of the initial CI workflow.
 The GLM-5.3 CPU config and SGLang contract checks are included in `test/unit`.
