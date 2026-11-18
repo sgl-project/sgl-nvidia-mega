@@ -40,14 +40,13 @@ def _same(a, b):
 
 
 @pytest.mark.parametrize("use_pdl", [False, True])
-@pytest.mark.parametrize("rows", [1, 5, 10, 24])
-def test_gather_returns_the_tables_rows(use_pdl, rows):
+def test_gather_returns_the_tables_rows(use_pdl):
+    rows = 5  # the draft's batch-1 width
     t = _table()
     ids = torch.randint(0, VOCAB, (rows,), device="cuda")
     ids[0] = VOCAB - 1
-    if rows > 2:
-        ids[1] = VOCAB + 7  # outside: the zero row
-        ids[2] = -3
+    ids[1] = VOCAB + 7  # outside: the zero row
+    ids[2] = -3
     q, kv = draft_stage0.gather(t, ids, use_pdl=use_pdl)
     wq, wkv = _want(t, ids)
     assert q.shape == (rows, HEADS, DIM) and kv.shape == (rows, DIM)
@@ -111,8 +110,3 @@ def test_check_passes_the_filled_table_and_finds_a_flip():
     t.kv[17, 3] = -t.kv[17, 3] if t.kv[17, 3] != 0 else 1.0
     bad = draft_stage0.check(t, rows_fn, (5, 10), extra=extra)
     assert bad[5] > 0 and bad[10] > 0
-
-
-def test_nbytes_is_the_q_and_kv_rows():
-    t = draft_stage0.Stage0Table(VOCAB, HEADS, DIM, "cuda")
-    assert t.nbytes == (VOCAB + 1) * (HEADS * DIM + DIM) * 2

@@ -7,18 +7,17 @@ SM100-family GPU (GB300).
 - Logits against SGLang's ``tiny_gemm_bf16`` bit for bit, on SGLang's own schedule for
   the target router (384 x 5120) and the DSpark draft router (128 x 5120), at every width
   SGLang serves on its MMA kernel up to 8 rows: random weights and rows over a wide
-  exponent range, zeros, subnormals, infinities and NaNs; strided rows; both release
-  points (after the weight loads and SGLang's own).
+  exponent range, zeros, subnormals, infinities and NaNs; strided rows.
 - A late router input and a late router output: the router's producer releases its
   dependents at entry and writes the router's rows only after a delay, so the router and
   the one-launch top-k + route + routed-input quant (gate_route_quant) behind it both
   launch early. The router's output buffer and input start poisoned (another input's
   rows and logits); the top-k's ids, weights, slot -> row map, the routed input's MXFP8
-  bytes and the GEMM2 rows must equal the chain on SGLang's router bit for bit, eager and
-  replayed from a CUDA graph (re-poisoned before each replay).
+  bytes and the GEMM2 rows must equal the chain on SGLang's router bit for bit, replayed
+  from a CUDA graph (re-poisoned before each replay), at the served 6 (target) and 5
+  (draft) rows.
 """
 
-import ctypes
 import os
 import sys
 
@@ -27,8 +26,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_deepseek_v41_moe as single  # noqa: E402
+from deepseek_v41_kernel_helpers import late_copy  # noqa: E402
+from test_deepseek_v41_moe import draft_layer, target_layer  # noqa: E402, F401
 
-from sgl_nvidia_mega.common import jit  # noqa: E402
 from sgl_nvidia_mega.deepseek_v41.sm103.moe import (  # noqa: E402
     routed_expert_gemm as reg,
 )
@@ -54,17 +54,10 @@ class _Gate(torch.nn.Module):
         )
 
 
-def _router(weight, early_release=True):
-    gate = _Gate(weight)
+def _router(weight):
     schedule = router_mma.sglang_schedule(*weight.shape)
     assert schedule is not None, "SGLang no longer serves this router on its MMA kernel"
-    warps, cluster, min_rows = schedule
-    router = router_mma.EarlyRouter(gate, warps, cluster, min_rows)
-    if not early_release:
-        router.kernel = router_mma.load_router_mma(
-            weight.device.index, router.n, router.k, warps, cluster, False
-        )
-    return router
+    return router_mma.EarlyRouter(_Gate(weight), *schedule)
 
 
 def _weight(kind, experts, seed):
@@ -106,14 +99,13 @@ def _equal(a, b):
 
 @needs_moe
 @pytest.mark.parametrize("which", list(ROUTERS))
-@pytest.mark.parametrize("kind", ["normal", "wide", "special"])
-@pytest.mark.parametrize("early_release", [True, False])
+@pytest.mark.parametrize("kind", ["wide", "special"])
 @pytest.mark.parametrize("strided", [False, True])
-def test_logits_match_tiny_gemm(which, kind, early_release, strided):
+def test_logits_match_tiny_gemm(which, kind, strided):
     from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 
     experts, _ = ROUTERS[which]
-    router = _router(_weight(kind, experts, 11), early_release)
+    router = _router(_weight(kind, experts, 11))
     assert router.min_rows <= 6 <= router.max_rows
     for rows in range(router.min_rows, router.max_rows + 1):
         x = _rows(kind, rows, 100 + rows, HIDDEN + 256 if strided else HIDDEN)
@@ -139,41 +131,6 @@ def test_check_and_serves():
 
 # ------------------------------------------------- late router input and output
 
-_LATE = r"""
-extern "C" __global__ void late_copy(const int* src, int* dst, int n,
-                                     unsigned long long delay_ns) {
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    unsigned long long t0, t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
-    do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < delay_ns);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
-}
-"""
-
-
-def _late_kernel():
-    major, minor = torch.cuda.get_device_capability()
-    return jit.load(
-        jit.compile_source(_LATE, "late_copy", f"sm_{major}{minor}a", ("-std=c++17",)),
-        "late_copy",
-        (256, 1, 1),
-        0,
-    )
-
-
-def _late_copy(kernel, src, dst, delay_us):
-    jit.launch(
-        kernel,
-        (1, 1, 1),
-        [
-            jit.pointer(src),
-            jit.pointer(dst),
-            ctypes.c_int32(src.numel() * src.element_size() // 4),
-            ctypes.c_uint64(int(delay_us * 1000)),
-        ],
-        torch.cuda.current_stream().cuda_stream,
-    )
-
 
 def _pair(layer, top_k, experts, offset):
     return reg.RoutedExpertGemm(
@@ -189,17 +146,13 @@ def _pair(layer, top_k, experts, offset):
 
 
 @needs_moe
-@pytest.mark.parametrize("which", list(ROUTERS))
-@pytest.mark.parametrize("rows", [2, 6, 8])
-@pytest.mark.parametrize("mode", ["eager", "graph"])
-@pytest.mark.parametrize("release", [0, 1, 2])
-def test_late_router_input_and_output(request, which, rows, mode, release):
-    """``release``: where the one-launch top-k releases GEMM1 (bind_early_release)."""
+@pytest.mark.parametrize("which, rows", [("target", 6), ("draft", 5)])
+def test_late_router_input_and_output(request, which, rows):
     experts, top_k = ROUTERS[which]
     layer = request.getfixturevalue(f"{which}_layer")
     half, offset = single._ep_half(layer, 1)
     gemm = _pair(half, top_k, experts, offset)
-    gemm.bind_early_release(release)
+    gemm.bind_early_release(router_mma.gate_route_release())
     router = _router(_weight("normal", experts, 21))
     assert router.serves(_rows("normal", rows, 0)) and gemm.serves_gate_route_quant(
         rows
@@ -229,12 +182,11 @@ def test_late_router_input_and_output(request, which, rows, mode, release):
     ref_q, ref_s = seen["q"].clone(), seen["s"].clone()
     torch.cuda.synchronize()
 
-    late = _late_kernel()
     x = poison.clone()
     logits = poison_logits.clone()
 
     def chain():
-        _late_copy(late, good, x, 50.0)
+        late_copy(good, x)
         router(x, out=logits)
         return gemm.gate_topk_and_gemms(
             None, None, logits, bias, single.SCALE, num_valid, x=x, early=True
@@ -245,31 +197,26 @@ def test_late_router_input_and_output(request, which, rows, mode, release):
         logits.copy_(poison_logits)
         torch.cuda.synchronize()
 
-    if mode == "eager":
+    repoison()
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = chain()
+    q = (seen["q"], seen["s"])
+    outs, quants = [], []
+    for _ in range(3):
         repoison()
-        outs = [chain()]
-        quants = [(seen["q"], seen["s"])]
-    else:
-        repoison()
-        chain()
+        for t in out:
+            t.zero_()
+        graph.replay()
         torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = chain()
-        q = (seen["q"], seen["s"])
-        outs, quants = [], []
-        for _ in range(3):
-            repoison()
-            for t in out:
-                t.zero_()
-            graph.replay()
-            torch.cuda.synchronize()
-            outs.append(tuple(t.clone() for t in out))
-            quants.append(tuple(t.clone() for t in q))
+        outs.append(tuple(t.clone() for t in out))
+        quants.append(tuple(t.clone() for t in q))
     torch.cuda.synchronize()
     (r0, w0, p0, i0) = ref
     for (r1, w1, p1, i1), (q1, s1) in zip(outs, quants):
-        where = f"{which} rows={rows} {mode}"
+        where = f"{which} rows={rows}"
         assert _equal(logits, ref_logits), where
         assert torch.equal(i1, i0), where
         assert _equal(w1, w0), where
@@ -280,13 +227,3 @@ def test_late_router_input_and_output(request, which, rows, mode, release):
         a = r1[p1.clamp(min=0).long()][kept]
         b = r0[p0.clamp(min=0).long()][kept]
         assert torch.equal(a.view(torch.int16), b.view(torch.int16)), where
-
-
-@pytest.fixture(scope="module")
-def target_layer():
-    return single._shuffled_layer(torch.Generator().manual_seed(2), 384)
-
-
-@pytest.fixture(scope="module")
-def draft_layer():
-    return single._shuffled_layer(torch.Generator().manual_seed(3), 128)

@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Slot gate_route_quant: opt-in, needs gate_route; the MoE slot takes the quant only on
 the fast top-k without a pre-quantized input, and then forks no routed-quant stream.
-The launch itself is tested bitwise in test/kernels/test_deepseek_v41_moe.py (one GPU)
-and test/kernels/test_deepseek_v41_moe_ep.py (world 8)."""
+The launch itself is tested bitwise in test/kernels/test_deepseek_v41_moe.py."""
 
 from types import SimpleNamespace
 

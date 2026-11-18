@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Slot markov_lowlat: opt-in, a draft slot, served with the Markov chain only, and the
 chain's row limits with it. The kernel is tested bitwise in
-test/kernels/test_deepseek_v41_draft.py and its waits in test_deepseek_v41_fail_stop.py."""
+test/kernels/test_deepseek_v41_draft.py and test_deepseek_v41_markov_slots.py, and its
+waits in test_deepseek_v41_fail_stop.py."""
 
 from sgl_nvidia_mega.deepseek_v41 import runtime
 from sgl_nvidia_mega.deepseek_v41.sm103 import markov

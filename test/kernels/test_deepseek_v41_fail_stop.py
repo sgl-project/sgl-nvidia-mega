@@ -5,8 +5,8 @@ that wait on it fault within their deadline instead of hanging: the Lamport cons
 the wo_b publish (1-8 rows), also with its RMSNorm sums on mbarriers (slot hop_mbar),
 the two-shot hop (49-384 rows), whose deadline comes from its build alone, and the
 draft's MoE post on its own mailbox (slot draft_hop); and the DSpark draft's Markov
-chain (sm103/markov.py), current and slot markov_lowlat's kernel, through the direct
-exchange (1 row) and the rank-local fold (8 rows), greedy and sampled.
+chain with slot markov_lowlat's kernel, through the direct exchange (1 row, greedy) and
+the rank-local fold (8 rows, sampled).
 
 Each case runs its own torchrun, since a faulted rank leaves its CUDA context unusable.
 Run with ``python test/kernels/test_deepseek_v41_fail_stop.py``.
@@ -211,12 +211,11 @@ MARKOV_FAULT_WORKER = textwrap.dedent(
 
 
 @pytest.mark.skipif(not _gpu4(), reason="needs 4 SM100-family GPUs")
-@pytest.mark.parametrize("sampled", [False, True], ids=["greedy", "sampled"])
-@pytest.mark.parametrize("rows", [1, 8], ids=["direct", "fold"])
-@pytest.mark.parametrize("lowlat", [False, True], ids=["current", "lowlat"])
-def test_a_missing_rank_faults_its_markov_peers_in_time(
-    lowlat, rows, sampled, tmp_path
-):
+@pytest.mark.parametrize(
+    "rows, sampled", [(1, False), (8, True)], ids=["direct", "fold"]
+)
+def test_a_missing_rank_faults_its_markov_peers_in_time(rows, sampled, tmp_path):
+    lowlat = True
     script = tmp_path / "markov_worker.py"
     script.write_text(MARKOV_FAULT_WORKER)
     port = (

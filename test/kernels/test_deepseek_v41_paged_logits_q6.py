@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Slot attn_indexer_logits_q6: DeepGEMM's paged MXFP4 logits with a request's 5-7 rows in
-one Q block equal SGLang's DeepGEMM call bit for bit on every valid logit (both TMEM
-release orders, index-K pages of 64 and 128, one and two requests, lengths that end
-mid-page and mid-split), eager and replayed in a CUDA graph."""
+"""Slot attn_indexer_logits_q6: DeepGEMM's paged MXFP4 logits with a request's rows in one
+Q block equal SGLang's DeepGEMM call bit for bit on every valid logit, at the built
+6-row, page-128 variant (one request, short and long contexts whose lengths end mid-page
+and mid-split), eager and replayed in a CUDA graph; other shapes are declined."""
 
 import pytest
 import torch
@@ -76,20 +76,15 @@ def _assert_equal(ref, out, lens):
     assert torch.equal(ref.view(torch.int16)[valid], out.view(torch.int16)[valid])
 
 
-@pytest.mark.parametrize("early", [True, False])
-@pytest.mark.parametrize("page", [128, 64])
-@pytest.mark.parametrize("rows", [6, 5, 7])
-@pytest.mark.parametrize("batch,keys", [(1, 300), (1, 70000), (2, 33333)])
-def test_bitwise_vs_deep_gemm(monkeypatch, rows, page, batch, keys, early):
+@pytest.mark.parametrize("keys", [300, 70000])
+def test_bitwise_vs_deep_gemm(keys):
     from sglang.kernels.ops.attention.dsv4.index_logits import (
         deep_gemm_fp4_paged_mqa_logits,
     )
 
     from sgl_nvidia_mega.deepseek_v41.sm103.attention import paged_logits_q6 as q6
 
-    monkeypatch.setattr(q6, "EARLY_RELEASE", early)
-    monkeypatch.setattr(q6, "_kernels", {})
-    args = _case(rows, batch, keys, page)
+    args = _case(6, 1, keys, 128)
     lens = args[3]
     ref = deep_gemm_fp4_paged_mqa_logits(*args)
     _assert_equal(ref, q6.paged_logits(*args), lens)

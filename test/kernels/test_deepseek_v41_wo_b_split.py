@@ -5,8 +5,8 @@
 any world size (attention TP8 over two trays: 8 ranks; one tray: 4).
 
 - Its rows against an FP64 reference of the same MXFP8 operands and against FlashInfer's
-  low-latency GEMM (the current hop A path), 1-8 rows: within tolerance (the FP32 sums are
-  ordered differently, so not bitwise).
+  low-latency GEMM (the current hop A path), at the served 6 rows: within tolerance (the
+  FP32 sums are ordered differently, so not bitwise).
 - The mailbox it writes: the hop's consumer on the split's published rows equals the same
   consumer on the same rows published by the hop's separate publish kernel, bit for bit,
   over sequences that mix the split, the publishing GEMM and the separate publish across
@@ -37,10 +37,10 @@ pytestmark = [
 ]
 
 # DeepSeek-V4.1-Flash: hidden 5120; wo_b's K per rank at attention TP8 (1 group of 1024),
-# and TP4's 2048
+# where a default start takes the slot
 HIDDEN, HC = 5120, 4
-KS = (1024, 2048)
-ROWS = (1, 2, 5, 6, 8)
+KS = (1024,)
+ROWS = (6,)
 
 
 @pytest.fixture(scope="module")

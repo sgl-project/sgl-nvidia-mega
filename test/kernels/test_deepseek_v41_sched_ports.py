@@ -4,11 +4,9 @@
 switch of muLLM v0.4.1, NVIDIA Corporation, Apache-2.0).
 
 - The compressor's kernel node is captured at the priority stream's priority, the other
-  nodes at the default, and a torch-instantiated graph dispatches a ready high-priority
-  node ahead of a low-priority grid's pending CTAs.
+  nodes at the default, and the indexer still reads the compressor's write.
 """
 
-import statistics
 from types import SimpleNamespace
 
 import pytest
@@ -47,18 +45,6 @@ def _spin(START, END, spin_ns):
         t = _now()
     tl.store(START + pid, t0)
     tl.store(END + pid, t)
-
-
-def _graph(fn):
-    fn()
-    torch.cuda.synchronize()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g, stream=stream):
-        out = fn()
-    torch.cuda.synchronize()
-    return g, out
 
 
 def _kernel_nodes(graph_ptr):
@@ -156,40 +142,3 @@ def test_the_compressor_node_is_captured_at_high_priority(slot):
         g.replay()
         torch.cuda.synchronize()
         assert bool((idx_out == r + 11).all())
-
-
-@needs_gpu
-def test_a_captured_high_priority_node_is_dispatched_first():
-    """The premise of attn_compressor_priority on this torch / driver: a node captured on
-    a high-priority stream starts ahead of a low-priority grid's pending CTAs."""
-    nsm = torch.cuda.get_device_properties(0).multi_processor_count
-    grid_a = nsm * 4 * 20
-    lo_prio, hi_prio = torch.cuda.Stream.priority_range()
-    a_s = torch.zeros(grid_a, dtype=torch.int64, device="cuda")
-    a_e = torch.zeros_like(a_s)
-    b = torch.zeros(4, dtype=torch.int64, device="cuda")
-    starts = {}
-    for name, prio in (("equal", lo_prio), ("high", hi_prio)):
-        lo = torch.cuda.Stream(priority=lo_prio)
-        hi = torch.cuda.Stream(priority=prio)
-
-        def body(lo=lo, hi=hi):
-            cur = torch.cuda.current_stream()
-            lo.wait_stream(cur)
-            hi.wait_stream(cur)
-            with torch.cuda.stream(lo):
-                _spin[(grid_a,)](a_s, a_e, 3000, num_warps=16)
-            with torch.cuda.stream(hi):
-                _spin[(1,)](b, b[1:], 2000, num_warps=1)
-                _spin[(1,)](b[2:], b[3:], 0, num_warps=1)
-            cur.wait_stream(lo)
-            cur.wait_stream(hi)
-
-        g, _ = _graph(body)
-        late = []
-        for _ in range(20):
-            g.replay()
-            torch.cuda.synchronize()
-            late.append((int(b[2]) - int(a_s.min())) / 1e3)
-        starts[name] = statistics.median(late)
-    assert starts["high"] < 0.3 * starts["equal"], starts

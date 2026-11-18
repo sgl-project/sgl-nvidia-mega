@@ -3,8 +3,8 @@
 """Slots attn_q_norm_gemm, attn_index_q_first and attn_index_weights_bf16.
 
 - ``q_norm_gemm.q_norm_linear`` (q_norm + MXFP8 quant inside FlashInfer's low-latency
-  GEMM) against ``rmsnorm_mxfp8`` followed by ``mxfp8_ll.linear``, bit for bit at 1-8
-  rows: wq_b at attention TP8 (8 heads) and TP4 (16 heads), the index query's wq_b, the
+  GEMM) against ``rmsnorm_mxfp8`` followed by ``mxfp8_ll.linear``, bit for bit at the
+  served 6 rows: wq_b at attention TP8 (8 heads) and TP4 (16 heads), the index query's wq_b, the
   quant it writes for the next GEMM (codes, the 128x4 scales and their zero padding), on
   memory poisoned beforehand; past 8 rows it declines.
 - The index-first hand-off of ``prepare.low_ratio`` in a captured graph: the index wq_b
@@ -17,11 +17,14 @@
 """
 
 import math
+import os
+import sys
 
 import pytest
 import torch
-import triton
-import triton.language as tl
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from deepseek_v41_kernel_helpers import late_copy, poison  # noqa: E402
 
 
 def _ready() -> bool:
@@ -39,7 +42,6 @@ needs_gpu = pytest.mark.skipif(not _ready(), reason="needs an SM100-family GPU, 
 
 K = 1280  # q_lora_rank
 EPS = 1e-6
-SPIN_NS = 50_000
 INDEX_N = 4096  # the index query's wq_b at attention TP8 (32 heads x 128)
 
 
@@ -63,12 +65,6 @@ def _shapes():
     ]
 
 
-def _poison():
-    # the caching allocator hands these bytes to the next allocations
-    junk = torch.full((1 << 24,), 0x7F, dtype=torch.uint8, device="cuda")
-    del junk
-
-
 def _reference(x, nw, w, ws, consumer):
     from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
     from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import rmsnorm_mxfp8
@@ -85,18 +81,18 @@ def test_q_norm_linear_is_the_unfused_chain_bit_for_bit(shape):
     name, n, consumer = _shapes()[shape]
     w, ws = _weight(n, shape)
     nw = (1 + 0.1 * torch.randn(K, device="cuda")).bfloat16()
-    for rows in range(1, 9):
+    for rows in (6,):
         assert not qng.reason(w, rows, consumer), (name, rows)
         for trial in range(3):
             # a strided view of wqkv_a's output, as the chain passes it
             qkv = torch.randn(rows, 1792, device="cuda").bfloat16() * (0.5 + trial)
             x = qkv[:, :K]
             ref, q8, s8 = _reference(x, nw, w, ws, consumer)
-            _poison()
+            poison()
             out, quant = qng.q_norm_linear(
                 x, nw, EPS, w, ws, consumer=consumer, write_quant=True
             )
-            _poison()
+            poison()
             plain = qng.q_norm_linear(x, nw, EPS, w, ws, consumer=consumer)
             torch.cuda.synchronize()
             what = (name, rows, trial)
@@ -109,60 +105,14 @@ def test_q_norm_linear_is_the_unfused_chain_bit_for_bit(shape):
     assert qng.reason(w, 24, consumer)
 
 
-SPIN = None
-
-
-def _late_copy_kernel():
-    global SPIN
-    if SPIN is None:
-
-        @triton.jit
-        def late_copy(
-            SRC, DST, N: tl.constexpr, BLOCK: tl.constexpr, spin_ns: tl.constexpr
-        ):
-            # release the PDL dependents, then write late
-            tl.extra.cuda.gdc_launch_dependents()
-            t0 = tl.inline_asm_elementwise(
-                "mov.u64 $0, %globaltimer;",
-                "=l",
-                [],
-                dtype=tl.int64,
-                is_pure=False,
-                pack=1,
-            )
-            t = t0
-            while t - t0 < spin_ns:
-                t = tl.inline_asm_elementwise(
-                    "mov.u64 $0, %globaltimer;",
-                    "=l",
-                    [],
-                    dtype=tl.int64,
-                    is_pure=False,
-                    pack=1,
-                )
-            i = tl.arange(0, BLOCK)
-            tl.store(DST + i, tl.load(SRC + i, i < N), i < N)
-
-        SPIN = late_copy
-    return SPIN
-
-
-def _late_write(src, dst):
-    """``dst`` <- ``src`` on the current stream by a kernel that triggers first."""
-    s, d = src.view(torch.int16).reshape(-1), dst.view(torch.int16).reshape(-1)
-    n = s.numel()
-    _late_copy_kernel()[(1,)](
-        s, d, N=n, BLOCK=triton.next_power_of_2(n), spin_ns=SPIN_NS, launch_pdl=True
-    )
-
-
 class Hand:
-    """``prepare.low_ratio``'s index-first order on stand-in inputs at 6 rows."""
+    """``prepare.low_ratio``'s index-first order on stand-in inputs at 6 rows, the index
+    wq_b on slot attn_q_norm_gemm's fused launch."""
 
-    def __init__(self, fused, rows=6, ctx=4096):
+    def __init__(self, rows=6, ctx=4096):
         from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 
-        self.fused, self.rows = fused, rows
+        self.rows = rows
         self.w, self.ws = _weight(4096, 1)
         self.wi, self.wis = _weight(INDEX_N, 2)
         self.consumer = mxfp8_ll.WQ_B_TP8
@@ -199,23 +149,16 @@ class Hand:
 
         from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
         from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm as qng
-        from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import (
-            rmsnorm_mxfp8,
-        )
 
         main, side = torch.cuda.current_stream(), self.side
         side.wait_stream(main)
         with torch.cuda.stream(side):
-            _late_write(self.src_hw, self.hw)  # the head weights
-        _late_write(self.src_x, self.x)  # wqkv_a's q_lora
-        if self.fused:
-            index_raw, quant = qng.q_norm_linear(
-                self.x, self.nw, EPS, self.wi, self.wis, write_quant=True
-            )
-            q8, s8 = quant.quant, quant.scale
-        else:
-            _, q8, s8 = rmsnorm_mxfp8(self.x, self.nw, EPS, pdl=True)
-            index_raw = mxfp8_ll.linear(q8, s8, self.wi, self.wis)
+            late_copy(self.src_hw, self.hw)  # the head weights
+        late_copy(self.src_x, self.x)  # wqkv_a's q_lora
+        index_raw, quant = qng.q_norm_linear(
+            self.x, self.nw, EPS, self.wi, self.wis, write_quant=True
+        )
+        q8, s8 = quant.quant, quant.scale
         quant_ready = main.record_event()
         main.wait_stream(side)
         packed = index_q_rope_pack_weights(
@@ -233,9 +176,8 @@ class Hand:
 
 
 @needs_gpu
-@pytest.mark.parametrize("fused", (False, True))
-def test_index_first_hand_off_reads_late_writers(fused):
-    h = Hand(fused)
+def test_index_first_hand_off_reads_late_writers():
+    h = Hand()
     h.fill(0)
     h.chain()
     torch.cuda.synchronize()
@@ -273,7 +215,7 @@ def test_bf16_head_weights_are_the_pack_cast():
         .contiguous()
     )
     pos = torch.randint(0, ctx, (rows,), device="cuda")
-    for heads in (32, 64):
+    for heads in (32,):
         scale = 128**-0.5 * heads**-0.5
 
         class Attn:

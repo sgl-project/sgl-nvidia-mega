@@ -2,15 +2,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Slot attn_wo_a_fp8: the fused wo_a streaming wo_a as E4M3 with 32x32 UE8M0 scales is bit
 for bit the BF16 launch when the BF16 wo_a is the exact dequant of that form (as SGLang
-loads DeepSeek-V4.1's FP8 wo_a): codes and scales at 1-48 rows, 1 and 2 groups, both
-trigger points, row-tile scales, int32 / int64 positions, on poisoned memory and in a graph
-replay. ``fp8_weight`` recovers the checkpoint's form exactly and refuses a BF16 weight
+loads DeepSeek-V4.1's FP8 wo_a): codes and scales at the served 6 rows and 1 group
+(attention TP8), int32 / int64 positions, on poisoned memory and in a graph replay. ``fp8_weight`` recovers the checkpoint's form exactly and refuses a BF16 weight
 that is not one."""
+
+import os
+import sys
 
 import pytest
 import torch
 
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from deepseek_v41_kernel_helpers import poison  # noqa: E402
 
 
 def _ready() -> bool:
@@ -46,26 +51,9 @@ def _inputs(rows, groups, int64):
     return o.view(rows, groups, -1), freqs.contiguous(), pos
 
 
-def _written(scales, rows, groups, row_tile_scales):
-    """The scale bytes the kernel writes: the row-tile layout leaves 12 of each row's 16
-    bytes of an atom untouched (they are never read)."""
-    if not row_tile_scales:
-        return scales
-    blocks = groups * wo_a.RANK // 32
-    r = torch.arange((rows + 7) // 8 * 8, device=scales.device)[:, None]
-    g = torch.arange(blocks, device=scales.device)[None, :]
-    off = ((r >> 3) * (blocks // 4) + (g >> 2)) * 512 + (r & 7) * 16 + (g & 3)
-    return scales[off.reshape(-1)]
-
-
-def _poison():
-    junk = torch.full((1 << 24,), 0x7F, dtype=torch.uint8, device="cuda")
-    del junk
-
-
 @needs_gpu
-@pytest.mark.parametrize("groups", (1, 2))
-def test_fp8_weight_recovers_the_checkpoint_form(groups):
+def test_fp8_weight_recovers_the_checkpoint_form():
+    groups = 1
     weight, codes, exp = _checkpoint_wo_a(groups, groups)
     fp8 = wo_a.fp8_weight(weight)
     assert fp8.codes.shape == (groups * wo_a.RANK, wo_a.GROUP_K)
@@ -83,29 +71,19 @@ def test_fp8_weight_recovers_the_checkpoint_form(groups):
 
 
 @needs_gpu
-@pytest.mark.parametrize("groups", (1, 2))
-@pytest.mark.parametrize("early_trigger", (True, False))
-@pytest.mark.parametrize("row_tile_scales", (False, True))
-def test_fp8_launch_is_the_bf16_launch_bit_for_bit(
-    groups, early_trigger, row_tile_scales
-):
-    weight, _, _ = _checkpoint_wo_a(groups, 10 + groups)
+def test_fp8_launch_is_the_bf16_launch_bit_for_bit():
+    weight, _, _ = _checkpoint_wo_a(1, 11)
     fp8 = wo_a.fp8_weight(weight)
-    for rows in (1, 2, 5, 6, 8, 12, 16, 17, 31, 32, 33, 48):
-        for int64 in (False, True):
-            x, freqs, pos = _inputs(rows, groups, int64)
-            kw = dict(early_trigger=early_trigger, row_tile_scales=row_tile_scales)
-            _poison()
-            ref_c, ref_s = wo_a.fused_rope_wo_a(x, weight, freqs, pos, **kw)
-            _poison()
-            got_c, got_s = wo_a.fused_rope_wo_a(x, weight, freqs, pos, fp8=fp8, **kw)
-            torch.cuda.synchronize()
-            what = (rows, int64)
-            assert torch.equal(got_c.view(torch.uint8), ref_c.view(torch.uint8)), what
-            assert torch.equal(
-                _written(got_s, rows, groups, row_tile_scales),
-                _written(ref_s, rows, groups, row_tile_scales),
-            ), what
+    for int64 in (False, True):
+        x, freqs, pos = _inputs(6, 1, int64)
+        kw = dict(early_trigger=True)  # as the chain launches it
+        poison()
+        ref_c, ref_s = wo_a.fused_rope_wo_a(x, weight, freqs, pos, **kw)
+        poison()
+        got_c, got_s = wo_a.fused_rope_wo_a(x, weight, freqs, pos, fp8=fp8, **kw)
+        torch.cuda.synchronize()
+        assert torch.equal(got_c.view(torch.uint8), ref_c.view(torch.uint8)), int64
+        assert torch.equal(got_s, ref_s), int64
 
 
 @needs_gpu

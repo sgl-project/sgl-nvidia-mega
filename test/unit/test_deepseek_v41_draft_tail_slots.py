@@ -3,7 +3,7 @@
 """Slots markov_tail and draft_final_collapse on CPU: opt-in draft slots with their
 prerequisites, the draft hop built with the collapse only when asked, the startup
 summary's state of each, and the proposal step's launches with and without the tail.
-The kernels are tested bitwise in test/kernels/test_deepseek_v41_markov_tail.py and
+The kernels are tested bitwise in test/kernels/test_deepseek_v41_markov_slots.py and
 test/kernels/test_deepseek_v41_draft_hop.py."""
 
 from types import SimpleNamespace

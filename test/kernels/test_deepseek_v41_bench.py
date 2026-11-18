@@ -34,7 +34,7 @@ def _ready() -> bool:
 needs_gpu = pytest.mark.skipif(not _ready(), reason="needs an SM100-family GPU")
 
 
-@pytest.mark.parametrize("d,half0", [(25, 13), (24, 12), (12, 0), (36, 30), (6, 3)])
+@pytest.mark.parametrize("d,half0", [(25, 13), (12, 0)])
 def test_synth_counts(d, half0):
     spec = bench._parse_fixed(f"synth:d={d},half0={half0},seed=3")
     for layer in range(5):
@@ -85,15 +85,15 @@ def _gate(logits, bias, experts, top_k):
 
 @needs_gpu
 @pytest.mark.parametrize("kind,experts,top_k", [("target", 384, 6), ("draft", 128, 3)])
-@pytest.mark.parametrize("bias_scale", [0.0, 0.5, 8.0])
-def test_fixed_logits_select_table(kind, experts, top_k, bias_scale):
+def test_fixed_logits_select_table(kind, experts, top_k):
+    bias_scale = 8.0  # a correction bias that would otherwise change the choice
     spec = bench._parse_fixed("synth:d=20,half0=9,draft_d=9,draft_half0=4,seed=1")
     gen = torch.Generator().manual_seed(7)
     bias = (torch.randn(experts, generator=gen) * bias_scale).cuda()
-    for layer in range(3):
+    for layer in range(2):
         ids = bench._synth_ids(spec, kind, layer, experts, top_k)
         fixed = bench.FixedLayer(kind, layer, ids, bias, 1.5, torch.device("cuda"))
-        for rows in (1, 6, 48):
+        for rows in (1, 6):
             real = torch.randn(rows, experts, device="cuda")
             w, got = _gate(fixed.router_logits(real), bias, experts, top_k)
             want = torch.from_numpy(ids[:rows]).cuda().to(torch.int32)

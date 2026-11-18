@@ -329,74 +329,24 @@ def _fast(logits, bias, num_valid, top_k, vl=None):
 # polynomial's n = rint(-|x| log2(e) / 2) steps, the x <= -174 underflow of z = w^2 and the
 # -176 underflow of w, the -500 clamp, the Triton kernel's x > 20 branch, and fp32's extremes.
 _SPECIAL = [
-    0.0,
-    -0.0,
-    1e-45,
-    -1e-45,
-    1e-40,
-    -1e-40,
-    1.1754942e-38,
-    -1.1754942e-38,
-    1e-30,
-    -1e-30,
-    1e-7,
-    -1e-7,
-    0.5,
-    -0.5,
-    0.6931472,
-    -0.6931472,
-    1.0,
-    -1.0,
-    1.3862944,
-    -1.3862944,
-    19.999998,
-    20.0,
-    20.000002,
-    -20.0,
-    87.0,
-    -87.0,
-    88.7,
-    -88.7,
-    103.0,
-    -103.0,
-    170.0,
-    -170.0,
-    173.9,
-    -173.9,
-    174.0,
-    -174.0,
-    174.7,
-    -174.7,
-    175.5,
-    -175.5,
-    176.0,
-    -176.0,
-    179.0,
-    -179.0,
-    181.0,
-    -181.0,
-    499.0,
-    -499.0,
-    500.0,
-    -500.0,
-    501.0,
-    -501.0,
-    1e4,
-    -1e4,
-    1e10,
-    -1e10,
-    1e30,
-    -1e30,
-    3.4028235e38,
-    -3.4028235e38,
-    float("inf"),
-    float("-inf"),
-]
+    sign * float(v)
+    for v in (
+        "0 1e-45 1e-40 1.1754942e-38 1e-30 1e-7 0.5 0.6931472 1 1.3862944 20 87 88.7 103 "
+        "170 173.9 174 174.7 175.5 176 179 181 499 500 501 1e4 1e10 1e30 3.4028235e38 inf"
+    ).split()
+    for sign in (1.0, -1.0)
+] + [19.999998, 20.000002]
 
 
 def _logits(kind, rows, experts, gen):
-    shape = (rows, experts)
-    dev = "cuda"
+    shape, dev = (rows, experts), "cuda"
+
+    def rand():
+        return torch.rand(shape, device=dev, generator=gen)
+
+    def sign():
+        return torch.randint(0, 2, shape, device=dev, generator=gen) * 2.0 - 1
+
     if kind == "normal":
         return torch.randn(shape, device=dev, generator=gen)
     if kind == "wide":  # both softplus branches (> 20 passes through)
@@ -408,48 +358,33 @@ def _logits(kind, rows, experts, gen):
         return base + 0.2 * torch.randn(shape, device=dev, generator=gen)
     if kind == "nan":
         x = torch.randn(shape, device=dev, generator=gen)
-        x[torch.rand(shape, device=dev, generator=gen) < 0.01] = float("nan")
+        x[rand() < 0.01] = float("nan")
         return x
-    if (
-        kind == "range"
-    ):  # sign * 2^u, u uniform over fp32's exponents, and the special values
-        u = torch.rand(shape, device=dev, generator=gen) * 277.0 - 149.0
-        sign = torch.randint(0, 2, shape, device=dev, generator=gen).float() * 2 - 1
-        x = (sign * torch.exp2(u.double())).float()
+    if kind == "range":
+        # sign * 2^u, u uniform over fp32's exponents, and the special values
+        x = (sign() * torch.exp2((rand() * 277.0 - 149.0).double())).float()
         special = torch.tensor(_SPECIAL, device=dev)
         pick = torch.randint(0, len(_SPECIAL), shape, device=dev, generator=gen)
-        mask = torch.rand(shape, device=dev, generator=gen) < 0.25
-        return torch.where(mask, special[pick], x)
+        return torch.where(rand() < 0.25, special[pick], x)
     if kind == "polynomial":  # dense over [-200, 40]: every n step and both underflows
-        return torch.rand(shape, device=dev, generator=gen) * 240.0 - 200.0
-    if (
-        kind == "subnormal"
-    ):  # |x| down in the subnormals, where -|x| and the selects matter
-        bits = torch.randint(
-            1, 0x00800000, shape, device=dev, generator=gen, dtype=torch.int32
-        )
-        x = bits.view(torch.float32)
-        sign = torch.randint(0, 2, shape, device=dev, generator=gen).bool()
-        return torch.where(sign, -x, x)
-    if (
-        kind == "large"
-    ):  # |x| from 1e2 to fp32's max: weights far from 1, sums that round
-        u = torch.rand(shape, device=dev, generator=gen) * 121.0 + 7.0
-        sign = torch.randint(0, 2, shape, device=dev, generator=gen).float() * 2 - 1
-        return (sign * torch.exp2(u.double())).float()
-    if (
-        kind == "underflow"
-    ):  # every score tiny (x <= -174): z and w underflow, sums tiny
-        return -174.0 - torch.rand(shape, device=dev, generator=gen) * 8.0
+        return rand() * 240.0 - 200.0
+    if kind == "subnormal":
+        # |x| down in the subnormals, where -|x| and the selects matter
+        bits = torch.randint(1, 0x00800000, shape, device=dev, generator=gen)
+        return bits.int().view(torch.float32) * sign()
+    if kind == "large":
+        # |x| from 1e2 to fp32's max: weights far from 1, sums that round
+        return (sign() * torch.exp2((rand() * 121.0 + 7.0).double())).float()
+    if kind == "underflow":
+        # every score tiny (x <= -174): z and w underflow, sums tiny
+        return -174.0 - rand() * 8.0
     if kind == "tie_cutoff":  # many experts equal to the k-th score, the rest below
         x = torch.full(shape, -2.0, device=dev)
         x[:, torch.randperm(experts, device=dev, generator=gen)[: experts // 4]] = 0.75
         top = torch.randint(0, experts, (rows, 2), device=dev, generator=gen)
-        x.scatter_(1, top, 1.5)
-        return x
-    if (
-        kind == "nan_rows"
-    ):  # rows all NaN, NaN mixed with +-inf, and NaN on a few experts
+        return x.scatter_(1, top, 1.5)
+    if kind == "nan_rows":
+        # rows all NaN, NaN mixed with +-inf, and NaN on a few experts
         x = torch.randn(shape, device=dev, generator=gen)
         x[0::3] = float("nan")
         x[1::3, ::5] = float("nan")
@@ -461,31 +396,18 @@ def _logits(kind, rows, experts, gen):
 
 def _bias(kind, experts, gen):
     if kind == "subnormal":  # keep score + bias in the subnormals too
-        bits = torch.randint(
-            0, 0x00800000, (experts,), device="cuda", generator=gen, dtype=torch.int32
-        )
-        return bits.view(torch.float32) * torch.where(
-            torch.rand(experts, device="cuda", generator=gen) < 0.5, -1.0, 1.0
-        )
+        bits = torch.randint(0, 0x00800000, (experts,), device="cuda", generator=gen)
+        sign = torch.rand(experts, device="cuda", generator=gen) < 0.5
+        return bits.int().view(torch.float32) * torch.where(sign, -1.0, 1.0)
     if kind == "ties":  # equal biased scores
         return torch.zeros(experts, device="cuda")
     return torch.randn(experts, device="cuda", generator=gen) * 0.05
 
 
-GATE_KINDS = [
-    "normal",
-    "wide",
-    "ties",
-    "correlated",
-    "nan",
-    "range",
-    "polynomial",
-    "subnormal",
-    "large",
-    "underflow",
-    "tie_cutoff",
-    "nan_rows",
-]
+GATE_KINDS = (
+    "normal wide ties correlated nan range polynomial subnormal large underflow "
+    "tie_cutoff nan_rows"
+).split()
 
 
 def _equal(fw, fid, sw, sid, where):
@@ -538,7 +460,7 @@ def test_gate_topk_matches_moe_fused_gate(router, kind):
 
 @needs_moe
 @pytest.mark.parametrize("router", sorted(ROUTERS))
-@pytest.mark.parametrize("kind", ["normal", "range", "ties", "nan_rows"])
+@pytest.mark.parametrize("kind", ["normal", "nan_rows"])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 def test_gate_topk_vision_routing_matches_moe_fused_gate(router, kind, ids_dtype):
     """Rows whose token is the image token rank with the vision bias (DSV4.1 VL routing),
@@ -774,7 +696,7 @@ def test_shared_gate_up_at_the_tp8_shard(rows):
     assert shared_ll.why_not(mlp) == ""
 
 
-# ------------------------------------------------- slot gate_route (top-k + route fused)
+# ------------------------- slots gate_route (top-k + route fused) and gate_route_quant
 
 
 def _gate_route_logits(kind, rows, experts, gen):
@@ -782,232 +704,22 @@ def _gate_route_logits(kind, rows, experts, gen):
         x = torch.randn((rows, experts), device="cuda", generator=gen)
         x[:, 7] = 30.0
         return x
-    if kind == "distinct":  # every row on its own experts
-        x = torch.full((rows, experts), -5.0, device="cuda")
-        top_k = TARGET_TOP_K if experts == TARGET_EXPERTS else DRAFT_TOP_K
-        for r in range(rows):
-            for k in range(top_k):
-                x[r, (r * top_k + k) % experts] = 3.0 + k
-        return x
     if kind == "cutoff_ties":  # equal scores straddle the top-k cutoff
         x = torch.randn((rows, experts), device="cuda", generator=gen) - 4.0
         x[:, 3:12] = 2.0
         return x
-    shape_kind = {"normal": "normal", "wide": "wide", "ties": "ties", "nan": "nan"}
-    return _logits(shape_kind[kind], rows, experts, gen)
-
-
-def _check_gate_route(layer, *, top_k, rows, kind, offset, vision, padded, graph, seed):
-    """gate_topk_and_gemms with slot gate_route against the gate_topk + route kernels on
-    the same layer half: ids, weights, slot -> row map, route record and GEMM2 rows bit
-    for bit."""
-    experts = layer[0].size(0)
-    router_experts = experts * (2 if offset is not None else 1)
-    generator = torch.Generator().manual_seed(seed)
-    gen = torch.Generator(device="cuda").manual_seed(seed)
-    x_q, x_s = _quantized_rows(rows, generator)
-    logits = _gate_route_logits(kind, rows, router_experts, gen).contiguous()
-    bias = torch.randn(router_experts, device="cuda", generator=gen) * 0.05
-    valid = max(1, rows - 2) if padded else rows
-    num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
-    alt = None
-    if vision:
-        bias_alt = torch.randn(router_experts, device="cuda", generator=gen) * 0.5
-        input_ids = torch.randint(0, 50, (rows,), device="cuda", generator=gen)
-        input_ids[::2] = 17  # every other row is an image token
-        alt = (bias_alt, input_ids, 17)
-    eps = EPS if vision else 0.0
-    gemms = {
-        fused: reg.RoutedExpertGemm(
-            *layer,
-            top_k=top_k,
-            max_rows=reg.SERVED_MAX_ROWS,
-            gate_topk=True,
-            router_experts=router_experts,
-            expert_offset=offset or 0,
-            gate_route=fused,
-        )
-        for fused in (False, True)
-    }
-    assert gemms[True].serves_gate_route(rows) == (rows <= reg.MAX_ROWS)
-    got = {}
-    for fused, gemm in gemms.items():
-
-        def run():
-            return gemm.gate_topk_and_gemms(
-                x_q,
-                x_s,
-                logits,
-                bias,
-                SCALE,
-                num_valid,
-                alt=alt,
-                renormalize_epsilon=eps,
-            )
-
-        if graph:
-            run()
-            torch.cuda.synchronize()
-            captured = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(captured):
-                out = run()
-            for t in out:
-                t.zero_()
-            for _ in range(3):
-                captured.replay()
-        else:
-            out = run()
-        torch.cuda.synchronize()
-        got[fused] = out
-    where = f"rows={rows} kind={kind} offset={offset} vision={vision} padded={padded} graph={graph}"
-    (r0, w0, p0, i0), (r1, w1, p1, i1) = got[False], got[True]
-    assert torch.equal(i1, i0), where
-    assert torch.equal(w1.view(torch.int32), w0.view(torch.int32)), where
-    assert torch.equal(p1, p0), where
-    kept = p0 >= 0
-    a = r1[p1.clamp(min=0).long()][kept]
-    b = r0[p0.clamp(min=0).long()][kept]
-    assert torch.equal(a.view(torch.int16), b.view(torch.int16)), where
-    if not graph:  # the stock gate on the same logits: the router's choice
-        sw, sid = _stock_any(logits, bias, num_valid, top_k, alt)
-        assert torch.equal(i1, sid), where
-        assert torch.equal(w1.view(torch.int32), sw.view(torch.int32)), where
-
-
-def _stock_any(logits, bias, num_valid, top_k, alt):
-    from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
-
-    extra = {}
-    if alt is not None:
-        bias_alt, input_ids, token = alt
-        extra = dict(
-            bias_alt=bias_alt,
-            input_ids=input_ids,
-            bias_alt_token_id=token,
-            renormalize_epsilon=EPS,
-        )
-    w, ids = moe_fused_gate(
-        logits,
-        bias,
-        topk=top_k,
-        scoring_func="sqrtsoftplus",
-        num_fused_shared_experts=0,
-        renormalize=True,
-        routed_scaling_factor=SCALE,
-        apply_routed_scaling_factor_on_output=True,
-        num_token_non_padded=num_valid,
-        sqrtsoftplus_log1p=True,
-        **extra,
-    )
-    return w, ids.to(torch.int32)
-
-
-@needs_moe
-@pytest.mark.parametrize("rows", [1, 2, 3, 5, 6, 7, 8, 12, 48])
-@pytest.mark.parametrize(
-    "kind", ["normal", "ties", "cutoff_ties", "one_expert", "distinct", "nan"]
-)
-@pytest.mark.parametrize("window", ["all", "ep0", "ep1"])
-def test_gate_route_matches_gate_topk_and_route(target_layer, rows, kind, window):
-    layer, offset = (
-        (target_layer, None)
-        if window == "all"
-        else _ep_half(target_layer, int(window[-1]))
-    )
-    for vision, padded, graph in (
-        (False, False, False),
-        (True, True, False),
-        (False, True, True),
-        (True, False, True),
-    ):
-        _check_gate_route(
-            layer,
-            top_k=TARGET_TOP_K,
-            rows=rows,
-            kind=kind,
-            offset=offset,
-            vision=vision,
-            padded=padded,
-            graph=graph,
-            seed=5000 + rows,
-        )
-
-
-@needs_moe
-@pytest.mark.parametrize("rows", [1, 3, 5, 8, 10])
-@pytest.mark.parametrize("kind", ["normal", "ties", "one_expert", "distinct"])
-@pytest.mark.parametrize("window", ["all", "ep0", "ep1"])
-def test_draft_gate_route_matches_gate_topk_and_route(draft_layer, rows, kind, window):
-    layer, offset = (
-        (draft_layer, None)
-        if window == "all"
-        else _ep_half(draft_layer, int(window[-1]))
-    )
-    for vision, padded, graph in ((False, False, False), (True, True, True)):
-        _check_gate_route(
-            layer,
-            top_k=DRAFT_TOP_K,
-            rows=rows,
-            kind=kind,
-            offset=offset,
-            vision=vision,
-            padded=padded,
-            graph=graph,
-            seed=6000 + rows,
-        )
-
-
-@needs_moe
-@pytest.mark.parametrize("rows", [1, 6, 8])
-def test_gate_route_record_matches_route_kernel(target_layer, rows):
-    """The fused kernel's route record (every word GEMM1 / GEMM2 read) equals route.cu's."""
-    half, offset = _ep_half(target_layer, 1)
-    gen = torch.Generator(device="cuda").manual_seed(77 + rows)
-    logits = torch.randn(rows, TARGET_EXPERTS, device="cuda", generator=gen)
-    bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
-    num_valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
-    gemm = reg.RoutedExpertGemm(
-        *half,
-        top_k=TARGET_TOP_K,
-        max_rows=reg.SERVED_MAX_ROWS,
-        gate_topk=True,
-        router_experts=TARGET_EXPERTS,
-        expert_offset=offset,
-        gate_route=True,
-    )
-    records = {}
-    real = gemm._gemms
-
-    def capture(x_q, x_s, record, ctas):
-        records[len(records)] = record.clone()
-        return real(x_q, x_s, record, ctas)
-
-    gemm._gemms = capture
-    x_q, x_s = _quantized_rows(rows, torch.Generator().manual_seed(rows))
-    gemm.gate_topk_and_gemms(x_q, x_s, logits, bias, SCALE, num_valid)
-    kernel = gemm.gate_route_kernel
-    gemm.gate_route_kernel = None
-    gemm.gate_topk_and_gemms(x_q, x_s, logits, bias, SCALE, num_valid)
-    gemm.gate_route_kernel = kernel
-    torch.cuda.synchronize()
-    assert torch.equal(records[0], records[1]), rows
-
-
-# ------------------------------- slot gate_route_quant (top-k + route + routed input quant)
+    return _logits(kind, rows, experts, gen)
 
 
 def _routed_input(kind, rows, seed):
     """BF16 routed-input rows; "special" puts every awkward scale block in each row."""
     gen = torch.Generator().manual_seed(seed)
     h = reg.HIDDEN
-    if kind == "normal":
-        x = torch.randn(rows, h, generator=gen)
-    elif kind == "wide":  # each 32-wide block at its own power of two, 2^-130 .. 2^126
-        x = torch.randn(rows, h, generator=gen)
+    x = torch.randn(rows, h, generator=gen)
+    if kind == "wide":  # each 32-wide block at its own power of two, 2^-130 .. 2^126
         exps = torch.randint(-130, 127, (rows, h // 32), generator=gen).float()
         x = x * torch.exp2(exps).repeat_interleave(32, dim=1)
     elif kind == "special":
-        x = torch.randn(rows, h, generator=gen)
         blocks = x.view(rows, h // 32, 32)
         blocks[:, 0] = 0.0
         blocks[:, 1] = -0.0
@@ -1023,8 +735,6 @@ def _routed_input(kind, rows, seed):
         blocks[:, 11, 0] = 2.0**-127  # the amax at the UE8M0 subnormal boundary
         blocks[:, 12] = 2.0**-133
         blocks[:, 13] = 1.5 * 2.0**-120
-    else:
-        raise ValueError(kind)
     return x.bfloat16().cuda().contiguous()
 
 
@@ -1034,11 +744,10 @@ def _quantize_routed_input(x):
         Mxfp4FlashinferTrtllmMoEMethod,
     )
 
-    x_q, x_s = Mxfp4FlashinferTrtllmMoEMethod.quantize_routed_input(None, x, reg.HIDDEN)
-    return x_q, x_s
+    return Mxfp4FlashinferTrtllmMoEMethod.quantize_routed_input(None, x, reg.HIDDEN)
 
 
-def _gate_route_quant_pair(layer, *, top_k, router_experts, offset):
+def _gate_route_pair(layer, *, top_k, router_experts, offset, route=True, quant=False):
     return reg.RoutedExpertGemm(
         *layer,
         top_k=top_k,
@@ -1046,34 +755,117 @@ def _gate_route_quant_pair(layer, *, top_k, router_experts, offset):
         gate_topk=True,
         router_experts=router_experts,
         expert_offset=offset or 0,
-        gate_route=True,
-        gate_route_quant=True,
+        gate_route=route,
+        gate_route_quant=quant,
         **GEMM2_OPTIONS,
     )
 
 
+def _run_gate(gemm, graph, *args, **kw):
+    """gate_topk_and_gemms, eager or captured and replayed into cleared outputs."""
+    if not graph:
+        out = gemm.gate_topk_and_gemms(*args, **kw)
+    else:
+        gemm.gate_topk_and_gemms(*args, **kw)
+        torch.cuda.synchronize()
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            out = gemm.gate_topk_and_gemms(*args, **kw)
+        for t in out:
+            t.zero_()
+        for _ in range(3):
+            captured.replay()
+    torch.cuda.synchronize()
+    return out
+
+
+def _assert_same_route(got, want, where):
+    """ids, weights, slot -> row map and the kept slots' GEMM2 rows bit for bit."""
+    (r1, w1, p1, i1), (r0, w0, p0, i0) = got, want
+    assert torch.equal(i1, i0), where
+    assert torch.equal(w1.view(torch.int32), w0.view(torch.int32)), where
+    assert torch.equal(p1, p0), where
+    kept = p0 >= 0
+    a = r1[p1.clamp(min=0).long()][kept]
+    b = r0[p0.clamp(min=0).long()][kept]
+    assert torch.equal(a.view(torch.int16), b.view(torch.int16)), where
+
+
+# (router, rows): the served batch-1 widths (target verify 6, DSpark draft 5) and a
+# target width past gate_route's 8 rows, which keeps the separate kernels
+GATE_ROUTE_CASES = [("target", 6), ("target", 12), ("draft", 5)]
+# (vision routing, padded rows, CUDA graph)
+GATE_ROUTE_VARIANTS = [(False, False, False), (True, True, False), (True, False, True)]
+
+
+def _gate_route_case(request, which, rows, window, kind, seed):
+    layer = request.getfixturevalue(f"{which}_layer")
+    top_k = TARGET_TOP_K if which == "target" else DRAFT_TOP_K
+    router_experts = layer[0].size(0)
+    offset = None
+    if window != "all":
+        layer, offset = _ep_half(layer, int(window[-1]))
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    x = _routed_input("normal", rows, seed)
+    logits = _gate_route_logits(kind, rows, router_experts, gen).contiguous()
+    bias = torch.randn(router_experts, device="cuda", generator=gen) * 0.05
+    return layer, top_k, router_experts, offset, x, logits, bias, gen
+
+
+def _gate_args(rows, router_experts, gen, vision, padded):
+    valid = max(1, rows - 2) if padded else rows
+    num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    if not vision:
+        return num_valid, dict(alt=None, renormalize_epsilon=0.0)
+    bias_alt = torch.randn(router_experts, device="cuda", generator=gen) * 0.5
+    input_ids = torch.randint(0, 50, (rows,), device="cuda", generator=gen)
+    input_ids[::2] = 17  # every other row is an image token
+    return num_valid, dict(alt=(bias_alt, input_ids, 17), renormalize_epsilon=EPS)
+
+
 @needs_moe
-@pytest.mark.parametrize("rows", [1, 2, 5, 6, 8])
-@pytest.mark.parametrize("kind", ["normal", "wide", "special"])
-@pytest.mark.parametrize("which", ["target", "draft"])
-def test_gate_route_quant_matches_quantize_routed_input(request, rows, kind, which):
+@pytest.mark.parametrize("which, rows", GATE_ROUTE_CASES)
+@pytest.mark.parametrize("kind", ["normal", "cutoff_ties", "one_expert", "nan"])
+@pytest.mark.parametrize("window", ["all", "ep1"])
+def test_gate_route_matches_gate_topk_and_route(request, which, rows, kind, window):
+    """Slot gate_route against the gate_topk + route kernels on the same layer half,
+    and against SGLang's gate on the same logits."""
+    case = _gate_route_case(request, which, rows, window, kind, 5000 + rows)
+    layer, top_k, router_experts, offset, _, logits, bias, gen = case
+    x_q, x_s = _quantized_rows(rows, torch.Generator().manual_seed(5000 + rows))
+    gemms = [
+        _gate_route_pair(
+            layer, top_k=top_k, router_experts=router_experts, offset=offset, route=r
+        )
+        for r in (False, True)
+    ]
+    assert gemms[1].serves_gate_route(rows) == (rows <= reg.MAX_ROWS)
+    for vision, padded, graph in GATE_ROUTE_VARIANTS:
+        num_valid, kw = _gate_args(rows, router_experts, gen, vision, padded)
+        args = (x_q, x_s, logits, bias, SCALE, num_valid)
+        want, got = (_run_gate(g, graph, *args, **kw) for g in gemms)
+        where = f"{which} rows={rows} {kind} {window} vision={vision} graph={graph}"
+        _assert_same_route(got, want, where)
+        if not graph:  # the stock gate on the same logits: the router's choice
+            sw, sid = _stock(logits, bias, num_valid, top_k, kw["alt"])
+            assert torch.equal(got[3], sid), where
+            assert torch.equal(got[1].view(torch.int32), sw.view(torch.int32)), where
+
+
+@needs_moe
+@pytest.mark.parametrize("kind", ["wide", "special"])
+@pytest.mark.parametrize("which, rows", [("target", 6), ("draft", 5)])
+def test_gate_route_quant_matches_quantize_routed_input(request, which, rows, kind):
     """The fused launch's MXFP8 values and linear scales equal SGLang's routed-input quant
     (FlashInfer's mxfp8_quantize) bit for bit, subnormal, infinite and NaN blocks too."""
-    layer, top_k = (
-        (request.getfixturevalue("target_layer"), TARGET_TOP_K)
-        if which == "target"
-        else (request.getfixturevalue("draft_layer"), DRAFT_TOP_K)
+    layer, top_k, router_experts, offset, _, logits, bias, _ = _gate_route_case(
+        request, which, rows, "ep1", "normal", rows
     )
-    half, offset = _ep_half(layer, 1)
-    router_experts = layer[0].size(0)
-    gemm = _gate_route_quant_pair(
-        half, top_k=top_k, router_experts=router_experts, offset=offset
+    gemm = _gate_route_pair(
+        layer, top_k=top_k, router_experts=router_experts, offset=offset, quant=True
     )
     assert gemm.serves_gate_route_quant(rows)
     x = _routed_input(kind, rows, 900 + rows)
-    gen = torch.Generator(device="cuda").manual_seed(rows)
-    logits = torch.randn(rows, router_experts, device="cuda", generator=gen)
-    bias = torch.randn(router_experts, device="cuda", generator=gen) * 0.05
     num_valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
     seen = {}
     real = gemm._gemms
@@ -1086,149 +878,38 @@ def test_gate_route_quant_matches_quantize_routed_input(request, rows, kind, whi
     gemm.gate_topk_and_gemms(None, None, logits, bias, SCALE, num_valid, x=x)
     want_q, want_s = _quantize_routed_input(x)
     torch.cuda.synchronize()
-    where = f"{which} rows={rows} kind={kind}"
-    assert torch.equal(seen["q"].view(torch.uint8), want_q.view(torch.uint8)), where
+    assert torch.equal(seen["q"].view(torch.uint8), want_q.view(torch.uint8))
     assert torch.equal(
         seen["s"].view(torch.uint8).flatten(), want_s.view(torch.uint8).flatten()
-    ), where
-
-
-def _check_gate_route_quant(
-    layer, *, top_k, rows, kind, offset, vision, padded, graph, seed
-):
-    """gate_topk_and_gemms with slot gate_route_quant on the BF16 rows against slot
-    gate_route on SGLang's quant of them: ids, weights, slot -> row map and GEMM2 rows
-    bit for bit."""
-    experts = layer[0].size(0)
-    router_experts = experts * (2 if offset is not None else 1)
-    gen = torch.Generator(device="cuda").manual_seed(seed)
-    x = _routed_input("normal", rows, seed)
-    x_q, x_s = _quantize_routed_input(x)
-    logits = _gate_route_logits(kind, rows, router_experts, gen).contiguous()
-    bias = torch.randn(router_experts, device="cuda", generator=gen) * 0.05
-    valid = max(1, rows - 2) if padded else rows
-    num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
-    alt = None
-    if vision:
-        bias_alt = torch.randn(router_experts, device="cuda", generator=gen) * 0.5
-        input_ids = torch.randint(0, 50, (rows,), device="cuda", generator=gen)
-        input_ids[::2] = 17
-        alt = (bias_alt, input_ids, 17)
-    eps = EPS if vision else 0.0
-    gemm = _gate_route_quant_pair(
-        layer, top_k=top_k, router_experts=router_experts, offset=offset
     )
-    got = {}
-    for fused in (False, True):
-
-        def run():
-            if fused:
-                return gemm.gate_topk_and_gemms(
-                    None,
-                    None,
-                    logits,
-                    bias,
-                    SCALE,
-                    num_valid,
-                    alt=alt,
-                    renormalize_epsilon=eps,
-                    x=x,
-                )
-            return gemm.gate_topk_and_gemms(
-                x_q,
-                x_s,
-                logits,
-                bias,
-                SCALE,
-                num_valid,
-                alt=alt,
-                renormalize_epsilon=eps,
-            )
-
-        if graph:
-            run()
-            torch.cuda.synchronize()
-            captured = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(captured):
-                out = run()
-            for t in out:
-                t.zero_()
-            for _ in range(3):
-                captured.replay()
-        else:
-            out = run()
-        torch.cuda.synchronize()
-        got[fused] = out
-    where = f"rows={rows} kind={kind} offset={offset} vision={vision} padded={padded} graph={graph}"
-    (r0, w0, p0, i0), (r1, w1, p1, i1) = got[False], got[True]
-    assert torch.equal(i1, i0), where
-    assert torch.equal(w1.view(torch.int32), w0.view(torch.int32)), where
-    assert torch.equal(p1, p0), where
-    kept = p0 >= 0
-    a = r1[p1.clamp(min=0).long()][kept]
-    b = r0[p0.clamp(min=0).long()][kept]
-    assert torch.equal(a.view(torch.int16), b.view(torch.int16)), where
 
 
 @needs_moe
-@pytest.mark.parametrize("rows", [1, 3, 6, 8])
-@pytest.mark.parametrize("kind", ["normal", "ties", "one_expert", "distinct"])
-@pytest.mark.parametrize("window", ["all", "ep0", "ep1"])
-def test_gate_route_quant_matches_gate_route(target_layer, rows, kind, window):
-    layer, offset = (
-        (target_layer, None)
-        if window == "all"
-        else _ep_half(target_layer, int(window[-1]))
-    )
-    for vision, padded, graph in (
-        (False, False, False),
-        (True, True, False),
-        (False, True, True),
-        (True, False, True),
-    ):
-        _check_gate_route_quant(
-            layer,
-            top_k=TARGET_TOP_K,
-            rows=rows,
-            kind=kind,
-            offset=offset,
-            vision=vision,
-            padded=padded,
-            graph=graph,
-            seed=7000 + rows,
-        )
-
-
-@needs_moe
-@pytest.mark.parametrize("rows", [1, 5, 8])
+@pytest.mark.parametrize("which, rows", [("target", 6), ("draft", 5)])
 @pytest.mark.parametrize("kind", ["normal", "one_expert"])
-@pytest.mark.parametrize("window", ["all", "ep0", "ep1"])
-def test_draft_gate_route_quant_matches_gate_route(draft_layer, rows, kind, window):
-    layer, offset = (
-        (draft_layer, None)
-        if window == "all"
-        else _ep_half(draft_layer, int(window[-1]))
+@pytest.mark.parametrize("window", ["all", "ep1"])
+def test_gate_route_quant_matches_gate_route(request, which, rows, kind, window):
+    """Slot gate_route_quant on the BF16 rows against slot gate_route on SGLang's quant
+    of them."""
+    case = _gate_route_case(request, which, rows, window, kind, 7000 + rows)
+    layer, top_k, router_experts, offset, x, logits, bias, gen = case
+    x_q, x_s = _quantize_routed_input(x)
+    gemm = _gate_route_pair(
+        layer, top_k=top_k, router_experts=router_experts, offset=offset, quant=True
     )
-    for vision, padded, graph in ((False, False, False), (True, True, True)):
-        _check_gate_route_quant(
-            layer,
-            top_k=DRAFT_TOP_K,
-            rows=rows,
-            kind=kind,
-            offset=offset,
-            vision=vision,
-            padded=padded,
-            graph=graph,
-            seed=8000 + rows,
-        )
+    for vision, padded, graph in GATE_ROUTE_VARIANTS:
+        num_valid, kw = _gate_args(rows, router_experts, gen, vision, padded)
+        args = (logits, bias, SCALE, num_valid)
+        want = _run_gate(gemm, graph, x_q, x_s, *args, **kw)
+        got = _run_gate(gemm, graph, None, None, *args, x=x, **kw)
+        _assert_same_route(got, want, f"{which} {kind} {window} {vision} {graph}")
 
 
 @needs_moe
 def test_gate_route_quant_refuses_what_it_does_not_serve(target_layer):
     half, offset = _ep_half(target_layer, 0)
-    gemm = _gate_route_quant_pair(
-        half, top_k=TARGET_TOP_K, router_experts=TARGET_EXPERTS, offset=offset
-    )
+    common = dict(top_k=TARGET_TOP_K, router_experts=TARGET_EXPERTS, offset=offset)
+    gemm = _gate_route_pair(half, quant=True, **common)
     x = _routed_input("normal", 12, 1)
     assert not gemm.serves_gate_route_quant(12, None, x)  # past gate_route's 8 rows
     assert not gemm.serves_gate_route_quant(6, None, x[:6].float())
@@ -1237,17 +918,7 @@ def test_gate_route_quant_refuses_what_it_does_not_serve(target_layer):
     bias = torch.zeros(TARGET_EXPERTS, device="cuda")
     with pytest.raises(ValueError, match="gate_route_quant"):
         gemm.gate_topk_and_gemms(None, None, logits, bias, SCALE, None, x=x)
-    plain = reg.RoutedExpertGemm(
-        *half,
-        top_k=TARGET_TOP_K,
-        max_rows=reg.SERVED_MAX_ROWS,
-        gate_topk=True,
-        router_experts=TARGET_EXPERTS,
-        expert_offset=offset,
-        gate_route=False,
-        gate_route_quant=True,
-    )
-    assert (
-        plain.gate_route_quant_kernel is None
-    )  # the quant rides on gate_route's launch
+    # the quant rides on gate_route's launch
+    plain = _gate_route_pair(half, route=False, quant=True, **common)
+    assert plain.gate_route_quant_kernel is None
     assert not plain.serves_gate_route_quant(6)

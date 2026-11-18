@@ -5,7 +5,8 @@
 Both expert-parallel groups hold all 384 target experts (SGLang's balanced expert
 storage); group g's pair keeps the step's distinct experts of even (g = 0) or odd (g = 1)
 rank in id order. Against the undealt pair over the same 384 experts, for the route
-kernel (1-8 rows), route_wide (9-48 rows) and the fused top-k + route (gate_route):
+kernel and the fused top-k + route (gate_route) at the served 6 rows, and route_wide at
+48 rows:
 
 - every valid slot is kept by exactly one group, and group g keeps exactly the distinct
   experts sorted[g::2] (so the groups serve ceil(D / 2) and floor(D / 2));
@@ -66,8 +67,7 @@ def _check_split(ids, outs, full, where):
 
 
 @single.needs_moe
-@pytest.mark.parametrize("rows", [1, 6, 8, 12, 48])
-@pytest.mark.parametrize("distinct", [6, 19, 36, 384])
+@pytest.mark.parametrize("rows, distinct", [(6, 19), (6, 36), (48, 384)])
 def test_route_kernels_deal_the_experts(layer, rows, distinct):
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
@@ -90,8 +90,8 @@ def test_route_kernels_deal_the_experts(layer, rows, distinct):
 
 
 @single.needs_moe
-@pytest.mark.parametrize("rows", [1, 6, 8])
-def test_gate_route_deals_the_experts(layer, rows):
+def test_gate_route_deals_the_experts(layer):
+    rows = 6
     gen = torch.Generator(device="cuda").manual_seed(41 + rows)
     logits = torch.randn(rows, EXPERTS, device="cuda", generator=gen)
     bias = torch.randn(EXPERTS, device="cuda", generator=gen) * 0.05

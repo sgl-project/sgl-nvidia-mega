@@ -345,13 +345,12 @@ def test_draft_final_collapse_is_the_draft_heads_hc_combine(env):
             head = sglang_ops.hc_combine(tail, inp.pre, HC, streams.dtype)
             assert _same(collapsed, head), (label, tail.dtype)
 
-    for rows in ROWS:
-        inp = _inputs(rows, 700 + rows, env)
-        for i in range(3):  # cycle the generations, interleaved with the plain hop
-            if i == 1 and env.rank == rows % env.tp:
-                torch.cuda._sleep(20_000)
-            streams, collapsed = last_post(inp)
-            check(streams, collapsed, inp, (rows, i))
+    inp = _inputs(GAMMA, 700, env)
+    for i in range(3):  # cycle the generations, interleaved with the plain hop
+        if i == 1 and env.rank == GAMMA % env.tp:
+            torch.cuda._sleep(20_000)
+        streams, collapsed = last_post(inp)
+        check(streams, collapsed, inp, i)
     inp = _inputs(GAMMA, 777, env)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
