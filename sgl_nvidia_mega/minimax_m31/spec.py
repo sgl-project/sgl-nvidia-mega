@@ -150,7 +150,7 @@ REQUIREMENTS = Requirements(
 
 # Slot mega's step's logits against SGLang's forward on the same eager step
 # (SGLANG_NVIDIA_MEGAKERNEL_PARITY=1; 835 verify steps of the first 20 GSM8K replies as
-# test/e2e/test_minimax_m31_server.py asks them, on 4 x GB300), measured with about 15%
+# test/e2e/test_minimax_m31_parity.py asks them, on 4 x GB300), measured with about 15%
 # headroom. Per step: the largest |difference| over the largest |logit|, its median and
 # 99th percentile (measured 0.101, 0.262); the fraction of rows whose argmax agrees, a
 # lower bound (0.957); the largest row KL(SGLang || this) at the median and 99th
