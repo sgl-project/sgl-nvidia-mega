@@ -14,8 +14,6 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sglang.srt.runtime_context import get_model
 
-from sgl_nvidia_mega.kimi_k31.k3.shape_policy import resident_blocks
-
 from sgl_nvidia_mega.kimi_k31.k3._host import (  # noqa: E402
     BuildContext,
     BuiltMegakernel,
@@ -26,6 +24,7 @@ from sgl_nvidia_mega.kimi_k31.k3._host import (  # noqa: E402
     Requirements,
     Step,
 )
+from sgl_nvidia_mega.kimi_k31.k3.shape_policy import resident_blocks
 
 if TYPE_CHECKING:
     from sgl_nvidia_mega.kimi_k31.k3._host import PreparationView
