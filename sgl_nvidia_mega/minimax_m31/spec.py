@@ -11,7 +11,9 @@ every rank, listing every reason. The checks of slot mega's kernels (their toolc
 the config fields they are built for, the context their page tables hold, the
 persistent grid's residency) apply while it is requested; so do those of the DSpark
 draft's slots markov and draft_lm_head (``draft_config_reasons``), which the draft
-spec builds (``draft``). This module stays light: SGLang imports it in the launcher.
+spec builds (``draft``), and of the opt-in slot lm_head_mxfp8
+(``lm_head_config_reasons``), which closes slot mega's step on an MXFP8 copy of the LM
+head. This module stays light: SGLang imports it in the launcher.
 """
 
 from __future__ import annotations
@@ -84,6 +86,8 @@ SGLANG_READS = {
         "disable_overlap_schedule",
         # SGLang's own quantized draft LM head, which slot draft_lm_head would double
         "speculative_dspark_lm_head_dtype",
+        # an FP32 LM head, which slot lm_head_mxfp8's BF16 stream cannot stand in for
+        "enable_fp32_lm_head",
     ),
     "srt/environ.py": (
         "envs",
@@ -165,16 +169,40 @@ MEGA_TOLERANCES = {
 }
 
 
+# Slot lm_head_mxfp8: this rank's shard of the step's logits from the MXFP8 stream
+# against SGLang's BF16 projection (torch.matmul on the BF16 shard) of the same hidden
+# rows: the largest |difference| over the largest |value| of the BF16 projection. The
+# weight's E4M3 rounding is the whole difference (the stream multiplies the dequantized
+# weight exactly and sums in FP32): a code is within 2^-4 of its weight, about 2.7% RMS
+# on Gaussian weights, where the ratio comes to 0.022-0.026 (the quantizer on CPU). The
+# bound is deepseek_v41's for the same quantizer and kernel
+# (target_lm_head_mxfp8.logits.rel).
+# test/kernels/test_minimax_m31_lm_head_mxfp8.py asserts it on Gaussian weights of the
+# TP4 shard's shape (N 50016, K 6144), eagerly and from CUDA graph replay; the build
+# asserts it on every rank's own shard, on seeded Gaussian rows
+# (logits.check_against_sglang); the parity switch logs it on the served rows
+# (logits.Mxfp8LmHead.log_parity). It is not a bound for every input: rows whose
+# products cancel far below their terms can differ by more of a small peak.
+# MEGA_TOLERANCES were measured without this slot, whose error adds to the step's
+LM_HEAD_TOLERANCES = {
+    "lm_head_mxfp8.logits.rel": 4e-2,
+}
+
+
 def _numerics(slots: frozenset = SLOTS) -> Numerics:
-    """TOLERANCE with slot mega (its steps' tolerances above), else BITWISE: the stock
-    executor runs SGLang's modules in SGLang's order, and the other slots
-    (runtime.BITWISE_SLOTS) run SGLang's kernels with SGLang's arguments. These are the
-    target's verify steps against SGLang's on the same inputs; the DSpark draft's slots
-    change the draft tokens those steps verify, and state their tolerances in the draft
-    spec's numerics (draft.NUMERICS)."""
+    """TOLERANCE with slot mega (its steps' tolerances above, and with slot
+    lm_head_mxfp8 its projection's), else BITWISE: the stock executor runs SGLang's
+    modules in SGLang's order, and the other slots (runtime.BITWISE_SLOTS) run SGLang's
+    kernels with SGLang's arguments. These are the target's verify steps against
+    SGLang's on the same inputs; the DSpark draft's slots change the draft tokens those
+    steps verify, and state their tolerances in the draft spec's numerics
+    (draft.NUMERICS)."""
     if target_slots(slots) <= BITWISE_SLOTS:
         return Numerics(kind=NumericsKind.BITWISE)
-    return Numerics(kind=NumericsKind.TOLERANCE, tolerances=MEGA_TOLERANCES)
+    tolerances = dict(MEGA_TOLERANCES)
+    if "lm_head_mxfp8" in slots:
+        tolerances.update(LM_HEAD_TOLERANCES)
+    return Numerics(kind=NumericsKind.TOLERANCE, tolerances=tolerances)
 
 
 NUMERICS = _numerics()
@@ -199,12 +227,12 @@ def _has_module(name: str) -> bool:
 
 def toolchain_reasons(slots: frozenset = SLOTS) -> list[str]:
     """The requested slots' toolchains, by import spec only: slot mega's kernels build
-    with the CUDA Python bindings and nvcc 13.4 or newer; slot markov's chain with the
-    bindings and any nvcc, its noise kernel with Triton; slot moe_nofill launches
-    FlashInfer's CuTe-DSL quantize (FlashInfer, CuTe DSL); slot draft_lm_head SGLang's
-    FlashInfer MXFP8 linear."""
+    with the CUDA Python bindings and nvcc 13.4 or newer; slot markov's chain and slot
+    lm_head_mxfp8's stream with the bindings and any nvcc, the chain's noise kernel
+    with Triton; slot moe_nofill launches FlashInfer's CuTe-DSL quantize (FlashInfer,
+    CuTe DSL); slot draft_lm_head SGLang's FlashInfer MXFP8 linear."""
     reasons = []
-    if slots & {"mega", "markov"}:
+    if slots & {"mega", "markov", "lm_head_mxfp8"}:
         if not _has_module("cuda.bindings"):
             reasons.append("needs the CUDA Python bindings")
         else:
@@ -310,6 +338,22 @@ def draft_config_reasons(cfg, slots: frozenset = SLOTS) -> list[str]:
     return reasons
 
 
+def lm_head_config_reasons(cfg, slots: frozenset = SLOTS) -> list[str]:
+    """Why slot lm_head_mxfp8 would not run on this server ([] when it would, or it is
+    not requested): its stream gives BF16 logits where SGLang's BF16 GEMM does, so a
+    server that asks for the FP32 LM head has no projection for it to replace. The
+    loaded head's own checks follow at load (``logits.head_reasons``)."""
+    if "lm_head_mxfp8" not in slots:
+        return []
+    reasons = []
+    if cfg.enable_fp32_lm_head:
+        reasons.append(
+            "slot lm_head_mxfp8 replaces SGLang's BF16 LM-head projection; "
+            "--enable-fp32-lm-head asks for the FP32 one: drop one of the two"
+        )
+    return reasons
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """The checks ``REQUIREMENTS`` cannot state: the requested slots, nested HF fields,
     derived values and the toolchains."""
@@ -318,6 +362,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         + toolchain_reasons(SLOTS)
         + flashinfer_api_reasons(SLOTS)
         + draft_config_reasons(cfg, SLOTS)
+        + lm_head_config_reasons(cfg, SLOTS)
     )
     if cfg.quantization not in (None, "minimax_m3_nvfp4"):
         reasons.append(

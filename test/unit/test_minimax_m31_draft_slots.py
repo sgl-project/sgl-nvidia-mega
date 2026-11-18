@@ -49,7 +49,8 @@ def test_markov_ships_and_draft_lm_head_is_opt_in():
     assert m31_runtime.requested_slots({}) == TARGET_SLOTS | {"markov"}
     assert "markov" in m31_runtime.SHIPPED_SLOTS
     assert "draft_lm_head" not in m31_runtime.SHIPPED_SLOTS
-    assert m31_runtime.OPT_IN_SLOTS == ("draft_lm_head",)
+    # lm_head_mxfp8 is the target's (test_minimax_m31_lm_head_mxfp8.py)
+    assert m31_runtime.OPT_IN_SLOTS == ("draft_lm_head", "lm_head_mxfp8")
     assert m31_runtime.DRAFT_SLOTS == ("markov", "draft_lm_head")
     listed = m31_runtime.requested_slots(
         {env: "mega,moe_nofill,moe_swap,markov,draft_lm_head"}
@@ -71,7 +72,10 @@ def test_the_slot_list_refusals_name_the_draft_slots():
     assert "slot 'draft_lm_head' needs slot 'markov'" in needs
     (unknown,) = m31_runtime.slot_reasons(frozenset({"markov", "draft_head"}))
     assert "unknown slot 'draft_head'" in unknown
-    assert "(known: mega, moe_nofill, moe_swap, markov, draft_lm_head)" in unknown
+    assert (
+        "(known: mega, moe_nofill, moe_swap, markov, draft_lm_head, lm_head_mxfp8)"
+        in unknown
+    )
 
 
 def test_the_draft_slots_state_their_tolerances_in_the_draft_spec():

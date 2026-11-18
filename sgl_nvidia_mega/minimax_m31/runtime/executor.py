@@ -13,7 +13,9 @@ switch). ``MegakernelDecode.forward`` takes and returns what
 ``MiniMaxM3SparseForConditionalGeneration.forward`` does, by the width's slots:
 
 - slot mega (one request's 8 rows): ``runtime.mega.MegaStep.run``, MegaAttention and
-  the token-parallel MoE on every MoE layer (not bitwise; ``spec.NUMERICS``);
+  the token-parallel MoE on every MoE layer (not bitwise; ``spec.NUMERICS``); with
+  slot lm_head_mxfp8 SGLang's logits processor closes it on the LM head's MXFP8
+  stream (``logits.Mxfp8LmHead``; not bitwise either);
 - otherwise the stock executor, from the step functions over SGLang's loaded modules,
   never through the model's or a decoder layer's ``forward``:
 
@@ -217,6 +219,14 @@ class MegakernelDecode:
     def _forward(self, step: Step, input_ids, positions, forward_batch):
         """``MiniMaxM3SparseForConditionalGeneration.forward`` for a covered step."""
         slots = self.slot_plan[step.rows]
+        if slots.mega and slots.lm_head_mxfp8:
+            return self.mega.run(
+                step,
+                input_ids,
+                positions,
+                forward_batch,
+                lm_head=self.bound["lm_head_mxfp8"],
+            )
         if slots.mega:
             return self.mega.run(step, input_ids, positions, forward_batch)
         return self._stock(step, slots, input_ids, positions, forward_batch)

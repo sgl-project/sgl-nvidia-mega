@@ -9,7 +9,10 @@ Two log lines, both starting ``NVIDIA megakernel parity``:
 - a step slot mega serves (``log_parity``, also the draft step's): the logits' (or the
   draft's rows') largest difference, its ratio to the largest value, the smallest row
   cosine, the fraction of rows whose argmax agrees and the largest row KL, against the
-  tolerances ``spec.NUMERICS`` (``draft.NUMERICS``) states;
+  tolerances ``spec.NUMERICS`` (``draft.NUMERICS``) states; with slot lm_head_mxfp8
+  such a step logs a second line of the same form for the slot alone, this rank's
+  shard of the logits from its MXFP8 stream against SGLang's BF16 projection of the
+  same hidden rows (``logits.Mxfp8LmHead.log_parity``);
 - any other covered step (``log_bitwise``), whose slots are bitwise: the largest
   difference of the logits and of the DSpark hidden states, that over the largest
   value, and the fraction of elements that differ (``0 (rel 0.00e+00, 0.00% differ)``

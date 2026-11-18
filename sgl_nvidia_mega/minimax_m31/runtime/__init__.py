@@ -62,7 +62,13 @@ SGLANG_READS = {
 SHIPPED_SLOTS: tuple[str, ...] = ("mega", "moe_nofill", "moe_swap", "markov")
 # Slots that run only when SLOTS_ENV lists them:
 # - draft_lm_head: a slot of the DSpark draft (DRAFT_SLOTS below)
-OPT_IN_SLOTS: tuple[str, ...] = ("draft_lm_head",)
+# - lm_head_mxfp8: the step slot mega serves (8 rows) projects its final-normed hidden
+#   rows through an MXFP8 copy of this rank's LM-head shard (E4M3 codes and UE8M0
+#   scales of 32 columns, about 300 MiB a rank, made at load) on a weight-stream
+#   kernel (logits, sm103/logits/lm_head_mxfp8.py), half the bytes of the BF16 shard
+#   SGLang's GEMM reads; SGLang's cross-rank gather, FP32 cast and logits processing
+#   follow. Not bitwise (E4M3 weights): spec.LM_HEAD_TOLERANCES states its bound
+OPT_IN_SLOTS: tuple[str, ...] = ("draft_lm_head", "lm_head_mxfp8")
 # The DSpark draft's slots: the draft spec builds them (draft.SPEC, draft_step), not
 # the target's plan, and they replace SGLang's folded proposal, the tail of the draft's
 # CUDA graph, at 1-16 requests. Neither is bitwise (DRAFT_TOLERANCES, in draft.NUMERICS):
@@ -88,9 +94,11 @@ NEEDS: dict[str, tuple[str, ...]] = {
     "moe_swap": ("moe_nofill",),
     # the MXFP8 copy serves the chain's step
     "draft_lm_head": ("markov",),
+    # the stream closes the one step slot mega serves
+    "lm_head_mxfp8": ("mega",),
 }
-# The slots whose kernels agree with SGLang's bit for bit; slot mega makes the spec's
-# numerics TOLERANCE (spec.NUMERICS)
+# The slots whose kernels agree with SGLang's bit for bit; slots mega and lm_head_mxfp8
+# make the spec's numerics TOLERANCE (spec.NUMERICS)
 BITWISE_SLOTS: frozenset[str] = frozenset({"moe_nofill", "moe_swap"})
 # draft slot -> {quantity: its largest difference against SGLang's proposal}
 DRAFT_TOLERANCES: dict[str, dict[str, float]] = {
@@ -206,12 +214,16 @@ def model_disable_reasons(model: Any, hf_config: Any, slots=None) -> list[str]:
         from sgl_nvidia_mega.minimax_m31.runtime import mega
 
         reasons += mega.model_disable_reasons(model, hf_config)
+    if "lm_head_mxfp8" in slots and not reasons:
+        from sgl_nvidia_mega.minimax_m31 import logits
+
+        reasons += [f"slot lm_head_mxfp8: {r}" for r in logits.head_reasons(model)]
     return reasons
 
 
 def build(model: Any, hf_config: Any, ctx: Any):
     """The executor of the covered steps; ``ctx`` is SGLang's BuildContext."""
-    from sgl_nvidia_mega.minimax_m31 import MAX_REQUESTS, ROWS, moe
+    from sgl_nvidia_mega.minimax_m31 import MAX_REQUESTS, ROWS, logits, moe
     from sgl_nvidia_mega.minimax_m31 import plan as slot_plan
     from sgl_nvidia_mega.minimax_m31.plan import Facts, served_widths
     from sgl_nvidia_mega.minimax_m31.runtime.agree import agree_tp
@@ -236,10 +248,17 @@ def build(model: Any, hf_config: Any, ctx: Any):
     # each slot's build result (None with its slot off) and the widths it serves
     bound: dict[str, Any] = {"moe": moe.build(model, widths, SLOTS)}
     bound["moe_swap"] = moe.build_swap(model, widths, SLOTS, bound["moe"])
+    # it closes slot mega's step: without that step it is not built (and refused below)
+    bound["lm_head_mxfp8"] = (
+        logits.build(model, widths, SLOTS) if mega is not None else None
+    )
     facts = Facts(
         mega=frozenset({ROWS}) if mega is not None else frozenset(),
         moe_nofill=frozenset(w for w in widths if moe.serves(bound["moe"], w)),
         moe_swap=frozenset(w for w in widths if moe.serves(bound["moe_swap"], w)),
+        lm_head_mxfp8=(
+            frozenset({ROWS}) if bound["lm_head_mxfp8"] is not None else frozenset()
+        ),
     )
     # every rank must launch the same kernels at each width
     agree_tp(facts, what="slot plans (widths per slot)")
@@ -254,6 +273,13 @@ def build(model: Any, hf_config: Any, ctx: Any):
             "mega": "built" if mega is not None else "not requested",
             "moe_nofill": _reason(bound["moe"]),
             "moe_swap": _reason(bound["moe_swap"]),
+            "lm_head_mxfp8": (
+                "built"
+                if bound["lm_head_mxfp8"] is not None
+                else "not requested"
+                if "lm_head_mxfp8" not in SLOTS
+                else "slot mega's step is not built"
+            ),
         }
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} serve no width of "
@@ -267,6 +293,8 @@ def build(model: Any, hf_config: Any, ctx: Any):
     )
     if mega is not None:
         summary += f"; mega: {mega.summary()}"
+    if bound["lm_head_mxfp8"] is not None:
+        summary += f"; lm_head_mxfp8: {bound['lm_head_mxfp8'].summary()}"
     engagement = None
     if draft:
         from sgl_nvidia_mega.minimax_m31.draft import (
