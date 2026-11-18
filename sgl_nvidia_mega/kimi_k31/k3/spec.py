@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103 and VR200/SM107."""
+"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103 and VR200/SM107 (and GB200/SM100, B300 with sm148)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     import sglang.srt.megakernels.spec as _host_spec
 
 from sglang.srt.runtime_context import get_model
+
+from sgl_nvidia_mega.kimi_k31.k3.shape_policy import resident_blocks
 
 from sgl_nvidia_mega.kimi_k31.k3._host import (  # noqa: E402
     BuildContext,
@@ -254,9 +256,10 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
 SPEC = MegakernelSpec(
     name="Kimi K3 packed-MXFP4",
     requires=Requirements(
-        isas=frozenset({"sm_103"}),
+        # sm_100: GB200/B200; the kernels JIT for the live arch (sm_100a), no kernel change
+        isas=frozenset({"sm_100", "sm_103"}),
         tp_sizes=frozenset({8, 16}),
-        resident_blocks=152,
+        resident_blocks=resident_blocks(),  # 152, or 148 with "sm148" in SGLANG_NVIDIA_MEGAKERNEL_SLOTS
         dtypes=frozenset({"bfloat16"}),
         decode_graph_backends=frozenset({"full"}),
         server_args={
