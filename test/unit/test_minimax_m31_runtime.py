@@ -169,9 +169,10 @@ class TestSlotList(CustomTestCase):
 
     def test_parsing(self):
         env = m31_runtime.SLOTS_ENV
+        # markov is the DSpark draft's slot (test_minimax_m31_draft_slots.py)
         self.assertEqual(
             m31_runtime.requested_slots({}),
-            frozenset({"mega", "moe_nofill", "moe_swap"}),
+            frozenset({"mega", "moe_nofill", "moe_swap", "markov"}),
         )
         self.assertEqual(m31_runtime.requested_slots({env: ""}), frozenset())
         self.assertEqual(m31_runtime.requested_slots({env: " , "}), frozenset())

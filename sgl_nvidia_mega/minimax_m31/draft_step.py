@@ -7,12 +7,21 @@
 The draft runner's one-request block step (seven rows: the bonus token and six mask
 tokens) runs the draft backbone: the target's vocab-parallel embedding, the five dense
 decoder layers and the final norm in one cooperative launch per rank, every TP4 sum
-inside it. SGLang's draft head (lm_head, Markov head, sampling) and its writes of the
-target's hidden states into the draft KV cache are unchanged; the kernel writes the
-block's own K/V. It reads SGLang's step data in place: the block's ids, positions and
-cache slots, and the attention metadata's KV length and page table."""
+inside it. SGLang's writes of the target's hidden states into the draft KV cache are
+unchanged; the kernel writes the block's own K/V. It reads SGLang's step data in place:
+the block's ids, positions and cache slots, and the attention metadata's KV length and
+page table.
+
+The proposal that samples the block (the draft LM head, the Markov head, the sampling)
+is SGLang's, or with slot ``markov`` the plugin's (``sampler``): the built object
+offers SGLang's folded proposal a ``draft_sampler`` for draft batches of 1-16 requests,
+whose Markov chain is one kernel per rank; slot ``draft_lm_head`` runs its LM head on
+an MXFP8 copy. Its buffers are allocated at the build, before SGLang sizes its KV
+pools; the folded proposal asks for the sampler later, with its own buffers."""
 
 from __future__ import annotations
+
+import logging
 
 import torch
 
@@ -26,12 +35,16 @@ from sgl_nvidia_mega.minimax_m31 import (
     DRAFT_LAYERS,
     DRAFT_ROWS,
     PAGE,
+    ROWS,
     TP,
     weights,
 )
+from sgl_nvidia_mega.minimax_m31.runtime import SLOTS, draft_slots
 from sgl_nvidia_mega.minimax_m31.sm103 import host
 from sgl_nvidia_mega.minimax_m31.sm103.draft import backbone
 from sgl_nvidia_mega.minimax_m31.spec import parity, scaled_rope, serves_this_step
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -39,6 +52,9 @@ SGLANG_READS = {
         "Step",
         "view",
         "deadline_s",
+        "tokens_per_request",
+        # the entry SGLang's folded DSpark proposal asks a built draft spec for
+        "draft_sampler",
     ),
     "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "metadata",
@@ -46,7 +62,18 @@ SGLANG_READS = {
         "pool",
     ),
     "srt/runtime_context.py": ("get_parallel", '"tp_group"', '"attn_tp_size"'),
-    "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
+    "srt/distributed/parallel_state.py": (
+        "cpu_group",
+        "device_group",
+        "world_size",
+        "rank_in_group",
+    ),
+    "srt/environ.py": (
+        "envs",
+        "SGLANG_DSPARK_EMBED_IN_GRAPH",
+        # the draft mode the chain's logit staging follows
+        "SGLANG_DSPARK_USE_GREEDY_DRAFT",
+    ),
     "srt/layers/dp_attention.py|srt/utils/common.py": (
         "get_cuda_graph_batch_size_alignment",
         "require_attn_tp_gather",
@@ -150,9 +177,27 @@ def _row_alignment() -> int:
     )
 
 
+def proposal_disable_reasons(model, slots=None) -> list[str]:
+    """Why slot markov's chain cannot serve the loaded draft's Markov head ([] when it
+    can, or the slot is off). The target's LM head is attached after the build:
+    ``sampler.build_steps`` checks it when the folded proposal asks for the sampler."""
+    if "markov" not in draft_slots(SLOTS if slots is None else slots):
+        return []
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.minimax_m31 import sampler
+
+    # the draft tokens of a block: the verify rows less the anchor (the spec's
+    # requirements fix speculative_num_draft_tokens at ROWS)
+    reason = sampler.head_reason(
+        model, gamma=ROWS - 1, world=get_parallel().tp_group.world_size
+    )
+    return [f"slot markov: {reason}"] if reason else []
+
+
 def model_disable_reasons(model, hf_config) -> list[str]:
-    """Why the loaded draft does not fit the backbone: SGLang checks a draft's spec at load
-    only, so every check runs here."""
+    """Why the loaded draft does not fit the backbone, or the requested draft slots:
+    SGLang checks a draft's spec at load only, so every check runs here."""
     from sglang.srt.environ import envs
     from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
     from sglang.srt.runtime_context import get_parallel
@@ -197,6 +242,7 @@ def model_disable_reasons(model, hf_config) -> list[str]:
         reasons.append(
             "the draft does not embed with the target's vocab-parallel embedding"
         )
+    reasons += proposal_disable_reasons(model)
     layers = getattr(model, "layers", None)
     if layers is None or len(layers) != DRAFT_LAYERS:
         return reasons + [
@@ -246,10 +292,13 @@ def model_disable_reasons(model, hf_config) -> list[str]:
 class DraftStep:
     """One rank's covered draft block: the backbone's kernel and arena, built at load;
     its operands and step bindings, made at the first covered forward (SGLang attaches
-    the target's embedding and sizes the draft KV cache after the build)."""
+    the target's embedding and sizes the draft KV cache after the build). With slot
+    markov also the draft proposal: its buffers, built at load, and the sampler SGLang's
+    folded proposal asks for."""
 
     widths = (DRAFT_ROWS,)
-    # SGLang's proposal samples the block (BuiltMegakernel)
+    # SGLang's proposal samples the block unless slot markov offers the sampler
+    # (BuiltMegakernel; __init__ sets it)
     draft_sampler = None
     # no EAGLE entries, graph variants or speculative runtime hooks (BuiltMegakernel)
     draft_loop = None
@@ -258,13 +307,16 @@ class DraftStep:
     graph_variants = None
     speculative_runtime_hooks = None
 
-    def __init__(self, model, hf_config, ctx):
+    def __init__(self, model, hf_config, ctx, slots=None):
         from sglang.srt.runtime_context import get_parallel
+
+        from sgl_nvidia_mega.minimax_m31 import draft as draft_spec
 
         self.model = model
         tp_group = get_parallel().tp_group
         self.cpu_group = tp_group.cpu_group
         self.device = device = torch.device("cuda", torch.cuda.current_device())
+        self.deadline_s = ctx.deadline_s
         self.deadline_ns = round(ctx.deadline_s * 1e9)
         self.eps = float(model.config.rms_norm_eps)
         backbone.load_module(device.index, self.deadline_ns)
@@ -274,9 +326,82 @@ class DraftStep:
         )
         self.backbone = None
         self._bound = None  # the identity of the step data the backbone reads
+        # the requested draft slots, and what samples the block (for the summary)
+        self.slots = draft_slots(SLOTS if slots is None else slots)
+        self.prebuilt = None  # sampler.Prebuilt, with slot markov built
+        self.proposal = self._build_proposal(ctx, tp_group.rank_in_group)
+        draft_spec._COUNTS["built"] += 1
+
+    def _build_proposal(self, ctx, rank: int) -> str:
+        """What samples the block. With slot markov: the chain's buffers (and slot
+        draft_lm_head's LM-head copy), allocated here, after the backbone's arena and
+        before SGLang sizes its KV pools (collective: every rank builds them in this
+        order), and the sampler offered to SGLang's folded proposal. Every rank logs
+        which proposal it serves and why."""
+        if "markov" not in self.slots:
+            logger.info(
+                "NVIDIA megakernel: DSpark draft proposal on rank %d: SGLang's (slot "
+                "markov is not requested)",
+                rank,
+            )
+            return "SGLang's proposal (slot markov off)"
+        from sglang.srt.environ import envs
+
+        from sgl_nvidia_mega.minimax_m31 import draft as draft_spec
+        from sgl_nvidia_mega.minimax_m31 import sampler
+
+        requested = sorted(self.slots)
+        off = draft_spec.proposal_off_reason()
+        if off:
+            logger.warning(
+                "NVIDIA megakernel: draft slots %s are not engaged on rank %d: %s",
+                requested,
+                rank,
+                off,
+            )
+            return f"SGLang's proposal (draft slots {requested} not engaged: {off})"
+        self.prebuilt = sampler.prebuild(
+            self.model,
+            deadline_s=ctx.deadline_s,
+            slots=self.slots,
+            gamma=ctx.tokens_per_request - 1,
+            greedy_draft=envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get(),
+        )
+        self.draft_sampler = self._draft_sampler
+        lm_head = (
+            "an MXFP8 copy of the LM head"
+            if "draft_lm_head" in self.slots
+            else "SGLang's LM head"
+        )
+        return (
+            f"Markov chain in one kernel at 1-{sampler.MAX_REQUESTS} requests, "
+            f"{lm_head} (draft slots {requested})"
+        )
+
+    def _draft_sampler(self, **buffers):
+        """SGLang's ``draft_sampler`` factory (BuiltMegakernel): the folded proposal
+        calls it once, on every rank, with its buffers (gamma, max_bs, greedy_draft,
+        noise, draft_tokens, step_logits, step_temperatures). Returns bs -> the step
+        that replaces the base logits and the Markov block there, or None where
+        SGLang's proposal stays (more requests than the chain serves)."""
+        from sgl_nvidia_mega.minimax_m31 import draft as draft_spec
+        from sgl_nvidia_mega.minimax_m31 import sampler
+
+        draft_spec._COUNTS["sampler"] += 1
+        steps = sampler.build_steps(
+            self.model,
+            prebuilt=self.prebuilt,
+            deadline_s=self.deadline_s,
+            slots=self.slots,
+            **buffers,
+        )
+        return steps.get
 
     def summary(self) -> str:
-        return f"DSpark draft block of {DRAFT_ROWS} rows: {DRAFT_LAYERS} layers in one launch"
+        return (
+            f"DSpark draft block of {DRAFT_ROWS} rows: {DRAFT_LAYERS} layers in one "
+            f"launch; proposal: {self.proposal}"
+        )
 
     def plan(
         self,

@@ -9,8 +9,9 @@ requirements at argument resolution and the model at load
 (``sglang.kernels.plugin_kernels.nvidia``); an unsupported setup stops the server on
 every rank, listing every reason. The checks of slot mega's kernels (their toolchain,
 the config fields they are built for, the context their page tables hold, the
-persistent grid's residency) apply while it is requested. This module stays light:
-SGLang imports it in the launcher.
+persistent grid's residency) apply while it is requested; so do those of the DSpark
+draft's slots markov and draft_lm_head (``draft_config_reasons``), which the draft
+spec builds (``draft``). This module stays light: SGLang imports it in the launcher.
 """
 
 from __future__ import annotations
@@ -47,7 +48,13 @@ from sgl_nvidia_mega.minimax_m31 import (
     SPARSE_OFF,
     TP,
 )
-from sgl_nvidia_mega.minimax_m31.runtime import BITWISE_SLOTS, SLOTS, slot_reasons
+from sgl_nvidia_mega.minimax_m31.runtime import (
+    BITWISE_SLOTS,
+    SLOTS,
+    draft_slots,
+    slot_reasons,
+    target_slots,
+)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -75,11 +82,16 @@ SGLANG_READS = {
         "quantization",
         "context_length",
         "disable_overlap_schedule",
+        # SGLang's own quantized draft LM head, which slot draft_lm_head would double
+        "speculative_dspark_lm_head_dtype",
     ),
     "srt/environ.py": (
         "envs",
         "SGLANG_FORCE_COARSE_WAR_BARRIER",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM",
+        # the DSpark switches draft_config_reasons reads
+        "SGLANG_DSPARK_FOLDED_PROPOSAL",
+        "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK",
     ),
 }
 
@@ -156,8 +168,11 @@ MEGA_TOLERANCES = {
 def _numerics(slots: frozenset = SLOTS) -> Numerics:
     """TOLERANCE with slot mega (its steps' tolerances above), else BITWISE: the stock
     executor runs SGLang's modules in SGLang's order, and the other slots
-    (runtime.BITWISE_SLOTS) run SGLang's kernels with SGLang's arguments."""
-    if slots <= BITWISE_SLOTS:
+    (runtime.BITWISE_SLOTS) run SGLang's kernels with SGLang's arguments. These are the
+    target's verify steps against SGLang's on the same inputs; the DSpark draft's slots
+    change the draft tokens those steps verify, and state their tolerances in the draft
+    spec's numerics (draft.NUMERICS)."""
+    if target_slots(slots) <= BITWISE_SLOTS:
         return Numerics(kind=NumericsKind.BITWISE)
     return Numerics(kind=NumericsKind.TOLERANCE, tolerances=MEGA_TOLERANCES)
 
@@ -184,17 +199,24 @@ def _has_module(name: str) -> bool:
 
 def toolchain_reasons(slots: frozenset = SLOTS) -> list[str]:
     """The requested slots' toolchains, by import spec only: slot mega's kernels build
-    with the CUDA Python bindings and nvcc 13.4 or newer; slot moe_nofill launches
-    FlashInfer's CuTe-DSL quantize (FlashInfer, CuTe DSL)."""
+    with the CUDA Python bindings and nvcc 13.4 or newer; slot markov's chain with the
+    bindings and any nvcc, its noise kernel with Triton; slot moe_nofill launches
+    FlashInfer's CuTe-DSL quantize (FlashInfer, CuTe DSL); slot draft_lm_head SGLang's
+    FlashInfer MXFP8 linear."""
     reasons = []
-    if "mega" in slots:
+    if slots & {"mega", "markov"}:
         if not _has_module("cuda.bindings"):
             reasons.append("needs the CUDA Python bindings")
         else:
             from sgl_nvidia_mega.minimax_m31.sm103 import nvcc
 
-            reason = nvcc.why_not(nvcc.QMUL4_VERSION)
+            # the QMUL4 floor is slot mega's
+            reason = nvcc.why_not(nvcc.QMUL4_VERSION if "mega" in slots else None)
             reasons += [reason] if reason else []
+    if "markov" in slots and not _has_module("triton"):
+        reasons.append("slot markov needs Triton")
+    if "draft_lm_head" in slots and not _has_module("flashinfer"):
+        reasons.append("slot draft_lm_head needs FlashInfer")
     if "moe_nofill" in slots:
         reasons += [
             f"slot moe_nofill needs {what}"
@@ -256,11 +278,46 @@ def flashinfer_api_reasons(slots: frozenset = SLOTS) -> list[str]:
     ]
 
 
+def draft_config_reasons(cfg, slots: frozenset = SLOTS) -> list[str]:
+    """Why the requested draft slots would not run on this server ([] when they would,
+    or none is requested): they replace SGLang's folded DSpark proposal, the tail of the
+    DSpark draft's CUDA graph (``REQUIREMENTS`` asks for DSpark and, outside the parity
+    switch, for decode CUDA graphs), so a server without it would run SGLang's proposal
+    under their names."""
+    requested = sorted(draft_slots(slots))
+    if not requested:
+        return []
+    from sglang.srt.environ import envs
+
+    reasons = []
+    if not envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+        reasons.append(
+            f"slots {requested} replace the folded DSpark proposal; "
+            "SGLANG_DSPARK_FOLDED_PROPOSAL is off"
+        )
+    if envs.SGLANG_DSPARK_OPT_INT8_MARKOV_WALK.get():
+        reasons.append(
+            "slot markov replaces the draft's Markov walk, and "
+            "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK asks for SGLang's int8 walk: unset one"
+        )
+    lm_head_dtype = cfg.speculative_dspark_lm_head_dtype
+    if "draft_lm_head" in requested and lm_head_dtype is not None:
+        reasons.append(
+            "slot draft_lm_head keeps its own MXFP8 copy of the draft's LM head; "
+            f"--speculative-dspark-lm-head-dtype {lm_head_dtype} already quantizes "
+            "SGLang's projection, which slot markov runs: drop one of the two"
+        )
+    return reasons
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """The checks ``REQUIREMENTS`` cannot state: the requested slots, nested HF fields,
     derived values and the toolchains."""
     reasons = (
-        slot_reasons(SLOTS) + toolchain_reasons(SLOTS) + flashinfer_api_reasons(SLOTS)
+        slot_reasons(SLOTS)
+        + toolchain_reasons(SLOTS)
+        + flashinfer_api_reasons(SLOTS)
+        + draft_config_reasons(cfg, SLOTS)
     )
     if cfg.quantization not in (None, "minimax_m3_nvfp4"):
         reasons.append(

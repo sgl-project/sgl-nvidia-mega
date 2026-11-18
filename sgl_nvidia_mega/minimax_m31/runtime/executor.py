@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -155,6 +155,7 @@ class MegakernelDecode:
         mega: Any = None,
         binding: Any = None,
         summary: str = "",
+        draft_check: Optional[Callable[[], bool]] = None,
     ):
         self.lm = lm
         self.widths = tuple(sorted(widths))
@@ -164,6 +165,9 @@ class MegakernelDecode:
         # SGLang's MegakernelBinding (BuildContext.binding)
         self.binding = binding
         self._summary = summary
+        # with draft slots requested, their engagement (draft.EngagementCheck): called
+        # on every forward until it returns True
+        self._draft_check = draft_check
 
     def summary(self) -> str:
         """What was built, for SGLang's startup line."""
@@ -177,6 +181,8 @@ class MegakernelDecode:
         pp_proxy_tensors=None,
     ) -> Optional[Step]:
         """The step if this forward is covered, else None (SGLang's forward runs)."""
+        if self._draft_check is not None and self._draft_check():
+            self._draft_check = None
         if get_embedding or pp_proxy_tensors is not None:
             return None
         if not forward_batch.forward_mode.is_target_verify():
