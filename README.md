@@ -17,7 +17,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | DeepSeek-V4.1-Flash | GB300 (SM103); 148-SM B300 (SM103) with `sm148` | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request); on B300, speed was measured at one request only, serving passed a GSM8K canary at client concurrency 12 and 16 with decode CUDA graphs up to batch 16 (DSpark block 5), and larger batches and other block sizes rely on the kernel tests |
 | DeepSeek-V4.1-Flash | GB300 (SM103) | 8, with the MoE at TP4 x EP2 (two trays, one NVLink domain) | The same verify widths and the DSpark draft step; served and measured at one request (DSpark block 5); larger batches rely on the world-8 kernel tests. See [TP8 + EP2](#deepseek-v41-flash-at-tp8--ep2) |
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
-| Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs) | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py) |
+| Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs); 148-SM B300 (SM103) and B200/GB200 (SM100) with `sm148` | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py). The 148-SM admission has no TP8 serving validation yet; the same gate was validated on Kimi K3.1 at TP16 on GB200 |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
@@ -193,7 +193,7 @@ With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_
 - SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.3), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
 - DeepSeek-V4.1-Flash: 4 x GB300, or 4 x 148-SM B300 (SM103) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`; at TP8 + EP2, 8 x GB300 on two trays of one NVLink domain
 - Qwen3.5: 8 x GB300, two trays of one NVLink domain
-- Kimi K3: 8 x GB300 (SM103, 152 SMs), BF16, context length up to 262144 within the
+- Kimi K3: 8 x GB300 (SM103, 152 SMs), or 8 x 148-SM B300 (SM103) or B200 (SM100) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (for Kimi K3 it only lowers the SM floor), BF16, context length up to 262144 within the
   native model limit, TP8, DP1 and DCP off,
   FP8 E4M3 KV cache with page size 64, `trtllm_mla` for prefill and decode,
   `flashinfer_mxfp4` with default precision, and full decode CUDA graphs

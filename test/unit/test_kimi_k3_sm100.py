@@ -18,7 +18,10 @@ SPEC_PY = Path(shape_policy.__file__).with_name("spec.py")
 def _spec_requirements() -> dict[str, ast.expr]:
     """The keyword arguments of the Requirements(...) call in kimi_k3/spec.py, read without importing SGLang."""
     for node in ast.walk(ast.parse(SPEC_PY.read_text())):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Requirements":
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "Requirements"
+        ):
             return {kw.arg: kw.value for kw in node.keywords}
     raise AssertionError("no Requirements(...) call in kimi_k3/spec.py")
 
@@ -30,7 +33,9 @@ class Sm100Admission(unittest.TestCase):
             self.assertEqual(shape_policy.resident_blocks(), 152)
         with mock.patch.dict(os.environ, {shape_policy.SLOTS_ENV: "sm148"}):
             self.assertEqual(shape_policy.resident_blocks(), 148)
-        with mock.patch.dict(os.environ, {shape_policy.SLOTS_ENV: "draft, sm148 ,target_lm_head"}):
+        with mock.patch.dict(
+            os.environ, {shape_policy.SLOTS_ENV: "draft, sm148 ,target_lm_head"}
+        ):
             self.assertEqual(shape_policy.resident_blocks(), 148)
         with mock.patch.dict(os.environ, {shape_policy.SLOTS_ENV: "sm1480"}):
             self.assertEqual(shape_policy.resident_blocks(), 152)

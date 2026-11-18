@@ -92,7 +92,7 @@ class TestKimiK3Contract(unittest.TestCase):
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
 
-    def test_spec_is_exact_api2_tp8_sm103_surface(self):
+    def test_spec_is_exact_api2_tp8_sm100_sm103_surface(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
             REQUIRED_MEGAKERNEL_API_VERSION,
             SPEC,

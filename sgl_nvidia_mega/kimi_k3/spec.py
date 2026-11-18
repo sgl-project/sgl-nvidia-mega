@@ -48,13 +48,13 @@ except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
         Step,
     )
 
-from .shape_policy import resident_blocks
 from .shape_policy import (
     DECODE_WIDTHS,
     VERIFY_QUERIES,
     baseline_capture_widths,
     mla_max_seq_len,
     prepared_widths,
+    resident_blocks,
     token_widths,
 )
 
