@@ -443,7 +443,7 @@ class TestStockStep(CustomTestCase):
 class TestParity(CustomTestCase):
     """SGLANG_NVIDIA_MEGAKERNEL_PARITY: SGLang's forward, then the executor's (or
     SGLang's again under "control"), the executor's output returned, one greppable
-    line; slot mega's steps log PR #34's tolerance line."""
+    line; slot mega's steps log the tolerance line."""
 
     def _run(self, value, rows=16, plan=None, mega=None):
         ids = torch.arange(rows, dtype=torch.long) + 3

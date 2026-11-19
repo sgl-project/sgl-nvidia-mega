@@ -139,7 +139,6 @@ SGLANG_READS = {
     # read through the model module's namespace, as MiniMaxM3MoE.forward_normal does
     "srt/models/minimax_m3.py": (
         "MiniMaxM3MoE",
-        "num_fused_shared_experts",
         "get_is_capture_mode",
         "is_in_breakable_cuda_graph",
         "MoeDeferredFinalize",
