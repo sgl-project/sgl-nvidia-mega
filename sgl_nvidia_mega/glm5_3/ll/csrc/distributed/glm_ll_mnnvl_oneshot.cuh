@@ -18,15 +18,17 @@
 //   * per-CTA arrival without a cluster barrier, flags rotated right after the
 //     poll (b6dd1dfe); max smem carveout, set per launch (edd689ce);
 //   * optional PDL trigger right after the grid dependency wait (ecb66c84).
+// The RMSNorm sums fp32 squares, as FlashInfer's one-shot does since v0.7.3
+// (flashinfer-ai/flashinfer#6818; v0.7.1 and v0.7.2 squared in bf16).
 //
-// Bit-identical to FlashInfer's one-shot kernel for the same launch geometry
-// (the host passes FlashInfer's adjustGridConfig geometry where FlashInfer runs
-// one-shot) and the same flags (--use_fast_math). Above FlashInfer's one-shot
-// threshold the host may pick another cluster size (the sum-of-squares order
-// follows it) and a unicast publish (kUnicast: one store per peer instead of
-// the multicast store, so the switch does not return this rank's own copy;
-// same values, same bits as the multicast publish). Buffers, flag layout,
-// rotation values and clears are FlashInfer's:
+// Bit-identical to FlashInfer's one-shot kernel (v0.7.3 or later) for the same
+// launch geometry (the host passes FlashInfer's adjustGridConfig geometry where
+// FlashInfer runs one-shot) and the same flags (--use_fast_math). Above
+// FlashInfer's one-shot threshold the host may pick another cluster size (the
+// sum-of-squares order follows it) and a unicast publish (kUnicast: one store
+// per peer instead of the multicast store, so the switch does not return this
+// rank's own copy; same values, same bits as the multicast publish). Buffers,
+// flag layout, rotation values and clears are FlashInfer's:
 //   flags = [cur idx, dirty idx, bytes per buffer, dirty num stages,
 //            bytes to clear x4, arrival counter]
 // Every rank of the buffer must run this kernel for the same call.
@@ -617,12 +619,15 @@ __global__ void __launch_bounds__((kTopK == 0 && !kFp4Out) ? 1024 : kMaxWarps * 
   Pack gam;
   gam.u4 = s_gamma[threadIdx.x];
 
-  // ---- Sum of squares: bf16 squares summed in fp32 in element order, then the
-  // warp butterfly (FlashInfer's warpReduceSumFull).
+  // ---- Sum of squares: fp32 squares of the bf16 sum, summed in fp32 in element
+  // order (FlashInfer >= v0.7.3, #6818), then the warp butterfly (FlashInfer's
+  // warpReduceSumFull).
   float thread_sum = 0.f;
 #pragma unroll
-  for (int i = 0; i < kElts; ++i)
-    thread_sum += __bfloat162float(__hmul(acc.e[i], acc.e[i]));
+  for (int i = 0; i < kElts; ++i) {
+    const float value = __bfloat162float(acc.e[i]);
+    thread_sum += value * value;
+  }
   float warp_sum = thread_sum;
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1)

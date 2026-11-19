@@ -26,7 +26,8 @@ same GPU) and the caps are in Lamport bytes per rank; they are derived, not meas
 
 Numerics (named tolerance ``ll.hops.max_ulp``): where the plan keeps FlashInfer's
 one-shot geometry (inside its 1 MiB band) a hop is bit-identical to FlashInfer's
-one-shot ``kARResidualRMSNorm``; the two-shot is bit-identical to FlashInfer's
+one-shot ``kARResidualRMSNorm`` (FlashInfer >= 0.7.3, which squares in fp32 like the
+hop; 0.7.1 and 0.7.2 squared in bf16); the two-shot is bit-identical to FlashInfer's
 two-shot + ``rmsNormLamport``; above the band the sum-of-squares order follows the
 chosen cluster (``test_glm5_3_ll_hops.py``).
 """
@@ -60,9 +61,10 @@ HOPS_PER_LAYER = 4
 EXTERNAL_SITES = 1000
 
 # Named tolerance (test_glm5_3_ll_hops.py): the norm output against an fp32
-# rank-order reference with bf16 squares, in bf16 ulps of the reference. The one-shot
-# is within 1 ulp (division and rsqrt rounding); the two-shot squares the bf16 sum in
-# fp32 and the sum-of-squares order follows the cluster.
+# rank-order reference with fp32 squares of the bf16 sum, in bf16 ulps of the
+# reference. Both forms square in fp32 (the one-shot as FlashInfer's does since
+# v0.7.3); the sum-of-squares order follows the cluster, and division and rsqrt
+# rounding stay within 1 ulp.
 TOLERANCES = {"ll.hops.max_ulp": 2.0}
 
 _VEC = 8  # bf16 per 16-byte vector, one vector per thread
