@@ -4,10 +4,11 @@
 draft_lm_head (opt-in): the numerics the draft spec declares with them; the target's
 summary and the engagement check its executor runs; the draft spec's built object,
 which offers SGLang's folded proposal the draft sampler only with slot markov and
-builds its buffers at the spec's build; the sampler's refusals of heads, buffers and
-proposals it does not fit; and the chain's host code. (The slot list, its refusals at
-argument resolution and the toolchains: test_minimax_m31_runtime.py and
-test_minimax_m31_spec.py.)"""
+builds its buffers at the spec's build; the sampler's refusals of LM heads, buffers
+and proposals it does not fit; and the chain's host code. (The slot list, its refusals
+at argument resolution and the toolchains: test_minimax_m31_runtime.py and
+test_minimax_m31_spec.py; the Markov heads the chain refuses and the engagement check
+against SGLang's graph runner: test_minimax_m31_draft_sampler.py.)"""
 
 import logging
 from types import SimpleNamespace
@@ -260,57 +261,7 @@ def test_a_markov_head_the_chain_cannot_serve_refuses_the_draft():
         ]
 
 
-def test_a_server_that_never_asks_for_the_draft_sampler_stops(monkeypatch):
-    """The target's executor calls the check on every forward: it waits for SGLang's
-    graph capture, then, at the first forward outside it, raises unless the folded
-    proposal asked for the draft sampler (the DSpark draft graph, captured after the
-    target's)."""
-    from sglang.srt.model_executor import runner
-
-    capturing = {"on": False}
-    monkeypatch.setattr(runner, "get_is_capture_mode", lambda: capturing["on"])
-    monkeypatch.setattr(draft, "_COUNTS", {"built": 1, "sampler": 0})
-    check = draft.EngagementCheck(frozenset({"markov"}))
-    assert check() is False  # before any capture: an autotune pass, say
-    capturing["on"] = True
-    assert check() is False
-    capturing["on"] = False
-    with pytest.raises(RuntimeError, match="never asked for the draft sampler"):
-        check()
-    monkeypatch.setattr(draft, "_COUNTS", {"built": 0, "sampler": 0})
-    with pytest.raises(RuntimeError, match="no DSpark draft spec was built"):
-        check()
-    monkeypatch.setattr(draft, "_COUNTS", {"built": 1, "sampler": 1})
-    assert check() is True
-
-
 # ------------------------------------------------------------------------ the sampler
-
-
-def _markov():
-    """sm103/draft/markov.py, which imports Triton for its noise kernel."""
-    pytest.importorskip("triton")
-    from sgl_nvidia_mega.minimax_m31.sm103.draft import markov
-
-    return markov
-
-
-def test_the_sampler_names_why_the_chain_cannot_serve_a_markov_head():
-    """Checked at the draft spec's load, before the LM head is attached: the chain
-    computes VanillaMarkov's bias, markov_w2 . markov_w1[previous], from BF16 tables."""
-    markov = _markov()
-    dspark = pytest.importorskip("sglang.srt.models.dspark")
-
-    def reason(head):
-        return sampler.head_reason(SimpleNamespace(markov_head=head), gamma=7, world=4)
-
-    head = dspark.VanillaMarkov(vocab_size=1024, markov_rank=markov.RANK_DIM)
-    head.to(torch.bfloat16)
-    head.markov_w2.weight.data = head.markov_w2.weight.data.float()
-    assert "no Markov head" in reason(None)
-    # a head of another class, whatever its tables
-    assert "needs VanillaMarkov" in reason(SimpleNamespace(vocab_size=1024))
-    assert "FP32 markov_w2" in reason(head)
 
 
 def _lm(*, vocab=1024, world=4, rank=1, **lm_head):
@@ -433,6 +384,14 @@ def test_the_bound_measure_allows_one_ulp_of_the_largest_bias():
 
 
 # ------------------------------------------------------------- the chain's host code
+
+
+def _markov():
+    """sm103/draft/markov.py, which imports Triton for its noise kernel."""
+    pytest.importorskip("triton")
+    from sgl_nvidia_mega.minimax_m31.sm103.draft import markov
+
+    return markov
 
 
 def test_the_chain_takes_m31_and_refuses_what_its_keys_cannot_hold():
