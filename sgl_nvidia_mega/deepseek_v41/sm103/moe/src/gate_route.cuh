@@ -20,7 +20,9 @@
 // row count and the token ids after it, as independent loads. No global access touches
 // the outputs before the wait. GATE_ROUTE_RELEASE moves that release (slot
 // gate_route_early, whose router launches this kernel early): 1 = right after the
-// grid-dependency wait, 2 = not at all (dependents launch at this grid's completion, as
+// grid-dependency wait, 3 = after the row's top-k (GEMM1's CTAs then reach the SMs after
+// the layer's shared expert, which forks at hop A's end, and still before this grid
+// completes), 2 = not at all (dependents launch at this grid's completion, as
 // TensorRT-LLM's one-cluster route); 0 (default) = at entry.
 //
 // kQuant (slot gate_route_quant): CTA r also writes row r of the routed input x as MXFP8
@@ -137,6 +139,9 @@ __device__ __forceinline__ void GateRoute(
   int id;
   int row_ids[kTopK];
   SelectRow<kExperts, kTopK>(scratch, s, b, valid_row, scale, eps, w, id, row_ids);
+#if GATE_ROUTE_RELEASE == 3
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   DSV41_STAMP(2);
   if (warp == 0 && lane < kTopK) {
     weights[row * kTopK + lane] = w;

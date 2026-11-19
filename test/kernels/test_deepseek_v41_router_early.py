@@ -15,7 +15,8 @@ SM100-family GPU (GB300).
   rows and logits); the top-k's ids, weights, slot -> row map, the routed input's MXFP8
   bytes and the GEMM2 rows must equal the chain on SGLang's router bit for bit, replayed
   from a CUDA graph (re-poisoned before each replay), at the served 6 (target) and 5
-  (draft) rows.
+  (draft) rows, with the top-k releasing GEMM1 after its wait (1) and after the row's
+  top-k (3, the default).
 """
 
 import os
@@ -147,12 +148,14 @@ def _pair(layer, top_k, experts, offset):
 
 @needs_moe
 @pytest.mark.parametrize("which, rows", [("target", 6), ("draft", 5)])
-def test_late_router_input_and_output(request, which, rows):
+@pytest.mark.parametrize("release", [1, 3])
+def test_late_router_input_and_output(request, which, rows, release):
+    """``release``: where the one-launch top-k releases GEMM1 (bind_early_release)."""
     experts, top_k = ROUTERS[which]
     layer = request.getfixturevalue(f"{which}_layer")
     half, offset = single._ep_half(layer, 1)
     gemm = _pair(half, top_k, experts, offset)
-    gemm.bind_early_release(router_mma.gate_route_release())
+    gemm.bind_early_release(release)
     router = _router(_weight("normal", experts, 21))
     assert router.serves(_rows("normal", rows, 0)) and gemm.serves_gate_route_quant(
         rows
@@ -216,7 +219,7 @@ def test_late_router_input_and_output(request, which, rows):
     torch.cuda.synchronize()
     (r0, w0, p0, i0) = ref
     for (r1, w1, p1, i1), (q1, s1) in zip(outs, quants):
-        where = f"{which} rows={rows}"
+        where = f"{which} rows={rows} release={release}"
         assert _equal(logits, ref_logits), where
         assert torch.equal(i1, i0), where
         assert _equal(w1, w0), where

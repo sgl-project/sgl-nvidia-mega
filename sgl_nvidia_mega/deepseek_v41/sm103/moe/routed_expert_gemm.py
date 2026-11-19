@@ -390,8 +390,9 @@ def load_gate_route(
     """The fused top-k + route kernel of the (experts, top_k) router (slot gate_route);
     with ``quant``, the build that also quantizes the routed input (slot gate_route_quant).
     ``release`` (gate_route.cuh GATE_ROUTE_RELEASE): where it releases GEMM1, 0 at entry,
-    1 after its grid-dependency wait, 2 at its completion (behind slot gate_route_early's
-    router). Built for the installed SGLang's router (``gate_reference``)."""
+    1 after its grid-dependency wait, 3 after the row's top-k, 2 at its completion (behind
+    slot gate_route_early's router). Built for the installed SGLang's router
+    (``gate_reference``)."""
     variants = GATE_ROUTE_QUANT_VARIANTS if quant else GATE_ROUTE_VARIANTS
     name, symbol = variants[(experts, top_k)]
     options = gate_topk_nvrtc_options(experts, top_k)

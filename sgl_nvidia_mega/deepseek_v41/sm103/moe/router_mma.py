@@ -46,16 +46,19 @@ SGLANG_READS = {
 
 SOURCE = Path(__file__).resolve().parent / "src" / "router_mma.cu"
 # Where the one-launch top-k behind the early router releases GEMM1 (gate_route.cuh
-# GATE_ROUTE_RELEASE): 1 = after its grid-dependency wait (default), 2 = at its completion
-# (TensorRT-LLM's one-cluster route), 0 = at entry (gate_route's own release, which also
-# launches GEMM1 early and lets its CTAs hold SMs while the router still runs)
+# GATE_ROUTE_RELEASE): 3 = after the row's top-k (default; GEMM1's CTAs then no longer
+# take the SMs ahead of the layer's shared expert chain), 1 = after its grid-dependency
+# wait, 2 = at its completion (TensorRT-LLM's one-cluster route), 0 = at entry
+# (gate_route's own release, which also launches GEMM1 early and lets its CTAs hold SMs
+# while the router still runs). GEMM1 reads the top-k's outputs only after its own
+# grid-dependency wait, so every release point is bitwise.
 RELEASE_ENV = "SGL_NVIDIA_MEGA_GATE_ROUTE_EARLY_RELEASE"
 
 
 def gate_route_release() -> int:
-    value = os.environ.get(RELEASE_ENV, "1")
-    if value not in ("0", "1", "2"):
-        raise ValueError(f"{RELEASE_ENV} must be 0, 1 or 2, got {value!r}")
+    value = os.environ.get(RELEASE_ENV, "3")
+    if value not in ("0", "1", "2", "3"):
+        raise ValueError(f"{RELEASE_ENV} must be 0, 1, 2 or 3, got {value!r}")
     return int(value)
 
 
