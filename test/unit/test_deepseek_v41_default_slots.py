@@ -24,8 +24,8 @@ def test_the_default_on_slots_are_shipped_and_not_opt_in():
     on = set(runtime.DEFAULT_ON_SLOTS)
     assert on <= set(runtime.SHIPPED_SLOTS)
     assert not on & set(runtime.OPT_IN_SLOTS)
-    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 29
-    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 69
+    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 30
+    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 70
 
 
 def test_the_shipped_list_needs_no_opt_in_slot(monkeypatch):
@@ -46,6 +46,7 @@ def test_the_numerics_changing_default_slots_are_labelled():
         "attn_indexer_logits_q6",
         "gemm2_reg_pool",
         "markov_shard_logits",
+        "target_lm_head_xload",
     ):
         assert slot in on and slot not in runtime.NUMERICS_CHANGE_SLOTS
     assert runtime.NUMERICS_CHANGE_SLOTS <= set(
@@ -92,11 +93,10 @@ def test_the_dropped_slots_are_unknown():
 def test_a_default_slot_can_be_turned_off(monkeypatch, slot):
     """Listing the shipped slots without one is a valid request (how a user turns a
     default slot off), unless another listed slot needs it."""
-    needed_by = {"target_lm_head": "target_lm_head_mxfp8"}
-    rest = (
-        set(runtime.SHIPPED_SLOTS)
-        - {slot}
-        - ({needed_by[slot]} if slot in needed_by else set())
-    )
+    needed_by = {
+        "target_lm_head": {"target_lm_head_mxfp8", "target_lm_head_xload"},
+        "target_lm_head_mxfp8": {"target_lm_head_xload"},
+    }
+    rest = set(runtime.SHIPPED_SLOTS) - {slot} - needed_by.get(slot, set())
     monkeypatch.setattr(runtime, "SLOTS", frozenset(rest))
     assert runtime.slot_reasons() == []

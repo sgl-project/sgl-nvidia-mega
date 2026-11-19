@@ -11,7 +11,9 @@ nearest even. :func:`matmul` runs src/lm_head_mxfp8.cu: BF16 rows times the dequ
 weight with FP32 accumulation, rounded once to BF16. Its LH_FP8=0 build reads a BF16
 weight through the same fragments and MMAs (:func:`matmul_bf16`), so
 ``matmul(x, q) == matmul_bf16(x, dequantize(q))`` bit for bit. Any N (a partial last
-tile is masked), so any vocabulary shard; K a multiple of 128.
+tile is masked), so any vocabulary shard; K a multiple of 128. ``xload=True`` (slot
+target_lm_head_xload) builds the kernel that brings x in as 16-byte loads issued
+together; the same products in the same order, so the same output bit for bit.
 
 :func:`shared` keeps one copy per weight, so the target and draft heads, which share the
 LM head, read the same bytes.
@@ -168,6 +170,7 @@ class Variant(NamedTuple):
     fp8: bool
     split: int
     depth: int
+    xload: bool = False
 
 
 def split_for(n: int, sms: int) -> int:
@@ -179,13 +182,13 @@ def split_for(n: int, sms: int) -> int:
     return 4 if per_cta <= WARPS // 4 else 2
 
 
-def variant(n: int, k: int, *, fp8: bool, sms: int) -> Variant:
+def variant(n: int, k: int, *, fp8: bool, sms: int, xload: bool = False) -> Variant:
     split = split_for(n, sms)
     chunks = k // CHUNK // split
     if k % (CHUNK * split):
         raise ValueError(f"K {k} does not split into {split} parts of {CHUNK} columns")
     depths = (4, 5, 2, 1) if fp8 else (2, 1)
-    return Variant(k, fp8, split, next(d for d in depths if chunks % d == 0))
+    return Variant(k, fp8, split, next(d for d in depths if chunks % d == 0), xload)
 
 
 def shared_bytes(v: Variant) -> int:
@@ -200,14 +203,19 @@ def load_kernel(device_index: int, v: Variant) -> _Kernel:
     with torch.cuda.device(device):
         torch.zeros(1, device=device)  # make the primary context current
         major, minor = torch.cuda.get_device_capability(device)
-        options = NVRTC_OPTIONS + (
-            f"-DLH_K={v.k}",
-            f"-DLH_FP8={int(v.fp8)}",
-            f"-DLH_SPLIT={v.split}",
-            f"-DLH_DEPTH={v.depth}",
-            f"-DLH_WARPS={WARPS}",
+        options = (
+            NVRTC_OPTIONS
+            + (
+                f"-DLH_K={v.k}",
+                f"-DLH_FP8={int(v.fp8)}",
+                f"-DLH_SPLIT={v.split}",
+                f"-DLH_DEPTH={v.depth}",
+                f"-DLH_WARPS={WARPS}",
+            )
+            + (("-DLH_XLOAD=1",) if v.xload else ())
         )
         name = f"lm_head_{'mxfp8' if v.fp8 else 'bf16'}_k{v.k}_s{v.split}_d{v.depth}"
+        name += "_x" if v.xload else ""
         cubin = _compile_source(
             SOURCE.read_text(), name, f"sm_{major}{minor}a", options
         )
@@ -219,9 +227,13 @@ def _sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def precompile(n: int, k: int, device: torch.device, *, fp8: bool = True) -> None:
+def precompile(
+    n: int, k: int, device: torch.device, *, fp8: bool = True, xload: bool = False
+) -> None:
     """Build the variant this shape runs; call before CUDA graph capture."""
-    load_kernel(device.index, variant(n, k, fp8=fp8, sms=_sms(device.index)))
+    load_kernel(
+        device.index, variant(n, k, fp8=fp8, sms=_sms(device.index), xload=xload)
+    )
 
 
 def _run(
@@ -232,6 +244,7 @@ def _run(
     k: int,
     fp8: bool,
     out: Optional[torch.Tensor],
+    xload: bool = False,
 ) -> torch.Tensor:
     rows = x.shape[0]
     if not (
@@ -252,7 +265,7 @@ def _run(
         out = torch.empty((rows, n), dtype=torch.bfloat16, device=device)
     assert out.shape == (rows, n) and out.stride(1) == 1 and out.dtype == torch.bfloat16
     sms = _sms(device.index)
-    v = variant(n, k, fp8=fp8, sms=sms)
+    v = variant(n, k, fp8=fp8, sms=sms, xload=xload)
     tiles = -(-n // TILE)
     _launch(
         load_kernel(device.index, v),
@@ -273,11 +286,15 @@ def _run(
 
 
 def matmul(
-    x: torch.Tensor, q: Mxfp8Weight, *, out: Optional[torch.Tensor] = None
+    x: torch.Tensor,
+    q: Mxfp8Weight,
+    *,
+    out: Optional[torch.Tensor] = None,
+    xload: bool = False,
 ) -> torch.Tensor:
     """``x @ dequantize(q).T`` in BF16 for BF16 ``x`` [1-8, K]."""
     n, k = q.shape
-    return _run(x, q.codes, q.scales, n, k, True, out)
+    return _run(x, q.codes, q.scales, n, k, True, out, xload)
 
 
 def matmul_bf16(

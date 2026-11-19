@@ -40,6 +40,7 @@ DEFAULT_ON_SLOTS = (
     "attn_indexer_logits_q6",
     "gemm2_reg_pool",
     "markov_shard_logits",
+    "target_lm_head_xload",
     # numerics changes (NUMERICS_CHANGE_SLOTS)
     "swapab_h8",
     "wo_a_g1",
@@ -276,7 +277,10 @@ DRAFT_SLOTS = frozenset(
 # streams once per step, not once per 4 rows (sm103/attention/paged_logits_q6.py; bitwise);
 # gemm2_reg_pool: with gemm2_pipe, that GEMM2 (target and draft) capped at 96 registers per
 # thread (muLLM's register pool), so a co-running kernel's CTA can land beside it (bitwise:
-# the same code, fewer registers)
+# the same code, fewer registers);
+# target_lm_head_xload: with target_lm_head_mxfp8, the stream's build that brings the rows
+# of x in as 16-byte loads all issued before their shared stores, so the first MMAs wait one
+# L2 round trip for x, not several (bitwise: the same shared bytes, MMAs and order)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -409,6 +413,7 @@ def slot_reasons() -> list[str]:
         ("moe_balanced", "moe"),
         ("attn_indexer_logits_q6", "attn_indexer"),
         ("gemm2_reg_pool", "gemm2_pipe"),
+        ("target_lm_head_xload", "target_lm_head_mxfp8"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -542,6 +547,10 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
             getattr(bound.get("logits"), "quant_method", None), "mxfp8", None
         )
         is not None,
+        # slot target_lm_head_xload: that stream's build that loads x 16 bytes at a time
+        "target_lm_head_xload": getattr(
+            getattr(bound.get("logits"), "quant_method", None), "xload", False
+        ),
     }
 
 
