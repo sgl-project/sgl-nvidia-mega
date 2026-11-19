@@ -820,8 +820,7 @@ def _worker(rank: int, init_method: str, out_dir: str) -> None:
         lines = [
             f"{torch.cuda.get_device_name(device)}: {torch.cuda.get_device_properties(device).multi_processor_count}"
             f" SMs; ctas {chain.ctas}, narrow rows {chain.narrow_rows}, wide rows "
-            f"{chain.wide_rows}, max rows {chain.max_rows}; (registers, spilled "
-            f"bytes) {chain.kernel_resources()}"
+            f"{chain.wide_rows}, max rows {chain.max_rows}"
         ]
         for rows in _row_counts(chain):
             _check_rows(

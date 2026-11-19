@@ -250,22 +250,6 @@ __device__ __forceinline__ void CpAsyncWaitAll() { asm volatile("cp.async.wait_g
 #ifndef SMEM_TILES
 #define SMEM_TILES 0
 #endif
-// Test only: the narrow kernel stamps %globaltimer per CTA at its phases into `trace`
-// (u64 [cta][3 + 4 * STEPS]): entry, prologue done, per step compute done, arrival
-// counted (fold) or posted (direct), records received, step done; then its end.
-#ifndef MARKOV_TRACE
-#define MARKOV_TRACE 0
-#endif
-#if MARKOV_TRACE
-#define TRACE(i)                                                                                  \
-  do {                                                                                            \
-    if (trace != nullptr && threadIdx.x == 0) trace[blockIdx.x * (3 + 4 * STEPS) + (i)] = GlobalTimer(); \
-  } while (0)
-#else
-#define TRACE(i) \
-  do {           \
-  } while (0)
-#endif
 #ifndef WIDE_IN_ROWS
 #define WIDE_IN_ROWS 64
 #endif
@@ -393,9 +377,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
     u32* control,                                   // local control words
     int rank, int world, int vocab_local, int rows, int max_rows, i64 timeout_ns,
     i64 mailbox_offset,  // bytes from a peer buffer's base to the direct-exchange mailbox
-    i64* noise_offset,   // SGLang's draft-noise counter, advanced once at the end (or null)
-    u64* trace) {        // MARKOV_TRACE only: per-CTA phase stamps (else unused)
-  TRACE(0);
+    i64* noise_offset) {  // SGLang's draft-noise counter, advanced once at the end (or null)
   __shared__ __align__(16) __nv_bfloat16 embedding[kMaxRows][kRankDim];
   __shared__ unsigned long long warp_best[kWarps][kMaxRows];
 #if MARKOV_DIRECT
@@ -473,7 +455,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
   }
   if (warp < kMaxRows) reinterpret_cast<uint4*>(embedding[warp])[lane] = anchor_row;
   __syncthreads();
-  TRACE(1);
   // Uniform over the grid and the ranks (the inputs are replicated).
   bool keeps = false;
   for (int i = lane; i < rows * STEPS; i += 32) {
@@ -645,7 +626,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
       warp_best[warp][2 * t + 1] = best[1];
     }
     __syncthreads();
-    TRACE(2 + 4 * step);
     // Only the last step's records publish logits stored to peers.
     const bool publish = last_step && launch_keeps;
 #if MARKOV_DIRECT
@@ -669,7 +649,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
                     (mine << kTagBits) | tag);
       }
     }
-    TRACE(3 + 4 * step);
     {
       const u64* const box = reinterpret_cast<const u64*>(PeerBase(peers, rank) + mailbox_offset) + step_blocks * max_rows;
       const int blocks = world * ctas;
@@ -700,7 +679,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
       }
     }
     __syncthreads();
-    TRACE(4 + 4 * step);
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(row_best[step][threadIdx.x]);
     }
@@ -711,7 +689,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
       }
       __syncthreads();
     }
-    TRACE(5 + 4 * step);
 #else
     if (warp == 0) {
       if (lane < rows) {
@@ -732,7 +709,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
         }
         last = atomicAdd(arrivals + step, 1u) == static_cast<u32>(ctas - 1);
       }
-      TRACE(3 + 4 * step);
       last = __shfl_sync(0xffffffffu, last, 0);
       // Lane L handles request row L / world and rank L % world.
       const int r = lane / world;
@@ -777,7 +753,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
       if (exchanging && other_rank == 0) winner[r] = global;
     }
     __syncthreads();
-    TRACE(4 + 4 * step);
     if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < rows) {
       draft_tokens[threadIdx.x * draft_stride + step] = KeyIndex(winner[threadIdx.x]);
     }
@@ -786,7 +761,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
           reinterpret_cast<const uint4*>(embed_table + static_cast<i64>(KeyIndex(winner[warp])) * kRankDim)[lane];
     }
     __syncthreads();
-    TRACE(5 + 4 * step);
 #endif
   }
 
@@ -816,7 +790,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_narrow(
   if (threadIdx.x == 0) control[kCountWord + blockIdx.x] = s_count + 1u;
   // The block drew its noise at this offset before the chain: the next block's is the next.
   if (noise_offset != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *noise_offset += 1;
-  TRACE(2 + 4 * STEPS);
 }
 
 #if !MARKOV_DIRECT
@@ -832,8 +805,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) m31_markov_wide(
     i64 cache_stride0, i64 cache_stride1, i64* draft_tokens, i64 draft_stride, const u64* __restrict__ peers,
     u32* control, int rank, int world, int vocab_local, int rows, int max_rows, i64 timeout_ns,
     i64 mailbox_offset,  // bytes from a peer buffer's base to this kernel's records
-    i64* noise_offset,   // SGLang's draft-noise counter, advanced once at the end (or null)
-    u64* trace) {        // unused (the narrow kernel's MARKOV_TRACE stamps)
+    i64* noise_offset) {  // SGLang's draft-noise counter, advanced once at the end (or null)
   __shared__ __align__(16) __nv_bfloat16 embedding[kWideRows][kRankDim];
   __shared__ unsigned long long row_best[kMaxSteps][kWideRows];
   __shared__ unsigned long long rank_key[kWideRows];

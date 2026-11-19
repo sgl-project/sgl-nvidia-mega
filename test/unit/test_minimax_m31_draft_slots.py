@@ -615,7 +615,6 @@ def test_the_chain_builds_with_the_packages_nvcc_helper():
             "-DSTEPS=7",
             "-DSMEM_TILES=5",
             "-DWIDE_IN_ROWS=16",
-            "-DMARKOV_TRACE=0",
         ),
     )
     assert (markov.NARROW_SYMBOL, markov.WIDE_SYMBOL) == (

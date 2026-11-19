@@ -237,7 +237,6 @@ def defines(
     direct: bool,
     smem_tiles: int = 0,
     wide_rows: int = WIDE_ROWS,
-    trace: bool = False,
 ) -> tuple[str, ...]:
     return (
         f"-DBASE_T={_C_TYPES[base_dtype]}",
@@ -246,7 +245,6 @@ def defines(
         f"-DSTEPS={steps}",
         f"-DSMEM_TILES={smem_tiles}",
         f"-DWIDE_IN_ROWS={wide_in_rows(wide_rows)}",
-        f"-DMARKOV_TRACE={int(trace)}",
     )
 
 
@@ -259,7 +257,6 @@ def compile_cubin(
     arch: str,
     smem_tiles: int = 0,
     wide_rows: int = WIDE_ROWS,
-    trace: bool = False,
 ) -> bytes:
     """The module of one exchange: the narrow kernel, plus the wide kernel with the fold."""
     options = NVCC_OPTIONS + defines(
@@ -269,7 +266,6 @@ def compile_cubin(
         direct=direct,
         smem_tiles=smem_tiles,
         wide_rows=wide_rows,
-        trace=trace,
     )
     # the translation unit includes the toolkit's headers only: no include root
     return nvcc.compile_cubin(
@@ -280,8 +276,6 @@ def compile_cubin(
 class _Kernel(NamedTuple):
     function: object  # cuda.bindings.driver.CUfunction
     max_ctas: int  # co-resident CTAs on the device (the cooperative grid's bound)
-    registers: int  # per thread
-    local_bytes: int  # per thread: register spills
     dynamic_smem: int  # bytes: the shared-memory tiles and their inputs
 
 
@@ -294,10 +288,8 @@ def load_kernels(
     direct: bool,
     smem_tiles: int = 0,
     wide_rows: int = WIDE_ROWS,
-    trace: bool = False,
 ) -> dict[str, _Kernel]:
     """Compile (or read from the cache) and load one exchange's kernels."""
-    cu = _driver()
     device = torch.device("cuda", device_index)
     in_rows = {"narrow": MAX_ROWS, "wide": wide_in_rows(wide_rows)}
     symbols = {"narrow": NARROW_SYMBOL}
@@ -314,32 +306,16 @@ def load_kernels(
             arch=nvcc.device_arch(device),
             smem_tiles=smem_tiles,
             wide_rows=wide_rows,
-            trace=trace,
         )
-        attribute = cu.CUfunction_attribute
         for name, symbol in symbols.items():
             module = host.Module(cubin, symbol)
             dynamic = dynamic_smem_bytes(
                 tiles_in_smem=smem_tiles, in_rows=in_rows[name], base_dtype=base_dtype
             )
             module.set_shared_memory(dynamic)
-            (registers,) = _check(
-                cu.cuFuncGetAttribute(
-                    attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, module.function
-                ),
-                "cuFuncGetAttribute",
-            )
-            (local_bytes,) = _check(
-                cu.cuFuncGetAttribute(
-                    attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, module.function
-                ),
-                "cuFuncGetAttribute",
-            )
             kernels[name] = _Kernel(
                 module.function,
                 int(module.resident_ctas(device, THREADS, dynamic)),
-                int(registers),
-                int(local_bytes),
                 dynamic,
             )
     return kernels
@@ -386,7 +362,6 @@ class ShardedMarkov:
         max_bs: int,
         deadline_s: float,
         keeps_logits: bool,
-        trace: bool = False,
         symm_group=None,
     ):
         device = embed_weight.device
@@ -452,12 +427,6 @@ class ShardedMarkov:
                 base_dtype=torch.bfloat16,
             ),
         )
-        # Test only: the narrow kernel's phase stamps (markov.cu MARKOV_TRACE)
-        self.trace = (
-            torch.zeros(self.ctas, 3 + 4 * num_steps, dtype=torch.int64, device=device)
-            if trace
-            else None
-        )
         self.noise = torch.empty(
             self.max_rows * num_steps,
             self.vocab_local,
@@ -518,7 +487,6 @@ class ShardedMarkov:
             self.peers,
             self.sampled_rows,
             self.inert_rows,
-            self.trace,
         )
         return {
             "peer buffer (symmetric)": self._peer_buffer.numel(),
@@ -526,18 +494,6 @@ class ShardedMarkov:
             "control": sum(
                 t.numel() * t.element_size() for t in small if t is not None
             ),
-        }
-
-    def kernel_resources(self) -> dict[str, tuple[int, int, int]]:
-        """(registers, spilled bytes) per thread and dynamic shared memory bytes of
-        each kernel a launch may pick."""
-        return {
-            f"{name} {dtype}".replace("torch.", ""): (
-                k.registers,
-                k.local_bytes,
-                k.dynamic_smem,
-            )
-            for (dtype, name), k in self._kernels.items()
         }
 
     def _kernel_names(self) -> list[str]:
@@ -565,7 +521,6 @@ class ShardedMarkov:
                     name == "narrow-direct",
                     self.smem_tiles,
                     max(self.wide_rows, MAX_ROWS),
-                    self.trace is not None,
                 )
                 kernel = module["wide" if name == "wide" else "narrow"]
                 if self.ctas > kernel.max_ctas:
@@ -752,7 +707,6 @@ class ShardedMarkov:
             ctypes.c_int64(self.timeout_ns),
             ctypes.c_int64(self.wide_offset if wide else self.mailbox_offset),
             ctypes.c_void_p(0 if advance_offset is None else advance_offset.data_ptr()),
-            ctypes.c_void_p(0 if self.trace is None else self.trace.data_ptr()),
         ]
         stream = torch.cuda.current_stream(self.device).cuda_stream
         _launch_cooperative(
