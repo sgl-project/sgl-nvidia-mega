@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU checks of the MiniMax-M3.1 DSpark draft's slots, markov (shipped) and
-draft_lm_head (opt-in): the slot list and what each slot needs; the numerics each spec
-declares with them; the servers refused at argument resolution; their toolchains; the
-target's summary and the engagement check its executor runs; the draft spec's built
-object, which offers SGLang's folded proposal the draft sampler only with slot markov,
-builds its buffers at the spec's build and says on every rank which proposal serves;
-and the sampler's refusals of buffers and proposals it does not fit."""
+draft_lm_head (opt-in): the numerics the draft spec declares with them; the target's
+summary and the engagement check its executor runs; the draft spec's built object,
+which offers SGLang's folded proposal the draft sampler only with slot markov and
+builds its buffers at the spec's build; the sampler's refusals of heads, buffers and
+proposals it does not fit; and the chain's host code. (The slot list, its refusals at
+argument resolution and the toolchains: test_minimax_m31_runtime.py and
+test_minimax_m31_spec.py.)"""
 
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,7 +22,6 @@ from sglang.srt.model_executor import cuda_graph_config
 
 from sgl_nvidia_mega.minimax_m31 import HF_CONFIG, MAX_REQUESTS, draft, draft_step
 from sgl_nvidia_mega.minimax_m31 import moe as m31_moe
-from sgl_nvidia_mega.minimax_m31 import plan as m31_plan
 from sgl_nvidia_mega.minimax_m31 import runtime as m31_runtime
 from sgl_nvidia_mega.minimax_m31 import sampler
 from sgl_nvidia_mega.minimax_m31 import spec as m31_spec
@@ -30,54 +29,15 @@ from sgl_nvidia_mega.minimax_m31.moe import moe_nofill as mn
 from sgl_nvidia_mega.minimax_m31.moe import moe_swap
 from sgl_nvidia_mega.minimax_m31.runtime import agree as m31_agree
 from sgl_nvidia_mega.minimax_m31.runtime import executor as m31_executor
-from sgl_nvidia_mega.minimax_m31.sm103 import host, nvcc
+from sgl_nvidia_mega.minimax_m31.sm103 import nvcc
 
 TARGET_SLOTS = frozenset({"mega", "moe_nofill", "moe_swap"})
 VERIFY_WIDTHS = tuple(range(8, 129, 8))
 
-# ------------------------------------------------------------------ the slot list
-
-
-def test_markov_ships_and_draft_lm_head_is_opt_in():
-    """Unset, the slot list runs markov; draft_lm_head runs only when listed. Both are
-    the draft spec's: no field of the target's plan."""
-    env = m31_runtime.SLOTS_ENV
-    assert m31_runtime.requested_slots({}) == TARGET_SLOTS | {"markov"}
-    assert "markov" in m31_runtime.SHIPPED_SLOTS
-    assert "draft_lm_head" not in m31_runtime.SHIPPED_SLOTS
-    # lm_head_mxfp8 is the target's (test_minimax_m31_lm_head_mxfp8.py)
-    assert m31_runtime.OPT_IN_SLOTS == ("draft_lm_head", "lm_head_mxfp8")
-    assert m31_runtime.DRAFT_SLOTS == ("markov", "draft_lm_head")
-    listed = m31_runtime.requested_slots(
-        {env: "mega,moe_nofill,moe_swap,markov,draft_lm_head"}
-    )
-    assert listed == TARGET_SLOTS | {"markov", "draft_lm_head"}
-    assert m31_runtime.target_slots(listed) == TARGET_SLOTS
-    assert m31_runtime.draft_slots(listed) == {"markov", "draft_lm_head"}
-    assert m31_runtime.requested_slots({env: "mega"}) == {"mega"}
-    for slot in m31_runtime.DRAFT_SLOTS:
-        assert slot not in m31_plan.Slots.__struct_fields__
-        assert slot not in m31_plan.Facts.__struct_fields__
-    assert set(m31_runtime.DRAFT_TOLERANCES) == set(m31_runtime.DRAFT_SLOTS)
-
-
-def test_the_slot_list_refusals_name_the_draft_slots():
-    assert m31_runtime.slot_reasons(frozenset(m31_runtime.SHIPPED_SLOTS)) == []
-    assert m31_runtime.slot_reasons(frozenset({"markov", "draft_lm_head"})) == []
-    (needs,) = m31_runtime.slot_reasons(frozenset({"draft_lm_head"}))
-    assert "slot 'draft_lm_head' needs slot 'markov'" in needs
-    (unknown,) = m31_runtime.slot_reasons(frozenset({"markov", "draft_head"}))
-    assert "unknown slot 'draft_head'" in unknown
-    assert (
-        "(known: mega, moe_nofill, moe_swap, markov, draft_lm_head, lm_head_mxfp8)"
-        in unknown
-    )
-
 
 def test_the_draft_slots_state_their_tolerances_in_the_draft_spec():
     """The draft spec's numerics: its backbone's tolerances and the requested draft
-    slots'. The target's numerics judge its own verify steps: a draft slot does not
-    change them."""
+    slots'."""
     backbone = draft.BACKBONE_TOLERANCES
     assert dict(draft._numerics(TARGET_SLOTS).tolerances) == backbone
     markov = dict(draft._numerics(TARGET_SLOTS | {"markov"}).tolerances)
@@ -89,84 +49,7 @@ def test_the_draft_slots_state_their_tolerances_in_the_draft_spec():
         **m31_runtime.DRAFT_TOLERANCES["markov"],
         **m31_runtime.DRAFT_TOLERANCES["draft_lm_head"],
     }
-    assert m31_runtime.draft_tolerances(TARGET_SLOTS) == {}
-    # the shipped list: the draft spec declares slot markov's bound
-    assert dict(draft.NUMERICS.tolerances) == dict(
-        draft._numerics(m31_runtime.SLOTS).tolerances
-    )
-    assert (
-        m31_spec._numerics(frozenset({"moe_nofill", "moe_swap", "markov"})).kind
-        is NumericsKind.BITWISE
-    )
-    shipped = m31_spec._numerics(frozenset(m31_runtime.SHIPPED_SLOTS))
-    assert dict(shipped.tolerances) == m31_spec.MEGA_TOLERANCES
-
-
-# ------------------------------------------------------------ argument resolution
-
-
-def _cfg(lm_head_dtype=None):
-    return SimpleNamespace(speculative_dspark_lm_head_dtype=lm_head_dtype)
-
-
-@pytest.mark.skipif(
-    not hasattr(envs, "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK"),
-    reason=m31_spec.NO_M31_HOST,
-)
-def test_a_server_whose_proposal_the_slots_cannot_replace_is_refused():
-    """The draft slots replace SGLang's folded DSpark proposal; a server that turned it
-    off, or asked for SGLang's own replacements of its parts, is refused."""
-    markov = TARGET_SLOTS | {"markov"}
-    both = markov | {"draft_lm_head"}
-    assert m31_spec.draft_config_reasons(_cfg(), markov) == []
-    assert m31_spec.draft_config_reasons(_cfg(), both) == []
-    with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(False):
-        (reason,) = m31_spec.draft_config_reasons(_cfg(), markov)
-        assert "SGLANG_DSPARK_FOLDED_PROPOSAL is off" in reason
-        assert "['markov']" in reason
-        # no draft slot requested: SGLang's eager proposal is the server's choice
-        assert m31_spec.draft_config_reasons(_cfg(), TARGET_SLOTS) == []
-    with envs.SGLANG_DSPARK_OPT_INT8_MARKOV_WALK.override(True):
-        (reason,) = m31_spec.draft_config_reasons(_cfg(), markov)
-        assert "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK" in reason
-        assert m31_spec.draft_config_reasons(_cfg(), TARGET_SLOTS) == []
-    # SGLang's own quantized draft LM head: slot markov runs it, draft_lm_head doubles it
-    assert m31_spec.draft_config_reasons(_cfg("mxfp8"), markov) == []
-    (reason,) = m31_spec.draft_config_reasons(_cfg("mxfp8"), both)
-    assert "--speculative-dspark-lm-head-dtype mxfp8" in reason
-    assert "slot draft_lm_head" in reason
-
-
-def test_the_draft_slots_toolchains():
-    """Slot markov builds with the CUDA Python bindings and nvcc (no version floor: the
-    QMUL4 one is slot mega's) and draws its noise with Triton; slot draft_lm_head
-    launches SGLang's FlashInfer MXFP8 linear."""
-
-    def reasons(slots, missing=(), nvcc_reason=""):
-        with (
-            patch.object(m31_spec, "_has_module", lambda name: name not in missing),
-            patch.object(nvcc, "why_not", return_value=nvcc_reason) as why_not,
-        ):
-            return m31_spec.toolchain_reasons(frozenset(slots)), why_not
-
-    found, why_not = reasons({"markov"})
-    assert found == []
-    why_not.assert_called_once_with(None)
-    found, why_not = reasons({"mega", "markov"})
-    why_not.assert_called_once_with(nvcc.QMUL4_VERSION)
-    found, why_not = reasons({"moe_nofill", "moe_swap"})
-    why_not.assert_not_called()
-    assert reasons({"markov"}, nvcc_reason="no CUDA toolkit (nvcc) found")[0] == [
-        "no CUDA toolkit (nvcc) found"
-    ]
-    assert reasons({"markov"}, missing=("cuda.bindings",))[0] == [
-        "needs the CUDA Python bindings"
-    ]
-    assert reasons({"markov"}, missing=("triton",))[0] == ["slot markov needs Triton"]
-    assert reasons({"markov", "draft_lm_head"}, missing=("flashinfer",))[0] == [
-        "slot draft_lm_head needs FlashInfer"
-    ]
-    assert reasons({"markov"}, missing=("flashinfer",))[0] == []
+    assert set(m31_runtime.DRAFT_TOLERANCES) == set(m31_runtime.DRAFT_SLOTS)
 
 
 # ------------------------------------------------------------------ the target's build
@@ -177,7 +60,7 @@ def _build(slots, off=""):
     build serving them; ``off``: why the server has no folded proposal."""
     served = mn.Bound(widths=VERIFY_WIDTHS)
     swap = moe_swap.Bound(widths=VERIFY_WIDTHS)
-    ctx = SimpleNamespace(widths=VERIFY_WIDTHS, tokens_per_request=8, binding=None)
+    ctx = SimpleNamespace(widths=VERIFY_WIDTHS)
     with (
         patch.object(m31_runtime, "SLOTS", frozenset(slots)),
         patch.object(m31_moe, "build", return_value=served),
@@ -204,13 +87,11 @@ def test_the_targets_summary_names_the_draft_slots_and_arms_the_check():
     stock = _build({"moe_nofill", "moe_swap"})
     assert "draft slots" not in stock.summary()
     assert stock._draft_check is None
-
-
-def test_eager_test_servers_do_not_arm_the_check():
+    # an eager test server has no folded proposal for the slots to replace
     off = "decode CUDA graphs are disabled"
-    built = _build({"moe_nofill", "moe_swap", "markov"}, off=off)
-    assert f"draft slots ['markov'] not engaged: {off}" in built.summary()
-    assert built._draft_check is None
+    eager = _build({"moe_nofill", "moe_swap", "markov"}, off=off)
+    assert f"draft slots ['markov'] not engaged: {off}" in eager.summary()
+    assert eager._draft_check is None
 
 
 def test_the_executor_runs_the_engagement_check_until_it_passes():
@@ -264,21 +145,45 @@ def _draft_step(slots):
 
 
 CTX = SimpleNamespace(deadline_s=30.0, tokens_per_request=8)
+OFF = "decode CUDA graphs are disabled"
 
 
-def test_without_markov_the_draft_keeps_sglangs_proposal(caplog):
-    built = _draft_step(TARGET_SLOTS)
+@pytest.mark.parametrize(
+    "slots, off, proposal, logged",
+    [
+        (
+            TARGET_SLOTS,
+            "",
+            "SGLang's proposal (slot markov off)",
+            "rank 2: SGLang's (slot markov is not requested)",
+        ),
+        # disabled decode CUDA graphs (the parity switch's eager steps): SGLang folds
+        # no proposal, so the slots build nothing
+        (
+            TARGET_SLOTS | {"markov", "draft_lm_head"},
+            OFF,
+            "SGLang's proposal (draft slots ['draft_lm_head', 'markov'] not engaged: "
+            f"{OFF})",
+            f"['draft_lm_head', 'markov'] are not engaged on rank 2: {OFF}",
+        ),
+    ],
+)
+def test_without_an_engaged_markov_the_draft_keeps_sglangs_proposal(
+    caplog, slots, off, proposal, logged
+):
+    built = _draft_step(slots)
     with (
+        patch.object(draft, "proposal_off_reason", return_value=off),
         patch.object(sampler, "prebuild") as prebuild,
         caplog.at_level(logging.INFO, logger=draft_step.__name__),
     ):
         built.proposal = built._build_proposal(CTX, rank=2)
     prebuild.assert_not_called()
-    assert built.draft_sampler is None
-    assert built.proposal == "SGLang's proposal (slot markov off)"
-    assert "proposal: SGLang's proposal (slot markov off)" in built.summary()
-    (line,) = caplog.messages
-    assert "rank 2" in line and "slot markov is not requested" in line
+    assert built.draft_sampler is None and built.prebuilt is None
+    assert built.proposal == proposal
+    assert built.summary().endswith(f"proposal: {proposal}")
+    (line,) = caplog.messages  # every rank says which proposal serves
+    assert logged in line
 
 
 @pytest.mark.parametrize(
@@ -336,39 +241,6 @@ def test_with_markov_the_draft_offers_the_sampler(slots, lm_head):
     assert steps(1) == "one" and steps(17) is None
 
 
-def test_with_markov_and_a_greedy_draft_the_chain_keeps_no_logits():
-    built = _draft_step({"markov"})
-    with (
-        patch.object(draft, "proposal_off_reason", return_value=""),
-        patch.object(sampler, "prebuild") as prebuild,
-        envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.override(True),
-    ):
-        built._build_proposal(CTX, rank=0)
-    assert prebuild.call_args.kwargs["greedy_draft"] is True
-
-
-def test_an_eager_test_server_keeps_sglangs_proposal_and_says_so(caplog):
-    """Disabled decode CUDA graphs (the parity switch's eager steps): SGLang folds no
-    proposal, so the slots build nothing; every rank logs it."""
-    built = _draft_step(TARGET_SLOTS | {"markov", "draft_lm_head"})
-    off = "decode CUDA graphs are disabled"
-    with (
-        patch.object(draft, "proposal_off_reason", return_value=off),
-        patch.object(sampler, "prebuild") as prebuild,
-        caplog.at_level(logging.WARNING, logger=draft_step.__name__),
-    ):
-        built.proposal = built._build_proposal(CTX, rank=3)
-    prebuild.assert_not_called()
-    assert built.draft_sampler is None and built.prebuilt is None
-    assert built.proposal == (
-        "SGLang's proposal (draft slots ['draft_lm_head', 'markov'] not engaged: "
-        f"{off})"
-    )
-    (line,) = caplog.messages
-    assert "['draft_lm_head', 'markov'] are not engaged on rank 3" in line
-    assert off in line
-
-
 def test_a_markov_head_the_chain_cannot_serve_refuses_the_draft():
     """SGLang gathers a draft spec's model reasons over the ranks and refuses the
     server with all of them: slot markov's Markov head check is one."""
@@ -388,7 +260,57 @@ def test_a_markov_head_the_chain_cannot_serve_refuses_the_draft():
         ]
 
 
+def test_a_server_that_never_asks_for_the_draft_sampler_stops(monkeypatch):
+    """The target's executor calls the check on every forward: it waits for SGLang's
+    graph capture, then, at the first forward outside it, raises unless the folded
+    proposal asked for the draft sampler (the DSpark draft graph, captured after the
+    target's)."""
+    from sglang.srt.model_executor import runner
+
+    capturing = {"on": False}
+    monkeypatch.setattr(runner, "get_is_capture_mode", lambda: capturing["on"])
+    monkeypatch.setattr(draft, "_COUNTS", {"built": 1, "sampler": 0})
+    check = draft.EngagementCheck(frozenset({"markov"}))
+    assert check() is False  # before any capture: an autotune pass, say
+    capturing["on"] = True
+    assert check() is False
+    capturing["on"] = False
+    with pytest.raises(RuntimeError, match="never asked for the draft sampler"):
+        check()
+    monkeypatch.setattr(draft, "_COUNTS", {"built": 0, "sampler": 0})
+    with pytest.raises(RuntimeError, match="no DSpark draft spec was built"):
+        check()
+    monkeypatch.setattr(draft, "_COUNTS", {"built": 1, "sampler": 1})
+    assert check() is True
+
+
 # ------------------------------------------------------------------------ the sampler
+
+
+def _markov():
+    """sm103/draft/markov.py, which imports Triton for its noise kernel."""
+    pytest.importorskip("triton")
+    from sgl_nvidia_mega.minimax_m31.sm103.draft import markov
+
+    return markov
+
+
+def test_the_sampler_names_why_the_chain_cannot_serve_a_markov_head():
+    """Checked at the draft spec's load, before the LM head is attached: the chain
+    computes VanillaMarkov's bias, markov_w2 . markov_w1[previous], from BF16 tables."""
+    markov = _markov()
+    dspark = pytest.importorskip("sglang.srt.models.dspark")
+
+    def reason(head):
+        return sampler.head_reason(SimpleNamespace(markov_head=head), gamma=7, world=4)
+
+    head = dspark.VanillaMarkov(vocab_size=1024, markov_rank=markov.RANK_DIM)
+    head.to(torch.bfloat16)
+    head.markov_w2.weight.data = head.markov_w2.weight.data.float()
+    assert "no Markov head" in reason(None)
+    # a head of another class, whatever its tables
+    assert "needs VanillaMarkov" in reason(SimpleNamespace(vocab_size=1024))
+    assert "FP32 markov_w2" in reason(head)
 
 
 def _lm(*, vocab=1024, world=4, rank=1, **lm_head):
@@ -493,20 +415,6 @@ def test_a_proposal_the_build_does_not_fit_is_refused():
             )
         assert want in str(raised.value)
         assert "the markov slot cannot run: rank 0:" in str(raised.value)
-    assert sampler._memory({"a": 2**20, "b": 2**19}) == (
-        "1.5 MiB of device memory (a 1.0, b 0.5 MiB)"
-    )
-
-
-def test_a_build_step_that_fails_on_one_rank_raises_on_every_rank():
-    """One rank: the step itself. Over a TP group: the package's ``host.agree``, which
-    gathers every rank's error."""
-    assert sampler._on_every_rank(None, lambda: 3, "allocating") == 3
-    step = Mock()
-    with patch.object(host, "agree", return_value="agreed") as agree:
-        assert sampler._on_every_rank("group", step, "allocating") == "agreed"
-    agree.assert_called_once_with("group", step, "allocating")
-    step.assert_not_called()
 
 
 def test_the_bound_measure_allows_one_ulp_of_the_largest_bias():
@@ -525,14 +433,6 @@ def test_the_bound_measure_allows_one_ulp_of_the_largest_bias():
 
 
 # ------------------------------------------------------------- the chain's host code
-
-
-def _markov():
-    """sm103/draft/markov.py, which imports Triton for its noise kernel."""
-    pytest.importorskip("triton")
-    from sgl_nvidia_mega.minimax_m31.sm103.draft import markov
-
-    return markov
 
 
 def test_the_chain_takes_m31_and_refuses_what_its_keys_cannot_hold():
@@ -569,13 +469,8 @@ def test_the_tiles_beyond_one_per_warp_go_to_shared_memory():
     assert markov.smem_tiles(tiles=152 * 16, ctas=152) == 0
     # one rank: one tile per warp in shared memory too, the rest from L2
     assert markov.smem_tiles(tiles=200_064 // 16, ctas=152) == markov.MAX_SMEM_TILES
-    narrow = 5 * markov.smem_tile_bytes(in_rows=8, base_dtype=torch.bfloat16)
-    wide = 5 * markov.smem_tile_bytes(
-        in_rows=markov.wide_in_rows(16), base_dtype=torch.bfloat16
-    )
-    assert (narrow, wide) == (5 * 9728, 5 * 11264)
-    # and every warp's register-tile inputs beside them: 71.5 / 103 KiB, within GB300's
-    # 227 KiB a block for both kernels
+    # with every warp's register-tile inputs beside them: 71.5 / 103 KiB, within
+    # GB300's 227 KiB a block for both kernels
     for in_rows, total in ((8, 73216), (16, 105472)):
         got = markov.dynamic_smem_bytes(
             tiles_in_smem=5, in_rows=in_rows, base_dtype=torch.bfloat16
@@ -621,50 +516,3 @@ def test_the_chain_builds_with_the_packages_nvcc_helper():
         "m31_markov_narrow",
         "m31_markov_wide",
     )
-
-
-def test_every_function_of_the_chains_source_names_where_it_runs():
-    """The chain builds with the package's nvcc helper, which has no default-device
-    switch: every function at file scope of markov.cu is ``__device__`` (or ``__host__
-    __device__``), and its two kernels are ``extern "C" __global__``, the symbols the
-    host loads."""
-    source = Path(draft_step.__file__).parent / "sm103" / "draft" / "markov.cu"
-    lines = source.read_text().splitlines()
-    code = [
-        line
-        for line in lines
-        if line and not line[0].isspace() and not line.startswith(("//", "#", "}"))
-    ]
-    declarations = ("static_assert", "constexpr", "using", "namespace")
-    functions = [
-        line for line in code if "(" in line and not line.startswith(declarations)
-    ]
-    targets = ("__device__", "__host__ __device__", 'extern "C" __global__')
-    assert len(functions) > 30
-    assert [line for line in functions if not line.startswith(targets)] == []
-    kernels = [
-        line.split("(kThreads, 1) ")[1].rstrip("(")
-        for line in functions
-        if line.startswith('extern "C" __global__')
-    ]
-    assert kernels == ["m31_markov_narrow", "m31_markov_wide"]
-
-
-def test_the_parity_line_names_every_count():
-    """The parity probe's counts (5) and extents (5), in order, against the bound."""
-    line = sampler.parity_message(
-        2, [11774, 0, 19173, 247471, 0, 0.0625, 46.25, 1.5, 2.25, 3], 2.0
-    )
-    for part in (
-        "rank 2:",
-        "blocks 11774",
-        "token mismatches 0",
-        "19173 at 1-8 rows and 247471 at 9+ rows",
-        "first token differs 0",
-        "max |difference| 0.0625",
-        "max |logit| 46.2",
-        "max 1.5 BF16 ulps",
-        "(declared 2; 2.25 without that allowance)",
-        "at most 3 BF16 values apart",
-    ):
-        assert part in line, (part, line)

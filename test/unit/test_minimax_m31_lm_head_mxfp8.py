@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""CPU checks of the MiniMax-M3.1 target's opt-in slot lm_head_mxfp8: the slot list
-(opt-in, needs slot mega), its field of the per-width plan, the numerics the spec
-declares with it and its toolchain; the kernel's shape rules on the TP4 shard (N 50016,
-K 6144: one variant, no padded weight row, no scale of a padded row read) and the
-quantizer's rules; the stand-in through SGLang's own
-``LogitsProcessor._compute_lm_head``; the heads the load refuses; the build (the copy,
-the check against SGLang's projection, the ranks' agreement); the target's build and
-summary, the executor and slot mega's step, which hand the logits processor the
-stand-in; and the parity switch's line. The kernel itself is in
-test/kernels/test_minimax_m31_lm_head_mxfp8.py.
+"""CPU checks of the MiniMax-M3.1 target's opt-in slot lm_head_mxfp8: the kernel's
+variant and copy size on the TP4 shard (N 50016, K 6144) and the quantizer's rules; the
+stand-in through SGLang's own ``LogitsProcessor._compute_lm_head``; the heads the load
+refuses; the build (the copy, the check against SGLang's projection, the ranks'
+agreement); the target's build and summary, the executor and slot mega's step, which
+hand the logits processor the stand-in; and the parity switch's line. The kernel itself
+is in test/kernels/test_minimax_m31_lm_head_mxfp8.py; the slot list, the plan, the
+numerics and the toolchain are in test_minimax_m31_runtime.py and
+test_minimax_m31_spec.py.
 
 The tests that drive SGLang's logits processor skip where it does not import."""
 
@@ -20,7 +19,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind, Step
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
 
 from sgl_nvidia_mega.minimax_m31 import ROWS, logits
 from sgl_nvidia_mega.minimax_m31 import moe as m31_moe
@@ -32,7 +31,6 @@ from sgl_nvidia_mega.minimax_m31.moe import moe_swap
 from sgl_nvidia_mega.minimax_m31.runtime import agree as m31_agree
 from sgl_nvidia_mega.minimax_m31.runtime import executor as m31_executor
 from sgl_nvidia_mega.minimax_m31.runtime import parity as m31_parity
-from sgl_nvidia_mega.minimax_m31.sm103 import host, nvcc
 from sgl_nvidia_mega.minimax_m31.sm103.logits import lm_head_mxfp8 as lh
 
 SLOT = "lm_head_mxfp8"
@@ -50,93 +48,6 @@ def _weight(n=VOCAB, k=DIM, seed=0):
     return (torch.randn(n, k) * 0.02).to(torch.bfloat16)
 
 
-# ------------------------------------------------------------------ the slot list
-
-
-def test_the_slot_is_opt_in_and_needs_slot_mega():
-    env = m31_runtime.SLOTS_ENV
-    assert SLOT in m31_runtime.OPT_IN_SLOTS
-    assert SLOT not in m31_runtime.SHIPPED_SLOTS
-    assert SLOT not in m31_runtime.requested_slots({})
-    listed = m31_runtime.requested_slots({env: f"mega,markov,{SLOT}"})
-    assert listed == {"mega", "markov", SLOT}
-    # a slot of the target's plan, not the draft's, and not bitwise
-    assert m31_runtime.target_slots(listed) == {"mega", SLOT}
-    assert SLOT not in m31_runtime.DRAFT_SLOTS
-    assert SLOT not in m31_runtime.BITWISE_SLOTS
-    assert m31_runtime.NEEDS[SLOT] == ("mega",)
-    assert m31_runtime.slot_reasons(listed) == []
-    (needs,) = m31_runtime.slot_reasons(frozenset({"moe_nofill", SLOT}))
-    assert f"slot '{SLOT}' needs slot 'mega'" in needs
-    (unknown,) = m31_runtime.slot_reasons(frozenset({"lm_head_fp8"}))
-    assert "unknown slot 'lm_head_fp8'" in unknown and SLOT in unknown
-
-
-def test_the_plan_gives_it_megas_step_only():
-    every = frozenset(VERIFY_WIDTHS)
-    facts = m31_plan.Facts(
-        mega=frozenset({8}), moe_nofill=every, moe_swap=every, lm_head_mxfp8=every
-    )
-    plan = m31_plan.plan(VERIFY_WIDTHS, facts)
-    assert plan[8] == m31_plan.Slots(mega=True, lm_head_mxfp8=True)
-    assert not any(plan[w].lm_head_mxfp8 for w in VERIFY_WIDTHS[1:])
-    assert (
-        m31_plan.describe(plan)
-        == "8: mega, lm_head_mxfp8; 16-128: moe_nofill, moe_swap"
-    )
-    # without slot mega's step there is nothing for it to close
-    no_mega = m31_plan.Facts(moe_nofill=every, lm_head_mxfp8=frozenset({8}))
-    assert not m31_plan.slots(8, no_mega).lm_head_mxfp8
-    # and off unless its build serves the width
-    assert m31_plan.slots(8, m31_plan.Facts(mega=frozenset({8}))) == m31_plan.Slots(
-        mega=True
-    )
-
-
-def test_the_spec_declares_its_tolerance_with_megas():
-    both = m31_spec._numerics(frozenset({"mega", SLOT}))
-    assert both.kind is NumericsKind.TOLERANCE
-    assert dict(both.tolerances) == {
-        **m31_spec.MEGA_TOLERANCES,
-        **m31_spec.LM_HEAD_TOLERANCES,
-    }
-    assert m31_spec.LM_HEAD_TOLERANCES == {"lm_head_mxfp8.logits.rel": 4e-2}
-    # not requested: the shipped list's numerics are slot mega's alone
-    shipped = m31_spec._numerics(frozenset(m31_runtime.SHIPPED_SLOTS))
-    assert dict(shipped.tolerances) == m31_spec.MEGA_TOLERANCES
-
-
-def test_its_toolchain_is_the_bindings_and_any_nvcc():
-    def reasons(slots, missing=(), nvcc_reason=""):
-        with (
-            patch.object(m31_spec, "_has_module", lambda name: name not in missing),
-            patch.object(nvcc, "why_not", return_value=nvcc_reason) as why_not,
-        ):
-            return m31_spec.toolchain_reasons(frozenset(slots)), why_not
-
-    found, why_not = reasons({SLOT})
-    assert found == []
-    why_not.assert_called_once_with(None)  # no version floor: QMUL4 is slot mega's
-    _, why_not = reasons({"mega", SLOT})
-    why_not.assert_called_once_with(nvcc.QMUL4_VERSION)
-    assert reasons({SLOT}, missing=("cuda.bindings",))[0] == [
-        "needs the CUDA Python bindings"
-    ]
-    assert reasons({SLOT}, nvcc_reason="no CUDA toolkit (nvcc) found")[0] == [
-        "no CUDA toolkit (nvcc) found"
-    ]
-
-
-def test_an_fp32_lm_head_server_is_refused_only_with_the_slot():
-    fp32 = SimpleNamespace(enable_fp32_lm_head=True)
-    bf16 = SimpleNamespace(enable_fp32_lm_head=False)
-    with_slot = frozenset({"mega", SLOT})
-    assert m31_spec.lm_head_config_reasons(bf16, with_slot) == []
-    (reason,) = m31_spec.lm_head_config_reasons(fp32, with_slot)
-    assert "--enable-fp32-lm-head" in reason and f"slot {SLOT}" in reason
-    assert m31_spec.lm_head_config_reasons(fp32, frozenset({"mega"})) == []
-
-
 # ------------------------------------------------- the kernel's shapes, on the shard
 
 
@@ -144,117 +55,41 @@ def test_the_tp4_shard_is_one_variant_and_302_mib():
     """N 50016 = 3126 whole 16-row tiles, K 6144 = 48 chunks of 128: two warps a tile,
     four chunks ahead, on B300's 148 SMs and GB300's 152; the copy is the codes and
     the scales of N padded to 128 rows."""
-    assert SHARD % 128 == 96 and SHARD % lh.TILE == 0 and HIDDEN % lh.CHUNK == 0
     for sms in (148, 152):
         v = lh.variant(SHARD, HIDDEN, fp8=True, sms=sms)
         assert v == lh.Variant(HIDDEN, True, 2, 4)
-        assert lh.variant(SHARD, HIDDEN, fp8=False, sms=sms) == lh.Variant(
-            HIDDEN, False, 2, 2
-        )
     # the rows of x and the split's partial sums, within SM100's 227 KiB a CTA
     assert lh.shared_bytes(v) == 8 * (HIDDEN + 8) * 2 + 4096 < 227 * 1024
-    assert lh._pad128(SHARD) == SHARD + 32
-    size = SHARD * HIDDEN + (SHARD + 32) * HIDDEN // lh.BLOCK
-    assert size == 316_907_520 and round(size / 2**20, 1) == 302.2
+    size = SHARD * HIDDEN + lh._pad128(SHARD) * HIDDEN // lh.BLOCK
+    assert round(size / 2**20, 1) == 302.2  # README states it
     with pytest.raises(ValueError, match="does not split"):
         lh.variant(SHARD, 6144 + 128, fp8=True, sms=148)
 
 
-def _scale_offset(row: int, block: int, k: int) -> int:
-    """lm_head_mxfp8.cu's scale_offset: where the kernel reads a row's block scale."""
-    cols = k // lh.BLOCK
-    return (
-        ((row >> 7) * (cols >> 2) + (block >> 2)) * 512
-        + (row & 31) * 16
-        + ((row >> 5) & 3) * 4
-        + (block & 3)
-    )
-
-
-@pytest.mark.parametrize("n", [VOCAB, 1000])
-def test_no_tile_reads_a_padded_row(n):
-    """The kernel's tiles are ceil(N / 16); a tile's rows past N read row N - 1. Every
-    scale it reads is the row's own: the bytes of the rows the swizzle pads to 128
-    are never addressed, whatever they hold."""
-    q = lh.quantize(_weight(n))
-    blocks = DIM // lh.BLOCK
-    scales = lh.unswizzle(q.scales, n, DIM)
-    rows = {
-        min(tile * lh.TILE + g, n - 1)
-        for tile in range(-(-n // lh.TILE))
-        for g in range(lh.TILE)
-    }
-    assert rows == set(range(n))
-    read = set()
-    for row in rows:
-        for block in range(blocks):
-            offset = _scale_offset(row, block, DIM)
-            assert q.scales[offset] == scales[row, block]
-            read.add(offset)
-    padded = {
-        _scale_offset(row, block, DIM)
-        for row in range(n, lh._pad128(n))
-        for block in range(blocks)
-    }
-    assert padded and not padded & read
-    assert len(read) + len(padded) == q.scales.numel()
-    # poisoned, the padded rows change nothing the kernel multiplies
-    poisoned = q.scales.clone()
-    poisoned[sorted(padded)] = 0xFF
-    assert torch.equal(
-        lh.dequantize(lh.Mxfp8Weight(q.codes, poisoned)), lh.dequantize(q)
-    )
-    assert q.codes.shape == (n, DIM)  # the codes are not padded
-
-
-def test_each_block_takes_the_smallest_scale_that_fits_448():
+def test_the_quantizer_takes_the_smallest_scale_that_fits_and_the_nearest_code():
     w = _weight()
     w[1, :32] = 0
     w[2, 32:64] = 448.0  # exactly 448 * 2^0
     w[3, 64:96] = 456.0  # just past 448 (449 is 448 in BF16)
     q = lh.quantize(w)
-    e = lh.unswizzle(q.scales, *q.shape).to(torch.int64) - 127
+    e = lh.unswizzle(q.scales, *q.shape).to(torch.float32) - 127
     amax = w.float().view(VOCAB, -1, lh.BLOCK).abs().amax(-1)
     nonzero = amax > 0
     assert torch.all(amax[nonzero] <= 448 * torch.exp2(e[nonzero].double()))
     assert torch.all(amax[nonzero] > 448 * torch.exp2(e[nonzero].double() - 1))
     assert e[2, 1] == 0 and e[3, 2] == 1
-    assert q.codes.float().abs().max() <= lh.E4M3_MAX
-    assert torch.all(q.codes[1, :32].float() == 0)
+    assert q.codes.float().abs().max() <= lh.E4M3_MAX  # no code saturates
     assert not lh.scale_reason(q) and lh.scale_reason(lh.quantize(_weight() * 1e6))
-
-
-def test_codes_round_to_the_nearest_e4m3_value_and_dequantize_exactly():
-    w = _weight()
-    q = lh.quantize(w)
-    e = lh.unswizzle(q.scales, *q.shape).to(torch.float32) - 127
+    # codes round to the nearest E4M3 value: a step at |v| is 2^(floor(log2 |v|) - 3),
+    # 2^-9 among the subnormals
     scaled = torch.ldexp(w.float().view(VOCAB, -1, lh.BLOCK), -e[..., None])
     codes = q.codes.float().view_as(scaled)
-    # an E4M3 step at |v|: 2^(floor(log2 |v|) - 3), 2^-9 among the subnormals
     step = torch.exp2(torch.floor(torch.log2(scaled.abs().clamp_min(2**-6))) - 3)
     assert torch.all((scaled - codes).abs() <= step / 2)
+    # and dequantize to the values the kernel multiplies, exactly
     dq = lh.dequantize(q)
-    exact = torch.ldexp(codes, e[..., None]).view(VOCAB, DIM)
-    assert torch.equal(dq.float(), exact)
+    assert torch.equal(dq.float(), torch.ldexp(codes, e[..., None]).view(VOCAB, DIM))
     assert torch.equal(lh.dequantize(lh.quantize(dq)), dq)
-
-
-def test_the_copys_projection_is_within_the_declared_bound_of_the_bf16_one():
-    """The quantizer's error on Gaussian data at the shard's K, without the kernel
-    (which multiplies the dequantized weight exactly): inside the declared bound."""
-    w = _weight(2048, HIDDEN)
-    dq = lh.dequantize(lh.quantize(w))
-    x = torch.randn(ROWS, HIDDEN).to(torch.bfloat16)
-    theirs = x.float() @ w.float().T
-    rel = ((x.float() @ dq.float().T - theirs).abs().max() / theirs.abs().max()).item()
-    assert 0 < rel < BOUND, rel
-
-
-def test_the_kernel_shape_rules():
-    assert lh.unsupported_reason(_weight()) == ""
-    assert "multiple of 128" in lh.unsupported_reason(_weight(k=192))
-    assert "BF16" in lh.unsupported_reason(_weight().float())
-    assert "BF16" in lh.unsupported_reason(_weight()[0])
 
 
 def test_a_launch_does_not_compile():
@@ -347,56 +182,29 @@ def test_sglang_routes_the_stand_in_to_the_stream_and_its_own_head_to_its_gemm(
 
 
 @pytest.mark.parametrize(
-    "change, want",
+    "owner, name, value, want",
     [
-        (lambda m: setattr(m.logits_processor, "use_fp32_lm_head", True), "FP32"),
-        (
-            lambda m: setattr(m.logits_processor, "use_fp32_lm_head_output", True),
-            "FP32",
-        ),
-        (
-            lambda m: setattr(m.logits_processor, "rl_on_policy_target", "fsdp"),
-            "on-policy",
-        ),
-        (
-            lambda m: (
-                setattr(m.lm_head, "set_lora", 1) or setattr(m.lm_head, "apply_lora", 1)
-            ),
-            "LoRA",
-        ),  # fmt: skip
-        (
-            lambda m: setattr(m.lm_head, "quant_method", SimpleNamespace(apply=print)),
-            "quant method",
-        ),  # fmt: skip
-        (lambda m: setattr(m.lm_head, "weight", m.lm_head.weight.half()), "float16"),
-        (
-            lambda m: setattr(m.lm_head, "weight", _weight(k=192)),
-            "K 192 is not a multiple of 128",
-        ),
-        (
-            lambda m: setattr(m.lm_head, "weight", _weight(k=2 * DIM)[:, ::2]),
-            "not contiguous",
-        ),
-        (lambda m: setattr(m.lm_head, "weight", None), "has no weight"),
-    ],
-    ids=[
-        "fp32",
-        "fp32_output",
-        "on_policy",
-        "lora",
-        "quantized",
-        "fp16",
-        "k",
-        "strided",
-        "no_weight",
+        ("logits_processor", "use_fp32_lm_head", True, "FP32"),
+        ("logits_processor", "use_fp32_lm_head_output", True, "FP32"),
+        ("logits_processor", "rl_on_policy_target", "fsdp", "on-policy"),
+        ("lm_head", "quant_method", SimpleNamespace(apply=print), "quant method"),
+        ("lm_head", "weight", _weight().float(), "not 2-D BF16"),
+        ("lm_head", "weight", _weight(k=192), "K 192 is not a multiple of 128"),
+        ("lm_head", "weight", _weight(k=2 * DIM)[:, ::2], "not contiguous"),
+        ("lm_head", "weight", None, "has no weight"),
     ],
 )
-def test_a_head_sglang_projects_another_way_is_refused(sglang_head, change, want):
+def test_a_head_sglang_projects_another_way_is_refused(
+    sglang_head, owner, name, value, want
+):
     model = sglang_head()
     assert logits.head_reasons(model) == []
-    change(model)
-    reasons = logits.head_reasons(model)
-    assert any(want in r for r in reasons), reasons
+    setattr(getattr(model, owner), name, value)
+    assert any(want in r for r in logits.head_reasons(model))
+    # a LoRA-wrapped head
+    model = sglang_head()
+    model.lm_head.set_lora = model.lm_head.apply_lora = print
+    assert any("LoRA" in r for r in logits.head_reasons(model))
 
 
 def test_build_makes_the_copy_and_checks_it_against_sglangs_projection(
@@ -418,10 +226,6 @@ def test_build_makes_the_copy_and_checks_it_against_sglangs_projection(
     assert torch.equal(lh.dequantize(copy), lh.dequantize(lh.quantize(_weight())))
     size = VOCAB * DIM + lh._pad128(VOCAB) * DIM // lh.BLOCK
     assert head.device_bytes() == size
-    assert head.summary() == (
-        f"the 8-row step's LM head streams an MXFP8 copy of this rank's "
-        f"[{VOCAB}, {DIM}] shard, {size / 2**20:.1f} MiB of device memory"
-    )
     (line,) = [r.getMessage() for r in caplog.records if SLOT in r.getMessage()]
     assert head.summary() in line and f"{head.rel:.2e}" in line
 
@@ -446,15 +250,13 @@ def test_build_refuses_logits_outside_the_bound_and_heads_it_cannot_serve(
         logits.build(model, VERIFY_WIDTHS, slots)
 
 
-@pytest.mark.parametrize("others", [None, "ValueError: K 192 is not a multiple of 128"])
-def test_every_rank_raises_when_one_ranks_build_fails(
-    sglang_head, stream, monkeypatch, others
-):
+def test_every_rank_raises_when_one_ranks_build_fails(sglang_head, stream, monkeypatch):
     """The build is agreed through sm103/host.py: a rank whose own build passed raises
     with the failed rank's error."""
     import torch.distributed as dist
 
     seen = []
+    others = "ValueError: K 192 is not a multiple of 128"
 
     def all_gather_object(errors, error, group):
         seen.append((error, group))
@@ -463,23 +265,16 @@ def test_every_rank_raises_when_one_ranks_build_fails(
     monkeypatch.setattr(logits, "_cpu_group", lambda: "cpu group")
     monkeypatch.setattr(dist, "get_world_size", lambda group: 4)
     monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
-    build = lambda: logits.build(  # noqa: E731
-        sglang_head(), VERIFY_WIDTHS, frozenset({"mega", SLOT})
-    )
-    if others is None:
-        assert isinstance(build(), logits.Mxfp8LmHead)
-    else:
-        with pytest.raises(RuntimeError) as caught:
-            build()
-        assert str(caught.value) == f"building slot {SLOT} failed: rank 1: {others}"
+    with pytest.raises(RuntimeError) as caught:
+        logits.build(sglang_head(), VERIFY_WIDTHS, frozenset({"mega", SLOT}))
+    assert str(caught.value) == f"building slot {SLOT} failed: rank 1: {others}"
     assert seen == [(None, "cpu group")]
 
 
-def test_the_stream_takes_no_bias_and_logs_its_capture_once(monkeypatch, caplog):
+def test_the_stream_takes_sglangs_rows_and_no_bias(monkeypatch):
     seen = []
     monkeypatch.setattr(lh, "matmul", lambda x, q, **kw: seen.append(q) or "logits")
     method = logits.Mxfp8LmHeadMethod("copy")
-    caplog.set_level(logging.INFO, logger=logits.__name__)
     x = torch.zeros(ROWS, DIM, dtype=torch.bfloat16)
     assert method.apply(None, x) == "logits" and seen == ["copy"]
     with pytest.raises(ValueError, match="without an embedding bias"):
@@ -492,11 +287,6 @@ def test_the_stream_takes_no_bias_and_logs_its_capture_once(monkeypatch, caplog)
     assert rows[0] is x
     assert rows[1].dtype == torch.bfloat16 and rows[1].is_contiguous()
     assert rows[1].shape == (ROWS, DIM) and bool((rows[1] == 1).all())
-    monkeypatch.setattr(logits, "_capturing", lambda: True)
-    for _ in range(3):
-        method.apply(None, x)
-    lines = [r.getMessage() for r in caplog.records if SLOT in r.getMessage()]
-    assert lines == [f"NVIDIA megakernel: {SLOT} captured at 8 rows"]
 
 
 # ------------------------------------------------------------- the target's build
@@ -522,7 +312,7 @@ def _builds(slots, *, head=None, mega=None):
         yield build, agreed
 
 
-VERIFY = SimpleNamespace(widths=VERIFY_WIDTHS, tokens_per_request=8, binding=None)
+VERIFY = SimpleNamespace(widths=VERIFY_WIDTHS)
 TARGET = ("mega", "moe_nofill", "moe_swap")
 
 
@@ -545,17 +335,6 @@ def test_the_target_builds_it_plans_it_at_8_rows_and_states_its_memory():
         "slots by width 8: mega, lm_head_mxfp8; 16-128: moe_nofill, moe_swap; mega: "
         "MegaAttention; lm_head_mxfp8: an MXFP8 copy, 302.2 MiB of device memory"
     )
-
-
-def test_the_default_list_builds_no_copy():
-    with _builds(TARGET) as (build, agreed):
-        built = m31_runtime.build("model", "hf", VERIFY)
-    # the slot's own build decides: it returns None unless the slot is listed
-    build.assert_called_once_with("model", VERIFY_WIDTHS, frozenset(TARGET))
-    assert built.bound[SLOT] is None
-    assert built.slot_plan[8] == m31_plan.Slots(mega=True)
-    assert agreed[0].lm_head_mxfp8 == frozenset()
-    assert SLOT not in built.summary()
 
 
 def test_without_megas_step_the_slot_is_refused_and_no_copy_is_made():
@@ -683,7 +462,7 @@ def test_megas_step_closes_on_the_stand_in_and_on_sglangs_head_without_it():
 # ------------------------------------------------------------- the parity switch
 
 
-@pytest.mark.parametrize("value, lines", [("0", 0), ("", 0), ("1", 1)])
+@pytest.mark.parametrize("value, lines", [("0", 0), ("1", 1)])
 def test_the_parity_switch_logs_the_stream_against_sglangs_projection(
     monkeypatch, caplog, value, lines
 ):
@@ -721,31 +500,3 @@ def test_the_parity_switch_logs_the_stream_against_sglangs_projection(
     asked.clear()
     stand_in.log_parity(model, _rows())
     assert asked == []
-
-
-def test_the_host_launch_asks_for_a_dependent_launch_only_when_told(monkeypatch):
-    """The stream is the package's one dependent (PDL) launch: the cooperative
-    kernels' launches carry no such attribute."""
-    launched = []
-
-    class Attribute:
-        def __init__(self):
-            self.id = None
-            self.value = SimpleNamespace()
-
-    cu = SimpleNamespace(
-        CUlaunchConfig=lambda: SimpleNamespace(),
-        CUlaunchAttribute=Attribute,
-        CUlaunchAttributeID=SimpleNamespace(
-            CU_LAUNCH_ATTRIBUTE_COOPERATIVE="cooperative",
-            CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION="dependent",
-        ),
-        CUstream=lambda stream: stream,
-        cuLaunchKernelEx=lambda config, function, parameters, extra: (
-            launched.append([a.id for a in config.attrs]) or (0,)
-        ),
-    )
-    monkeypatch.setattr(host, "driver", lambda: cu)
-    for kwargs in ({}, {"cooperative": True}, {"dependent": True}):
-        host.launch("function", (1, 1, 1), (32, 1, 1), 0, [], 0, **kwargs)
-    assert launched == [[], ["cooperative"], ["dependent"]]

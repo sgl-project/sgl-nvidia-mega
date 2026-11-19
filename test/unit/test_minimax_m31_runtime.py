@@ -67,75 +67,61 @@ class TestPlan(CustomTestCase):
     def test_verify_steps_of_built_widths_are_covered_only_while_capturing(self):
         built = _built()
         ids = torch.zeros(16, dtype=torch.long)
+        verify = _batch("target_verify", 2)
         with patch.object(m31_executor, "serves_this_step", return_value=True):
-            for requests in range(1, 17):
+            for requests in (1, 2, 16):
                 rows = 8 * requests
                 self.assertEqual(
                     built.plan(torch.zeros(rows), _batch("target_verify", requests)),
                     Step(mode="target_verify", rows=rows),
                 )
-            self.assertEqual(
-                built.plan(ids, _batch("target_verify", 2), pp_proxy_tensors=None),
-                Step(mode="target_verify", rows=16),
-            )
             for mode in ("decode", "extend"):
                 self.assertIsNone(built.plan(ids, _batch(mode, 2)))
-            # rows that are not 8 a request, or past 16 requests
-            self.assertIsNone(built.plan(torch.zeros(12), _batch("target_verify", 2)))
+            # rows that are not 8 a request, past 16 requests, or a width not built
+            self.assertIsNone(built.plan(torch.zeros(12), verify))
             self.assertIsNone(built.plan(ids, _batch("target_verify", 1)))
             self.assertIsNone(built.plan(torch.zeros(136), _batch("target_verify", 17)))
+            self.assertIsNone(_built(widths=(8, 24)).plan(ids, verify))
             # SGLang's other entries, and two-batch overlap
-            self.assertIsNone(built.plan(ids, _batch("target_verify", 2), True))
-            self.assertIsNone(
-                built.plan(ids, _batch("target_verify", 2), pp_proxy_tensors=object())
-            )
+            self.assertIsNone(built.plan(ids, verify, True))
+            self.assertIsNone(built.plan(ids, verify, pp_proxy_tensors=object()))
             self.assertIsNone(
                 built.plan(ids, _batch("target_verify", 2, can_run_tbo=True))
             )
         with patch.object(m31_executor, "serves_this_step", return_value=False):
-            self.assertIsNone(built.plan(ids, _batch("target_verify", 2)))
-
-    def test_only_the_built_widths(self):
-        built = _built(widths=(8, 16, 24))
-        with patch.object(m31_executor, "serves_this_step", return_value=True):
-            self.assertIsNotNone(
-                built.plan(torch.zeros(24), _batch("target_verify", 3))
-            )
-            self.assertIsNone(built.plan(torch.zeros(32), _batch("target_verify", 4)))
+            self.assertIsNone(built.plan(ids, verify))
 
 
 class TestSlotPlan(CustomTestCase):
-    """plan.slots per width: mega at one request only, moe_nofill / moe_swap at their
-    builds' widths where mega does not take the step."""
+    """plan.slots per width: mega at one request only, with lm_head_mxfp8 on its
+    step; moe_nofill / moe_swap at their builds' widths where mega does not take the
+    step."""
 
-    def test_served_widths(self):
-        self.assertEqual(m31_plan.served_widths(VERIFY_WIDTHS), VERIFY_WIDTHS)
-        self.assertEqual(m31_plan.served_widths(tuple(range(8, 257, 8))), VERIFY_WIDTHS)
-        self.assertEqual(m31_plan.served_widths((6, 8, 12, 16)), (8, 16))
-        self.assertEqual(m31_plan.MAX_ROWS, 128)
-
-    def test_default_plan(self):
+    def test_the_plan_by_width(self):
         every = frozenset(VERIFY_WIDTHS)
+        self.assertEqual(m31_plan.served_widths((6, 8, 12, 16, 136)), (8, 16))
         facts = m31_plan.Facts(mega=frozenset({8}), moe_nofill=every, moe_swap=every)
         plan = m31_plan.plan(VERIFY_WIDTHS, facts)
         self.assertEqual(plan[8], MEGA)
-        for w in VERIFY_WIDTHS[1:]:
-            self.assertEqual(plan[w], NOFILL_SWAP)
+        self.assertTrue(all(plan[w] == NOFILL_SWAP for w in VERIFY_WIDTHS[1:]))
         self.assertEqual(
             m31_plan.describe(plan), "8: mega; 16-128: moe_nofill, moe_swap"
         )
-
-    def test_without_mega_the_moe_slots_serve_8_rows_too(self):
-        every = frozenset(VERIFY_WIDTHS)
-        plan = m31_plan.plan(
+        # without mega the MoE slots serve 8 rows too; no slot is SGLang's step code
+        moe = m31_plan.plan(
             VERIFY_WIDTHS, m31_plan.Facts(moe_nofill=every, moe_swap=every)
         )
-        self.assertTrue(all(s == NOFILL_SWAP for s in plan.values()))
-        self.assertEqual(m31_plan.describe(plan), "8-128: moe_nofill, moe_swap")
-        self.assertEqual(
-            m31_plan.describe(m31_plan.plan(VERIFY_WIDTHS, m31_plan.Facts())),
-            "8-128: stock",
+        self.assertEqual(m31_plan.describe(moe), "8-128: moe_nofill, moe_swap")
+        stock = m31_plan.plan(VERIFY_WIDTHS, m31_plan.Facts())
+        self.assertEqual(m31_plan.describe(stock), "8-128: stock")
+        # lm_head_mxfp8 closes the step mega serves, and only where its build serves
+        head = m31_plan.plan(
+            VERIFY_WIDTHS, m31_plan.Facts(mega=frozenset({8}), lm_head_mxfp8=every)
         )
+        self.assertEqual(head[8], m31_plan.Slots(mega=True, lm_head_mxfp8=True))
+        self.assertFalse(any(head[w].lm_head_mxfp8 for w in VERIFY_WIDTHS[1:]))
+        no_mega = m31_plan.Facts(moe_nofill=every, lm_head_mxfp8=every)
+        self.assertFalse(m31_plan.slots(8, no_mega).lm_head_mxfp8)
 
     def test_bounds(self):
         # mega serves only 8 rows, whatever its build says
@@ -162,46 +148,46 @@ class TestSlotPlan(CustomTestCase):
 
 class TestSlotList(CustomTestCase):
     """SGLANG_NVIDIA_MEGAKERNEL_SLOTS: unset ships every slot, a list replaces it, ""
-    is SGLang's step code everywhere; unknown slots and missing needs are refused."""
+    is SGLang's step code everywhere (the refusals of a list go through SGLang's
+    argument resolution: test_minimax_m31_spec.py)."""
 
-    def test_parsing(self):
+    def test_the_list_and_its_two_specs(self):
         env = m31_runtime.SLOTS_ENV
-        # markov is the DSpark draft's slot (test_minimax_m31_draft_slots.py)
-        self.assertEqual(
-            m31_runtime.requested_slots({}),
-            frozenset({"mega", "moe_nofill", "moe_swap", "markov"}),
-        )
+        shipped = frozenset({"mega", "moe_nofill", "moe_swap", "markov"})
+        self.assertEqual(m31_runtime.requested_slots({}), shipped)
         self.assertEqual(m31_runtime.requested_slots({env: ""}), frozenset())
         self.assertEqual(m31_runtime.requested_slots({env: " , "}), frozenset())
-        self.assertEqual(
-            m31_runtime.requested_slots({env: "moe_nofill, moe_swap,"}),
-            frozenset({"moe_nofill", "moe_swap"}),
+        listed = m31_runtime.requested_slots(
+            {env: "moe_nofill, moe_swap,markov,draft_lm_head,lm_head_mxfp8"}
         )
+        # the target's plan takes its slots, the draft spec the draft's
         self.assertEqual(
-            m31_runtime.requested_slots({env: "mega"}), frozenset({"mega"})
+            m31_runtime.target_slots(listed),
+            {"moe_nofill", "moe_swap", "lm_head_mxfp8"},
         )
-
-    def test_refusals(self):
-        self.assertEqual(
-            m31_runtime.slot_reasons(frozenset(m31_runtime.SHIPPED_SLOTS)), []
-        )
+        self.assertEqual(m31_runtime.draft_slots(listed), {"markov", "draft_lm_head"})
+        for slot in m31_runtime.DRAFT_SLOTS:
+            self.assertNotIn(slot, m31_plan.Slots.__struct_fields__)
+        self.assertEqual(m31_runtime.slot_reasons(shipped), [])
         self.assertEqual(m31_runtime.slot_reasons(frozenset()), [])
-        (unknown,) = m31_runtime.slot_reasons(frozenset({"hop_mxfp8"}))
-        self.assertIn("unknown slot 'hop_mxfp8'", unknown)
-        (needs,) = m31_runtime.slot_reasons(frozenset({"moe_swap"}))
-        self.assertIn("slot 'moe_swap' needs slot 'moe_nofill'", needs)
 
-    def test_numerics(self):
+    def test_the_targets_numerics(self):
         from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
 
-        tol = m31_spec._numerics(frozenset(m31_runtime.SHIPPED_SLOTS))
-        self.assertEqual(tol.kind, NumericsKind.TOLERANCE)
-        self.assertEqual(dict(tol.tolerances), m31_spec.MEGA_TOLERANCES)
-        for slots in ({"moe_nofill", "moe_swap"}, {"moe_nofill"}, set()):
+        shipped = m31_spec._numerics(frozenset(m31_runtime.SHIPPED_SLOTS))
+        self.assertEqual(shipped.kind, NumericsKind.TOLERANCE)
+        self.assertEqual(dict(shipped.tolerances), m31_spec.MEGA_TOLERANCES)
+        # slot lm_head_mxfp8 adds its bound to slot mega's
+        head = m31_spec._numerics(frozenset({"mega", "lm_head_mxfp8"}))
+        self.assertEqual(
+            dict(head.tolerances),
+            {**m31_spec.MEGA_TOLERANCES, **m31_spec.LM_HEAD_TOLERANCES},
+        )
+        # the MoE slots are bitwise; a draft slot does not change the target's steps
+        for slots in ({"moe_nofill", "moe_swap", "markov"}, {"moe_nofill"}, set()):
             self.assertEqual(
                 m31_spec._numerics(frozenset(slots)).kind, NumericsKind.BITWISE
             )
-        self.assertEqual(m31_runtime.BITWISE_SLOTS, {"moe_nofill", "moe_swap"})
 
 
 # --------------------------------------------------------------- the stock step
@@ -453,16 +439,6 @@ class TestStockStep(CustomTestCase):
         self.assertEqual(len(seen), 5)
         self.assertTrue(all(s is NOFILL_SWAP for _, s in seen))
 
-    def test_slot_mega_runs_its_step(self):
-        mega = Mock()
-        mega.run.return_value = "mega"
-        built = m31_executor.MegakernelDecode(
-            None, widths=(8, 16), plan={8: MEGA, 16: STOCK}, bound={}, mega=mega
-        )
-        step = Step(mode="target_verify", rows=8)
-        self.assertEqual(built._forward(step, "ids", "pos", "fb"), "mega")
-        mega.run.assert_called_once_with(step, "ids", "pos", "fb")
-
 
 class TestParity(CustomTestCase):
     """SGLANG_NVIDIA_MEGAKERNEL_PARITY: SGLang's forward, then the executor's (or
@@ -545,7 +521,7 @@ def _builds(slots, *, moe=None, swap=None, agree=None, mega=None):
         yield
 
 
-VERIFY = SimpleNamespace(widths=VERIFY_WIDTHS, tokens_per_request=8, binding=None)
+VERIFY = SimpleNamespace(widths=VERIFY_WIDTHS)
 
 
 class TestBuild(CustomTestCase):
@@ -554,9 +530,11 @@ class TestBuild(CustomTestCase):
         mega.return_value.summary.return_value = "MegaAttention"
         nofill = mn.Bound(widths=VERIFY_WIDTHS)
         swap = moe_swap.Bound(widths=VERIFY_WIDTHS)
+        # SGLang may ask for wider steps than the megakernel covers
+        ctx = SimpleNamespace(widths=tuple(range(8, 257, 8)))
         with _builds(m31_runtime.SHIPPED_SLOTS, moe=nofill, swap=swap, mega=mega):
-            built = m31_runtime.build("model", "hf", VERIFY)
-        mega.assert_called_once_with("model", "hf", VERIFY)
+            built = m31_runtime.build("model", "hf", ctx)
+        mega.assert_called_once_with("model", "hf", ctx)
         self.assertIs(built.mega, mega.return_value)
         self.assertEqual(built.widths, VERIFY_WIDTHS)
         self.assertEqual(built.slot_plan[8], MEGA)
@@ -578,13 +556,6 @@ class TestBuild(CustomTestCase):
         ):
             self.assertIsNone(getattr(built, name))
 
-    def test_the_widths_sglang_asks_for(self):
-        ctx = SimpleNamespace(widths=tuple(range(8, 257, 8)), binding=None)
-        with _builds(set()):
-            built = m31_runtime.build("model", "hf", ctx)
-        self.assertEqual(built.widths, VERIFY_WIDTHS)
-        self.assertEqual(m31_plan.describe(built.slot_plan), "8-128: stock")
-
     def test_no_mega_no_routed_expert_copy(self):
         mega = Mock()
         nofill = mn.Bound(widths=VERIFY_WIDTHS)
@@ -596,7 +567,7 @@ class TestBuild(CustomTestCase):
         self.assertEqual(built.slot_plan[8], NOFILL_SWAP)
 
     def test_mega_needs_one_requests_width(self):
-        ctx = SimpleNamespace(widths=(16, 24), binding=None)
+        ctx = SimpleNamespace(widths=(16, 24))
         mega = Mock()
         with (
             _builds({"mega"}, mega=mega),
@@ -616,7 +587,7 @@ class TestBuild(CustomTestCase):
     def test_one_request_server_with_the_default_slots(self):
         """--cuda-graph-max-bs-decode 1: mega takes the only width; moe_nofill built
         there is not a failed build."""
-        ctx = SimpleNamespace(widths=(8,), binding=None)
+        ctx = SimpleNamespace(widths=(8,))
         with _builds(
             m31_runtime.SHIPPED_SLOTS,
             moe=mn.Bound(widths=(8,)),

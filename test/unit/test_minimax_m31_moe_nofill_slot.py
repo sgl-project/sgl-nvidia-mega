@@ -930,35 +930,29 @@ class TestBuild(CustomTestCase):
 
             fi.nq.nvfp4_quantize_per_token_cute_dsl = drifted
 
+        def without_pdl(fi):
+            # FlashInfer's own call turns PDL off: the same bytes (PDL only orders
+            # launches), another kernel than the slot's key launches
+            stock = fi.nq.nvfp4_quantize_per_token_cute_dsl
+            fi.nq.nvfp4_quantize_per_token_cute_dsl = lambda *a, **k: stock(
+                *a, **{**k, "enable_pdl": False}
+            )
+
+        variant = (
+            f"under [('bfloat16', {H}, 2, False, False, None, False, 32, False, 0, 0)]"
+        )
         for mutate, needle in (
             (without_cute_dsl_quantize, "does not import"),
             (without_getter, "has no _get_compiled_kernel_nvfp4_per_token"),
             (other_bytes, "differ from FlashInfer's nvfp4_quantize"),
+            (without_pdl, variant),
         ):
-            bound, _, _ = self._build(fi_mutate=[mutate])
+            bound, _, fi = self._build(fi_mutate=[mutate])
             self.assertEqual(bound.widths, (), needle)
             self.assertIn(needle, bound.reason)
-
-    def test_none_when_flashinfer_compiles_another_variant_of_the_same_bytes(self):
-        def without_pdl(fi):
-            # FlashInfer's own per-token call turns PDL off: the same bytes (PDL
-            # only orders launches), another kernel than the slot's key launches
-            stock = fi.nq.nvfp4_quantize_per_token_cute_dsl
-
-            def call(*a, **k):
-                return stock(*a, **{**k, "enable_pdl": False})
-
-            fi.nq.nvfp4_quantize_per_token_cute_dsl = call
-
-        bound, _, fi = self._build(fi_mutate=[without_pdl])
-        self.assertEqual(bound.widths, ())
-        self.assertIn("compiles its per-token kernel under", bound.reason)
-        self.assertIn(
-            f"under [('bfloat16', {H}, 2, False, False, None, False, 32, False, 0, 0)]",
-            bound.reason,
-        )
-        self.assertNotIn("differ from FlashInfer's nvfp4_quantize", bound.reason)
+        # a variant of the same bytes shows only in the key FlashInfer compiles under;
         # the build leaves FlashInfer's getter as it found it
+        self.assertNotIn("differ from FlashInfer's nvfp4_quantize", bound.reason)
         self.assertEqual(fi.nq._get_compiled_kernel_nvfp4_per_token, fi._compile)
 
     def test_none_on_every_rank_when_one_rank_misses(self):
