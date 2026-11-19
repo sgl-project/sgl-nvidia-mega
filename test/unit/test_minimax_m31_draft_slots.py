@@ -113,6 +113,10 @@ def _cfg(lm_head_dtype=None):
     return SimpleNamespace(speculative_dspark_lm_head_dtype=lm_head_dtype)
 
 
+@pytest.mark.skipif(
+    not hasattr(envs, "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK"),
+    reason=m31_spec.NO_M31_HOST,
+)
 def test_a_server_whose_proposal_the_slots_cannot_replace_is_refused():
     """The draft slots replace SGLang's folded DSpark proposal; a server that turned it
     off, or asked for SGLang's own replacements of its parts, is refused."""

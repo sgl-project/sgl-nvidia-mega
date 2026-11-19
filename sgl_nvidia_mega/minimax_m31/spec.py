@@ -358,9 +358,28 @@ def lm_head_config_reasons(cfg, slots: frozenset = SLOTS) -> list[str]:
     return reasons
 
 
+# The package mirrors SGLang's MiniMax-M3.1 step code and reads its DSpark switches as
+# of sgl-project/sglang#46693 (the model's layer boundary and expert requantization),
+# #42855 and #49595 (the DSpark switches the draft's slots refuse). On an older SGLang
+# the spec still imports and refuses every configuration; the newest of the three, the
+# --speculative-dspark-lm-head-dtype argument, is the marker.
+NO_M31_HOST = (
+    "this SGLang predates the MiniMax-M3.1 support the megakernel is built on "
+    "(sgl-project/sglang#46693, #42855, #49595)"
+)
+
+
+def host_reasons(cfg) -> list[str]:
+    """Why this SGLang cannot host the package ([] when it can)."""
+    return [] if hasattr(cfg, "speculative_dspark_lm_head_dtype") else [NO_M31_HOST]
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    """The checks ``REQUIREMENTS`` cannot state: the requested slots, nested HF fields,
-    derived values and the toolchains."""
+    """The checks ``REQUIREMENTS`` cannot state: the hosting SGLang, the requested
+    slots, nested HF fields, derived values and the toolchains."""
+    host = host_reasons(cfg)
+    if host:
+        return host
     reasons = (
         slot_reasons(SLOTS)
         + toolchain_reasons(SLOTS)

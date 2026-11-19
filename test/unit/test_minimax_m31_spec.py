@@ -84,10 +84,29 @@ def _refusal(
     return ""
 
 
+# Against an SGLang that predates the MiniMax-M3.1 support the package is built on, the
+# spec refuses every configuration (the test below); the other checks of SGLang's
+# resolution step then have nothing to accept or refuse
+needs_host = pytest.mark.skipif(
+    bool(spec.host_reasons(ServerArgs(**DOCUMENTED))), reason=spec.NO_M31_HOST
+)
+
+
+def test_an_sglang_without_the_m31_support_is_refused_with_that_reason():
+    with patch.object(spec, "host_reasons", return_value=[spec.NO_M31_HOST]):
+        assert spec.NO_M31_HOST in _refusal()
+    assert spec.host_reasons(SimpleNamespace()) == [spec.NO_M31_HOST]
+    assert (
+        spec.host_reasons(SimpleNamespace(speculative_dspark_lm_head_dtype=None)) == []
+    )
+
+
+@needs_host
 def test_the_documented_setup_is_accepted():
     assert _refusal() == ""
 
 
+@needs_host
 @pytest.mark.parametrize(
     "kw, want",
     [
@@ -109,6 +128,7 @@ def test_each_refusal_names_its_reason(kw, want):
     assert want in _refusal(**kw)
 
 
+@needs_host
 def test_a_missing_toolchain_is_refused_before_the_weights_load():
     from sgl_nvidia_mega.minimax_m31.sm103 import nvcc
 
@@ -118,6 +138,7 @@ def test_a_missing_toolchain_is_refused_before_the_weights_load():
     assert "nvcc" in _refusal(toolchain=reasons)
 
 
+@needs_host
 def test_a_default_rope_type_and_a_serial_scheduler_are_accepted():
     assert _refusal(text=dict(rope_scaling={"rope_type": "default"})) == ""
     off = {"SGLANG_FORCE_COARSE_WAR_BARRIER": False}
@@ -151,6 +172,7 @@ def test_one_spec_covers_1_to_16_requests():
     assert spec.SPEC.requires.server_args["speculative_num_draft_tokens"] == {8}
 
 
+@needs_host
 @pytest.mark.parametrize(
     "slots, want",
     [
@@ -165,6 +187,7 @@ def test_a_slot_list_refusal_names_it(slots, want):
         assert want in _refusal()
 
 
+@needs_host
 def test_the_draft_slots_checks_apply_only_with_them():
     """Slot markov ships: the documented setup runs it. The draft's slots replace
     SGLang's folded DSpark proposal, so a server without it is refused while one is
@@ -183,6 +206,7 @@ def test_the_draft_slots_checks_apply_only_with_them():
         assert _refusal(env=unfolded) == ""
 
 
+@needs_host
 def test_slot_lm_head_mxfp8s_checks_apply_only_with_it():
     """Opt-in: the documented setup does not run it. Listed, it replaces SGLang's BF16
     LM-head projection, so a server that asks for the FP32 one is refused."""
@@ -199,6 +223,7 @@ def test_slot_lm_head_mxfp8s_checks_apply_only_with_it():
         assert "config.hidden_size 4096" in refusal
 
 
+@needs_host
 def test_slot_megas_checks_apply_only_with_it():
     """MegaAttention's checks (the config it is built for, the persistent grid's
     residency) refuse a server only while slot mega is requested."""
