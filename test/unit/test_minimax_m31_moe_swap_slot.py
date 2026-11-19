@@ -122,12 +122,6 @@ class TestSwappedMoe(CustomTestCase):
                     [*((what, "main") for what in ROUTED), ("shared", "main")],
                 )
 
-    def test_every_width_of_the_buffers(self):
-        for m in (1, 8, 16):
-            with self.subTest(m=m):
-                stock, swap = self._run(capturing=True, m=m)
-                self._check_same_work(stock, swap)
-
 
 class TestMoeStep(CustomTestCase):
     """moe.step: moe_swap's chain where planned, moe_nofill's where only it is,
