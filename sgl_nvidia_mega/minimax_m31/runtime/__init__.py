@@ -23,14 +23,9 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from sgl_nvidia_mega.minimax_m31.runtime.parity import log_parity  # noqa: F401
-
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/nvidia/spec.py": (
-        "widths",
-        "binding",
-    ),
+    "kernels/plugin_kernels/nvidia/spec.py": ("widths",),
     "srt/models/minimax_m3.py": (
         "MiniMaxM3DecoderLayer",
         "MiniMaxM3Model",
@@ -315,7 +310,6 @@ def build(model: Any, hf_config: Any, ctx: Any):
         plan=plan,
         bound=bound,
         mega=mega,
-        binding=getattr(ctx, "binding", None),
         summary=summary,
         draft_check=engagement,
     )

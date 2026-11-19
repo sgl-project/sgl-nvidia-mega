@@ -58,7 +58,6 @@ SGLANG_READS = {
         "Step",
         "mode",
         "rows",
-        "view",
         "widths",
         "draft_sampler",
         "draft_loop",
@@ -149,7 +148,6 @@ class MegakernelDecode:
         plan: dict,
         bound: dict,
         mega: Any = None,
-        binding: Any = None,
         summary: str = "",
         draft_check: Optional[Callable[[], bool]] = None,
     ):
@@ -158,8 +156,6 @@ class MegakernelDecode:
         self.slot_plan = plan
         self.bound = bound
         self.mega = mega  # runtime.mega.MegaStep, with slot mega built
-        # SGLang's MegakernelBinding (BuildContext.binding)
-        self.binding = binding
         self._summary = summary
         # with draft slots requested, their engagement (draft.EngagementCheck): called
         # on every forward until it returns True
@@ -245,10 +241,8 @@ class MegakernelDecode:
             forward_batch=forward_batch,
             positions=positions,
             input_ids=input_ids,
-            step=step,
             slots=slots,
             bound=self.bound,
-            binding=self.binding,
         )
         m = st.model
         x = boundary.start(st)
@@ -265,7 +259,6 @@ class MegakernelDecode:
             )
             with ctx:
                 layer = m.layers[i]
-                st.layer_id = i
                 captured = (
                     aux if getattr(layer, "_is_layer_to_capture", False) else None
                 )
