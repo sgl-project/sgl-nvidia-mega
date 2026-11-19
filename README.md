@@ -20,6 +20,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | Kimi K3 (packed MXFP4) | GB300 (SM103, 152 SMs); 148-SM B300 (SM103) and B200/GB200 (SM100) with `sm148` | 8 | Decode rows 1–8, 16, 32 and 64; fixed q4–q8 verification within 64 token rows. Admission and tested configurations differ; see [`spec.py`](sgl_nvidia_mega/kimi_k3/spec.py). The 148-SM admission has no TP8 serving validation yet; the same gate was validated on Kimi K3.1 at TP16 on GB200 |
 | Kimi K3.1 (packed MXFP4) | GB300 (SM103) | 16 (one NVLink domain); 8 | DFlash target verify steps of 8 rows a request (7 drafted tokens and the anchor) at 1 to 8 requests, without DCP or with DCP equal to TP, also as the decode role of a PD-disaggregated deployment; the DFlash2 draft decoder layers at one request. Served and measured end to end at TP16, one request. See [Kimi K3.1 on GB300](#kimi-k31-on-gb300) |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
+| Qwen3.8-Flash-Next (NVFP4) | Rubin (SM107) | 1; 4 with every op on SGLang's module | Target verify and decode steps and MTP draft-extend steps of 1 to 1024 rows in CUDA graphs, prefill and extend eagerly. See [Qwen3.8](#qwen38) |
 
 For DeepSeek-V4.1-Flash, larger verify steps, prefill and extend run
 SGLang's standard path. Qwen3.5 also offers the explicit GDN prefill slot below. Their draft specs provide the DSpark proposal and the
@@ -174,6 +175,53 @@ At TP4 (one GB300 tray, 16 attention heads per rank) the verify step's groups ar
 The TP4 split-K GEMMs (`ll.gemm`) run FlashInfer's split-K kernel (`mm_bf16(..., tactic=)`) when the installed FlashInfer has it with the synchronization fixes (`SplitKTactic.SYNC_FIXED`); otherwise they run the plugin's vendored copy (`ll/kernels/cute/splitk.py`). The startup log names the source. `SGLANG_NVIDIA_MEGAKERNEL_GLM_GEMM_SPLITK` switches it: `auto` (the default), `flashinfer` (FlashInfer's kernel even without the fixes; the server stops if FlashInfer has no such API) or `vendored`.
 
 With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting only; a list without a slot another needs (`dnorm` needs `qkv_a_small_m_shared` and `hops`, `qkv_a_small_m_shared` needs `attention`, `draft_rowselect` needs `draft`) stops the server at startup, naming it. Slot `draft` needs embedding replication, which the flag turns on (SGLang sets `SGLANG_ENABLE_EMBED_REPLICATION` when it is unset), greedy draft acceptance and an SGLang whose EAGLE draft graph runners run a draft spec's capture check; the server stops at startup, naming each one that is missing (an explicit `SGLANG_ENABLE_EMBED_REPLICATION=0` too).
+
+### Qwen3.8
+
+The Qwen3.8 executor (`qwen3_8/runtime`) owns the forward of the target and of its MTP
+draft: target verify, decode, draft extend, and prefill / extend. It runs the layer loop
+itself. Per layer, that is the HC read, the mixer (QSA attention or GatedDeltaNet), the HC
+write-back, and the MoE. SGLang keeps the scheduling, the speculative orchestration, the
+caches, the sampling and the pools. The executor reads the running forward's metadata and
+pools through SGLang's EAGLE hybrid binding (`binding="eagle_hybrid"`).
+
+Each op runs its slot's kernel where that kernel serves the step's width, and SGLang's own
+module everywhere else. The log records which implementation each op ran, once per new set
+for each (mode, width): `NVIDIA megakernel engagement: ...`.
+
+`SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) lists the slots to run. Unset or empty
+runs every op on SGLang's module.
+
+| Slot | Runs | Numerics against SGLang's module |
+| --- | --- | --- |
+| `hc` | HC write-backs of 1 to 32 rows; with `SGLANG_HC_MACRO` (on by default) at TP1, the HC reads the executor makes itself at 9 to 32 rows (the PLE layer's, and every layer's with the BF16 pin table) on the source's row-aware split-K tactics | rounding |
+| `hc_wide` | HC reads and write-backs of 33 to 1024 rows; at 33 to 320 rows, a write-back and the next read in one launch | rounding |
+| `gdn_native_pdl` | the GDN target verify on the circular ReplaySSM rings, as a PDL launch | within SGLang's own run-to-run variation |
+| `qsa_indexer` | the QSA indexer's fold, scorer and top-k in verify, decode and draft extend | the same blocks, except on ties |
+| `qsa_pool` | TP1 QSA sparse attention of up to 64 verify / decode rows on split-K pool kernels | rounding |
+| `qsa_pool_fp8` | TP1 QSA sparse attention of 56 to 576 target-verify rows on an FP8 E4M3 KV pool: the new K/V cast in the pool write, each request's token union, the warp-specialized attention (PDL) and the merge; `SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_QSA_UNION_MIN_ROWS` and `..._QSA_UNION_SPLITS` (default 56 and 2) tune it | rounding |
+| `moe_finalize` | the TP1 MoE finalize with the gated shared expert in one ordered kernel; from 1024 rows (prefill and extend, in breakable prefill graphs too) the extend-size stream order and a register-capped PDL launch, plus a FlashInfer tuning pass of the routed experts at prefill sizes that applies the prefill table of `SGLANG_FLASHINFER_TACTIC_PIN_FILE` | rounding |
+| `gdn_prefill` | the GDN prefill on FlashInfer's chunked kernel: split conv, retiled gating, l2norm and norm, one-launch state copies | bitwise |
+| `qsa_prefill` | QSA prefill: row-group union attention, row pack, fast top-k select, TMA prefill | union: rounding; the rest bitwise |
+| `ple` | the PLE target-verify layout, host-table gather, gate and short conv | bitwise |
+
+Switches:
+
+- **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_DECOMPOSE=1`** runs the S1 layers: the executor calls
+  each layer's HC read, mixer, HC write-back and MoE itself, instead of going through the
+  stage boundaries. It needs TP1. `hc`, `hc_wide`, `moe_finalize` and the PLE add need it.
+- **`SGLANG_NVIDIA_MEGAKERNEL_QWEN3_8_UCACHE=1`** turns on the GDN u-cache target verify, a
+  deferred-fold ReplaySSM.
+  - The executor owns the rings, keyed by request row with an fp16 key ring. It allocates
+    them in the spec's `prepare`, resets them, and commits each verify.
+  - It does so through SGLang's `SupportsStateSlotReset` and `SupportsRecurrentCommit`.
+  - Needs: `--mamba-ssm-dtype float16`, `--linear-attn-decode-backend triton`, a linear
+    NEXTN / EAGLE chain of 1 to 8 draft tokens, and SM107.
+  - Incompatible with `--enable-linear-replayssm-spec`.
+  - The server stops at startup otherwise, naming the reason.
+- **`SGLANG_NVIDIA_MEGAKERNEL_PARITY=layer|control`** is test only. It runs SGLang's forward
+  beside the executor on every covered step, restoring the recurrent state between the two,
+  and logs the steps, layers and logits that differ (`qwen3_8/tools/parity.py`).
 
 ### Design
 
@@ -426,6 +474,7 @@ sgl-nvidia-mega/
 │   │   ├── logits/          # the head and the logits
 │   │   └── sm103/           # kernels and the build-time runner; no SGLang imports
 │   ├── qwen3_5/              # spec, plan, runtime, boundary, GDN, attention, MoE and SM103 kernels
+│   ├── qwen3_8/              # spec, the executor (runtime/), its kernels (kernels/, qsa/) and test tools
 │   ├── glm5_3/            # GLM-5.3 and GLM-5.2: the same layout (spec, plan, runtime, boundary, attention, moe, logits, sm103)
 │   ├── kimi_k3/              # the Kimi K3 spec, adapter and executor
 │   │   └── sm103/            # GB300 CuTe DSL kernels and their launchers

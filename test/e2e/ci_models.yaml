@@ -16,3 +16,10 @@ qwen3_5:
   gpus: 8
   tests:
     - test_qwen3_5_stock_parity.py
+
+# TP1 on one VR200 (SM 10.7); a runner without VR200 skips it
+qwen3_8:
+  gpu: VR200
+  gpus: 1
+  tests:
+    - test_qwen3_8_server.py
