@@ -130,8 +130,8 @@ def reason(engram, tp_size: int, table) -> str:
 
     if not _per_rank_host_table(table):
         return (
-            "needs the per-rank host Engram table (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"
-            ", SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank)"
+            "needs the per-rank host Engram table "
+            """(--engram-config '{"placement": "cpu"}')"""
         )
     wkv = engram.wkv
     method = wkv.quant_method

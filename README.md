@@ -274,19 +274,19 @@ DeepSeek-V4.1-Flash:
 
 ```bash
 SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample \
-SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --tp 4 \
   --ep-size 1 \
   --kv-cache-dtype fp8_e4m3 \
   --dsv4-attn-backend flashmla \
+  --engram-config '{"placement": "cpu"}' \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
   --enable-nvidia-megakernel
 ```
 
-The three environment variables are required by the DeepSeek-V4.1 spec; without them the server stops at startup, naming each.
+`SGLANG_SPEC_TP_SYNC` and `--engram-config` are required by the DeepSeek-V4.1 spec; without them the server stops at startup, naming each.
 
 ### DeepSeek-V4.1-Flash at TP8 + EP2
 
@@ -295,7 +295,6 @@ On two GB300 trays of one NVLink domain the spec admits one more layout: attenti
 ```bash
 SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1 \
 SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample \
-SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 NCCL_CUMEM_ENABLE=1 NCCL_MNNVL_ENABLE=1 \
 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
@@ -303,6 +302,7 @@ python -m sglang.launch_server \
   --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
   --kv-cache-dtype fp8_e4m3 \
   --dsv4-attn-backend flashmla \
+  --engram-config '{"placement": "cpu"}' \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
   --enable-nvidia-megakernel

@@ -19,7 +19,6 @@ NODE_RANK=${SLURM_NODEID:-0}
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=$AB_SRC${PYTHONPATH:+:$PYTHONPATH}
 export SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample
-export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export SGLANG_SIMULATE_ACC_LEN=3.51 SGLANG_SIMULATE_ACC_METHOD=match-expected
 export SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
@@ -48,6 +47,7 @@ COMMON=(--model-path "$AB_MODEL" --served-model-name deepseek-ai/DeepSeek-V4.1-F
   --trust-remote-code --enable-nvidia-megakernel
   --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4
   --dsv4-attn-backend flashmla --kv-cache-dtype fp8_e4m3
+  --engram-config '{"placement": "cpu"}'
   --speculative-algorithm DSPARK --speculative-dspark-block-size 5
   --cuda-graph-max-bs-decode 1 --max-running-requests 1
   --mem-fraction-static 0.8 --chunked-prefill-size 8192

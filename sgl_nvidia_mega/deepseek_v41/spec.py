@@ -144,6 +144,30 @@ def topology_reasons(cfg) -> list[str]:
     return reasons
 
 
+ENGRAM_CONFIG = '--engram-config \'{"placement": "cpu"}\''
+
+
+def engram_reasons(cfg) -> list[str]:
+    """Why the Engram tables are not the per-rank host tables slot engram reads ([]
+    when they are, and without the slot): --engram-config with placement cpu and no
+    replication (no per-table NUMA placement; SGLang's process membind,
+    SGLANG_NUMA_BIND_V2, only). The option is a dict before SGLang resolves it; an
+    SGLang without the option is left to the slot's own check of the table."""
+    if "engram" not in SLOTS or not hasattr(cfg, "engram_config"):
+        return []
+    config = cfg.engram_config or {}
+    if not isinstance(config, dict):
+        config = {k: getattr(config, k) for k in ("placement", "replication")}
+    placement = config.get("placement", "gpu")
+    replication = config.get("replication", "none")
+    if placement == "cpu" and replication == "none":
+        return []
+    return [
+        f"engram_config placement {placement!r}, replication {replication!r}: the "
+        f"Engram prefetch reads the per-rank host tables; pass {ENGRAM_CONFIG}"
+    ]
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     tp_sizes=frozenset(tp for tp, _ in TOPOLOGIES),
@@ -176,16 +200,6 @@ REQUIREMENTS = Requirements(
         # the shared expert split over the whole TP group, as SGLang loads it by
         # default: a TP partial the boundary's all-reduce sums (288 rows a rank at TP8)
         "SGLANG_SHARED_EXPERT_TP1": False,
-        # slot engram reads the per-rank host table SGLang builds only with these (no
-        # per-table NUMA placement; SGLang's process membind, SGLANG_NUMA_BIND_V2, only)
-        **(
-            {
-                "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": True,
-                "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
-            }
-            if "engram" in SLOTS
-            else {}
-        ),
     },
 )
 
@@ -321,7 +335,12 @@ def flashinfer_ll_gemm_digest():
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    reasons = topology_reasons(cfg) + toolchain_reasons() + runtime.slot_reasons()
+    reasons = (
+        topology_reasons(cfg)
+        + engram_reasons(cfg)
+        + toolchain_reasons()
+        + runtime.slot_reasons()
+    )
     if cfg.cuda_graph_config.decode.backend == "disabled" and not eager_steps_allowed():
         reasons.append(
             "decode CUDA graphs are disabled: the eager forward is not supported yet; "

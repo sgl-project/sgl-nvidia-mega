@@ -19,11 +19,11 @@ of every measured launch, and its share of the numbers was not measured separate
 
 ```
 SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample \
-SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 SGLANG_SIMULATE_ACC_LEN=3.51 SGLANG_SIMULATE_ACC_METHOD=match-expected \
 SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
 python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \
   --tp 4 --ep-size 1 --kv-cache-dtype fp8_e4m3 --dsv4-attn-backend flashmla --mem-fraction-static 0.8 \
+  --engram-config '{"placement": "cpu"}' \
   --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \
   --cuda-graph-max-bs-decode 64 --max-running-requests 256 --chunked-prefill-size 8192 \
   --enable-decoder-swa-bounded-replay \
