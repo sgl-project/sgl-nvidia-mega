@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
 )
 
 from sgl_nvidia_mega.deepseek_v41.attention.indexer import CHECK_ENV
-from sgl_nvidia_mega.deepseek_v41.runtime import SHIPPED_SLOTS, SLOTS_ENV
+from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS_ENV
 from sgl_nvidia_mega.deepseek_v41.runtime.bench import FIXED_ENV
 from sgl_nvidia_mega.plugin import FLAG_CLI
 
@@ -128,7 +128,10 @@ class TestIndexerFusedConsumer(CustomTestCase):
         cls.logs = tuple(
             tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err")
         )
-        env = {SLOTS_ENV: ",".join((*SHIPPED_SLOTS, "attn_indexer_fused"))}
+        # attn_indexer_fused is on by default: a default start, which leaves off the
+        # default-on slots that have nothing to serve on this SGLang (listing every
+        # shipped slot would require them all); the log check below sees it serve
+        env = {}
         extra = ["--watchdog-timeout", "600"]
         if INDEXER_CHECK:
             env[CHECK_ENV] = "1"
