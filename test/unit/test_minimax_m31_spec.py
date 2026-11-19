@@ -10,15 +10,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.environ import envs
-
-try:
-    from sglang.kernels.plugin_kernels.nvidia import spec as registry
-    from sglang.srt.kernel_plugins.nvidia import binding as guards
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels import guards
-    from sglang.srt.megakernels import spec as registry
-
+from sglang.srt.kernel_plugins.nvidia import binding as guards
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.server_args import ServerArgs
 

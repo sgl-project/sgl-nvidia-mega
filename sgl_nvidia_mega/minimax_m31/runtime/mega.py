@@ -39,12 +39,12 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py": (
         "view",
         "widths",
         "deadline_s",
     ),
-    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py": (
         "metadata",
         "kv_pool",
         "pool",

@@ -44,11 +44,7 @@ from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 import torch
-
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
 
 from sgl_nvidia_mega.minimax_m31 import ROWS, attention, boundary, logits, moe
 from sgl_nvidia_mega.minimax_m31.runtime import parity
@@ -58,7 +54,7 @@ from sgl_nvidia_mega.minimax_m31.spec import serves_this_step
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     # the BuiltMegakernel members SGLang reads and the Step it hands forward
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py": (
         "Step",
         "mode",
         "rows",
@@ -74,9 +70,7 @@ SGLANG_READS = {
         "plan",
         "forward",
     ),
-    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
-        "is_target_verify",
-    ),
+    "srt/model_executor/forward_mode.py": ("is_target_verify",),
     "srt/model_executor/forward_batch_info.py": (
         "forward_mode",
         "batch_size",

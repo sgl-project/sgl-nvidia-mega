@@ -20,11 +20,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind, Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import NumericsKind, Step
+from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind, Step
 
 from sgl_nvidia_mega.minimax_m31 import ROWS, logits
 from sgl_nvidia_mega.minimax_m31 import moe as m31_moe

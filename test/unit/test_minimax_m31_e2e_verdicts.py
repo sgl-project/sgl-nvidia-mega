@@ -201,12 +201,12 @@ def test_the_tables_carry_both_arms_the_difference_and_the_verdict():
 
 # The log lines the engagement check reads, as the installed SGLang formats them
 ROOT = Path(sglang.__file__).resolve().parent
-BINDINGS = ("srt/kernel_plugins/nvidia/binding.py", "srt/megakernels/binding.py")
+BINDING = "srt/kernel_plugins/nvidia/binding.py"
 
 
 def _sglang_format(start: str) -> str:
     """The one string constant of SGLang's megakernel binding that starts this way."""
-    path = next(ROOT / p for p in BINDINGS if (ROOT / p).is_file())
+    path = ROOT / BINDING
     found = [
         node.value
         for node in ast.walk(ast.parse(path.read_text()))

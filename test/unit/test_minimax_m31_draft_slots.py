@@ -15,14 +15,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
 from sglang.srt import runtime_context
 from sglang.srt.environ import envs
 from sglang.srt.model_executor import cuda_graph_config
-
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import NumericsKind
 
 from sgl_nvidia_mega.minimax_m31 import HF_CONFIG, MAX_REQUESTS, draft, draft_step
 from sgl_nvidia_mega.minimax_m31 import moe as m31_moe

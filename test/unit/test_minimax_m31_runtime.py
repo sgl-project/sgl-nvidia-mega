@@ -17,10 +17,7 @@ import torch
 
 pytest.importorskip("sglang.srt.layers.quantization.minimax_m3_nvfp4")
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step  # noqa: E402
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step  # noqa: E402
+from sglang.kernels.plugin_kernels.nvidia.spec import Step  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
 
 from sgl_nvidia_mega.minimax_m31 import moe as m31_moe  # noqa: E402

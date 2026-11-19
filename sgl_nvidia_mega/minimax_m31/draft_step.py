@@ -24,11 +24,7 @@ from __future__ import annotations
 import logging
 
 import torch
-
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
 
 from sgl_nvidia_mega.minimax_m31 import (
     DRAFT_HF_CONFIG,
@@ -48,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py": (
         "Step",
         "view",
         "deadline_s",
@@ -56,7 +52,7 @@ SGLANG_READS = {
         # the entry SGLang's folded DSpark proposal asks a built draft spec for
         "draft_sampler",
     ),
-    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py": (
         "metadata",
         "kv_pool",
         "pool",
@@ -74,7 +70,7 @@ SGLANG_READS = {
         # the draft mode the chain's logit staging follows
         "SGLANG_DSPARK_USE_GREEDY_DRAFT",
     ),
-    "srt/layers/dp_attention.py|srt/utils/common.py": (
+    "srt/layers/dp_attention.py": (
         "get_cuda_graph_batch_size_alignment",
         "require_attn_tp_gather",
     ),
@@ -123,9 +119,7 @@ SGLANG_READS = {
         "num_added_elements",
     ),
     "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "hidden_states"),
-    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
-        "is_target_verify",
-    ),
+    "srt/model_executor/forward_mode.py": ("is_target_verify",),
     "srt/model_executor/forward_batch_info.py": (
         "forward_mode",
         "batch_size",
@@ -160,16 +154,10 @@ LINEARS = (
 def _row_alignment() -> int:
     """The row multiple a captured draft step pads to: SGLang captures only the batch
     sizes whose rows divide by it."""
-    try:
-        from sglang.srt.layers.dp_attention import (
-            get_cuda_graph_batch_size_alignment,
-            require_attn_tp_gather,
-        )
-    except ImportError:  # SGLang before the helpers moved out of srt/utils/common.py
-        from sglang.srt.utils.common import (
-            get_cuda_graph_batch_size_alignment,
-            require_attn_tp_gather,
-        )
+    from sglang.srt.layers.dp_attention import (
+        get_cuda_graph_batch_size_alignment,
+        require_attn_tp_gather,
+    )
 
     # the dense DSpark draft is DP-local, so only the attention-TP gather applies
     return get_cuda_graph_batch_size_alignment(

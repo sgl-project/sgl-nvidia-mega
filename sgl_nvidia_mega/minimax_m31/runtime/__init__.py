@@ -27,7 +27,7 @@ from sgl_nvidia_mega.minimax_m31.runtime.parity import log_parity  # noqa: F401
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py": (
         "widths",
         "binding",
     ),

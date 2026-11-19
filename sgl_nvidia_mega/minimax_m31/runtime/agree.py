@@ -14,7 +14,7 @@ from typing import Any
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel", '"tp_group"'),
     "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
-    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py": (
         "megakernel_agree",
         "megakernel_agree(what)",
     ),
@@ -36,9 +36,6 @@ def gather_tp(obj: Any) -> list[Any]:
 
 def agree_tp(value: Any, *, what: str) -> None:
     """Raise on every rank unless every TP rank holds ``value`` (a collective)."""
-    try:
-        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.megakernels.binding import megakernel_agree
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
 
     megakernel_agree(value, what=what)

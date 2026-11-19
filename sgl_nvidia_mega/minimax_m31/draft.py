@@ -16,22 +16,13 @@ light."""
 
 from __future__ import annotations
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
+from sglang.kernels.plugin_kernels.nvidia.spec import (
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+)
 
 from sgl_nvidia_mega.minimax_m31 import DRAFT_ROWS
 from sgl_nvidia_mega.minimax_m31 import spec as target
@@ -39,7 +30,7 @@ from sgl_nvidia_mega.minimax_m31.runtime import SLOTS, draft_tolerances
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py": (
         "Feature",
         "MegakernelSpec",
         "Numerics",
