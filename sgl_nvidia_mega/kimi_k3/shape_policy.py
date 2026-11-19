@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 """Deployment query widths and prepared token rows; no runtime dependencies."""
 
+import os
+
 DECODE_WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 VERIFY_QUERIES = (4, 5, 6, 7, 8)
 MAX_ROWS = 64
@@ -83,3 +85,17 @@ def mla_max_seq_len(context_length: int, tokens_per_request: int) -> int:
     if maximum > (1 << 31) - 1:
         raise ValueError("Kimi K3 MLA scheduling length exceeds signed int32")
     return maximum
+
+
+SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
+
+
+def resident_blocks() -> int:
+    """GB300's 152 SMs; with "sm148" listed in SGLANG_NVIDIA_MEGAKERNEL_SLOTS, the 148 of a
+    B200/GB200 (SM100) or a B300, the same opt-in as deepseek_v41 (sgl-project/sgl-nvidia-mega#35)."""
+    slots = {
+        name.strip()
+        for name in os.environ.get(SLOTS_ENV, "").split(",")
+        if name.strip()
+    }
+    return 148 if "sm148" in slots else 152

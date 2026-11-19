@@ -1,0 +1,276 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+"""Output projection fused with its TP all-reduce and post-attention AttnRes: rank
+partials go into Lamport slots of a multicast [TP, 64, 7168] mailbox (parity alternates
+by layer) and the consumer sums and re-arms them. TP16 B<=8 fuses producer and consumer
+(MLA layers below B5 keep them split); above B8 the producer runs 16-token groups.
+At ``twoshot_batches``, given ``TwoShot`` buffers, the all-reduce is ``common.twoshot``
+(chunks pushed to their column owner, owner sums + multicasts, all Lamport-polled), so
+each GPU receives ~2 x 14 KB per token instead of TP x 14 KB. ``K31MK_OPROJ_FP8=1``
+(TP16, one-shot B<=8; default off, not bitwise) sends the partials as MXFP8 instead:
+7168 E4M3 bytes + 448 scale bytes per token row instead of 14336.
+``K31MK_OPROJ_NORM_FOLD=1`` (TP16; default off, not bitwise) folds AttnRes's final-norm
+cluster exchange into the first one (``OprojConsumer``'s norm_fold)."""
+
+import logging
+import os
+from functools import cache
+from typing import Any
+
+import cutlass
+import cutlass.cute as cute
+import torch
+import torch.distributed._symmetric_memory as symm_mem
+from cutlass.cute.runtime import make_fake_stream
+
+from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
+
+from ..common.host import dynamic_fake, dynamic_view, fake, stream, to_cute
+from ..common.policy import batch_table
+from .consumer import OprojConsumer, OprojFused
+from .producer import OprojProducer, OprojUmma
+
+
+class OprojMailbox:
+    """Sentinel-armed multicast mailbox; defaults to [parity, TP, 64, 7168] BF16."""
+
+    def __init__(self, group, device, tp, rank, shape=None):
+        self.tp, self.rank = tp, rank
+        shape = (2, tp, 64, 7168) if shape is None else shape
+        self.buffer = symm_mem.empty(shape, dtype=torch.bfloat16, device=device)
+        self.handle = handle = symm_mem.rendezvous(self.buffer, group)
+        self.mc = int(handle.multicast_ptr or 0)
+        if not self.mc:  # slot() offsets this address
+            raise RuntimeError(
+                "Kimi K3 specialized o-projection needs multicast memory"
+            )
+        self.buffer.view(torch.int32).fill_(-0x80000000)
+        torch.accelerator.synchronize(device)
+        torch.distributed.barrier(group=group)
+
+    def slot(self, parity):
+        return self.buffer[parity], self.mc + parity * self.buffer[0].numel() * 2
+
+
+# Two-shot all-reduce batches per TP (2-/4-node GB300, 32 MLA layers, time per layer, max
+# over ranks, multicast vs two-shot: two-shot is faster from TP8 B64 and from TP16 B32).
+TWOSHOT = {8: "33-64:1", 16: "17-64:1"}
+
+
+def twoshot_batches(tp):
+    table = batch_table(TWOSHOT.get(tp, ""))
+    return {batch for batch, on in table.items() if on}
+
+
+def engine(batch, tp):
+    """Producer engine above B8 (GB300): grouped mma.sync for TP8 up to B16, else
+    tcgen05."""
+    default = "mma" if tp == 8 and batch <= 16 else "umma"
+    return default
+
+
+def staged_blocks(batch, tp, mla):
+    """K blocks (of 12 at TP8) the B<=8 producer stages in SMEM; the rest stay in
+    registers. The partial rows are bit-identical for every count (same MMA and K-part
+    order); only speed changes. GB300: 4 at B1/MLA, else 8. SM107 (VR200, TP4 in-tray,
+    producer per call over cold weights): 2 is the fastest at B2-8 (8 is slower, and much
+    slower at B8: the 64-register build); at B1, 2 and 4 tie, so B1 keeps GB300's 4.
+    ``K31MK_OPROJ_STAGED`` overrides the
+    count (A/B only)."""
+    if tp == 16:
+        return 0
+    override = os.environ.get("K31MK_OPROJ_STAGED")
+    if override:
+        return int(override)
+    if torch.cuda.get_device_capability() == (10, 7):
+        return 4 if batch == 1 else 2
+    return 4 if mla or batch == 1 else 8
+
+
+logger = logging.getLogger(__name__)
+_ENGAGED = set()
+
+
+def _engaged(key, text):
+    """The engagement line of an opt-in knob, once per process (not per layer)."""
+    if key not in _ENGAGED:
+        _ENGAGED.add(key)
+        logger.info(text)
+
+
+# Opt-in, not bitwise (A/B and accuracy gates only): MXFP8 o-proj partials.
+OPROJ_FP8 = "K31MK_OPROJ_FP8"
+
+
+def fp8_partials(batch, tp, twoshot):
+    """Whether ``batch`` sends MXFP8 partials (``OPROJ_FP8``; TP16 one-shot B<=8)."""
+    on = (
+        os.environ.get(OPROJ_FP8, "0") not in ("", "0")
+        and tp == 16
+        and batch <= 8
+        and not twoshot
+    )
+    if on:
+        _engaged(
+            "fp8",
+            "NVIDIA megakernel: o-proj all-reduce partials in MXFP8 (K31MK_OPROJ_FP8, not bitwise)",
+        )
+    return on
+
+
+# On by default in the GB300 BEST scope, kimi_k31/k3/default_scope.py (0 = off), not bitwise: the AttnRes final norm from exchange 1.
+OPROJ_NORM_FOLD = "K31MK_OPROJ_NORM_FOLD"
+
+
+def norm_fold(tp):
+    """Whether the consumers fold the final-norm exchange (``OPROJ_NORM_FOLD``; TP16)."""
+    on = best_default(OPROJ_NORM_FOLD, "1", "0") not in ("", "0") and tp == 16
+    if on:
+        _engaged(
+            "fold",
+            "NVIDIA megakernel: o-proj AttnRes final norm folded into exchange 1 "
+            "(K31MK_OPROJ_NORM_FOLD, not bitwise)",
+        )
+    return on
+
+
+def producer(k, batch, tp, mla, twoshot=False, kind=None, fp8=False):
+    """B<=8: one mma.sync pass staging ``staged_blocks`` of the K blocks in SMEM. Above
+    B8 (``kind`` overrides ``engine``): the tcgen05 engine, or 2-tile warps over 8 K
+    parts in 16-token groups, TP8 staging 2 of 6 K blocks per warp."""
+    if batch <= 8:
+        staged = staged_blocks(batch, tp, mla)
+        return OprojProducer(k, staged_blocks=staged, twoshot=twoshot, fp8=fp8)
+    if (kind or engine(batch, tp)) == "umma":
+        return OprojUmma(k, twoshot=twoshot)
+    grouped = dict(rows=2, group_tiles=2, twoshot=twoshot)
+    return OprojProducer(k, staged_blocks=0 if tp == 16 else 2, **grouped)
+
+
+@cache
+def compile_oproj(
+    kind,
+    k,
+    batch,
+    tp,
+    nb,
+    has_delta,
+    mla,
+    front=False,
+    cap=64,
+    twoshot=False,
+    deadline_ns=0,
+    fp8=False,
+    fold=False,
+):
+    """Producer, consumer or fused kernel over a [TP, cap, 7168] parity view;
+    ``front``: the consumer also publishes x_moe [1, 4, 7168] and the epoch hint.
+    ``twoshot``: the two-shot pair (arguments as ``TwoShot.views``). ``fp8``: MXFP8
+    partials (``fp8_partials``), a compile key like every other knob; ``fold``: the
+    consumers' final-norm fold (``norm_fold``), likewise."""
+    box = fake((1 if twoshot else tp, cap, 7168), (cap * 7168, 7168, 1))
+    x, w = fake((batch, k), (k, 1)), fake((7168, k), (k, 1))
+    mc, slot, eps = cutlass.Int64(0), cutlass.Int32(0), cutlass.Float32(1e-6)
+    recv, peers = fake((tp, cap, 7168 // tp)), fake((tp,), None, torch.int64)
+    if kind.startswith("producer"):  # producer_mma / producer_umma: engine A/B
+        kernel = producer(k, batch, tp, mla, twoshot, kind[9:] or None, fp8)
+        tail = (recv, peers, slot) if twoshot else (box, mc, slot)
+        return cute.compile(kernel, x, w, *tail, make_fake_stream())
+    row, weight = dynamic_fake(2), fake((7168,), (1,))
+    xmoe = fake((1, 4, 7168), (4 * 7168, 7168, 1)) if front else None
+    hints = fake((224,), (1,), torch.int32) if front else None
+    rows = (row, dynamic_fake(3), weight, weight, weight, row, xmoe, hints, eps, eps)
+    if kind == "consumer":  # B64: one 128-thread group per CTA polls every rank
+        options = dict(has_delta=has_delta)
+        groups = 4 if batch <= 32 and not twoshot else 1
+        kernel = OprojConsumer(
+            nb,
+            groups=groups,
+            twoshot=twoshot,
+            deadline_ns=deadline_ns,
+            fp8=fp8,
+            norm_fold=fold,
+            **options,
+        )
+        extra = (recv, mc, slot) if twoshot else ()
+        return cute.compile(kernel, box, *rows, *extra, make_fake_stream())
+    kernel = OprojFused(nb, has_delta=has_delta, fp8=fp8, norm_fold=fold)
+    return cute.compile(kernel, x, w, box, mc, slot, *rows, make_fake_stream())
+
+
+class PreparedOproj:
+    """One decoder layer's o-projection + all-reduce + post-attention AttnRes."""
+
+    def __init__(
+        self,
+        decoder,
+        mailbox,
+        batches,
+        mla,
+        front=None,
+        twoshot=None,
+        *,
+        deadline_ns,
+    ):
+        weight = decoder.self_attn.o_proj.weight
+        norm, out_norm = decoder.mlp_res_norm, decoder.post_attention_layernorm
+        weights = (norm.weight, decoder.mlp_res_proj.weight.squeeze(0), out_norm.weight)
+        self.views = tuple(to_cute(w.reshape(-1)) for w in weights)
+        self.eps = tuple(cutlass.Float32(n.variance_epsilon) for n in (norm, out_norm))
+        parity, rank = decoder.layer_idx % 2, cutlass.Int32(mailbox.rank)
+        local_box, mc = mailbox.slot(parity)
+        self.device, self.box = weight.device, to_cute(local_box)
+        self.head = (self.box, cutlass.Int64(mc), rank)
+        self.twoshot: Any = None
+        if twoshot is not None:
+            recv, peers, gather, gather_mc = twoshot.views(parity)
+            recv = to_cute(recv)
+            self.twoshot = (
+                (recv, to_cute(peers), rank),
+                to_cute(gather),
+                (recv, cutlass.Int64(gather_mc), rank),
+            )
+        self.wview, tp, k = to_cute(weight), mailbox.tp, weight.shape[1]
+        nb = decoder.prev_valid_blocks + decoder.is_block_write_layer
+        delta = not decoder.is_block_write_layer
+        self.front = None if front is None else (*map(to_cute, front[:2]), front[2])
+        self.codes, self.twoshots = {}, twoshot_batches(tp) if self.twoshot else set()
+        for b in batches:
+            publish = front is not None and b in front[2]
+            fused = tp == 16 and (not mla or b >= 5) and b <= 8
+            kinds = ("fused",) if fused else ("producer", "consumer")
+            twoshot = b in self.twoshots and not fused
+            fp8 = fp8_partials(b, tp, twoshot)
+            shape = (k, b, tp, nb, delta, mla)
+            self.codes[b] = tuple(
+                compile_oproj(
+                    kind,
+                    *shape,
+                    publish and kind != "producer",
+                    64,
+                    twoshot,
+                    deadline_ns,
+                    fp8,
+                    norm_fold(tp) and kind != "producer",
+                )
+                for kind in kinds
+            )
+
+    def run(self, local, prefix, blocks, out):
+        batch, s = local.shape[0], stream(self.device)
+        codes, x = self.codes[batch], to_cute(local)
+        front = (None, None)
+        if self.front is not None and batch in self.front[2]:
+            front = self.front[:2]
+        rows = (dynamic_view(prefix), dynamic_view(blocks), *self.views)
+        rows += (dynamic_view(out), *front, *self.eps, s)
+        if len(codes) == 1:
+            codes[0](x, self.wview, *self.head, *rows)
+        elif batch in self.twoshots:
+            head, gather, tail = self.twoshot
+            codes[0](x, self.wview, *head, s)
+            codes[1](gather, *rows[:-1], *tail, s)
+        else:
+            codes[0](x, self.wview, *self.head, s)
+            codes[1](self.box, *rows)
+        return out, prefix, blocks

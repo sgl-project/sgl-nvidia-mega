@@ -685,7 +685,8 @@ def test_the_numerics_claim_covers_the_slots_a_plan_can_add():
     assert topology.plannable(shipped) == shipped | {"mkm_wide_bal"}
 
 
-def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head():
+@pytest.mark.parametrize("a2a", ["flashinfer", "flashinfer_nvlink_one_sided"])
+def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head(a2a):
     assert (
         _refusal(
             disaggregation_mode="decode",
@@ -694,7 +695,7 @@ def test_dep8_accepts_the_recipe_stock_moe_and_dp_lm_head():
             ep_size=8,
             enable_dp_lm_head=True,
             moe_runner_backend="flashinfer_cutedsl",
-            moe_a2a_backend="flashinfer",
+            moe_a2a_backend=a2a,
             flashinfer_allreduce_fusion_backend=None,
         )
         == ""

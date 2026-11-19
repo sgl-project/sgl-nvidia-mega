@@ -84,7 +84,7 @@ FLASHINFER_LL_GEMM = "gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py"
 FLASHINFER_LL_GEMM_SHA256 = frozenset(
     {
         "118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280",  # 0.7.0-0.7.2
-        "c9d16930cc99c98d2de57e10882f52611a784268ba497b2b10d613a935a5596c",  # 0.7.3
+        "c9d16930cc99c98d2de57e10882f52611a784268ba497b2b10d613a935a5596c",  # 0.7.3, 0.7.4
     }
 )
 

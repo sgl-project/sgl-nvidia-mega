@@ -114,6 +114,7 @@ def _flashinfer_gemm(linear, qa, tactic):
     """FlashInfer's own low-latency GEMM with ``tactic`` (output, valid tactics); past 8
     rows, which its runner refuses, the same kernel launched by mxfp8_ll."""
     from flashinfer.gemm import gemm_base
+    from flashinfer.utils import _get_cache_buf
 
     from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
 
@@ -128,7 +129,8 @@ def _flashinfer_gemm(linear, qa, tactic):
     runner = gemm_base._cutedsl_low_latency_blockscaled_gemm_runner(
         major * 10 + minor, True
     )
-    workspace = gemm_base._get_cache_buf(
+    # FlashInfer 0.7.4 dropped the re-export from gemm_base; flashinfer.utils has it in 0.7.x
+    workspace = _get_cache_buf(
         "mm_mxfp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, a.device
     )
     inputs = [

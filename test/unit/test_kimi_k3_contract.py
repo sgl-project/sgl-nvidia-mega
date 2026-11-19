@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -92,7 +94,7 @@ class TestKimiK3Contract(unittest.TestCase):
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
 
-    def test_spec_is_exact_api2_tp8_sm103_surface(self):
+    def test_spec_is_exact_api2_tp8_sm100_sm103_surface(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
             REQUIRED_MEGAKERNEL_API_VERSION,
             SPEC,
@@ -101,9 +103,8 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 2)
         self.assertEqual(SPEC.api_version, 2)
         self.assertEqual(MEGAKERNEL_API_VERSION, 2)
-        self.assertEqual(SPEC.requires.isas, frozenset({"sm_103"}))
+        self.assertEqual(SPEC.requires.isas, frozenset({"sm_100", "sm_103"}))
         self.assertEqual(SPEC.requires.tp_sizes, frozenset({8}))
-        self.assertEqual(SPEC.requires.resident_blocks, 152)
         self.assertEqual(SPEC.requires.dtypes, frozenset({"bfloat16"}))
         self.assertEqual(SPEC.requires.decode_graph_backends, frozenset({"full"}))
         self.assertEqual(
@@ -136,6 +137,30 @@ class TestKimiK3Contract(unittest.TestCase):
             {"forward.selected_logprobs.max_abs": 0.5},
         )
 
+    def test_resident_blocks_uses_startup_environment(self):
+        from sgl_nvidia_mega.kimi_k3.shape_policy import SLOTS_ENV
+
+        # SPEC reads the environment once at import; isolate both startup cases.
+        for slots, expected in ((None, 152), ("sm148", 148)):
+            with self.subTest(slots=slots):
+                env = dict(os.environ)
+                env.pop(SLOTS_ENV, None)
+                if slots is not None:
+                    env[SLOTS_ENV] = slots
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from sgl_nvidia_mega.kimi_k3.spec import SPEC; "
+                        f"assert SPEC.requires.resident_blocks == {expected}",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_registration_is_lazy_and_api_mismatch_fails_closed(self):
         # Preserve modules already held by other collected contract tests.
         parent = importlib.import_module("sgl_nvidia_mega")
@@ -164,7 +189,7 @@ class TestKimiK3Contract(unittest.TestCase):
             self.assertEqual(reason, "")
             self.assertFalse(
                 any(
-                    name.startswith("sgl_nvidia_mega.kimi_k3.cutedsl")
+                    name.startswith("sgl_nvidia_mega.kimi_k3.sm103")
                     for name in sys.modules
                 )
             )
@@ -279,6 +304,42 @@ class TestKimiK3Contract(unittest.TestCase):
                     )
                 )
 
+    def test_native_admission_enforces_declared_graph_backends(self):
+        from sglang.srt.kernel_plugins.nvidia import binding
+
+        from sgl_nvidia_mega.kimi_k3.spec import SPEC
+
+        cfg = SimpleNamespace(
+            **{
+                key: next(iter(values))
+                for key, values in SPEC.requires.server_args.items()
+            },
+            tp_size=8,
+            watchdog_timeout=300,
+            context_length=8192,
+            speculative_algorithm=None,
+        )
+        hf_config = SimpleNamespace(
+            **SPEC.requires.hf_config,
+            architectures=["KimiK3ForConditionalGeneration"],
+            max_position_embeddings=1048576,
+        )
+        with (
+            patch.object(binding, "find_spec", return_value=(SPEC, "")),
+            patch.object(binding, "features_in_use", return_value=set()),
+        ):
+            for backend in ("full", "disabled", "breakable"):
+                with self.subTest(backend=backend):
+                    cfg.cuda_graph_config = SimpleNamespace(
+                        decode=SimpleNamespace(backend=backend)
+                    )
+                    _, reasons = binding.megakernel_disable_reasons(
+                        cfg=cfg, hf_config=hf_config, isa="sm_103"
+                    )
+                    self.assertEqual(len(reasons), 0 if backend == "full" else 1)
+                    if reasons:
+                        self.assertIn("decode CUDA graphs", reasons[0])
+
     def test_configuration_and_loaded_model_refusals_are_named(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
             _config_disable_reasons,
@@ -286,16 +347,13 @@ class TestKimiK3Contract(unittest.TestCase):
         )
 
         cfg = SimpleNamespace(
-            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
             context_length=8192,
             speculative_algorithm=None,
         )
         hf_config = SimpleNamespace(max_position_embeddings=1048576)
         self.assertEqual(_config_disable_reasons(cfg, hf_config), [])
         cfg.context_length = 262145
-        cfg.cuda_graph_config.decode.backend = "disabled"
         reasons = _config_disable_reasons(cfg, hf_config)
-        self.assertTrue(any("FULL" in reason for reason in reasons))
         self.assertTrue(any("1..262144" in reason for reason in reasons))
 
         class PackedMXFP4Method:
@@ -328,7 +386,7 @@ class TestKimiK3Contract(unittest.TestCase):
         import sgl_nvidia_mega
 
         package_root = Path(sgl_nvidia_mega.__file__).resolve().parent
-        frozen_root = package_root / "kimi_k3/cutedsl"
+        frozen_root = package_root / "kimi_k3/sm103"
         paths = sorted(frozen_root.rglob("*.py"))
         self.assertEqual(len(paths), 43)
         digest = hashlib.sha256()

@@ -119,6 +119,8 @@ def test_every_sglang_import_is_declared(path):
 
 @pytest.mark.parametrize("path", READERS, ids=_id)
 def test_sglang_provides_what_the_plugin_reads(path):
+    if _id(path).startswith(K31_PACKAGE) and not _has_k31_host():
+        pytest.skip(f"{NO_K31_HOST}: {_id(path)}")
     missing, unchecked = [], []
     required = _declared(path)
     optional = _declared(path, "SGLANG_OPTIONAL_READS")
@@ -225,6 +227,18 @@ DRAFT_CHECK, DRAFT_CHECK_NAMES = (
     ("EAGLE_DRAFT_CAPTURE_CHECK",),
 )
 NO_DRAFT_CHECK = "this SGLang's EAGLE draft graph runners run no draft capture check"
+
+
+# The Kimi K3.1 megakernel reads SGLang's K3.1 host bindings (sgl-project/sglang#48414);
+# against an SGLang without them its spec refuses every configuration, and its reads
+# are skipped here, naming each file.
+K31_PACKAGE = "sgl_nvidia_mega/kimi_k31/"
+K31_HOST = "srt/kernel_plugins/nvidia/kimi_k31_verify_binding.py"
+NO_K31_HOST = "this SGLang has no Kimi K3.1 megakernel host bindings"
+
+
+def _has_k31_host() -> bool:
+    return bool(_files(K31_HOST))
 
 
 def _has_draft_check() -> bool:
@@ -335,6 +349,10 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "workspace_buffer",
         "multi_ctas_kv_counter_buffer",
         "index_page_size",
+        # the Kimi K3.1 binding's hybrid pool, DSA indexer and cache views
+        "hybrid",
+        "indexer",
+        "caches",
     }
     # Startup agreement is a host preparation API, not a borrowed runtime-view
     # callable to replace with data. Keep its exact signature covered separately.
@@ -497,3 +515,83 @@ def test_every_built_object_defines_speculative_runtime_hooks(name):
     # SGLang's BuiltMegakernel requires the member (None without a factory) and
     # reads it unguarded under SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
     assert "speculative_runtime_hooks" in BUILT[name], name
+
+
+def _plugin_imports_in_sglang() -> list:
+    """Each ``from sgl_nvidia_mega.<module> import <name>`` in SGLang's own code."""
+    sites = []
+    for path in sorted(ROOT.rglob("*.py")):
+        if "sgl_nvidia_mega" not in path.read_text(errors="ignore"):
+            continue
+        for node in ast.walk(_tree(path)):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "sgl_nvidia_mega."
+            ):
+                rel = path.relative_to(ROOT)
+                sites += [
+                    (f"{rel}:{node.lineno}", node.module, a.name) for a in node.names
+                ]
+    return sites
+
+
+def _module_level_names(module: str) -> Optional[frozenset]:
+    """The names a package module binds at module level (defs, assignments,
+    imports, submodules), from its source; None when there is no such module."""
+    rel = Path(*module.split(".")[1:])
+    for path in (PACKAGE / rel.with_suffix(".py"), PACKAGE / rel / "__init__.py"):
+        if not path.is_file():
+            continue
+        names = set()
+        if path.name == "__init__.py":  # a package's submodules import by name too
+            names |= {p.stem for p in path.parent.glob("*.py")}
+            names |= {p.parent.name for p in path.parent.glob("*/__init__.py")}
+        todo = list(_tree(path).body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.If, ast.Try)):
+                todo += node.body + node.orelse + getattr(node, "finalbody", [])
+                todo += [s for h in getattr(node, "handlers", []) for s in h.body]
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                names |= {
+                    n.id
+                    for t in targets
+                    for n in ast.walk(t)
+                    if isinstance(n, ast.Name)
+                }
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        return frozenset(names)
+    return None
+
+
+PLUGIN_IMPORTS = _plugin_imports_in_sglang()
+
+
+# SGLang's host bindings (the Kimi K3.1 ones) import package modules by path: a move
+# or rename here fails at a GPU server's first covered step, so pin each name.
+@pytest.mark.parametrize(
+    "site, module, name",
+    PLUGIN_IMPORTS
+    or [
+        pytest.param(
+            None,
+            None,
+            None,
+            marks=pytest.mark.skip(
+                reason="this SGLang imports nothing from the package by name"
+            ),
+        )
+    ],
+    ids=[f"{s}:{n}" for s, _, n in PLUGIN_IMPORTS] or None,
+)
+def test_the_package_defines_what_sglang_imports_from_it(site, module, name):
+    names = _module_level_names(module)
+    assert names is not None, f"SGLang {site} imports the missing module {module}"
+    assert name in names, f"SGLang {site} imports {module}.{name}, which is not defined"
