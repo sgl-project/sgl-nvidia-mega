@@ -39,9 +39,6 @@ def test_the_sampler_names_why_the_chain_cannot_serve_a_markov_head():
     # a head of another class, whatever its tables
     assert "needs VanillaMarkov" in reason(SimpleNamespace(vocab_size=1024))
     assert "FP32 markov_w2" in reason(_head(w2_dtype=torch.float32))
-    # the LM head's own reasons come first once it is attached
-    lm = SimpleNamespace(markov_head=None, lm_head=None)
-    assert "no LM head" in sampler.disable_reason(lm, gamma=7, world=4, rank=1)
 
 
 def test_a_server_that_never_asks_for_the_draft_sampler_stops(monkeypatch):

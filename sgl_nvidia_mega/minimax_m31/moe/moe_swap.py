@@ -141,11 +141,6 @@ class Bound(msgspec.Struct):
         return rows in self.widths
 
 
-def serves(bound: Optional[Bound], rows: int) -> bool:
-    """Whether the slot's build serves a step of this many rows."""
-    return bound is not None and bound.serves(rows)
-
-
 def two_stream_reason(mlp) -> str:
     """Why SGLang's MoE ``mlp`` does not fork its routed chain onto an alternate stream
     while capturing ("" when it does), which leaves the slot nothing to swap."""

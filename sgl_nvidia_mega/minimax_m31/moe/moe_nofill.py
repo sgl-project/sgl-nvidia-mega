@@ -54,6 +54,8 @@ from typing import Any, Iterator, Optional
 import msgspec
 import torch
 
+from sgl_nvidia_mega.minimax_m31.spec import FLASHINFER_NAMES
+
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     # SGLang's TRT-LLM MoE runner module, reached as fit.<name> at call time
@@ -238,9 +240,10 @@ E4M3_MAXES = (448.0, 256.0)
 FP4_ACTIVATIONS = frozenset({"silu", "relu2", "gelu", "situ"})
 # The activations' dtype the build checks the kernel on (the spec serves bfloat16)
 DTYPE = torch.bfloat16
-# FlashInfer 0.7.4's per-token kernel getter: its parameters (PerTokenQuant.kernel_key
-# passes all of them) and the names the slot launches it through (FlashInfer 0.7.4,
-# flashinfer/quantization/kernels/nvfp4_quantize.py); config_reasons checks both
+# FlashInfer 0.7.4's per-token kernel getter (flashinfer/quantization/kernels/
+# nvfp4_quantize.py): its parameters, all of which PerTokenQuant.kernel_key passes;
+# config_reasons checks them and the names the slot launches the kernel through
+# (spec.FLASHINFER_NAMES)
 KEY_PARAMETERS = (
     "dtype_key",
     "K",
@@ -255,15 +258,6 @@ KEY_PARAMETERS = (
     "sf_rows_per_group",
 )
 KEY_THREADS = KEY_PARAMETERS.index("threads")
-FLASHINFER_NAMES = (
-    "_get_compiled_kernel_nvfp4_per_token",
-    "SF_LAYOUT_LINEAR",
-    "_env_flag_enabled",
-    "resolve_nvfp4_4over6",
-    "_per_token_cta_threads",
-    "get_device_sm_count",
-    "_MAX_THREADS_PER_BLOCK",
-)
 
 
 def _flashinfer_trtllm():

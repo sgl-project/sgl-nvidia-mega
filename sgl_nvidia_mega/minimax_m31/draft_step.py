@@ -295,7 +295,7 @@ class DraftStep:
     graph_variants = None
     speculative_runtime_hooks = None
 
-    def __init__(self, model, hf_config, ctx, slots=None):
+    def __init__(self, model, hf_config, ctx):
         from sglang.srt.runtime_context import get_parallel
 
         from sgl_nvidia_mega.minimax_m31 import draft as draft_spec
@@ -304,7 +304,6 @@ class DraftStep:
         tp_group = get_parallel().tp_group
         self.cpu_group = tp_group.cpu_group
         self.device = device = torch.device("cuda", torch.cuda.current_device())
-        self.deadline_s = ctx.deadline_s
         self.deadline_ns = round(ctx.deadline_s * 1e9)
         self.eps = float(model.config.rms_norm_eps)
         backbone.load_module(device.index, self.deadline_ns)
@@ -315,7 +314,7 @@ class DraftStep:
         self.backbone = None
         self._bound = None  # the identity of the step data the backbone reads
         # the requested draft slots, and what samples the block (for the summary)
-        self.slots = draft_slots(SLOTS if slots is None else slots)
+        self.slots = draft_slots(SLOTS)
         self.prebuilt = None  # sampler.Prebuilt, with slot markov built
         self.proposal = self._build_proposal(ctx, tp_group.rank_in_group)
         draft_spec._COUNTS["built"] += 1
@@ -376,13 +375,7 @@ class DraftStep:
         from sgl_nvidia_mega.minimax_m31 import sampler
 
         draft_spec._COUNTS["sampler"] += 1
-        steps = sampler.build_steps(
-            self.model,
-            prebuilt=self.prebuilt,
-            deadline_s=self.deadline_s,
-            slots=self.slots,
-            **buffers,
-        )
+        steps = sampler.build_steps(self.model, prebuilt=self.prebuilt, **buffers)
         return steps.get
 
     def summary(self) -> str:
@@ -533,7 +526,7 @@ class DraftStep:
         forward, for the parity check)."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        from sgl_nvidia_mega.minimax_m31.runtime import log_parity
+        from sgl_nvidia_mega.minimax_m31.runtime.parity import log_parity
 
         want = None
         if parity() and not torch.cuda.is_current_stream_capturing():

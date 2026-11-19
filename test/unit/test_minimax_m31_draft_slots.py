@@ -258,7 +258,6 @@ def _draft_step(slots):
     ``_draft_sampler`` read."""
     built = draft_step.DraftStep.__new__(draft_step.DraftStep)
     built.model = SimpleNamespace(name="draft")
-    built.deadline_s = 30.0
     built.slots = m31_runtime.draft_slots(frozenset(slots))
     built.prebuilt = None
     return built
@@ -331,13 +330,7 @@ def test_with_markov_the_draft_offers_the_sampler(slots, lm_head):
         patch.object(sampler, "build_steps", return_value={1: "one"}) as build_steps,
     ):
         steps = built.draft_sampler(**buffers)
-    build_steps.assert_called_once_with(
-        built.model,
-        prebuilt="prebuilt",
-        deadline_s=30.0,
-        slots=frozenset(slots),
-        **buffers,
-    )
+    build_steps.assert_called_once_with(built.model, prebuilt="prebuilt", **buffers)
     assert counts["sampler"] == 1
     # bs -> the step, or None where SGLang's proposal stays
     assert steps(1) == "one" and steps(17) is None
@@ -480,7 +473,6 @@ def test_a_proposal_the_build_does_not_fit_is_refused():
         slots=frozenset({"markov"}),
     )
     buffers = dict(
-        deadline_s=30.0,
         max_bs=16,
         noise=None,
         draft_tokens=torch.empty(16 * 7, dtype=torch.int64),

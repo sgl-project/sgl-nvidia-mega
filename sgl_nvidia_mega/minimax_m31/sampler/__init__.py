@@ -198,13 +198,6 @@ def lm_head_reason(lm, *, world: int, rank: int) -> str:
     return ""
 
 
-def disable_reason(lm, *, gamma: int, world: int, rank: int) -> str:
-    """Why the chain cannot serve this draft, or ""; the same on every rank."""
-    return lm_head_reason(lm, world=world, rank=rank) or head_reason(
-        lm, gamma=gamma, world=world
-    )
-
-
 def buffer_reason(
     *,
     max_bs: int,
@@ -343,14 +336,11 @@ class Prebuilt:
         rank,
         cpu_group,
         slots,
-        when="before SGLang sizes its KV pools",
     ):
         self.chain, self.lm_head = chain, lm_head
         self.gamma, self.greedy_draft = gamma, greedy_draft
         self.world, self.rank, self.cpu_group = world, rank, cpu_group
         self.slots = frozenset(slots)
-        # when the buffers were allocated, for the startup lines
-        self.when = when
 
     def device_bytes(self) -> dict[str, int]:
         out = self.chain.device_bytes()
@@ -372,7 +362,6 @@ def prebuild(
     slots,
     gamma: int,
     greedy_draft: bool,
-    when: str = "before SGLang sizes its KV pools",
 ) -> Prebuilt:
     """The chain and the LM head's storage, for the draft spec's build; collective over
     the TP group, so every rank runs it. Raises on every rank when any rank's Markov
@@ -427,12 +416,11 @@ def prebuild(
         rank=rank,
         cpu_group=cpu_group,
         slots=slots,
-        when=when,
     )
     logger.info(
-        "NVIDIA megakernel: draft proposal buffers on rank %d, %s: %s",
+        "NVIDIA megakernel: draft proposal buffers on rank %d, before SGLang sizes "
+        "its KV pools: %s",
         rank,
-        when,
         _memory(prebuilt.device_bytes()),
     )
     return prebuilt
@@ -473,9 +461,7 @@ def _warm(steps: dict, prebuilt: Prebuilt, *, noise, step_temperatures) -> None:
 def build_steps(
     lm,
     *,
-    prebuilt: Optional[Prebuilt] = None,
-    deadline_s: float,
-    slots: frozenset = frozenset({"markov"}),
+    prebuilt: Prebuilt,
     gamma: int,
     max_bs: int,
     greedy_draft: bool,
@@ -484,20 +470,10 @@ def build_steps(
     step_logits: Optional[torch.Tensor],
     step_temperatures: torch.Tensor,
 ) -> dict:
-    """The per-batch-size steps over SGLang's buffers; collective over the TP group, so
-    every rank runs it. Raises on every rank when any rank cannot run the chain, or
-    when the ranks would serve different sizes (their graphs would wait on each other)."""
-    if prebuilt is None:
-        # no draft spec build allocated them (a caller outside it): allocated now, after
-        # SGLang sized its KV pools
-        prebuilt = prebuild(
-            lm,
-            deadline_s=deadline_s,
-            slots=slots,
-            gamma=gamma,
-            greedy_draft=greedy_draft,
-            when="after SGLang sized its KV pools",
-        )
+    """The per-batch-size steps over SGLang's buffers and what the draft spec's build
+    allocated (``prebuilt``); collective over the TP group, so every rank runs it.
+    Raises on every rank when any rank cannot run the chain, or when the ranks would
+    serve different sizes (their graphs would wait on each other)."""
     chain, lm_head = prebuilt.chain, prebuilt.lm_head
     world, rank, cpu_group = prebuilt.world, prebuilt.rank, prebuilt.cpu_group
     reason = ""
@@ -558,7 +534,8 @@ def build_steps(
         "NVIDIA megakernel: draft proposal on rank %d: Markov chain in one kernel "
         "(%d ranks, %d CTAs, %d head tiles a CTA in shared memory, batch 1-%d, %d "
         "draft tokens), LM head %s; tolerance numerics (draft slots %s); wait deadline "
-        "%.0f s; %s, allocated %s; compiled and warmed on every rank",
+        "%.0f s; %s, allocated before SGLang sizes its KV pools; compiled and warmed on "
+        "every rank",
         rank,
         world,
         chain.ctas,
@@ -569,7 +546,6 @@ def build_steps(
         sorted(draft_slots(prebuilt.slots)),
         chain.timeout_ns / 1e9,
         _memory(prebuilt.device_bytes()),
-        prebuilt.when,
     )
     return steps
 

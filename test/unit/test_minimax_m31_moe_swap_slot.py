@@ -188,7 +188,6 @@ class TestBuild(CustomTestCase):
         built = moe_swap.build(model, (8, 16), frozenset({"moe_swap"}), nofill)
         self.assertEqual((built.widths, built.reason), (nofill.widths, ""))
         self.assertIsNone(moe_swap.build(model, (8,), frozenset(), nofill))
-        self.assertFalse(moe_swap.serves(None, 8))
         # nothing to swap: no moe_nofill, or a MoE on one stream
         for bound in (None, mn.Bound()):
             built = moe_swap.build(model, (8,), frozenset({"moe_swap"}), bound)
