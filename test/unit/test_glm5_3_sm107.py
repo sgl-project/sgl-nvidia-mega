@@ -14,23 +14,23 @@ from pathlib import Path
 
 import pytest
 
-PKG = Path(__file__).resolve().parents[2] / "sgl_nvidia_mega" / "glm52" / "sm107"
+PKG = Path(__file__).resolve().parents[2] / "sgl_nvidia_mega" / "glm5_3" / "sm107"
 
 
 def test_the_package_imports_without_sglang_torch_or_cute_dsl():
     code = (
-        "import sys, sgl_nvidia_mega.glm52.sm107\n"
+        "import sys, sgl_nvidia_mega.glm5_3.sm107\n"
         "bad = sorted(m for m in sys.modules if m.split('.')[0] in ('sglang', 'torch', 'cutlass'))\n"
         "assert not bad, bad\n"
     )
-    env = dict(os.environ, PYTHONPATH=str(PKG.parents[1]))
+    env = dict(os.environ, PYTHONPATH=str(PKG.parents[2]))
     env.pop("GLM5MK", None)
     subprocess.run([sys.executable, "-c", code], check=True, env=env)
 
 
 @pytest.fixture
 def mk(monkeypatch):
-    import sgl_nvidia_mega.glm52.sm107 as mk
+    import sgl_nvidia_mega.glm5_3.sm107 as mk
 
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     monkeypatch.delattr(mk.install, "_done", raising=False)
@@ -59,13 +59,13 @@ def test_the_model_runner_wrapper_marks_the_class_once(mk):
 
 
 def test_the_plugin_entry_point_installs_the_hooks(monkeypatch):
-    import sgl_nvidia_mega.glm52.sm107 as mk
+    import sgl_nvidia_mega.glm5_3.sm107 as mk
     from sgl_nvidia_mega import plugin
 
     called = []
     monkeypatch.setattr(mk, "install", lambda: called.append(1))
     monkeypatch.setitem(sys.modules, "sglang", None)
-    monkeypatch.setenv(plugin.GLM52_TP16_ENV, "1")
+    monkeypatch.setenv(plugin.GLM5_3_SM107_ENV, "1")
     try:
         plugin.register()
     except (ImportError, ModuleNotFoundError):
@@ -154,7 +154,7 @@ def test_the_kernel_entry_modules_import_with_cute_dsl(tmp_path, tree, entry):
 
 
 def test_the_fc2_lists_follow_the_kernel_work_split():
-    from sgl_nvidia_mega.glm52.sm107.kernels.chain_n148sq import schedule
+    from sgl_nvidia_mega.glm5_3.sm107.kernels.chain_n148sq import schedule
 
     payload = schedule.fc2_lists_payload()
     # pins the device split (schedule constants + moe.precompute_cuts): a split change must change this on purpose
@@ -292,7 +292,7 @@ def test_the_chain_tree_reference_gives_the_expected_values():
 @pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="needs a GPU with CuTe DSL")
 def test_the_cute_dsl_ops_are_bitwise_equal_to_the_references():
     pytest.importorskip("cutlass")
-    from sgl_nvidia_mega.glm52.sm107 import ops
+    from sgl_nvidia_mega.glm5_3.sm107 import ops
 
     d = "cuda"
     rng = random.Random(3)

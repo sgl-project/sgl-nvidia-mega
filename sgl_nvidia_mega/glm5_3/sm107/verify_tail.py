@@ -90,7 +90,7 @@ class VerifyTail:
         if not self.active and self.in_graph == 0:
             reasons.append("not-our-verify")
         if reasons or not self.bound:
-            raise RuntimeError(f"glm52.sm107: verify mode {reasons or ['unbound']} not covered (bs=1 only, no fallback)")
+            raise RuntimeError(f"glm5_3.sm107: verify mode {reasons or ['unbound']} not covered (bs=1 only, no fallback)")
         d = self.d
         si = batch.sampling_info
         if not getattr(verify_input, "_glm5mk_ours", False):
@@ -115,7 +115,7 @@ class VerifyTail:
         L = 0
         if su.SIMULATE_ACC_LEN > 0:
             if su.SIMULATE_ACC_TOKEN_MODE != "real-draft-token" or verify_input.max_tree_depth != 8:
-                raise RuntimeError(f"glm52.sm107: simulation mode {su.SIMULATE_ACC_TOKEN_MODE} depth "
+                raise RuntimeError(f"glm5_3.sm107: simulation mode {su.SIMULATE_ACC_TOKEN_MODE} depth "
                                    f"{verify_input.max_tree_depth} not covered")
             L = su.sample_simulated_acc_len(su.SIMULATE_ACC_LEN, su.SIMULATE_ACC_METHOD, verify_input.max_tree_depth)
         cand = verify_input.draft_token.reshape(-1)

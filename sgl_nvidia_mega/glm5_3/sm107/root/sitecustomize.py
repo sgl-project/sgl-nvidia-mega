@@ -3,9 +3,9 @@
 import os
 
 if os.environ.get("GLM5MK") == "1":
-    import sgl_nvidia_mega.glm52.sm107 as glm52_sm107
+    import sgl_nvidia_mega.glm5_3.sm107 as glm5_3_sm107
 
-    glm52_sm107.install()
+    glm5_3_sm107.install()
 
 try:
     import apport_python_hook

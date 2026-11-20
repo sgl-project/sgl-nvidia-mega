@@ -39,8 +39,8 @@ TEST_HOOKS = (
     ),
 )
 
-# GLM-5.2 TP16 (sgl_nvidia_mega.glm52.sm107) is enabled by this switch, not by --enable-nvidia-megakernel
-GLM52_TP16_ENV = "GLM5MK"
+# GLM-5.2 TP16 on Rubin (sgl_nvidia_mega.glm5_3.sm107) is enabled by this switch, not by --enable-nvidia-megakernel
+GLM5_3_SM107_ENV = "GLM5MK"
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -57,10 +57,10 @@ SGLANG_READS = {
 
 def register() -> None:
     """SGLang's plugin loader calls this in every process, before any model is built."""
-    if os.environ.get(GLM52_TP16_ENV) == "1":
-        from sgl_nvidia_mega.glm52 import sm107 as glm52_sm107
+    if os.environ.get(GLM5_3_SM107_ENV) == "1":
+        from sgl_nvidia_mega.glm5_3 import sm107 as glm5_3_sm107
 
-        glm52_sm107.install()
+        glm5_3_sm107.install()
     try:
         import sglang.kernels.plugin_kernels.nvidia.spec as megakernels
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389

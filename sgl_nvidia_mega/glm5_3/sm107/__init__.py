@@ -76,7 +76,7 @@ class _Finder(importlib.abc.MetaPathFinder):
             return None
         spec = importlib.machinery.PathFinder.find_spec(name, path, target)
         if spec is None or spec.loader is None:
-            raise ImportError("glm52.sm107: cannot locate " + name)
+            raise ImportError("glm5_3.sm107: cannot locate " + name)
         spec.loader = _Loader(spec.loader, self.targets.pop(name))
         if not self.targets:
             sys.meta_path.remove(self)
