@@ -39,6 +39,7 @@ def _experts(balanced: bool, ep_rank: int):
         moe_ep_size=2,
         num_local_experts=LOCAL,
         num_experts=E,
+        uses_expert_location=False,
         balanced_expert_storage=balanced,
     )
     if balanced:

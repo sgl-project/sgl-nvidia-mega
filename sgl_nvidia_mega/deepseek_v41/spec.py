@@ -188,7 +188,7 @@ REQUIREMENTS = Requirements(
         "startup_weight_load_mode": frozenset({"serial"}),
         # EP2: the trivial expert placement (rank r holds experts [r * 192, r * 192 +
         # 192)), which the routed pair's expert window assumes
-        "ep_num_redundant_experts": frozenset({0}),
+        "ep_num_redundant_experts": frozenset({0, 384}),
         "init_expert_location": frozenset({"trivial"}),
         "ep_dispatch_algorithm": frozenset({None}),
         "ep_join_mode": frozenset({None}),
