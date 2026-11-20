@@ -44,7 +44,10 @@ to the cubin directory (`{chain,d012,draft,tail}/{entry.cubin,CALL.json}`),
 `SGLANG_DSA_FUSE_TOPK=0`, `--kv-cache-dtype fp8_e4m3 --dsa-decode-backend trtllm
 --moe-runner-backend flashinfer_trtllm --speculative-algorithm EAGLE
 --speculative-num-steps 7 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8`.
-Steps with more than one request run SGLang's forward.
+It serves one request at a time. A target verify step it does not cover (more than one
+request, grammar, logprobs, penalties, logit bias, a sampling seed, top-k / min-p
+sampling) raises instead of falling back (`sm107/verify_tail.py`), so serve it at
+concurrency 1 with greedy or temperature / top-p sampling.
 
 ### Speculative step graph (any EAGLE v2 model)
 
