@@ -71,7 +71,8 @@ PINS = {
 }
 
 # sha256 of csrc/pull_gather_bounded.cuh as validated (bitwise, fault and sanitizer tests); any other file is not used.
-SOURCE_SHA256 = "b6aa914f1a704fd1bcdb02f89253b354364dda57350f33013d99d02c923749c0"
+# The validation ran on this file without its two copyright lines; the digest below is of this copy.
+SOURCE_SHA256 = "10423c5c0fbda9a28eb1223d24aa1f109bb778ced09bb920dc165ccc70104772"
 
 _state: dict = {"engaged": None, "max_polls": None}
 

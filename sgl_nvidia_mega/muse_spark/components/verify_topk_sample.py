@@ -39,11 +39,14 @@ Under the synthetic-acceptance benchmark mode (``SGLANG_SIMULATE_ACC_LEN`` > 0) 
 real acceptance, and the mode's scaffolding runs completely and unchanged: the full-row verify-logits gather (the
 wrapped stock gather), the worker's ``torch.argmax`` over those rows and ``apply_dflash_simulated_acceptance``. The
 component never skips, feeds or replaces any of it (it does not read or write ``target_predict``), so the
-synthetic-mode gain is the real-mode gain minus the full gather that only the scaffolding needs.
+synthetic-mode gain is the real-mode gain minus the full gather that only the scaffolding needs. With the shadow check on, the records also carry each shard's
+argmax (``torch.argmax`` order) for the comparison with ``torch.argmax`` over the gathered rows.
 
 Every output (accept lengths, bonus tokens, ``predicts`` / ``accept_index`` buffers) is meant to be bit-identical to
 the stock path for the same RNG state: ``tests/test_verify_topk_sample.py`` (one GPU, shards simulated) compares them
-with the stock functions, ``tests/dist_verify_topk_sample.py`` across ranks.
+with the stock functions, ``tests/dist_verify_topk_sample.py`` across ranks. ``MUSE_VR_VERIFY_TOPK_SAMPLE_SHADOW=1``
+(debug; host syncs) also runs the stock gather and sampling on the same draws in the server and tallies bitwise
+matches with ``bed.shadow_result``.
 
 Engaged only when every request samples with the same ``top_k`` in [2, 64], ``top_p`` 1, no penalties, logit bias,
 custom logit processor, grammar, logprobs or sampling-mask capture, the selector path without block verification,
@@ -103,8 +106,14 @@ from . import bed
 SGLANG_READS = {
     "srt/distributed/parallel_state.py": ("get_tp_group",),
     "srt/speculative/dflash_worker_v2.py": ("SIMULATE_ACC_LEN",),
+    "kernels/ops/speculative/reject_sampling.py": (
+        "speculative_sampling_classic_kernel",
+    ),
     "kernels/jit/utils/__init__.py": ("load_jit",),
-    "srt/speculative/dflash_utils.py": ("_get_or_create_chain_verify_buffers",),
+    "srt/speculative/dflash_utils.py": (
+        "_get_or_create_chain_verify_buffers",
+        "build_speculative_verify_target_probs",
+    ),
     "srt/layers/logits_processor.py": ("LogitsProcessor",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
 }
@@ -210,6 +219,7 @@ def _flags() -> dict:
     f = _state["flags"]
     if f is None:
         f = {
+            "shadow": bed.enabled(NAME + "_shadow"),
             "sampling_graph": bed.enabled("sampling_graph"),
             "lowtie": bed.enabled(NAME + "_lowtie"),
         }
@@ -995,8 +1005,9 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
         side.wait_stream(torch.cuda.current_stream(dev))
         with torch.cuda.stream(side):
             temps = torch.ones((bs,), dtype=torch.float32, device=dev)
+            with_argmax = _flags()["shadow"]
             if k is None:
-                prep_shard(logits, float(cap), temps, block, cols)
+                prep_shard(logits, float(cap), temps, block, cols, with_argmax)
             else:
                 rec = local_records(
                     logits,
@@ -1006,6 +1017,7 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
                     k,
                     col_offset,
                     cols,
+                    with_argmax=with_argmax,
                 )
                 merge_records(rec.unsqueeze(0), k)
                 if kq is not None:
@@ -1152,6 +1164,7 @@ def _h_gather(original, lp, logits):
         k,
         col_offset,
         cols,
+        with_argmax=_flags()["shadow"],
         pool=True,
     )
     if world > 1:
@@ -1250,6 +1263,71 @@ def _sample_layout_ok(cand, cids, q, a) -> bool:
     )
 
 
+def _shadow(kw, a, coins, outs):
+    """Debug: the stock gather + verify-probability build + sampling kernel on copies of the chain buffers with the
+    same draws, compared bit for bit with the top-k path (host sync)."""
+    import sglang.kernels.ops.speculative.reject_sampling as rs
+    from sglang.srt.speculative.dflash_utils import (
+        _get_or_create_chain_verify_buffers,
+        build_speculative_verify_target_probs,
+    )
+
+    cand, cids, q = kw["candidates"], kw["candidate_ids"], kw["q_rows"]
+    bs, block = cand.shape
+    full = _full_logits(a)
+    di = kw["draft_input"]
+    tp = build_speculative_verify_target_probs(
+        next_token_logits=full,
+        sampling_info=kw["sampling_info"],
+        draft_token_num=block,
+        bs=bs,
+        max_top_k=di.max_top_k,
+        uniform_top_k_value=di.uniform_top_k_value,
+    )
+    mine = torch.zeros_like(tp).view(bs * block, -1)
+    mine.scatter_(1, a["ids"], a["probs"])
+    ok_probs = torch.equal(tp.view(bs * block, -1), mine)
+    ok_amax = torch.equal(torch.argmax(full, dim=-1), a["amax"])
+    dp = torch.zeros(
+        (bs, block - 1, full.shape[-1]), dtype=torch.float32, device=full.device
+    )
+    dp.scatter_(-1, cids, q.float())
+    ri, _rnt, _rns, _p, _ai, _an = _get_or_create_chain_verify_buffers(
+        bs=bs, draft_token_num=block, device=cand.device
+    )
+    pr, ai, an = (t.clone() for t in outs)
+    rs.speculative_sampling_classic_kernel[(bs,)](
+        pr,
+        ai,
+        an,
+        cand,
+        ri,
+        coins[0],
+        coins[1],
+        tp,
+        dp,
+        cand.stride(0),
+        cand.stride(1),
+        ri.stride(0),
+        ri.stride(1),
+        coins[0].stride(0),
+        coins[0].stride(1),
+        tp.stride(0),
+        tp.stride(1),
+        tp.stride(2),
+        dp.stride(0),
+        dp.stride(1),
+        dp.stride(2),
+        NUM_SLOTS=block,
+        VOCAB_SIZE=tp.shape[-1],
+        BLOCK_V=4096,
+        BLOCK_VERIFICATION=False,
+        BLOCK_REDUCE=min(triton.next_power_of_2(tp.shape[-1]), 32768),
+        num_warps=4,
+    )
+    return ok_probs, ok_amax, (pr, ai, an)
+
+
 def _h_sample(original, worker, **kw):
     a = getattr(_tls, "active", None)
     logits = kw.get("next_token_logits")
@@ -1261,10 +1339,17 @@ def _h_sample(original, worker, **kw):
         bed.count(NAME, "fallback:full rows")
         kw["next_token_logits"] = _full_logits(a)
         return original(worker, **kw)
+    from sglang.srt.speculative.dflash_utils import _get_or_create_chain_verify_buffers
 
     cand = kw["candidates"]
     bs, block = cand.shape
     coins = draw_coins(bs, block - 1, cand.device)
+    shadow = _flags()["shadow"]
+    if shadow:
+        _r, _n, _s, pr0, ai0, an0 = _get_or_create_chain_verify_buffers(
+            bs=bs, draft_token_num=block, device=cand.device
+        )
+        ok_probs, ok_amax, ref = _shadow(kw, a, coins, (pr0, ai0, an0))
     accept_len, bonus, _ = accept_from_topk(
         candidates=cand,
         top_probs=a["probs"],
@@ -1274,6 +1359,18 @@ def _h_sample(original, worker, **kw):
         vocab=a["vocab"],
         coins=coins,
     )
+    if shadow:
+        _r, _n, _s, pr1, ai1, an1 = _get_or_create_chain_verify_buffers(
+            bs=bs, draft_token_num=block, device=cand.device
+        )
+        bed.shadow_result(NAME + ":probs", ok_probs)
+        bed.shadow_result(NAME + ":argmax", ok_amax)
+        bed.shadow_result(
+            NAME + ":sample",
+            torch.equal(ref[0], pr1)
+            and torch.equal(ref[1], ai1)
+            and torch.equal(ref[2], an1),
+        )
     bed.count(NAME, f"sample:bs={bs}")
     return accept_len, bonus
 
@@ -1295,6 +1392,7 @@ def register() -> bool:
     bed.report(
         NAME,
         True,
+        shadow=bed.enabled(NAME + "_shadow"),
         lowtie=bed.enabled(NAME + "_lowtie"),
     )
     return True

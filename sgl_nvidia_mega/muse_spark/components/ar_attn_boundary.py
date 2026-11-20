@@ -39,6 +39,10 @@ rule; the 2-shot gives each rank a column slice of every row, reduces it in rank
 all-reduce dispatch resolves to the custom all-reduce (any algorithm) and that op's own support check passes. Its outputs
 are those of the push all-reduce + the boundary kernel at the same launch shape (bitwise to the stock pair at the launch
 shapes it uses in this range).
+
+``MUSE_VR_AR_ATTN_BOUNDARY_SHADOW=1`` (debug, eager calls only) also runs the stock pair (all-reduce, then the
+boundary) on the same inputs after every fused call and tallies bitwise equality of all outputs with
+``bed.shadow_result``. Every rank takes the same decision, so the extra all-reduce is issued on all of them or none.
 """
 
 from __future__ import annotations
@@ -79,6 +83,7 @@ ENV_K47_MIN_M = "MUSE_VR_AR_K47_MIN_M"
 ENV_K47_MAX_M = "MUSE_VR_AR_K47_MAX_M"
 DEFAULT_K47_MIN_M = 80
 DEFAULT_K47_MAX_M = 1024
+_state = {"shadow": False}
 TARGET = "sglang.srt.models.muse_spark.MuseSpark1xDecoderLayer.forward"
 
 # sha256 of the SGLang sources (relative to the directory holding the ``sglang`` package) whose behaviour the fused
@@ -320,6 +325,32 @@ def _layer_eligible(layer, attn_input: torch.Tensor, forward_batch) -> str | Non
     return None
 
 
+def _shadow_compare(
+    group, boundary, layer, partial, stream, router_dtype, fused
+) -> None:
+    """Debug: the stock pair on the same inputs, compared bit for bit with the fused outputs."""
+    ref_out = boundary(
+        stream.clone(),
+        group.all_reduce(partial),
+        branch_dtype=layer.operator_dtype,
+        router_dtype=router_dtype,
+    )
+    ok = True
+    for a, b in zip(fused, ref_out):
+        if (a is None) != (b is None):
+            ok = False
+        elif a is not None:
+            ia = a.view(torch.int16) if a.element_size() == 2 else a.view(torch.int32)
+            ib = b.view(torch.int16) if b.element_size() == 2 else b.view(torch.int32)
+            ok = (
+                ok
+                and a.shape == b.shape
+                and a.dtype == b.dtype
+                and bool(torch.equal(ia, ib))
+            )
+    bed.shadow_result(NAME, ok)
+
+
 def _around_forward(original, layer, positions, stream, attn_input, forward_batch):
     reason = _layer_eligible(layer, attn_input, forward_batch)
     if reason is not None:
@@ -389,6 +420,16 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
             want_router=router_dtype is not None,
         )
         bed.count(NAME, f"k47:M={m_rows}:tp={comm.world_size}")
+        if _state["shadow"] and not torch.cuda.is_current_stream_capturing():
+            _shadow_compare(
+                group,
+                boundary,
+                layer,
+                partial,
+                stream,
+                router_dtype,
+                (ffn_input, stream_out, router_input),
+            )
         stream = stream_out
     elif two_shot:
         boundary._ensure_cached_weights(layer.operator_dtype)
@@ -410,6 +451,16 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
             want_router=router_dtype is not None,
         )
         bed.count(NAME, f"fused2:M={m_rows}:tp={comm.world_size}")
+        if _state["shadow"] and not torch.cuda.is_current_stream_capturing():
+            _shadow_compare(
+                group,
+                boundary,
+                layer,
+                partial,
+                stream,
+                router_dtype,
+                (ffn_input, stream_out, router_input),
+            )
         stream = stream_out
     elif (
         form == "one"
@@ -439,6 +490,16 @@ def _around_forward(original, layer, positions, stream, attn_input, forward_batc
             want_router=router_dtype is not None,
         )
         bed.count(NAME, f"fused:M={partial.shape[0]}:tp={comm.world_size}")
+        if _state["shadow"] and not torch.cuda.is_current_stream_capturing():
+            _shadow_compare(
+                group,
+                boundary,
+                layer,
+                partial,
+                stream,
+                router_dtype,
+                (ffn_input, stream_out, router_input),
+            )
         stream = stream_out
     else:
         # the stock pair, as RowParallelLinear.forward and the decoder layer issue them
@@ -486,12 +547,14 @@ def register() -> bool:
             return original(*args, **kwargs)
         return _around_forward(original, *args)
 
+    _state["shadow"] = bed.enabled(NAME + "_shadow")
     HookRegistry.register(TARGET, hook, HookType.AROUND)
     bed.report(
         NAME,
         True,
         max_m=_max_m(),
         rows=sorted(_rows()) if _rows() is not None else None,
+        shadow=_state["shadow"],
         ar2=_ar2_enabled(),
         ar2_min_m=_ar2_min_m(),
         ar2_max_m=_ar2_max_m(),
