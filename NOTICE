@@ -107,3 +107,14 @@ Portions are adapted from SGLang (https://github.com/sgl-project/sglang): the
 exact DCP top-k merge in sgl_nvidia_mega/kimi_k31/sm103/dsa/split_merge.cuh follows
 SGLang's python/sglang/kernels/jit/csrc/dsa/dcp_topk_merge.cuh (Apache License 2.0,
 Copyright SGLang Team), with a signed-zero tie rule.
+
+Portions are copied from TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM): the Rubin
+(sm_107) decode megakernel of Muse Spark Open and its host code in
+sgl_nvidia_mega/muse_spark/sm107/trtllm_ab93b78/, at commit
+ab93b785a476f01d2f1e1907c930780fc6d7832e (Apache License 2.0, Copyright (c) 2011-2026 NVIDIA
+CORPORATION & AFFILIATES), unchanged or with a "Modified by NVIDIA" header;
+muse_spark/sm107/README.md lists the files. TensorRT-LLM's license, with the third-party
+notices it carries, is kept in muse_spark/sm107/trtllm_ab93b78/LICENSE.tensorrt_llm. Their
+GB300 (sm_103) port in sgl_nvidia_mega/muse_spark/sm103/trtllm_ab93b78/ is a copy of those
+files with a "Modified by NVIDIA" header on each changed file (muse_spark/sm103/README.md
+says what changed), and keeps the license in muse_spark/sm103/trtllm_ab93b78/LICENSE.tensorrt_llm.
