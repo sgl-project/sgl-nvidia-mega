@@ -14,13 +14,16 @@ fails to build raises (every rank builds the same set). The fused step is first
 recorded under capture, so a call at a row count the plan serves but nobody built
 raises instead of compiling there. A role the plan does not serve at a shape or row
 count (another GPU, a quantized weight, rows outside its ranges) runs stock; ``build``
-logs why, once per rank 0.
+logs why, once per rank 0. The plan is per GPU (``gemm_plan.PLANS``: GB300 measured,
+Rubin derived from it).
 
 Split-K source: the vendored copy of FlashInfer's kernel (``ll/kernels/cute/splitk.py``),
 which carries synchronization fixes FlashInfer's body lacks, or FlashInfer's
 ``mm_bf16(..., backend="cute-dsl", tactic=...)`` once the installed FlashInfer has that
-API (fi-1) and marks its kernel as carrying the same fixes (``SplitKTactic.<FI1_SYNC_MARKER>``).
-The fixes change no arithmetic: both return bit for bit the same result.
+API (fi-1), marks its kernel as carrying the same fixes (``SplitKTactic.<FI1_SYNC_MARKER>``)
+and serves this GPU's architecture with explicit tactics (``FI1_TACTIC_SMS``: SM100 /
+SM103, not Rubin's SM107). The fixes change no arithmetic: both return bit for bit the
+same result.
 ``SGLANG_NVIDIA_MEGAKERNEL_GLM_GEMM_SPLITK`` = ``auto`` (default: as above),
 ``flashinfer`` (FlashInfer's kernel whenever it has the API, fixed or not; raise
 without it) or ``vendored``. Each rank logs the resolved source once.
@@ -72,6 +75,10 @@ SPLITK_SOURCES = ("auto", "flashinfer", "vendored")
 FI1_SYNC_MARKER = "SYNC_FIXED"
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+# The compute capabilities on which FlashInfer's explicit split-K tactics are served
+# (its CuTe DSL split-K kernel is built for SM100 / SM103); elsewhere ``auto`` runs the
+# vendored copy of the same kernel
+FI1_TACTIC_SMS = ((10, 0), (10, 3))
 # the named tolerances of these kernels (ll.tolerances() -> the spec's NUMERICS)
 TOLERANCES = dict(plan.TOLERANCES)
 
@@ -144,6 +151,19 @@ def _vendored_source() -> _SplitKSource:
     return _SplitKSource("vendored", splitk.SplitKTactic, run)
 
 
+def _device_capability() -> Optional[Tuple[int, int]]:
+    """This process's GPU's compute capability, or None without one (CPU tests)."""
+    if not torch.cuda.is_available():
+        return None
+    return tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
+
+
+def flashinfer_serves_tactics(capability: Optional[Tuple[int, int]]) -> bool:
+    """Whether FlashInfer's explicit split-K tactics run on ``capability`` (None:
+    unknown, assumed so)."""
+    return capability is None or tuple(capability) in FI1_TACTIC_SMS
+
+
 @functools.lru_cache(maxsize=None)
 def _splitk_source_for(choice: str) -> _SplitKSource:
     if choice not in SPLITK_SOURCES:
@@ -160,7 +180,9 @@ def _splitk_source_for(choice: str) -> _SplitKSource:
             "mm_bf16(..., tactic=SplitKTactic) API"
         )
     fixed = fi_gemm is not None and flashinfer_splitk_sync_fixed(fi_gemm)
-    if fi_gemm is not None and (choice == "flashinfer" or fixed):
+    capability = _device_capability()
+    serves = flashinfer_serves_tactics(capability)
+    if fi_gemm is not None and (choice == "flashinfer" or (fixed and serves)):
         source, why = _flashinfer_source(fi_gemm), "mm_bf16(..., tactic=)"
         why += "" if fixed else " (without the synchronization fixes)"
     else:
@@ -171,6 +193,9 @@ def _splitk_source_for(choice: str) -> _SplitKSource:
             else "FlashInfer has no mm_bf16(..., tactic=)"
             if fi_gemm is None
             else f"FlashInfer's kernel lacks the synchronization fixes ({FI1_SYNC_MARKER})"
+            if not fixed
+            else f"FlashInfer's explicit split-K tactics serve SM100 / SM103, not "
+            f"SM{capability[0]}{capability[1]}"
         )
     logger.info("ll.gemm split-K source: %s (%s)", source.name, why)
     return source
@@ -215,10 +240,11 @@ def _planned(
         raise ValueError(f"ll.gemm: unknown role {role!r}; known: {plan.ROLES}")
     if not units.enabled(unit(role)):
         return None, f"unit {unit(role)} is off (not in {SLOTS_ENV})"
-    if (tuple(sm), sms) != plan.MEASURED_DEVICE:
-        (major, minor), want_sms = plan.MEASURED_DEVICE
+    entries = plan.device_plan(sm, sms)
+    if entries is None:
+        planned = " and ".join(f"SM{s[0]}{s[1]} with {n} SMs" for s, n in plan.PLANS)
         return None, (
-            f"the plan is measured on SM{major}{minor} with {want_sms} SMs; this GPU is "
+            f"the plans are for {planned} (measured on SM103 with 152 SMs); this GPU is "
             f"SM{sm[0]}{sm[1]} with {sms} SMs"
         )
     weight = module.weight
@@ -226,7 +252,7 @@ def _planned(
         return None, f"weight is {weight.dtype} {tuple(weight.shape)}, not 2-D BF16"
     if getattr(module, "bias", None) is not None:
         return None, "the module has a bias"
-    e = plan.entry(role, tuple(weight.shape))
+    e = plan.entry(role, tuple(weight.shape), entries)
     if e is None:
         return None, f"no measured plan for (N={weight.shape[0]}, K={weight.shape[1]})"
     if not e.preferred and not _unit_listed(role):
@@ -236,13 +262,15 @@ def _planned(
     return e, ""
 
 
-def _check_tactic(source, r: plan.Range, m: int, n: int, k: int, sms: int):
+def _check_tactic(
+    source, r: plan.Range, m: int, n: int, k: int, sms: int, gpcs: int = plan.GPCS
+):
     tactic = source.tactic_type(*r.tactic)
     tactic.validate(m, n, k)  # ValueError for a tactic that cannot serve the problem
-    if not plan.splitk_fits_one_wave(r.tactic, m, n, sms):
+    if not plan.splitk_fits_one_wave(r.tactic, m, n, sms, gpcs):
         raise ValueError(
             f"{plan.kernel_name(r)} needs {plan.splitk_ctas(r.tactic, m, n)} CTAs at "
-            f"M={m}, N={n}: more than one wave of {sms} SMs"
+            f"M={m}, N={n}: more than one wave of {sms} SMs ({gpcs} GPCs)"
         )
     return tactic
 
@@ -306,6 +334,12 @@ def build(
             _DECLINED[key] = why
             _log_rank0(f"ll.gemm: {role} (N={n}, K={k}) stock: {why}")
         return _describe_key(key)
+    from sgl_nvidia_mega.glm5_3.ll import device
+
+    device.note_derived(
+        "ll.gemm", sm, "GB300's GEMM ranges, split-K checked for one wave of this GPU"
+    )
+    gpcs = plan.device_gpcs(sm)
     min_m = _min_rows(role, module)
     ready = _READY.setdefault(key, {})
     out_dtype = _DTYPES[plan.ROLE_DTYPES[role]]
@@ -315,7 +349,7 @@ def build(
             continue
         if r.kernel == plan.SPLITK:
             source = splitk_source()
-            tactic = _check_tactic(source, r, m, n, k, sms)
+            tactic = _check_tactic(source, r, m, n, k, sms, gpcs)
             served = _Served(
                 plan.SPLITK, tactic, f"{plan.kernel_name(r)} [{source.name}]", source
             )

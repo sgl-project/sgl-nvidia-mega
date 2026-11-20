@@ -19,7 +19,10 @@ The launch plan (one- or two-shot, cluster geometry, unicast or multicast publis
 shared-memory carveout) is a function of the world size, the row count and the SM
 count only, so every rank runs the same hop sequence. The tables are GB300
 measurements at H6144, chosen on the hop followed by its dependent kernel (the
-router GEMM, the fused QKV-A GEMM) at the row counts the decode graphs replay.
+router GEMM, the fused QKV-A GEMM) at the row counts the decode graphs replay. On
+Rubin (SM107, ``ll.device``) the same tables apply: the cluster geometry follows the SM
+count (FlashInfer's rule, so a hop stays bit-identical to FlashInfer's one-shot on the
+same GPU) and the caps are in Lamport bytes per rank; they are derived, not measured.
 
 Numerics (named tolerance ``ll.hops.max_ulp``): where the plan keeps FlashInfer's
 one-shot geometry (inside its 1 MiB band) a hop is bit-identical to FlashInfer's
@@ -647,8 +650,11 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
         return f"{mode} steps are the draft's"
     if profile.tp != 4:
         return f"TP{profile.tp}: the LL hops serve TP4 (the symmetric-memory hops serve TP8)"
-    if tuple(profile.sm) != (10, 3):
-        return f"sm_{profile.sm[0]}{profile.sm[1]}: the hop plans are measured on GB300 (sm_103)"
+    from sgl_nvidia_mega.glm5_3.ll import device
+
+    why = device.reason(profile.sm)
+    if why is not None:
+        return why
     a = (profile.tp, rows, HIDDEN, profile.sms)
     if plain_plan(*a) is None or finalize_plan(*a) is None:
         return f"no hop plan at {rows} rows"
@@ -660,8 +666,13 @@ def _family(model: Any, derived: Any, profile: Any):
     why = model_reason(model)
     if why is not None:
         return DeclinedFamily(why)
+    from sgl_nvidia_mega.glm5_3.ll import device
+
     family = build(model, deadline_s=profile.deadline_s, sm_count=profile.sms)
     family.model, family.sm = model, tuple(profile.sm)
+    device.note_derived(
+        "ll.hops", profile.sm, f"GB300's caps, geometry for {profile.sms} SMs"
+    )
     return family
 
 

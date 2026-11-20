@@ -611,10 +611,13 @@ def check_draft_config(model) -> None:
         if not ok:
             problems.append(what)
 
+    from sgl_nvidia_mega.glm5_3.ll import device
+
     cfg, spec, par = model.config, get_spec(), get_parallel()
     need(
-        torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 3),
-        "an SM103 GPU",
+        torch.cuda.is_available()
+        and device.lookup(torch.cuda.get_device_capability()) is not None,
+        "an SM103 (GB300) or SM107 (Rubin) GPU",
     )
     need(getattr(cfg, "hidden_size", None) == HIDDEN, f"hidden size {HIDDEN} (GLM-5)")
     need(

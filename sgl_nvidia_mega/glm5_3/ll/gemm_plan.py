@@ -15,9 +15,11 @@ measured row in each of three runs):
   ``griddepcontrol.wait``. FP32 output for the router.
 - ``tgv``: SGLang's CuTe DSL TGV GEMM (``cutedsl_bf16_gemm``), BF16 output.
 
-Rows a role's ranges leave out keep SGLang's GEMM for that module, bit for bit. The plan
-applies only on the GPU it was measured on (GB300: SM103 with 152 SMs); anywhere else
-every role keeps SGLang's GEMM.
+Rows a role's ranges leave out keep SGLang's GEMM for that module, bit for bit. A plan
+applies only on the GPU (compute capability and SM count) it is for (``PLANS``): GB300
+(SM103 with 152 SMs), where it was measured, and Rubin (SM107 with 212 SMs), where it is
+GB300's plan with every split-K tactic re-checked for one wave of 212 SMs (derived, not
+measured: ``ll.device``); anywhere else every role keeps SGLang's GEMM.
 """
 
 from __future__ import annotations
@@ -26,19 +28,22 @@ from typing import Dict, Optional, Tuple
 
 import msgspec
 
+from sgl_nvidia_mega.glm5_3.ll import device as _device
+
 SPLITK = "splitk"
 TGV = "tgv"
 
 # The GPU the plan was measured on: (compute capability, SMs).
-MEASURED_DEVICE = ((10, 3), 152)
+MEASURED_DEVICE = (_device.GB300.sm, _device.GB300.sms)
 # Largest row count any range serves.
 MAX_M = 96
 # A cluster of c CTAs needs c free SMs in one GPC, so up to c - 1 SMs per GPC can sit
 # idle: a split-K grid fits one wave with at most SMs - (split_k - 1) * GPCS CTAs. Every
 # split-K CTA reserves the full shared memory (one CTA per SM), so a second wave would
 # serialize a nearly empty tail and miss the window in which CTAs load weights before
-# their wait. 8 GPCs is the B200 / B300 layout (assumed, not queried).
-GPCS = 8
+# their wait. 8 GPCs is the B200 / B300 layout (assumed, not queried); each device of
+# ``PLANS`` states its own (``ll.device.Device.gpcs``).
+GPCS = _device.GB300.gpcs
 # K extent of one split-K tile.
 SPLITK_CTA_K = 128
 
@@ -134,6 +139,24 @@ PLAN: Tuple[Entry, ...] = (
     Entry("q_b", (2048, 2048), (_tgv(17, 96),), preferred=False),
 )
 
+# Rubin (VR200, SM107, 212 SMs): GB300's plan, derived, not measured, without the
+# router's split-K ranges. The kernels are the same (TGV: SGLang's CuTe DSL kernel, which
+# has a 10.7 path; split-K: the vendored copy where FlashInfer's explicit tactics do not
+# serve SM107, ll.gemm), and every split-K tactic still fits one wave of 212 SMs with 16
+# GPCs assumed (at most 96 CTAs against 164). The router keeps SGLang's gate on Rubin: its
+# split-K logits passed the router-vs-cuBLAS bound there but missed the separate FP64
+# comparison (error to FP64 at most 1.5x cuBLAS's plus 1e-6) at 18 and 20 rows, where
+# Rubin's cuBLAS is closer to FP64 than GB300's. The ranges start at 17 rows; one or two
+# requests at 3-6 tokens never reach them. The crossovers against SGLang's GEMM are
+# GB300 measurements.
+RUBIN_PLAN: Tuple[Entry, ...] = tuple(e for e in PLAN if e.role != "router")
+
+# (compute capability, SMs) -> the plan for that GPU
+PLANS: Dict[Tuple[Tuple[int, int], int], Tuple[Entry, ...]] = {
+    MEASURED_DEVICE: PLAN,
+    (_device.RUBIN.sm, _device.RUBIN.sms): RUBIN_PLAN,
+}
+
 # Named tolerances of the registered kernels against cuBLAS on the same GPU and inputs
 # (test/kernels/test_glm5_3_ll_gemm.py, every preferred role at every served row, random
 # and checkpoint weights). Split-K and TGV compute the same FP32 dot products in another
@@ -148,9 +171,23 @@ TOLERANCES: Dict[str, float] = {
 }
 
 
-def entry(role: str, shape: Tuple[int, int]) -> Optional[Entry]:
-    """The plan entry of ``role`` at per-rank weight ``shape``, or None."""
-    for e in PLAN:
+def device_plan(sm, sms: int) -> Optional[Tuple[Entry, ...]]:
+    """The plan for the GPU of compute capability ``sm`` with ``sms`` SMs, or None."""
+    return PLANS.get((tuple(int(v) for v in sm), int(sms)))
+
+
+def device_gpcs(sm) -> int:
+    """The GPCs the one-wave check assumes on compute capability ``sm``."""
+    d = _device.lookup(sm)
+    return d.gpcs if d is not None else GPCS
+
+
+def entry(
+    role: str, shape: Tuple[int, int], plan: Tuple[Entry, ...] = PLAN
+) -> Optional[Entry]:
+    """The entry of ``plan`` (default GB300's) for ``role`` at per-rank weight
+    ``shape``, or None."""
+    for e in plan:
         if e.role == role and e.shape == tuple(shape):
             return e
     return None
@@ -169,8 +206,10 @@ def splitk_ctas(tactic: Tuple[int, ...], m: int, n: int) -> int:
     return -(-n // mma_m) * -(-m // mma_n) * split_k
 
 
-def splitk_fits_one_wave(tactic: Tuple[int, ...], m: int, n: int, sms: int) -> bool:
-    return splitk_ctas(tactic, m, n) <= sms - (tactic[2] - 1) * GPCS
+def splitk_fits_one_wave(
+    tactic: Tuple[int, ...], m: int, n: int, sms: int, gpcs: int = GPCS
+) -> bool:
+    return splitk_ctas(tactic, m, n) <= sms - (tactic[2] - 1) * gpcs
 
 
 def kernel_name(r: Range) -> str:
