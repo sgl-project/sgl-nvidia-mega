@@ -119,7 +119,7 @@ struct MkdXchgParams {
  * [c * H / kChunks, ...) of the candidate and partial rows. Every CTA redoes the shard
  * argmax (a few tens of KB from L2) so no CTA waits for another before sending.
  */
-template <int kH, int kWorld, bool kMemo, int kChunks, int kThreads, bool kUsePDL>
+template <int kH, int kWorld, bool kMemo, int kChunks, int kThreads, bool kUsePDL, bool kSplitSend = false>
 SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   using namespace device;
   using vec_t = AlignedVector<bf16_t, 8>;
@@ -175,9 +175,12 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   constexpr int kScanUnroll = 4;
   const int nvec = p.vocab / 8;
   const bool from_head = p.head_part != nullptr;
-  const bool split = !from_head && p.scan_part != nullptr && nvec >= mkd_xchg::kSplitScanMinVecs;
+  // TP2's vocabulary shard exceeds the packed key's 16-bit row. Reuse the exact
+  // full-index scan below; narrow shards retain their packed/head fast path.
+  const bool wide = p.vocab > 65536;
+  const bool split = !wide && !from_head && p.scan_part != nullptr && nvec >= mkd_xchg::kSplitScanMinVecs;
   const int lo = split ? static_cast<int>((static_cast<int64_t>(nvec) * c) / kChunks) : 0;
-  const int hi = from_head ? 0 : split ? static_cast<int>((static_cast<int64_t>(nvec) * (c + 1)) / kChunks) : nvec;
+  const int hi = (wide || from_head) ? 0 : split ? static_cast<int>((static_cast<int64_t>(nvec) * (c + 1)) / kChunks) : nvec;
   for (int v0 = lo + static_cast<int>(threadIdx.x); v0 < hi; v0 += kThreads * kScanUnroll) {
     uint4 x[kScanUnroll];
 #pragma unroll
@@ -250,7 +253,7 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
   int32_t bidx = static_cast<int32_t>(0xffffu - (best & 0xffffu));
   const uint32_t k16 = best >> 16;
   best = (k16 << 16) | (k16 < 0x8000u ? 0xffffu : 0u);
-  if (nan_any != 0u) {
+  if (wide || nan_any != 0u) {
     __syncthreads();
     best = 0u;
     bidx = 0x7fffffff;
@@ -319,7 +322,12 @@ SGL_DEVICE void mkd_xchg_kernel(const MkdXchgParams& p) {
     }
     if (p.rank >= kEmbed) {
       const float* part = p.own_partial + c * kCols;
-      for (int w = static_cast<int>(threadIdx.x); w < kPartWords; w += kThreads) {
+      // With kSplitSend the partial goes out from the threads after the candidate, so
+      // a hidden rank's two loads are not serialized in the same threads.
+      constexpr int kPartFirst = kSplitSend && kCandWords + kPartWords <= kThreads ? kCandWords : 0;
+      constexpr int kPartStride = kPartFirst > 0 ? kThreads - kPartFirst : kThreads;
+      for (int w = static_cast<int>(threadIdx.x) - kPartFirst; w < kPartWords; w += kPartStride) {
+        if (w < 0) break;
         if (p.partial_flag != nullptr) {
           // The partial comes from a side-stream kernel that is not a stream predecessor.
           uint32_t f, n = 0;
@@ -479,4 +487,9 @@ extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_memo(const MkdXchgPa
 
 extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_emb(const MkdXchgParams __grid_constant__ p) {
   sglang::mkd_xchg_kernel<4096, MKD_WORLD, false, 16, 1024, true>(p);
+}
+
+// Memo exchange with the hidden partial sent by its own threads.
+extern "C" __global__ void __launch_bounds__(1024) mkd_xchg_memo_split(const MkdXchgParams __grid_constant__ p) {
+  sglang::mkd_xchg_kernel<4096, MKD_WORLD, true, 16, 1024, true, true>(p);
 }

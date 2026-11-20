@@ -212,6 +212,12 @@ constexpr int kARow = 132;  // FC1 accumulator row stride in floats: 16 B aligne
 #endif
 #ifndef DIAG_NO_MMA  // timing diagnostic only: no MMAs, stages are released as soon as they land
 #define DIAG_NO_MMA 0
+#endif
+#ifndef SPEC_STAGES  // ring stages warp 1 issues for its token's expert before the routing verdict (the rest after it)
+#define SPEC_STAGES 5
+#endif
+#ifndef PACE_D  // > 0: the producer issues stage st only once stage st - PACE_D has landed (bounded bytes in flight)
+#define PACE_D 0
 #endif  // partial row stride in floats: 16 B aligned, rows land on distinct banks
 
 struct Params {
@@ -712,7 +718,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
     if (lane == 0) {
       stamp(p, 9);
       const uint64_t pol = policy_evict_first();
-      for (int st = 0; st < kStages; ++st) issue_stage(st, (int)espec, pol);
+      for (int st = 0; st < SPEC_STAGES; ++st) issue_stage(st, (int)espec, pol);
       stamp(p, 2);
     }
     mbar_wait(&s.route_done, 0);
@@ -759,7 +765,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
   if (e < 0) {  // duplicate pair (both CTAs agree): let the speculative loads land; nothing was sent over DSMEM
     if (warp == 1) {
       if (lane == 0)
-        for (int b = 0; b < kStages; ++b) mbar_wait(&s.full[b], 0);
+        for (int b = 0; b < SPEC_STAGES; ++b) mbar_wait(&s.full[b], 0);
       __syncwarp();
     }
     mbar_wait(&s.x_full, 0);
@@ -774,10 +780,11 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
 
   if (warp == 1) {
     if (lane == 0) {
-      // ---------------- TMA producer: the rest of the weight stream (stages 0 .. kStages - 1 went out above)
+      // ---------------- TMA producer: the rest of the weight stream (stages 0 .. SPEC_STAGES - 1 went out above)
       const uint64_t pol = policy_evict_first();
-      for (int st = kStages; st < kTotStages; ++st) {
-        mbar_wait(&s.empty[st % kStages], ((st / kStages) - 1) & 1);
+      for (int st = SPEC_STAGES; st < kTotStages; ++st) {
+        if (st >= kStages) mbar_wait(&s.empty[st % kStages], ((st / kStages) - 1) & 1);
+        if (PACE_D > 0 && st >= PACE_D) mbar_wait(&s.full[(st - PACE_D) % kStages], ((st - PACE_D) / kStages) & 1);
         issue_stage(st, e, pol);
       }
     }
@@ -1015,6 +1022,7 @@ q35_mkm_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CU
 }
 
 static_assert(sizeof(Smem) + 1024 == Q35_MKM_SMEM_BYTES, "the launcher's dynamic shared memory size");
+static_assert(SPEC_STAGES >= 1 && SPEC_STAGES <= kStages && PACE_D >= 0 && PACE_D < kStages, "stage issue knobs");
 
 }  // namespace qwen_mkm_moe
 

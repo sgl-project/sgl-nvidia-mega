@@ -38,9 +38,9 @@ SGLANG_READS = {
 MAX_M = 1
 # Whether the attention output's o_proj runs as the one-row GEMV that pushes into the FFN
 # input's hop, per TP size, as SGLang branch nvidia/qwen35-agentx-gb300 runs them: TP8 does
-# (SGLANG_Q35MF_MKD_GEMV); TP4 runs SGLang's o_proj and the hop publishes its output (that
+# (its GEMV path); TP4 runs SGLang's o_proj and the hop publishes its output (that
 # branch's TP4 setup also pushes the single-launch MoE into the final norm's hop,
-# SGLANG_Q35MF_MKD_HOP_PUSH, which changes no bits and is not ported).
+# its hop-push path, which changes no bits and is not ported).
 GEMV_O_PROJ = {8: True, 4: False}
 
 

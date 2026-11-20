@@ -54,7 +54,7 @@ HEAD_DIM = 256
 KV_HEADS = 1  # the draft's KV heads on a rank: 2 KV heads over TP8, replicated
 QUERY_HEADS = (4, 8)
 # the KV length from which the branch serves the draft's q1 decode with SKV2-Q1
-# (SGLANG_Q35MF_MKA_Q1_MIN_LENGTH, unset in its TP8 serving configuration)
+# (the default threshold, unchanged in its TP8 serving configuration)
 MIN_LENGTH = 16384
 # the merge's head-dim block and warps (Q1SplitPlan.run)
 MERGE_BLOCK_D, MERGE_WARPS = 32, 4

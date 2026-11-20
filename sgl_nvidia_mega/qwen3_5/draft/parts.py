@@ -27,6 +27,9 @@ SGLANG_READS = {
     "srt/layers/vocab_parallel_embedding.py": (
         "shard_indices",
         "org_vocab_start_index",
+        "org_vocab_end_index",
+        "added_vocab_start_index",
+        "added_vocab_end_index",
     ),
     "srt/models/qwen3_5.py": (
         "layers",
@@ -64,33 +67,84 @@ class Parts:
         self.moe: Optional[Any] = None  # draft.moe.DraftMoe (slot draft_moe)
         self.hop: Optional[Any] = None  # draft.hop.DraftHop (slot draft_hop)
         self.mkd: Optional[Any] = None  # draft.xchg.MkdBoundary (slot draft_xchg)
+        # sm103.draft.top1.Top1Exchange: the multi-request steps' sharded top-1 (slot
+        # draft_multi)
+        self.top1x: Optional[Any] = None
+        # sm103.draft.embed.EmbedExchange: those steps' embedding rows (slot draft_embed)
+        self.embedx: Optional[Any] = None
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
+        # draft.moe_mkm.DraftMkm: compatible quantized draft experts on the target path
+        self.moe_mkm: Optional[Any] = None
 
     @classmethod
-    def build(cls, draft) -> Parts:
+    def build(cls, draft) -> Parts | None:
         from sgl_nvidia_mega.qwen3_5.draft.attention import Attention
+        from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
 
         m = draft.lm.model
         layers = [m.layers[i] for i in range(m.start_layer, m.end_layer)]
         if len(layers) != 1:
-            raise RuntimeError(
-                f"NVIDIA megakernel: the MTP draft has {len(layers)} layers, not 1"
+            unavailable_slots(
+                draft.slots, f"the MTP draft has {len(layers)} layers, not 1"
             )
+            return None
+        if getattr(draft, "context_len", 0) is None:
+            unavailable_slots(draft.slots, "the draft's HF config has no context_len")
+            return None
         parts = cls(draft, layers[0])
-        parts.attention = Attention(parts)
+        try:
+            parts.attention = Attention(parts)
+        except ImportError as exc:
+            unavailable_slots(
+                draft.slots, f"draft attention dependency unavailable: {exc}"
+            )
+            return None
         slots = parts.slots
+        if "draft_fin" in slots:
+            from sgl_nvidia_mega.qwen3_5.draft import finalize
+
+            reason = finalize.enable(parts.layer.mlp)
+            if reason:
+                unavailable_slots("draft_fin", reason)
+                slots = parts.slots = slots - {"draft_fin"}
         if "draft_moe" in slots:
             parts.moe = parts._build_moe()
+            if parts.moe is None:
+                slots = parts.slots = slots - {"draft_moe"}
         if "draft_hop" in slots:
             parts.hop = parts._build_hop()
+            if parts.hop is None:
+                slots = parts.slots = slots - {"draft_hop", "draft_fin"}
         if "draft_xchg" in slots:
             parts.mkd = parts._build_mkd()
+        if "draft_multi" in slots:
+            parts.top1x = parts._build_top1x()
+            if parts.top1x is None:
+                slots = parts.slots = slots - {"draft_multi", "draft_embed"}
+        if "draft_embed" in slots:
+            parts.embedx = parts._build_embedx()
+            if parts.embedx is None:
+                slots = parts.slots = slots - {"draft_embed"}
+        if "draft_moe" in slots:
+            from sgl_nvidia_mega.qwen3_5.draft import moe_mkm
+
+            parts.moe_mkm, why = moe_mkm.DraftMkm.build(parts.layer.mlp)
+            if parts.moe_mkm is None:
+                logger.info(
+                    "NVIDIA megakernel: draft MoE target path unavailable (%s)", why
+                )
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft parts built (slots %s; MoE %s, hop "
             "%s, exchange %s)",
             sorted(slots),
-            "single launch" if parts.moe is not None else "SGLang's",
+            (
+                "single launch at one row, target path from two rows"
+                if parts.moe_mkm is not None
+                else "single launch"
+                if parts.moe is not None
+                else "SGLang's"
+            ),
             "draft hop" if parts.hop is not None else "SGLang's",
             "MKD" if parts.mkd is not None else "SGLang's",
         )
@@ -99,13 +153,7 @@ class Parts:
     def _build_moe(self):
         from sgl_nvidia_mega.qwen3_5.draft.moe import DraftMoe
 
-        moe = DraftMoe.build(self.layer.mlp, self.device.index)
-        if moe is None:
-            raise RuntimeError(
-                "NVIDIA megakernel: slot draft_moe cannot run: "
-                f"{getattr(DraftMoe, 'last_reason', 'see the log')}"
-            )
-        return moe
+        return DraftMoe.build(self.layer.mlp, self.device.index)
 
     def _build_hop(self):
         from sgl_nvidia_mega.qwen3_5.draft.hop import GEMV_O_PROJ, DraftHop
@@ -123,7 +171,10 @@ class Parts:
             early_head=True,
         )
         if hop is None:
-            raise RuntimeError(f"NVIDIA megakernel: slot draft_hop cannot run: {why}")
+            from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
+
+            unavailable_slots("draft_hop", why)
+            return None
         logger.info(
             "NVIDIA megakernel: Qwen3.5 MTP draft hop releases at entry: the "
             "single-launch MoE %s, the draft head %s",
@@ -169,11 +220,109 @@ class Parts:
                 num_steps=b.num_steps,
             )
         if mkd is None:
-            raise RuntimeError(
-                "NVIDIA megakernel: slot draft_xchg cannot run: "
-                + ("; ".join(refused) or "see the MKD draft boundary warning")
+            from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
+
+            unavailable_slots(
+                "draft_xchg", "; ".join(refused) or "see the MKD draft boundary warning"
             )
         return mkd
+
+    def _build_top1x(self):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import Top1Exchange
+
+        lm, b = self.lm, self.binding
+        rows = int(lm.lm_head.weight.shape[0])
+        start = int(lm.lm_head.shard_indices.org_vocab_start_index)
+        vocab = int(lm.logits_processor.vocab_size)
+        # the shard layout the all-gathered logits have: rank-major, no padding rows
+        reason = ""
+        if start != b.tp_rank * rows or rows * b.tp_size != vocab:
+            reason = (
+                "the LM head's "
+                f"{rows}-row shard at {start} is not rank {b.tp_rank}'s slice of "
+                f"{vocab} ids"
+            )
+        weight = lm.lm_head.weight
+        if (
+            weight.dtype != torch.bfloat16
+            or weight.dim() != 2
+            or not weight.is_contiguous()
+        ):
+            reason = f"LM head {weight.dtype} {tuple(weight.shape)}; needs a contiguous BF16 shard"
+        from sgl_nvidia_mega.qwen3_5.runtime import slot_supported
+
+        if not slot_supported(
+            "draft_multi", reason, cpu_group=getattr(b, "tp_cpu_group", None)
+        ):
+            return None
+        from sgl_nvidia_mega.qwen3_5.runtime import SlotUnavailable, unavailable_slots
+
+        try:
+            return Top1Exchange(
+                world=b.tp_size,
+                rank=b.tp_rank,
+                vocab_local=rows,
+                vocab_start=start,
+                vocab_size=vocab,
+                group=b.tp_device_group,
+                cpu_group=b.tp_cpu_group,
+                device=self.device,
+            )
+        except SlotUnavailable as exc:
+            unavailable_slots("draft_multi", exc.reason)
+            return None
+
+    def _build_embedx(self):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import EmbedExchange
+
+        b = self.binding
+        embed = self.model.embed_tokens
+        shard = embed.shard_indices
+        reason = ""
+        if shard.added_vocab_end_index != shard.added_vocab_start_index:
+            reason = "the embedding has added vocabulary"
+        table = embed.weight.data
+        local = int(shard.org_vocab_end_index - shard.org_vocab_start_index)
+        if (
+            table.dtype != torch.bfloat16
+            or table.dim() != 2
+            or not table.is_contiguous()
+            or table.shape[1] % 2
+            or table.shape[0] < local
+        ):
+            reason = f"embedding table {table.dtype} {tuple(table.shape)}, local vocabulary {local}; needs contiguous BF16 rows with an even hidden size"
+        from sgl_nvidia_mega.qwen3_5.runtime import slot_supported
+
+        if not slot_supported(
+            "draft_embed", reason, cpu_group=getattr(b, "tp_cpu_group", None)
+        ):
+            return None
+        from sgl_nvidia_mega.qwen3_5.runtime import SlotUnavailable, unavailable_slots
+
+        try:
+            return EmbedExchange(
+                world=b.tp_size,
+                table=embed.weight.data,
+                vocab_start=int(shard.org_vocab_start_index),
+                vocab_local=int(
+                    shard.org_vocab_end_index - shard.org_vocab_start_index
+                ),
+                group=b.tp_device_group,
+                cpu_group=b.tp_cpu_group,
+                device=self.device,
+            )
+        except SlotUnavailable as exc:
+            unavailable_slots("draft_embed", exc.reason)
+            return None
+
+    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """The embedding rows of ``token_ids``: slot draft_embed's exchange where it is
+        built and the rows fit it, else SGLang's vocabulary-parallel embedding."""
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS
+
+        if self.embedx is not None and token_ids.shape[0] <= MAX_ROWS:
+            return self.embedx(token_ids)
+        return self.model.embed_tokens(token_ids)
 
     def note_engaged(self, entry: str, bs: int) -> None:
         """Log once per (entry, bs) captured: the engagement line every rank prints."""

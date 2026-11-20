@@ -23,9 +23,15 @@ SPECS = (
     # The MTP draft offers EAGLE draft-loop and draft-extend entries.
     ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
-    ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm_dsa.spec:SPEC"),
-    # the NextN draft: the fused draft forward and its top-1 logits
-    ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm_dsa.draft_spec:SPEC"),
+    # GLM-5.3 and GLM-5.2: the MTP target verify step
+    ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm5_3.spec:SPEC"),
+    # the NextN draft (ModelConfig names a GLM draft's architecture this way)
+    ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
+    ("MuseSparkForConditionalGeneration", "sgl_nvidia_mega.muse_spark.spec:SPEC"),
+    # Kimi K3.1: the DFlash target verify step and the sparse decode step
+    ("KimiK31ForConditionalGeneration", "sgl_nvidia_mega.kimi_k31.spec:SPEC"),
+    # the Kimi K3.1 DFlash2 draft: its decoder layers on the megakernel chain
+    ("DFlash2DraftModel", "sgl_nvidia_mega.kimi_k31.draft.serving:SPEC"),
 )
 
 # Test only: with SGLANG_NVIDIA_MEGAKERNEL_PARITY_SORT_TOPK=1, the composition check
@@ -71,6 +77,15 @@ def register() -> None:
             return
     for architecture, path in SPECS:
         megakernels.register(architecture=architecture, path=path)
+    # Muse Spark's kernels hook SGLang's own forward rather than replacing a
+    # whole step; each is opt-in and default off, so this is a no-op unless a
+    # MUSE_VR_* switch is set.
+    try:
+        from sgl_nvidia_mega.muse_spark.components import register_all
+    except ImportError:
+        pass
+    else:
+        register_all()
     if os.environ.get(PARITY_SORT_ENV) == "1":
         import pkgutil
 

@@ -30,6 +30,12 @@ FAST_GATE_WIDE_ROWS = frozenset(range(1, ROUTED_MAX_ROWS + 1))
 # the Engram prefetch serves batch 1 only (6 rows): at batch 2 (12 rows) the A/B measured
 # +78 us, the quarters' HBM reads overlapping a MoE that is no longer latency-bound
 ENGRAM_PREFETCH_MAX_ROWS = 8
+# Slots that lower numerics below what the checkpoint ships, for measurement only:
+# draft_lm_head_mxfp8 runs the DSpark draft's LM head on an MXFP8 copy, while the released
+# DeepSeek-V4.1-Flash ships that head in BF16 (one `head.weight`, shared by the target and
+# the draft); InferenceX's review rules forbid a draft head below the checkpoint's
+# precision. target_lm_head_mxfp8 (the verifier's head) is not here: it is gated on evals.
+MEASUREMENT_ONLY_SLOTS = frozenset({"draft_lm_head_mxfp8"})
 
 
 class Slots(msgspec.Struct, frozen=True):
@@ -39,6 +45,8 @@ class Slots(msgspec.Struct, frozen=True):
     embed: bool = False  # the embedding looks up this rank's whole table
     engram_prefetch: bool = False  # Engram lookups + WKVs run on the prefetch stream
     two_shot: bool = False  # both posts run the two-shot all-reduce + mHC
+    # the Engram hashes forked at the step start, the embedding written into the streams
+    prologue_fork: bool = False
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -52,6 +60,7 @@ class Facts(msgspec.Struct, frozen=True):
     engram_prefetch: bool = False  # every Engram layer prefetches, checked at build
     two_shot: bool = False  # the two-shot mailbox and kernels built
     fast_gate_wide: bool = False  # slot gate_wide: the fast top-k at every routed width
+    prologue_fork: bool = False  # slot prologue_fork
 
 
 def max_rows(two_shot: bool) -> int:
@@ -118,6 +127,7 @@ def slots(rows: int, facts: Facts) -> Slots:
         embed=facts.embed,
         engram_prefetch=facts.engram_prefetch and rows <= ENGRAM_PREFETCH_MAX_ROWS,
         two_shot=facts.two_shot and rows >= TWO_SHOT_MIN_ROWS,
+        prologue_fork=facts.prologue_fork,
     )
 
 

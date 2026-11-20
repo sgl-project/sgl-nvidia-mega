@@ -47,7 +47,7 @@ SGLANG_MIRRORS = {
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.self_attention": "db0f4d98e0fb1abf",
 }
 
-ATTENTION_SLOTS = ("skv2", "mka", "mka_push")
+ATTENTION_SLOTS = ("skv2", "skv2_cp", "mka", "mka_push", "route_lin")
 
 
 class Bound(msgspec.Struct, frozen=True):
@@ -55,7 +55,9 @@ class Bound(msgspec.Struct, frozen=True):
 
     skv2: bool = False  # slot skv2 serves every full-attention layer
     mka: bool = False
+    mka_wide: bool = False  # mka's front path also serves steps of several requests
     mka_push: bool = False
+    route_lin: bool = False  # router-before-all-reduce packed for every layer
     reason: str = ""  # why a requested slot is not built
 
 
@@ -75,22 +77,42 @@ def build(model, ctx) -> Bound:
         for i in range(m.start_layer, m.end_layer)
         if isinstance(m.layers[i], Qwen3_5AttentionDecoderLayer)
     ]
+    reasons = []
+    skv2_on, mka_on = "skv2" in SLOTS, "mka" in SLOTS
     for i, layer in layers:
-        reason = ""
-        if "skv2" in SLOTS:
+        if skv2_on:
             reason = split_kv.unsupported(layer.attn, ctx.tokens_per_request)
-        if not reason and "mka" in SLOTS:
+            if reason:
+                reasons.append(f"layer {i}: {reason}")
+                skv2_on = False
+        if mka_on:
             reason = (
                 mka.unsupported(layer)
                 if model.is_mrope_enabled
                 else "no M-RoPE positions (MKA reads them)"
             )
+            if reason:
+                reasons.append(f"layer {i}: {reason}")
+                mka_on = False
+    if "skv2_cp" in SLOTS:
+        reason = split_kv.cp_reason()
         if reason:
-            return Bound(reason=f"layer {i}: {reason}")
-    if "mka" in SLOTS:
-        for _, layer in layers:
-            mka.pack(layer)
-    return Bound(skv2="skv2" in SLOTS, mka="mka" in SLOTS, mka_push="mka_push" in SLOTS)
+            reasons.append(f"slot skv2_cp: {reason}")
+    route_lin = mka_on and "route_lin" in SLOTS
+    if mka_on:
+        for i, layer in layers:
+            reason = mka.pack(layer, route_lin=route_lin)
+            if reason:
+                reasons.append(f"slot route_lin: layer {i}: {reason}")
+                route_lin = False
+    return Bound(
+        skv2=skv2_on,
+        mka=mka_on,
+        mka_wide=mka_on,
+        mka_push=mka_on and "mka_push" in SLOTS,
+        route_lin=route_lin,
+        reason="; ".join(reasons),
+    )
 
 
 def pool_reasons(view, binding, skv2: bool = True, mka: bool = False) -> list[str]:
@@ -111,16 +133,34 @@ def step(layer, x, st):
         from sgl_nvidia_mega.qwen3_5.attention import mka
 
         return mka.step(layer, x, st)
-    q, k, v, gate = layer._prepare_qkv_gate(
-        positions=st.positions, hidden_states=x, forward_batch=st.fb
-    )
-    if st.slots.skv2:
-        from sgl_nvidia_mega.qwen3_5.attention import split_kv
+    from sgl_nvidia_mega.qwen3_5 import lowm
 
+    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    if st.slots.lowm_in or x8 is not None:
+        q, k, v, gate = lowm.prepare_qkv_gate(
+            layer, st.positions, x, x8, low_m=st.slots.lowm_in
+        )
+    else:
+        q, k, v, gate = layer._prepare_qkv_gate(
+            positions=st.positions, hidden_states=x, forward_batch=st.fb
+        )
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    if st.slots.skv2 or split_kv.cp_multi(q.shape[0]):
         o = split_kv.attend(layer.attn, q, k, v, st)
     else:
         o = layer.attn(q, k, v, st.fb)
     if layer.attn_output_gate:
         o = fused_sigmoid_mul(o, gate, inplace=True)
+    if st.slots.lowm_oproj:
+        from sgl_nvidia_mega.qwen3_5 import lowm
+        from sgl_nvidia_mega.qwen3_5.boundary import hop as hop_step
+
+        hop = None
+        if st.slots.lowm_push and hop_step.takes_moe_input(
+            st.bound["boundary"].hop, layer, st, o.shape[0]
+        ):
+            hop = st.bound["boundary"].hop
+        return lowm.row_parallel(layer.o_proj, o, o.dtype, "o_proj", hop)
     out, _ = layer.o_proj(o)
     return out

@@ -30,10 +30,10 @@ from typing import Callable, Optional
 
 import torch
 
+from sgl_nvidia_mega.qwen3_5.runtime import SlotUnavailable, slot_failure
 from sgl_nvidia_mega.qwen3_5.sm103.draft import xchg as kernels
 
 logger = logging.getLogger(__name__)
-
 # Memo rows built per launch at construction
 _MEMO_BLOCK = 4096
 # CTAs of mkd_draft_head per SM (T1, TP8 shard: 1 -> 39.3 us, 2 -> 40.5 us, 3 -> 41.6 us)
@@ -44,7 +44,7 @@ _HEAD_CTAS_PER_SM = 1
 HEAD_SMEM_PAD = 120 * 1024
 # SMs a hidden rank leaves to the side-stream hidden partial: the early-released head
 # would fill every SM, and the partial (which the exchange waits for) would start only as
-# head CTAs retire; the head then runs on the other SMs
+# head CTAs retire; the four-row partial ends before the head at this measured split
 PARTIAL_SMS = 24
 # Draft and draft-extend widths that take the row-split fc (2.2 _FC_SPLIT_MAX_TOKENS)
 FC_SPLIT_MAX_TOKENS = kernels.GATHER_MAX_TOKENS
@@ -171,6 +171,13 @@ class MkdBoundary:
         self._fc_gather = kernels.FcGather(
             world=world, rank=rank, group=device_group, cpu_group=cpu_group, device=dev
         )
+        self._fc_allsum = kernels.FcAllsum(
+            world=world,
+            rank=rank,
+            group=device_group,
+            cpu_group=cpu_group,
+            device=dev,
+        )
         self.is_hidden_rank = use_hidden
         self.slice_start, self.width = start, width
         self.n_embed = hidden // width
@@ -179,7 +186,9 @@ class MkdBoundary:
         self.embed_weight, self.local_vocab = embed_shard, rows
         if vocab_start != rank * rows:
             raise RuntimeError(
-                "MKD draft boundary: vocabulary shard is not the rank-th equal slice"
+                slot_failure(
+                    "draft_xchg", "vocabulary shard is not the rank-th equal slice"
+                )
             )
         # Full vocabulary: candidate position p (rank-major) is vocabulary id p.
         self.hot_ids = torch.arange(rows * world, dtype=torch.int64).to(dev)
@@ -234,6 +243,7 @@ class MkdBoundary:
         self.step = 0
         self.last_step = False
         self.partial_pending = False
+        self._extend_head_noted = False
         # the vocabulary exchange's per-step outputs (DraftVocabExchange)
         self.num_rows = 1
         self.topk_index = [
@@ -245,8 +255,8 @@ class MkdBoundary:
             for _ in range(num_steps)
         ]
         logger.info(
-            "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer); "
-            "sources %s.",
+            "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange "
+            "buffer; one-launch split-fc all-sum); sources %s.",
             world,
             "memo" if memo else "embedding",
             words * 8 / 2**20,
@@ -255,8 +265,8 @@ class MkdBoundary:
 
     @classmethod
     def maybe_create(cls, *, vocab_size: int, **kwargs) -> Optional[MkdBoundary]:
-        """The boundary, or None (logged) when ``unsupported_reason`` refuses it; every
-        rank decides alike."""
+        """The boundary, or None (logged) when ``unsupported_reason`` or a build check
+        (multicast mapping, memo parity) refuses it; every rank decides alike."""
         fc_weight = kwargs["fc_weight"]
         reason = unsupported_reason(
             hidden=int(fc_weight.shape[0]),
@@ -266,12 +276,15 @@ class MkdBoundary:
             embed_shard=kwargs["embed_shard"],
             lm_head_shard=kwargs["lm_head_shard"],
         )
-        if reason is not None:
-            logger.warning(
-                "MKD draft boundary disabled (%s); using the stock path.", reason
-            )
-            return None
-        return cls(**kwargs)
+        if reason is None:
+            try:
+                return cls(**kwargs)
+            except SlotUnavailable as exc:
+                reason = exc.reason
+        logger.warning(
+            "MKD draft boundary disabled (%s); using the stock path.", reason
+        )
+        return None
 
     # ---------------------------------------------------------------- memo table
 
@@ -296,9 +309,9 @@ class MkdBoundary:
         bad_t = torch.tensor([bad, rows], dtype=torch.int64, device=emb.device)
         dist.all_reduce(bad_t, group=self._device_group)
         if int(bad_t[0]) != 0:
-            raise RuntimeError(
-                f"MKD memo table differs from the split fc on {int(bad_t[0])} of "
-                f"{int(bad_t[1])} rows"
+            raise SlotUnavailable(
+                "draft_xchg",
+                f"MKD memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} rows",
             )
         logger.info(
             "MKD memo table: %d rows on this rank (%.1f MB), equal to the split fc on all %d rows.",
@@ -383,6 +396,10 @@ class MkdBoundary:
         """The one-row draft logits [1, N] bf16 on this rank's shard (the exchange then
         reads the per-CTA maxima). For an armed step with the head installed."""
         x = hidden_states.to(torch.bfloat16).contiguous()
+        if self.head_part is None:
+            # TP2's BF16 head shard is wider than the fused head's 16-bit row key.
+            # The exchange selects over its full row ids, behind SGLang's linear op.
+            return torch.nn.functional.linear(x, self.lm_head_weight)
         logits = torch.empty(
             1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device
         )
@@ -513,7 +530,9 @@ class MkdBoundary:
         topk_index, topk_p = self.topk_index[step][:m], self.topk_p[step][:m]
         if not self.armed:
             raise RuntimeError(
-                "MKD draft boundary: only armed (one-row) steps take the exchange"
+                slot_failure(
+                    "draft_xchg", "only armed (one-row) steps take the exchange"
+                )
             )
         self.exchange(
             local_logits,
@@ -564,16 +583,75 @@ class MkdBoundary:
             raise RuntimeError("MKD draft boundary: the extend exchange serves one row")
         return self.exchange_extend(local_logits, hidden_states)
 
+    def extend_head(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """Run a one-request extend head as an MKD step.
+
+        On a hidden rank the next draft's partial runs on the side stream; the exchange
+        waits on its flag and reads the head's per-CTA maxima. Return ``None`` when the
+        boundary cannot use this shape.
+        """
+        if self.head_part is None or not self.extend_fc or hidden_states.shape[0] != 1:
+            return None
+        x = hidden_states.to(torch.bfloat16).contiguous()
+        partial_ctas = (
+            max(0, min(self.partial_sms, self.head_part.numel() - 1))
+            if self.is_hidden_rank
+            else 0
+        )
+        if self.is_hidden_rank:
+            norm = self.norm_hidden
+            self.side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.side_stream):
+                kernels.mkd_hidden_partial(
+                    x,
+                    self._fc_shard,
+                    norm.weight.data,
+                    norm.variance_epsilon,
+                    self.slice_start,
+                    self.own_partial,
+                    self.epoch_done,
+                    self.partial_sync,
+                    self.world,
+                    ctas=partial_ctas,
+                )
+            self.partial_pending = True
+        logits = torch.empty(
+            1, self.lm_head_weight.shape[0], dtype=torch.bfloat16, device=x.device
+        )
+        self.head_part_cur = self.head_part[: self.head_part.numel() - partial_ctas]
+        kernels.mkd_draft_head(
+            x,
+            self.lm_head_weight,
+            logits,
+            self.head_part_cur,
+            reverse=False,
+            smem_pad=self.head_pad,
+        )
+        self.head_used = True
+        if torch.cuda.is_current_stream_capturing() and not self._extend_head_noted:
+            self._extend_head_noted = True
+            logger.info(
+                "NVIDIA megakernel: MKD draft extend uses the BF16 step head on "
+                "%d CTAs, %s",
+                self.head_part_cur.numel(),
+                f"hidden partial on {partial_ctas} SMs of the side stream"
+                if self.is_hidden_rank
+                else "no partial (embedding rank)",
+            )
+        return logits
+
     def exchange_extend(
         self,
         local_logits: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         topk_index: Optional[torch.Tensor] = None,
         topk_p: Optional[torch.Tensor] = None,
+        mkd_head: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange;
         with extend_fc it also writes the next draft's first fc into fc_buf. The token and
-        its 1.0 land in ``topk_index`` / ``topk_p`` ([1, 1]) when given."""
+        its 1.0 land in ``topk_index`` / ``topk_p`` ([1, 1]) when given. ``mkd_head``: the
+        logits come from ``extend_head`` (its per-CTA maxima and side-stream partial)."""
         if topk_index is None:
             topk_index = torch.empty(
                 (1, 1), dtype=torch.int64, device=local_logits.device
@@ -585,7 +663,7 @@ class MkdBoundary:
         payload = (
             self.extend_fc and hidden_states is not None and hidden_states.shape[0] == 1
         )
-        if payload and self.is_hidden_rank:
+        if payload and self.is_hidden_rank and not mkd_head:
             norm = self.norm_hidden
             kernels.draft_fc_partial(
                 hidden_states.contiguous(),
@@ -617,8 +695,15 @@ class MkdBoundary:
             kernels.NAN_KEY_TORCH_ARGMAX,
             fc_out=self.fc_buf if payload else None,
             token_only=not payload,
+            partial_flag=self.partial_sync[1:]
+            if mkd_head and payload and self.partial_pending
+            else None,
             scan_part=self.scan_part,
+            head_part=self.head_part_cur if mkd_head and self.head_used else None,
         )
+        if mkd_head:
+            self.head_used = False
+            self._join_side_streams()
         self.fc_buf_key = self.input_seq if payload else None
         return topk_p, topk_index
 
@@ -681,6 +766,5 @@ class MkdBoundary:
         return self._gather_partials(partial)
 
     def _gather_partials(self, partial: torch.Tensor) -> torch.Tensor:
-        gathered = self._fc_gather(partial)
         out = partial.new_empty(partial.shape, dtype=torch.bfloat16)
-        return kernels.ordered_partial_sum(gathered, self.world, out)
+        return self._fc_allsum(partial, out)

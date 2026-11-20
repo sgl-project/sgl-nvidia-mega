@@ -24,7 +24,13 @@ from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import Boundaries, Boundar
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/models/deepseek_v4.py": ("layers", "start_layer", "end_layer"),
+    "srt/models/deepseek_v4.py": (
+        "layers",
+        "start_layer",
+        "end_layer",
+        "attn_hc",
+        "ffn_hc",
+    ),
     "srt/models/deepseek_v4_mhc.py": ("materialized", "residual", "pre"),
     "srt/runtime_context.py": (
         "get_forward",
@@ -43,6 +49,28 @@ class MoeOperands(msgspec.Struct, frozen=True):
     input_ids_global: object
     do_shared_local: bool
     return_moe_output: bool  # the MoE leaves its finalize to the post
+
+
+def _wo_b_split_default_takes(m, runtime) -> bool:
+    """Slot wo_b_publish_split on a default start (no slot list) only where wo_b has at
+    most wo_b_split.DEFAULT_MAX_INPUTS inputs per rank (attention TP8); listed, at every
+    shape the kernel takes."""
+    import logging
+
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_b_split
+
+    if not runtime.default_start():
+        return True
+    k = m.layers[m.start_layer].self_attn.wo_b.weight.shape[1]
+    if k <= wo_b_split.DEFAULT_MAX_INPUTS:
+        return True
+    logging.getLogger(__name__).info(
+        "NVIDIA megakernel: default slot wo_b_publish_split left off: wo_b has %d "
+        "inputs per rank (a default start takes it up to %d)",
+        k,
+        wo_b_split.DEFAULT_MAX_INPUTS,
+    )
+    return False
 
 
 def build(model, ctx, group) -> Boundaries:
@@ -65,12 +93,18 @@ def build(model, ctx, group) -> Boundaries:
             hop_b_wide="hop_b_wide" in runtime.SLOTS,
             hop_b_cap16="hop_b_cap16" in runtime.SLOTS,
             hop_b_quad_trigger="hop_b_quad_trigger" in runtime.SLOTS,
+            mbarrier_exchange="hop_mbar" in runtime.SLOTS,
+            final_collapse="hop_final_collapse" in runtime.SLOTS,
+            wo_b_split="wo_b_publish_split" in runtime.SLOTS
+            and _wo_b_split_default_takes(m, runtime),
         )
     two_shot, two_shot_reason = None, "stock (slot off)"
     if "two_shot" in runtime.SLOTS:
         two_shot, two_shot_reason = _build_two_shot(model, ctx, group)
     # a load-time fact of the platform and config, the same on every rank
     use_prenorm = "hc_prenorm" in runtime.SLOTS and not prenorm.reason()
+    if use_prenorm and "hc_coeff_fused" in runtime.SLOTS:
+        _build_hc_coeff(model, group)
     return Boundaries(
         [m.layers[i] for i in range(m.start_layer, m.end_layer)],
         hop_a=hop,
@@ -79,7 +113,21 @@ def build(model, ctx, group) -> Boundaries:
         two_shot_reason=two_shot_reason,
         hop_b="hop_b" in runtime.SLOTS,
         prenorm=use_prenorm,
+        final_collapse="hop_final_collapse" in runtime.SLOTS,
     )
+
+
+def _build_hc_coeff(model, group) -> None:
+    """Slot hc_coeff_fused: the one-launch coefficients, checked bit for bit against
+    the prenorm pair on every sublayer's weights; raises on every rank alike."""
+    from sgl_nvidia_mega.deepseek_v41.boundary import prenorm
+
+    m = model.model
+    layers = [m.layers[i] for i in range(m.start_layer, m.end_layer)]
+    subs = [hc for layer in layers for hc in (layer.attn_hc, layer.ffn_hc)]
+    device = layers[0].self_attn.wo_b.weight.device
+    if why := prenorm.build_fused(subs, device, group):
+        raise RuntimeError(f"NVIDIA megakernel: slot hc_coeff_fused: {why}")
 
 
 def _build_two_shot(model, ctx, group):
@@ -135,11 +183,14 @@ def set_residual(st, residual) -> None:
     st.state = bs.hc
 
 
-def pre(layer, sublayer: str, st, aux=None):
+def pre(layer, sublayer: str, st, aux=None, need_input: bool = True):
     """The input of ``layer``'s ``sublayer`` ("attn"); sets ``st.x_quant``. With
-    ``aux``, appends the streams' mean (a DSpark capture layer)."""
+    ``aux``, appends the streams' mean (a DSpark capture layer). Without ``need_input``,
+    only opens the sublayer (the first attention of fresh streams; returns None)."""
     assert sublayer == "attn"
-    x, st.x_quant = st.bound["boundary"].pre(layer, "attn", _state(st), st.fb, aux)
+    x, st.x_quant = st.bound["boundary"].pre(
+        layer, "attn", _state(st), st.fb, aux, need_input=need_input
+    )
     return x
 
 
@@ -176,6 +227,18 @@ def final(st):
     st.bound["boundary"].join_aux(bs)
     state = bs.hc.materialized(m.layers[m.end_layer - 1].hc_cfg)
     return state.residual, state.pre
+
+
+def final_collapse(st):
+    """The head's mHC collapse the last layer's hop B wrote (slot hop_final_collapse),
+    or None: the head then combines the final streams itself."""
+    return _state(st).final_collapse
+
+
+def head(st, residual, collapsed):
+    """``logits.head`` on the collapse hop B wrote: (hidden, pre_hc_head), SGLang's
+    final RMSNorm on the same BF16 rows its mhc_combine would give."""
+    return st.model.norm(collapsed), residual.flatten(1)
 
 
 def clear(st) -> None:

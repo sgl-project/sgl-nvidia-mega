@@ -27,10 +27,47 @@ from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
 from sgl_nvidia_mega.qwen3_5.runtime import executor
 
 
+class _CudaMeta:
+    """Tensor metadata stand-in for CPU capability-policy tests."""
+
+    def __init__(
+        self,
+        shape,
+        dtype,
+        *,
+        transpose_contiguous=True,
+        contiguous=True,
+        is_cuda=True,
+        device="cuda:0",
+    ):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.transpose_contiguous = transpose_contiguous
+        self.contiguous = contiguous
+        self.is_cuda = is_cuda
+        self.device = torch.device(device)
+
+    def is_contiguous(self):
+        return self.contiguous
+
+    def dim(self):
+        return len(self.shape)
+
+    def t(self):
+        return SimpleNamespace(
+            is_contiguous=lambda: self.transpose_contiguous,
+        )
+
+
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding as plugin_binding
+
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    monkeypatch.setattr(
+        plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
+    )
     plugin.register()
 
 
@@ -121,7 +158,7 @@ def _moe_block(log, x, *, alt_stream=True, shared=True, deferred_ok=True):
     mlp = qwen2_moe.Qwen2MoeSparseMoeBlock.__new__(qwen2_moe.Qwen2MoeSparseMoeBlock)
     torch.nn.Module.__init__(mlp)
     bypassed = SimpleNamespace(format="bypassed")
-    routed = torch.zeros(7, 4)
+    routed = torch.zeros(x.shape[0], 4)
     log.known["routed"] = routed
     experts = _Callable(
         log.op("experts", routed),
@@ -135,7 +172,10 @@ def _moe_block(log, x, *, alt_stream=True, shared=True, deferred_ok=True):
         _use_mega_moe=False,
         layer_id=3,
         gate=_Callable(log.op("gate", ("logits", None))),
-        topk=_Callable(log.op("topk", bypassed)),
+        topk=_Callable(
+            log.op("topk", bypassed),
+            empty_topk_output=log.op("empty_topk", bypassed),
+        ),
         experts=experts,
         shared_expert=_Callable(log.op("shared", "shared_out")) if shared else None,
         shared_expert_gate=_Callable(
@@ -209,8 +249,100 @@ def test_the_moe_step_issues_what_sglang_issues(capture, defer, alt_stream):
     assert want == got if not isinstance(want, torch.Tensor) else torch.equal(want, got)
 
 
+@pytest.mark.parametrize("capture", [False, True])
+def test_empty_dp_rank_skips_gate_and_shared_but_runs_experts(capture):
+    runs = []
+    for which in ("sglang", "plugin"):
+        x = torch.zeros(0, 4)
+        log = _log(x=x)
+        mlp = _moe_block(log, x)
+        with _streams(log, capture), _moe_kernels(log):
+            if which == "sglang":
+                out = mlp.forward(x, None)
+            else:
+                out = moe.step(SimpleNamespace(mlp=mlp), x, _st(), defer=False)
+        runs.append((log, out))
+    (want_log, want), (got_log, got) = runs
+    assert got_log == want_log
+    assert [entry[0] for entry in got_log] == ["empty_topk", "experts"]
+    assert want.shape == got.shape == (0, 4)
+
+
 def _st(route=False):
-    return SimpleNamespace(slots=plan.Slots(route=route))
+    return SimpleNamespace(
+        slots=plan.Slots(route=route), bound={"moe": moe.route.Bound()}
+    )
+
+
+@pytest.mark.parametrize(
+    "topology,pre,reason,want",
+    [
+        ((8, 1, 8), True, "", True),
+        ((8, 1, 4), True, "", True),
+        ((8, 1, 8), False, "", False),
+        ((8, 1, 1), True, "", False),
+        ((8, 8, 8), True, "", False),
+        ((4, 1, 4), True, "", False),
+        ((8, 1, 8), True, "BF16 down projection", False),
+    ],
+)
+def test_ordinary_shared_act_quant_builds_only_for_eligible_tep8(
+    monkeypatch, topology, pre, reason, want
+):
+    from sglang.srt import runtime_context
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import shared_act_quant
+
+    monkeypatch.setattr(
+        runtime_context,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            tp_size=topology[0], attn_dp_size=topology[1], moe_ep_size=topology[2]
+        ),
+    )
+    expert = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight=_CudaMeta((4096, 256), torch.float8_e4m3fn))
+    )
+    mlp = SimpleNamespace(shared_expert=expert)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=2, layers=[SimpleNamespace(mlp=mlp)] * 2
+        )
+    )
+    monkeypatch.setattr(moe.route, "shared_unsupported", lambda _: reason)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    built = []
+    monkeypatch.setattr(shared_act_quant, "build", lambda *args: built.append(args))
+    bound = moe._build_shared_act_quant(model, moe.route.Bound(pre=pre))
+    assert bound.shared_act_quant is want
+    assert built == ([(0, 256)] if want else [])
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ordinary_shared_act_quant_preserves_the_gate_and_streams(
+    monkeypatch, capture, enabled
+):
+    x = torch.zeros(448, 4)
+    log = _log(x=x)
+    mlp = _moe_block(log, x)
+    mlp.shared_expert.gate_up_proj = log.op("shared_up", ("gate_up", None))
+    monkeypatch.setattr(
+        moe.route,
+        "shared_expert_tail",
+        lambda se, gu: log.op("act_quant_tail", "shared_out")(gu),
+    )
+    st = _st()
+    st.bound["moe"] = moe.route.Bound(shared_act_quant=enabled)
+    with _streams(log, capture), _moe_kernels(log):
+        assert moe.step(SimpleNamespace(mlp=mlp), x, st, defer=True) == "handoff"
+    names = [e[0] for e in log]
+    assert ("act_quant_tail" in names) == (capture and enabled)
+    assert ("shared" in names) == (not (capture and enabled))
+    assert names.count("gate_mul") == 1
+    assert [e for e in log if e[0] == "wait"] == (
+        [("wait", "alt", "main"), ("wait", "main", "alt")] if capture else []
+    )
 
 
 def _router_front(log, mlp):
@@ -308,6 +440,7 @@ class _GateUp:
 
     def __init__(self, log):
         self.log = log
+        self.dtype = torch.bfloat16
 
     def record_stream(self, stream):
         self.log.append(("record_stream", stream.name))
@@ -432,15 +565,289 @@ def test_the_route_shared_slot_names_what_a_layer_lacks(change, want):
         gate_up_proj=SimpleNamespace(
             quant_method=method,
             bias=change.get("bias"),
-            weight=torch.zeros(rows, 4096, dtype=torch.float8_e4m3fn).t(),
-            input_scale=torch.ones(1),
-            weight_scale=torch.ones(1),
+            weight=_CudaMeta((4096, rows), torch.float8_e4m3fn),
+            input_scale=_CudaMeta((1,), torch.float32),
+            weight_scale=_CudaMeta((1,), torch.float32),
         ),
         act_fn=change.get("act_fn", object.__new__(SiluAndMul)),
+        down_proj=SimpleNamespace(
+            quant_method=method,
+            weight=_CudaMeta((256, 4096), torch.float8_e4m3fn),
+            input_scale=_CudaMeta((1,), torch.float32),
+        ),
     )
     mlp = SimpleNamespace(shared_expert=expert, shared_expert_gate="gate")
     got = route.shared_unsupported(mlp)
     assert (want in got) if want else got == ""
+
+    if not change:
+        # ModelOptFp8LinearMethod collapses these scales with ``.max()`` after
+        # loading, so production modules carry 0-D Parameters rather than [1].
+        expert.gate_up_proj.input_scale = _CudaMeta((), torch.float32)
+        expert.gate_up_proj.weight_scale = _CudaMeta((), torch.float32)
+        expert.down_proj.input_scale = _CudaMeta((), torch.float32)
+        assert route.shared_unsupported(mlp) == ""
+
+
+def test_route_shared_missing_quant_scales_falls_back_instead_of_raising():
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    expert = qwen2_moe.Qwen2MoeMLP.__new__(qwen2_moe.Qwen2MoeMLP)
+    torch.nn.Module.__init__(expert)
+    expert.__dict__.update(
+        gate_up_proj=SimpleNamespace(
+            quant_method=object(),
+            bias=None,
+            weight=_CudaMeta((4096, 256), torch.bfloat16),
+        ),
+        act_fn=object(),
+        down_proj=object(),
+    )
+
+    reason = route.shared_unsupported(
+        SimpleNamespace(shared_expert=expert, shared_expert_gate="gate")
+    )
+
+    assert "not a static per-tensor FP8 linear" in reason
+
+
+def test_route_shared_owns_the_static_fp8_down_projection_policy():
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+    weight = _CudaMeta((256, 4096), torch.float8_e4m3fn)
+    scale = _CudaMeta((1,), torch.float32)
+    expert = SimpleNamespace(
+        down_proj=SimpleNamespace(quant_method=method, weight=weight, input_scale=scale)
+    )
+
+    assert route._down_takes_static_fp8(expert)
+    expert.down_proj.input_scale = _CudaMeta((), torch.float32)
+    assert route._down_takes_static_fp8(expert)
+    expert.down_proj.input_scale = scale
+    method.use_marlin = True
+    assert not route._down_takes_static_fp8(expert)
+    method.use_marlin = False
+    method.use_sm120_fp8 = True
+    assert not route._down_takes_static_fp8(expert)
+    method.use_sm120_fp8 = False
+    expert.down_proj.input_scale = _CudaMeta((2,), torch.float32)
+    assert not route._down_takes_static_fp8(expert)
+    expert.down_proj.input_scale = scale
+    expert.down_proj.weight = _CudaMeta((256, 4096), torch.bfloat16)
+    assert not route._down_takes_static_fp8(expert)
+    expert.down_proj = SimpleNamespace(weight=weight, input_scale=scale)
+    assert not route._down_takes_static_fp8(expert)
+
+
+def test_route_shared_normalizes_modelopts_scalar_down_scale(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.moe import route
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import shared_act_quant
+
+    scale = torch.ones((), dtype=torch.float32)
+    seen = []
+
+    def quantize(gate_up, got_scale):
+        seen.append((gate_up, got_scale))
+        return "quantized"
+
+    class Down:
+        input_scale = scale
+
+        def __call__(self, value):
+            return value, None
+
+    expert = SimpleNamespace(
+        _enable_silu_fp4_quant_fusion=False,
+        down_proj=Down(),
+    )
+    monkeypatch.setattr(route, "_down_takes_static_fp8", lambda unused: True)
+    monkeypatch.setattr(shared_act_quant, "silu_and_mul_static_quant_fp8", quantize)
+
+    gate_up = torch.ones((2, 4), dtype=torch.bfloat16)
+    assert route.shared_expert_tail(expert, gate_up) == "quantized"
+    assert seen[0][0] is gate_up
+    assert tuple(seen[0][1].shape) == (1,)
+
+
+@pytest.mark.parametrize("scale_name", ["input_scale", "weight_scale"])
+@pytest.mark.parametrize(
+    "scale",
+    [
+        _CudaMeta((1,), torch.bfloat16),
+        _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
+        _CudaMeta((1,), torch.float32, contiguous=False),
+        _CudaMeta((2,), torch.float32),
+        _CudaMeta((1, 1), torch.float32),
+        _CudaMeta((1,), torch.float32, device="cuda:1"),
+    ],
+    ids=[
+        "wrong-dtype",
+        "not-cuda",
+        "non-contiguous",
+        "wrong-size",
+        "wrong-rank",
+        "device",
+    ],
+)
+def test_route_shared_rejects_invalid_gate_up_scales(scale_name, scale):
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+    gate_up = SimpleNamespace(
+        quant_method=method,
+        bias=None,
+        weight=_CudaMeta((4096, 256), torch.float8_e4m3fn),
+        input_scale=_CudaMeta((1,), torch.float32),
+        weight_scale=_CudaMeta((1,), torch.float32),
+    )
+    setattr(gate_up, scale_name, scale)
+    expert = qwen2_moe.Qwen2MoeMLP.__new__(qwen2_moe.Qwen2MoeMLP)
+    torch.nn.Module.__init__(expert)
+    expert.__dict__.update(
+        gate_up_proj=gate_up,
+        act_fn=object.__new__(SiluAndMul),
+        down_proj=SimpleNamespace(
+            quant_method=method,
+            weight=_CudaMeta((256, 4096), torch.float8_e4m3fn),
+            input_scale=_CudaMeta((1,), torch.float32),
+        ),
+    )
+    mlp = SimpleNamespace(shared_expert=expert, shared_expert_gate="gate")
+
+    assert "shared gate/up is not a static per-tensor FP8 linear" in (
+        route.shared_unsupported(mlp)
+    )
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [
+        _CudaMeta((1,), torch.bfloat16),
+        _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
+        _CudaMeta((1,), torch.float32, contiguous=False),
+        _CudaMeta((2,), torch.float32),
+        _CudaMeta((1, 1), torch.float32),
+        _CudaMeta((1,), torch.float32, device="cuda:1"),
+    ],
+    ids=[
+        "wrong-dtype",
+        "not-cuda",
+        "non-contiguous",
+        "wrong-size",
+        "wrong-rank",
+        "device",
+    ],
+)
+def test_route_shared_rejects_invalid_down_scale(scale):
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    method = object.__new__(ModelOptFp8LinearMethod)
+    method.use_marlin = method.use_sm120_fp8 = False
+    expert = SimpleNamespace(
+        down_proj=SimpleNamespace(
+            quant_method=method,
+            weight=_CudaMeta((256, 4096), torch.float8_e4m3fn),
+            input_scale=scale,
+        )
+    )
+
+    assert not route._down_takes_static_fp8(expert)
+
+
+@pytest.mark.parametrize(
+    "x",
+    [
+        _CudaMeta((2, 4), torch.bfloat16, is_cuda=False, device="cpu"),
+        _CudaMeta((2, 4), torch.float32),
+        _CudaMeta((4,), torch.bfloat16),
+        _CudaMeta((2, 4), torch.bfloat16, contiguous=False),
+        _CudaMeta((2, 0), torch.bfloat16),
+        _CudaMeta((2, 3), torch.bfloat16),
+    ],
+    ids=["not-cuda", "wrong-dtype", "wrong-rank", "non-contiguous", "empty", "odd"],
+)
+def test_route_shared_act_quant_rejects_invalid_input_metadata(x):
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
+        silu_and_mul_static_quant_fp8,
+    )
+
+    with pytest.raises(ValueError, match="shared act\\+quant input"):
+        silu_and_mul_static_quant_fp8(x, _CudaMeta((1,), torch.float32))
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [
+        _CudaMeta((1,), torch.float32, is_cuda=False, device="cpu"),
+        _CudaMeta((1,), torch.bfloat16),
+        _CudaMeta((2,), torch.float32),
+        _CudaMeta((1,), torch.float32, contiguous=False),
+        _CudaMeta((1,), torch.float32, device="cuda:1"),
+    ],
+    ids=["not-cuda", "wrong-dtype", "wrong-shape", "non-contiguous", "device"],
+)
+def test_route_shared_act_quant_rejects_invalid_scale_metadata(scale):
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.shared_act_quant import (
+        silu_and_mul_static_quant_fp8,
+    )
+
+    with pytest.raises(ValueError, match="shared act\\+quant scale"):
+        silu_and_mul_static_quant_fp8(
+            _CudaMeta((2, 4), torch.bfloat16),
+            scale,
+        )
+
+
+def test_route_shared_prebuilds_the_plugin_owned_act_quant(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.moe import route
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router, shared_act_quant
+
+    layers = [
+        SimpleNamespace(
+            mlp=SimpleNamespace(
+                shared_expert=SimpleNamespace(
+                    gate_up_proj=SimpleNamespace(weight=torch.empty(4096, columns))
+                )
+            )
+        )
+        for columns in (512, 256, 256)
+    ]
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=len(layers), layers=layers)
+    )
+    calls = []
+    monkeypatch.setattr(route, "unsupported", lambda mlp: "")
+    monkeypatch.setattr(route, "shared_unsupported", lambda mlp: "")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        router,
+        "build",
+        lambda device, rows, shared: calls.append(("router", device, rows, shared)),
+    )
+    monkeypatch.setattr(
+        shared_act_quant,
+        "build",
+        lambda device, columns: calls.append(("tail", device, columns)),
+    )
+
+    bound = route.build(model, 7, fused=False, shared=True)
+
+    assert bound.route and bound.shared
+    assert calls == [
+        ("router", 3, 7, True),
+        ("tail", 3, 256),
+        ("tail", 3, 512),
+    ]
 
 
 @pytest.mark.parametrize("capture", [False, True])
@@ -481,7 +888,10 @@ def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(captu
 
         mlp.experts.dispatcher.combine = combine
         bound = SimpleNamespace(
-            mkm={3: "maps"}, identity=torch.arange(70, dtype=torch.int32)
+            mkm={3: "maps"},
+            identity=torch.arange(70, dtype=torch.int32),
+            m16_max_rows=16,
+            shared_act_quant=False,
         )
         st = SimpleNamespace(slots=slots, bound={"moe": bound})
         fused = patch.object(
@@ -513,7 +923,11 @@ def test_the_mkm_slot_runs_the_routed_experts_on_the_router_fronts_outputs(captu
                 "c(512,)",
                 "g2(512,)",
             ),
-            (),
+            (
+                ("m16_max_rows", 16),
+                ("routing", None),
+                ("wide_bal", False),
+            ),
         ),
         ("combine", "main"),
     ]
@@ -579,7 +993,44 @@ def test_the_mkm_slot_names_what_a_layer_lacks():
     assert mkm.unsupported(mlp).startswith("an expert activation")
 
 
-def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
+@pytest.mark.parametrize("local_experts", [128, 512])
+def test_route_topk_checks_materialized_routing_without_a_fused_expert_engine(
+    monkeypatch, local_experts
+):
+    from sgl_nvidia_mega.qwen3_5.moe import mkm, route
+
+    experts = SimpleNamespace(num_experts=512, num_local_experts=local_experts)
+    mlp = SimpleNamespace(experts=experts)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=0, end_layer=1, layers=[SimpleNamespace(mlp=mlp)]
+        )
+    )
+    checked = []
+    monkeypatch.setattr(route, "unsupported", lambda _: "")
+    monkeypatch.setattr(
+        mkm, "routing_unsupported", lambda _: checked.append("routing") or ""
+    )
+    monkeypatch.setattr(
+        mkm, "unsupported", lambda _: pytest.fail("full-expert engine checked")
+    )
+
+    assert route.topk_unsupported(model) == ""
+    assert checked == ["routing"]
+
+
+def test_the_draft_mkm_uses_the_complete_slot_schema(monkeypatch):
+    """Draft widths leave unrelated target slots off instead of omitting them."""
+    from sgl_nvidia_mega.qwen3_5.draft.moe_mkm import DraftMkm
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    slots = DraftMkm(bound="bound", wide=False).state(7).slots
+    assert isinstance(slots, plan.Slots)
+    assert slots.route and slots.mkm
+    assert not slots.route_lin and not slots.route_pre_topk
+
+
+def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch, caplog):
     from sgl_nvidia_mega.qwen3_5.moe import route
 
     mlp = _moe_block(_log(), torch.zeros(7, 4))
@@ -589,22 +1040,95 @@ def test_the_route_slot_is_not_built_for_a_layer_it_cannot_serve(monkeypatch):
         model=SimpleNamespace(start_layer=0, end_layer=1, layers=layers)
     )
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"route"}))
-    ctx = SimpleNamespace(widths=(7,), tokens_per_request=7, deadline_s=60.0)
+    # runtime.build reads moe_ep_size (expert parallelism); no process groups here
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(tp_size=8, attn_tp_size=8, moe_ep_size=1),
+    )
+    ctx = SimpleNamespace(
+        widths=(7,),
+        tokens_per_request=7,
+        deadline_s=60.0,
+        binding="EagleBinding",
+    )
     want = "layer 0: router gate torch.float16 (512, 4096)"
     assert route.build(model, 7, fused=False).reason == want
-    with pytest.raises(
-        RuntimeError, match="requested slots \\['route'\\] built no width"
-    ):
-        runtime.build(model, ctx)
+    with caplog.at_level("INFO"):
+        built = runtime.build(model, ctx)
+    assert built.slots == {7: plan.Slots()}
+    assert "none (stock)" in built.summary()
+    assert "requested slots ['route'] use stock" in caplog.text
+    assert want in caplog.text
 
 
-def _gdn_module(log, x):
+def _gdn_build_model():
+    layer = qwen3_5.Qwen3_5LinearDecoderLayer.__new__(qwen3_5.Qwen3_5LinearDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.linear_attn = SimpleNamespace(
+        attn=SimpleNamespace(layer_id=0, num_k_heads=2, num_v_heads=8),
+        norm=SimpleNamespace(weight=torch.ones(128)),
+        out_proj=SimpleNamespace(weight=torch.ones(4, 4)),
+    )
+    return SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
+    )
+
+
+@pytest.mark.parametrize("tokens,reason", [(6, "6 rows a request"), (7, "TP 4")])
+def test_optional_gdn_front_falls_back_without_disabling_verify(
+    monkeypatch, tokens, reason
+):
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    slots = {
+        "gdn_verify",
+        "gdn_pdl",
+        "gdn_conv",
+        "gdn_core",
+        "gdn_front",
+        "gdn_trt_front",
+    }
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+    monkeypatch.setattr(front, "unsupported", lambda _: "TP 4")
+    monkeypatch.setattr(front, "build", lambda *a: pytest.fail("front built"))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(core, "build", lambda *a: None)
+    bound = gdn.build(_gdn_build_model(), SimpleNamespace(tokens_per_request=tokens))
+    assert bound.gdn_verify and bound.gdn_pdl and bound.gdn_conv and bound.gdn_core
+    assert bound.front == {} and not bound.gdn_trt_front and reason in bound.reason
+
+
+@pytest.mark.parametrize("bad_slot", ["gdn_push", "route_lin"])
+def test_optional_gdn_push_or_route_lin_falls_back_independently(monkeypatch, bad_slot):
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+    from sgl_nvidia_mega.qwen3_5.sm103 import hop
+
+    slots = {"gdn_verify", "gdn_pdl", "gdn_push", "route_lin"}
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    monkeypatch.setattr(verify, "unsupported", lambda _: "")
+
+    def pack(weight):
+        if bad_slot == "gdn_push":
+            raise ValueError("unsupported out_proj shape")
+        return "packed"
+
+    monkeypatch.setattr(hop, "pack_out_proj", pack)
+    monkeypatch.setattr(gdn, "_route_lin", lambda *a: ({}, "TP 4"))
+    bound = gdn.build(_gdn_build_model(), SimpleNamespace(tokens_per_request=7))
+    assert bound.gdn_verify and bound.gdn_pdl and bound.rlin == {}
+    assert bad_slot in bound.reason
+    assert bound.packed == ({} if bad_slot == "gdn_push" else {0: "packed"})
+
+
+def _gdn_module(log, x, core_rows=7):
     """A Qwen3_5GatedDeltaNet whose projections, backend call, norm and out_proj log."""
     mod = qwen3_5.Qwen3_5GatedDeltaNet.__new__(qwen3_5.Qwen3_5GatedDeltaNet)
     torch.nn.Module.__init__(mod)
     qkvz, ba = torch.zeros(7, 10), torch.zeros(7, 2)
     z = torch.zeros(7, 2, 3)
-    core = torch.zeros(7, 2, 3)
+    core = torch.ones(core_rows, 2, 3)
     log.known.update(qkvz=qkvz, ba=ba, z=z, core=core)
     mod.__dict__.update(
         num_k_heads=16,
@@ -622,12 +1146,21 @@ def _gdn_module(log, x):
 
 
 @pytest.mark.parametrize("packed_verify", [False, True])
-def test_the_gdn_step_issues_what_sglang_issues(packed_verify):
+@pytest.mark.parametrize("core_rows", [3, 7])
+def test_the_gdn_step_issues_what_sglang_issues(packed_verify, core_rows):
     runs = []
     for which in ("sglang", "plugin"):
         x = torch.zeros(7, 4)
         log = _log(x=x)
-        mod, split = _gdn_module(log, x)
+        mod, split = _gdn_module(log, x, core_rows=core_rows)
+        norm_inputs = []
+        norm = mod.norm
+
+        def checked_norm(core, z):
+            norm_inputs.append(core.clone())
+            return norm(core, z)
+
+        mod.norm = checked_norm
         backend = SimpleNamespace(
             linear_attn_backend=SimpleNamespace(supports_packed_verify=packed_verify)
         )
@@ -663,13 +1196,14 @@ def test_the_gdn_step_issues_what_sglang_issues(packed_verify):
                     out = gdn.step(SimpleNamespace(linear_attn=mod), x, st)
             except (NotImplementedError, RuntimeError, AttributeError) as e:
                 out = type(e).__name__
-        runs.append((log, out))
-    (want_log, want), (got_log, got) = runs
+        runs.append((log, out, norm_inputs))
+    (want_log, want, want_norm), (got_log, got, got_norm) = runs
     if packed_verify:
         # SGLang folds the split and conv into such a backend; the step refuses it
         assert got == "NotImplementedError" and want != got
         return
     assert got_log == want_log and want == got == "out"
+    assert torch.equal(got_norm[0], want_norm[0])
 
 
 def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=7):
@@ -724,6 +1258,7 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
         weight_scale=k["out_s"],
         input_scale=k["scale"],
         tp_group="tp",
+        orig_dtype=torch.bfloat16,
     )
     gdn = SimpleNamespace(
         attn=attn,
@@ -760,6 +1295,7 @@ def _gdn_verify_setup(log, *, ring_len=16, temporal_dtype=torch.bfloat16, draft=
         fb=SimpleNamespace(req_pool_indices=k["req"]),
         binding=SimpleNamespace(tokens_per_request=draft),
         view=SimpleNamespace(gdn=meta, mamba=pools),
+        slots=plan.Slots(),
         scratch={},
     )
     return verify, gdn, st
@@ -855,6 +1391,22 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(
 
     with (
         patch(
+            "sglang.srt.layers.attention.linear.kernels.state_pool_io.stage_pool_states",
+            side_effect=AssertionError("target verify must not stage prefill state"),
+        ),
+        patch(
+            "sglang.srt.layers.attention.linear.kernels.state_pool_io.unstage_pool_states",
+            side_effect=AssertionError("target verify must not unstage prefill state"),
+        ),
+        patch(
+            "sglang.srt.layers.attention.linear.gdn_backend.stage_pool_states",
+            side_effect=AssertionError("target verify must not stage prefill state"),
+        ),
+        patch(
+            "sglang.srt.layers.attention.linear.gdn_backend.unstage_pool_states",
+            side_effect=AssertionError("target verify must not unstage prefill state"),
+        ),
+        patch(
             "sglang.kernels.ops.attention.triton_gdn_fused_proj.qwen3_5_gdn_prefill_projection_views",
             views,
         ),
@@ -933,6 +1485,134 @@ def test_the_gdn_verify_slot_runs_the_backend_chain_on_the_forward_views_rows(
         ("?(7, 16)", "out_w(16, 8)", "scale(1,)", "out_s(1,)", "?"),
         (),
     )
+
+
+@pytest.mark.parametrize(
+    "model_dtype,recurrence_dtype",
+    [
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+        (torch.float32, torch.bfloat16),
+    ],
+)
+def test_gdn_prequantized_out_proj_uses_v3_model_dtype(
+    monkeypatch, model_dtype, recurrence_dtype
+):
+    """The plugin's prequantized out_proj follows the layer dtype, not the
+    recurrence's working dtype, exactly as v3 ModelOpt does."""
+    from sglang.srt import runtime_context
+    from sglang.srt.distributed.device_communicators import pynccl_allocator
+    from sglang.srt.layers import dp_attention
+    from sglang.srt.layers.quantization import fp8_utils
+
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    layer = SimpleNamespace(
+        weight=torch.zeros((4, 3), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.ones(1),
+        input_scale=torch.ones(1),
+        tp_group="tp",
+        orig_dtype=model_dtype,
+    )
+    fp8 = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+    calls = []
+
+    def bmm(x, weight, x_scale, weight_scale, output_dtype):
+        calls.append((x, weight, x_scale, weight_scale, output_dtype))
+        return torch.zeros((2, 3), dtype=output_dtype)
+
+    # This symbol is platform-gated in SGLang and is absent in a real CPU-only
+    # contract process, so install the native BMM stand-in explicitly.
+    monkeypatch.setattr(fp8_utils, "flashinfer_bmm_fp8", bmm, raising=False)
+    monkeypatch.setattr(
+        pynccl_allocator,
+        "use_symmetric_memory",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(dp_attention, "is_allocation_symmetric", lambda: True)
+    monkeypatch.setattr(
+        runtime_context, "get_parallel", lambda: SimpleNamespace(tp_group=None)
+    )
+
+    if model_dtype == torch.float32:
+        with pytest.raises(ValueError, match="explicit BF16 or FP16"):
+            verify._out_proj(layer, fp8, recurrence_dtype)
+        assert calls == []
+        return
+
+    actual = verify._out_proj(layer, fp8, recurrence_dtype)
+
+    assert actual.dtype == model_dtype
+    assert len(calls) == 1
+    x, weight, x_scale, weight_scale, output_dtype = calls[0]
+    assert output_dtype == model_dtype
+    assert x.data_ptr() == fp8.data_ptr()
+    assert weight is layer.weight
+    assert x_scale is layer.input_scale and weight_scale is layer.weight_scale
+
+
+def test_gdn_bf16_out_proj_can_use_lowm(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import lowm
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    layer = SimpleNamespace(orig_dtype=torch.bfloat16)
+    fp8 = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+    seen = []
+
+    def row_parallel(linear, x, dtype, what, hop):
+        seen.append((linear, x, dtype, what, hop))
+        return "out"
+
+    monkeypatch.setattr(lowm, "row_parallel", row_parallel)
+    st = SimpleNamespace(slots=SimpleNamespace(lowm_outproj=True))
+
+    assert verify._out_proj(layer, fp8, torch.float32, st) == "out"
+    assert seen == [(layer, fp8, torch.bfloat16, "out_proj", None)]
+
+
+def test_gdn_fp16_out_proj_bypasses_the_bf16_only_lowm(monkeypatch):
+    from sglang.srt import runtime_context
+    from sglang.srt.distributed.device_communicators import pynccl_allocator
+    from sglang.srt.layers import dp_attention
+    from sglang.srt.layers.quantization import fp8_utils
+
+    from sgl_nvidia_mega.qwen3_5 import lowm
+    from sgl_nvidia_mega.qwen3_5.gdn import verify
+
+    layer = SimpleNamespace(
+        weight=torch.zeros((4, 3), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.ones(1),
+        input_scale=torch.ones(1),
+        tp_group="tp",
+        orig_dtype=torch.float16,
+    )
+    fp8 = torch.zeros((2, 4), dtype=torch.float8_e4m3fn)
+    seen = []
+
+    def bmm(x, weight, x_scale, weight_scale, output_dtype):
+        seen.append(output_dtype)
+        return torch.zeros((2, 3), dtype=output_dtype)
+
+    monkeypatch.setattr(
+        lowm,
+        "row_parallel",
+        lambda *args, **kwargs: pytest.fail("FP16 entered the BF16-only low-M kernel"),
+    )
+    monkeypatch.setattr(fp8_utils, "flashinfer_bmm_fp8", bmm, raising=False)
+    monkeypatch.setattr(
+        pynccl_allocator,
+        "use_symmetric_memory",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(dp_attention, "is_allocation_symmetric", lambda: True)
+    monkeypatch.setattr(
+        runtime_context, "get_parallel", lambda: SimpleNamespace(tp_group=None)
+    )
+    st = SimpleNamespace(slots=SimpleNamespace(lowm_outproj=True))
+
+    out = verify._out_proj(layer, fp8, torch.bfloat16, st)
+    assert out.dtype == torch.float16
+    assert seen == [torch.float16]
 
 
 @pytest.mark.parametrize("takes", [False, True])
@@ -1037,6 +1717,7 @@ def _gdn_front_setup(log):
     )
     st = SimpleNamespace(
         fb=SimpleNamespace(req_pool_indices=k["req"]),
+        slots=plan.Slots(gdn_verify=True, gdn_pdl=True, gdn_front=True),
         view=SimpleNamespace(gdn=meta, mamba=pools),
         bound={
             "gdn": SimpleNamespace(
@@ -1087,7 +1768,7 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         patch.object(
             verify,
             "_out_proj",
-            lambda linear, fp8, dtype: (
+            lambda linear, fp8, dtype, *slot: (
                 log.append(("out_proj", linear, fp8, dtype)) or "partial"
             ),
         ),
@@ -1123,6 +1804,7 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         "history_g": "ring_g2(3, 8, 16)",
         "ring_indices": "req(1,)",
         "pad_slot": -1,
+        "prefetch": True,
     }
     # q / k / v are the conv rows' views; a / b the front's b8 / a8 halves
     q, k_, v = seen["qkv"]
@@ -1170,6 +1852,292 @@ def test_the_gdn_front_slot_runs_the_front_the_verify_the_norm_and_out_proj(push
         _, linear, fp8, dtype = log[3]
         assert linear is gdn.out_proj and dtype == torch.bfloat16
         assert fp8.data_ptr() == quant.data_ptr() and fp8.shape == (7, 1024)
+
+
+@pytest.mark.parametrize(
+    "pin, early, rows, prefetch",
+    [
+        (False, False, 7, True),
+        (True, False, 7, False),
+        (True, False, 14, True),
+        (False, True, 14, False),
+    ],
+)
+def test_the_gdn_front_leaves_out_its_l2_prefetch_ahead_of_a_pinned_or_early_core(
+    pin, early, rows, prefetch
+):
+    """In front of slot gdn_core the front's L2 prefetch of the checkpoint / ring is left out
+    with the core's early history (any request count) and with the pinned one-request front."""
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front as kernel
+
+    gdn, st = _gdn_front_setup(_log())
+    seen = {}
+    opts = msgspec.structs.replace(verify.SLOT_PDL, core=True)
+    with (
+        patch.object(kernel, "front", lambda *args, **kw: seen.update(kw)),
+        patch.object(kernel, "PIN", pin),
+        patch.object(core_kernel, "EARLY", early),
+        patch.object(verify, "_fused", lambda *args: "fused"),
+    ):
+        assert (
+            front.step(gdn, torch.zeros(rows, 4096, dtype=torch.bfloat16), st, opts)
+            == "fused"
+        )
+    assert seen["prefetch"] is prefetch
+
+
+def test_the_gdn_core_caps_registers_for_the_three_cta_wave():
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core
+
+    with patch.object(core, "_sms", return_value=148):
+        for batch in range(1, 129):
+            ctas = batch * 8
+            old = 3 if ctas > 4 * 148 else 1
+            assert core._min_blocks(0, ctas) == (3 if 38 <= batch <= 55 else old)
+        for ctas, expected in (
+            (296, 1),
+            (297, 3),
+            (444, 3),
+            (445, 1),
+            (592, 1),
+            (593, 3),
+        ):
+            assert core._min_blocks(0, ctas) == expected
+
+
+@pytest.mark.parametrize("trt, wants", [(False, False), (True, True)])
+def test_the_hop_quantizes_a_gdn_layers_input_for_the_trt_front_only(trt, wants):
+    """Slot hop_fp8 writes the input consumed by slot gdn_trt_front."""
+    from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+
+    scale = torch.ones(1)
+    layer = Qwen3_5LinearDecoderLayer.__new__(Qwen3_5LinearDecoderLayer)
+    object.__setattr__(
+        layer,
+        "linear_attn",
+        SimpleNamespace(in_proj_qkvz=SimpleNamespace(input_scale=scale)),
+    )
+    st = SimpleNamespace(
+        slots=plan.Slots(
+            hop_fp8=True,
+            gdn_verify=True,
+            gdn_front=True,
+            gdn_trt_front=trt,
+        )
+    )
+    got = lowm_mod.layer_input_fp8_scale(layer, st, 7)
+    assert (got is scale) if wants else got is None
+
+
+@pytest.mark.parametrize(
+    "trt, hop_fp8, rows, core",
+    [
+        (True, True, 7, True),
+        (True, False, 7, True),
+        (True, True, 14, True),
+        (True, True, 21, True),
+        (True, True, 28, True),
+        (True, True, 7, False),
+        (False, True, 7, True),
+    ],
+)
+def test_the_trt_gdn_front_runs_ahead_of_slot_gdn_core(trt, hop_fp8, rows, core):
+    """With slot gdn_trt_front, one to four requests take TensorRT-LLM's
+    in_proj launch, on the hop's E4M3 rows where it wrote them (BF16 rows otherwise): the raw
+    [N, K] in_proj_qkvz weight, the layer's conv pools and the step's state index; the core
+    reads the convolved q / k / v and the raw z of one output, and b / a from the other."""
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5 import lowm as lowm_mod
+    from sgl_nvidia_mega.qwen3_5.gdn import front, verify
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import front as kernel
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    log = _log()
+    gdn, st = _gdn_front_setup(log)
+    k = log.known
+    gdn.in_proj_qkvz.weight = torch.zeros(2560, 4096, dtype=torch.float8_e4m3fn).t()
+    st.slots = plan.Slots(
+        hop_fp8=hop_fp8,
+        gdn_verify=True,
+        gdn_pdl=True,
+        gdn_core=core,
+        gdn_front=True,
+        gdn_trt_front=trt,
+    )
+    x = k["x"] if rows == 7 else torch.zeros(rows, 4096, dtype=torch.bfloat16)
+    x8 = torch.zeros(rows, 4096, dtype=torch.float8_e4m3fn)
+    seen = {}
+    opts = msgspec.structs.replace(verify.SLOT_PDL, core=core)
+    with (
+        patch.object(trt_front, "front", lambda *args: seen.update(trt=args)),
+        patch.object(kernel, "front", lambda *args, **kw: seen.update(front=kw)),
+        patch.object(lowm_mod, "take_fp8", lambda st_, x_: x8 if x_ is x else None),
+        patch.object(
+            verify, "_fused", lambda *args: seen.update(fused=args) or "fused"
+        ),
+    ):
+        try:
+            front.step(gdn, x, st, opts)
+        except Exception:
+            assert not core  # the stock tail of the mock layer
+    if not (trt and core):
+        assert "trt" not in seen and "front" in seen
+        return
+    assert "front" not in seen
+    args = seen["trt"]
+    assert args[0] is x and args[1] is (x8 if hop_fp8 else None)
+    w = args[2]
+    assert w.shape == (2560, 4096) and w.stride() == (4096, 1)
+    assert tuple(map(log.tag, args[3:10])) == (
+        "in_s(1,)",
+        "in_ws(1,)",
+        "ba_w(16, 4096)",
+        "conv_w(1536, 4)",
+        "conv2(3, 1536, 3)",
+        "window2(3, 7, 1536, 3)",
+        "states(1,)",
+    )
+    out, ba = args[10], args[11]
+    assert out.shape == (rows, 2560) and ba.shape == (rows, 16)
+    _, qkv, z, a, b, *_ = seen["fused"]
+    assert qkv.data_ptr() == out.data_ptr() and qkv.shape == (rows, 1536)
+    assert qkv.stride() == (2560, 1)
+    assert z.data_ptr() == out[:, 1536:].data_ptr()
+    assert z.shape == (rows, 8, 128) and z.stride() == (2560, 128, 1)
+    assert a.data_ptr() == ba[:, 8:].data_ptr() and b.data_ptr() == ba.data_ptr()
+    assert a.shape == b.shape == (rows, 8)
+
+
+def test_the_trt_gdn_front_prepares_on_the_first_gdn_layers_pools():
+    """``front.prepare`` (the executor's first covered step, before any capture) compiles the
+    TensorRT-LLM front on a GDN layer's weights and its pools' layouts; nothing when
+    the slot is absent."""
+    from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
+
+    from sgl_nvidia_mega.qwen3_5.gdn import front
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    log = _log()
+    gdn, st = _gdn_front_setup(log)
+    gdn.in_proj_qkvz.weight = torch.zeros(2560, 4096, dtype=torch.float8_e4m3fn).t()
+    layer = Qwen3_5LinearDecoderLayer.__new__(Qwen3_5LinearDecoderLayer)
+    object.__setattr__(layer, "linear_attn", gdn)
+    lm = SimpleNamespace(
+        model=SimpleNamespace(
+            start_layer=1, end_layer=3, layers=[None, SimpleNamespace(), layer]
+        )
+    )
+    seen = []
+    for enabled in (False, True):
+        with patch.object(trt_front, "prepare", lambda *args: seen.append(args)):
+            front.prepare(lm, st.view.mamba, trt=enabled)
+    assert len(seen) == 1 and seen[0][:2] == (2560, 16)
+    assert tuple(map(log.tag, seen[0][2:])) == (
+        "conv_w(1536, 4)",
+        "conv2(3, 1536, 3)",
+        "window2(3, 7, 1536, 3)",
+    )
+
+
+def test_the_trt_gdn_front_stops_at_the_request_window_capacity(monkeypatch):
+    """A small max-running-requests pool does not prepare impossible widths."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    compiled = []
+    monkeypatch.setattr(trt_front, "_SPECS", {})
+    monkeypatch.setattr(
+        trt_front,
+        "spec",
+        lambda act, qkvz, ba, conv_weight, conv_state, windows, requests: (
+            act,
+            requests,
+        ),
+    )
+    monkeypatch.setattr(trt_lowm, "prepare", compiled.append)
+    windows = SimpleNamespace(shape=(2, 7, 1536, 3))
+    trt_front.prepare(2560, 16, "weight", "state", windows)
+
+    assert compiled == [("fp8", 1), ("quant", 1), ("fp8", 2), ("quant", 2)]
+    assert set(trt_front._SPECS) == {
+        ("fp8", 2560, 1),
+        ("quant", 2560, 1),
+        ("fp8", 2560, 2),
+        ("quant", 2560, 2),
+    }
+
+
+@pytest.mark.parametrize(
+    "qkvz, ba, d, requests, tactic_fp8, tactic_quant",
+    [
+        (2560, 16, 1536, 1, (16, 2, 1, True, 2), (16, 4, 1, True, 1)),
+        (2560, 16, 1536, 2, (8, 4, 1, False, 1), (16, 4, 1, False, 1)),
+        (2560, 16, 1536, 4, (8, 4, 1, False, 1), (16, 4, 1, False, 1)),
+    ],
+)
+def test_trt_lowm_takes_trts_gdn_tactics_and_refuses_an_unprepared_launch(
+    qkvz, ba, d, requests, tactic_fp8, tactic_quant
+):
+    """The TensorRT-LLM front's TP8 launches use its GDN mixer's tactics
+    (mixed8 on E4M3 rows, mixed on BF16 rows: k_warps, n_tiles, ksplit, swap_ab, min_blocks;
+    the BF16 segment one tile a CTA), PDL with the early trigger; ``trt_lowm`` refuses to compile
+    inside a capture and to launch what was not prepared."""
+    from sgl_nvidia_mega.qwen3_5.sm103 import trt_lowm
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import trt_front
+
+    conv_w = torch.zeros(d, 4, dtype=torch.bfloat16)
+    pool_requests = max(3, requests)
+    state = torch.zeros(pool_requests, d, 3, dtype=torch.bfloat16)
+    windows = torch.zeros(pool_requests, d, 9, dtype=torch.bfloat16).as_strided(
+        (pool_requests, 7, d, 3), (d * 9, 1, 9, 1)
+    )
+    for act, tactic in (("fp8", tactic_fp8), ("quant", tactic_quant)):
+        s = trt_front.spec(act, qkvz, ba, conv_w, state, windows, requests)
+        assert s.m == 7 * requests and s.conv_shapes[2] == requests
+        assert (s.k_warps, s.n_tiles, s.ksplit, s.swap_ab, s.min_blocks) == tactic
+        assert (s.n_fp8, s.n_bf16, s.n_tiles_bf16, s.fp8_act) == (qkvz, ba, 1, act)
+        assert (
+            s.n_out,
+            s.n_out2,
+            s.conv_channels,
+            s.conv_tokens,
+            s.conv_write_state,
+        ) == (qkvz, ba, d, 7, True)
+        assert (s.a16_stride, s.a8_stride) == (4096, 4096 if act == "fp8" else 0)
+        assert (
+            s.use_pdl
+            and s.early_trigger
+            and not s.release_after_wait
+            and not s.unsafe_skip_wait
+        )
+        assert s.conv_shapes[3] == (
+            (pool_requests, 7, d, 3),
+            (d * 9, 1, 9, 1),
+        )
+    with pytest.raises(RuntimeError, match="not prepared"):
+        trt_lowm.run(s, out=torch.zeros(7 * requests, qkvz, dtype=torch.bfloat16))
+    with patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
+        with pytest.raises(RuntimeError, match="before graph capture"):
+            trt_lowm.prepare(s)
+
+
+def test_sglangs_verify_intermediate_rows_are_the_batch_rows(monkeypatch):
+    """The TensorRT-LLM front writes a request's conv windows at its batch row, as SGLang's
+    target verify indexes them (verify_intermediate_state_indices: request r, row r)."""
+    from sglang.srt.layers.attention.linear import utils
+    from sglang.srt.utils import common
+
+    monkeypatch.setattr(common, "get_eager_max_batch_size", lambda n: n)
+    assert utils.build_verify_intermediate_state_indices(8, "cpu").tolist() == list(
+        range(8)
+    )
 
 
 @pytest.mark.parametrize("front_slot", [False, True])
@@ -1335,6 +2303,16 @@ def test_the_gdn_verify_slot_names_the_pools_it_cannot_serve(kw, want):
         built.forward(step, None, torch.zeros(7, dtype=torch.int64), None, None)
 
 
+@pytest.mark.parametrize("ring_len", [16, 32])
+def test_gdn_verify_accepts_aggregate_and_dep8_rings(ring_len):
+    verify, _, st = _gdn_verify_setup(_log(), ring_len=ring_len)
+    assert verify.pool_reasons(st.view.mamba, st.binding.tokens_per_request) == []
+    if ring_len == 32:
+        assert "core ring length 32 (serves 16)" in verify.core_pool_reasons(
+            st.view.mamba
+        )
+
+
 def test_the_pools_are_checked_once_at_the_first_covered_step(monkeypatch):
     verify, _, st = _gdn_verify_setup(_log())
     built = _verify(binding=st.binding)
@@ -1354,7 +2332,7 @@ def _attention_layer(log, x):
         qwen3_5.Qwen3_5AttentionDecoderLayer
     )
     torch.nn.Module.__init__(layer)
-    q, k, v, gate, o = (torch.zeros(7, 4) for _ in range(5))
+    q, k, v, gate, o = (torch.zeros(x.shape[0], 4) for _ in range(5))
     log.known.update(q=q, k=k, v=v, gate=gate, o=o)
     layer.__dict__.update(
         attn_output_gate=True,
@@ -1454,7 +2432,7 @@ def _skv2_kernels(log, label=None, capture=True):
         yield
 
 
-def _skv2_setup(log, k_scale=None, **fb):
+def _skv2_setup(log, k_scale=None, *, batch_size=1, rows=7, **fb):
     """Layer 7's RadixAttention (TP8: 4 query heads, 1 KV head of 256), the forward's
     view of a pool of 3 pages for layers 3 and 7, and the verify step's state."""
     from sgl_nvidia_mega.qwen3_5.attention import split_kv
@@ -1485,12 +2463,14 @@ def _skv2_setup(log, k_scale=None, **fb):
             v_scale=(1.0, 0.5),
         ),
         attn=SimpleNamespace(
-            page_table=torch.zeros(1, 4, dtype=torch.int32),
-            cache_seqlens=torch.full((1,), 130, dtype=torch.int32),
+            page_table=torch.zeros(batch_size, 4, dtype=torch.int32),
+            cache_seqlens=torch.full((batch_size,), 130, dtype=torch.int32),
         ),
     )
     batch = SimpleNamespace(
-        out_cache_loc=torch.zeros(7, dtype=torch.int64), batch_size=1, **fb
+        out_cache_loc=torch.zeros(rows, dtype=torch.int64),
+        batch_size=batch_size,
+        **fb,
     )
     log.known.update(
         pool,
@@ -1593,12 +2573,176 @@ def test_the_split_kv_variants_select_on_host_state_only():
     assert route.VERIFY.select(batch(bound=8192)) == "split_kv_long"
     assert route.VERIFY.select(batch(bound=8191)) == "split_kv_stock"
     assert route.EXTEND.select(batch(bound=32767)) == "split_kv_stock"
-    assert route.VERIFY.select(batch(bs=2, bound=10**6)) == "split_kv_stock"
+    # past max_batch_size every batch takes the stock label, so SGLang captures one graph there
+    assert route.SplitKVGraphVariants.max_batch_size == 1
+    for bs in range(route.SplitKVGraphVariants.max_batch_size + 1, 129):
+        assert route.VERIFY.select(batch(bs=bs, bound=10**6)) == "split_kv_stock"
+        assert route.EXTEND.select(batch(bs=bs, bound=10**6)) == "split_kv_stock"
     assert route.VERIFY.select(batch(lens=torch.tensor([8192]))) == "split_kv_long"
     assert route.VERIFY.select(batch(lens=torch.tensor([9000, 9000]))) == (
         "split_kv_stock"
     )
     assert route.VERIFY.select(batch()) == "split_kv_stock"
+
+
+def test_slot_skv2_cp_adds_a_cp_variant_from_its_kv_length(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import route
+
+    def batch(bs=1, bound=None):
+        return SimpleNamespace(
+            batch_size=bs, attention_kv_len_lower_bound=bound, seq_lens_cpu=None
+        )
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2"}))
+    assert route.verify_variants() is route.VERIFY
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    variants = route.verify_variants()
+    crossover = route.CP_MIN_KV["verify"]
+    assert variants.capture_labels == ("split_kv_stock", "split_kv_long", "split_kv_cp")
+    assert (variants.min_length, variants.cp_min_length) == (8192, crossover)
+    assert variants.max_batch_size == 1
+    assert [
+        variants.select(batch(bound=n)) for n in (8191, 8192, crossover - 1, crossover)
+    ] == [
+        "split_kv_stock",
+        "split_kv_long",
+        "split_kv_long",
+        "split_kv_cp",
+    ]
+    assert variants.select(batch(bs=2, bound=10**6)) == "split_kv_stock"
+    # slot draft_skv2_cp is not requested
+    assert route.extend_variants() is route.EXTEND
+    assert route.CP_MIN_KV == {
+        "verify": 139264,
+        "draft": 184320,
+        "extend": 245760,
+    }
+
+
+@pytest.mark.parametrize("served", [True, False])
+def test_the_skv2_cp_slot_runs_cp_lite_for_one_request_in_its_variant(
+    monkeypatch, served
+):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2", "skv2_cp"}))
+    log = _log()
+    attn, st = _skv2_setup(log)
+    q8 = torch.zeros(7, 1024, dtype=torch.float8_e4m3fn)
+    log.known["q8"] = q8
+    out = torch.ones(7, 4, 256, dtype=torch.bfloat16)
+    calls = []
+
+    class CpLite:
+        def attend(
+            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+        ):
+            calls.append(
+                (
+                    tuple(q.shape),
+                    tuple(kv[0].shape),
+                    kv[0].stride(),
+                    pages is st.view.attn.page_table,
+                    lens is st.view.attn.cache_seqlens,
+                    q_len,
+                    bmm1,
+                    bmm2,
+                    layer is attn,
+                    fb is st.fb,
+                    min_bs,
+                )
+            )
+            return out if served else None
+
+    monkeypatch.setattr(split_kv, "cp_lite", CpLite)
+    with (
+        _skv2_kernels(log, label="split_kv_cp"),
+        patch("sglang.srt.runtime_context.get_buffer", lambda name, make: None),
+    ):
+        o = split_kv.core(attn, q8, st)
+    # the request's 7 rows on the view's pool pages, as SKV2 takes them, at one request
+    assert calls == [
+        ((7, 4, 256), (3, 1, 64, 256), (16384, 16384, 256, 1), True, True, 7)
+        + (0.75 * 0.0625, 0.5, True, True, 1)
+    ]
+    if served:
+        assert o.shape == (7, 1024) and bool((o == 1).all()) and len(log) == 0
+    else:
+        # CP-lite declines by shape: SKV2 runs as in the long variant
+        assert log[-1][0] == "skv2"
+
+
+@pytest.mark.parametrize("served", [True, False])
+def test_cp_slots_keep_multi_request_target_verify_in_the_plugin(monkeypatch, served):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    requests, rows = 8, 8 * 7
+    log = _log()
+    attn, st = _skv2_setup(log, batch_size=requests, rows=rows)
+    q8 = torch.zeros(rows, 1024, dtype=torch.float8_e4m3fn)
+    out = torch.ones(rows, 4, 256, dtype=torch.bfloat16)
+    log.known["q8"] = q8
+    calls = []
+
+    class CpLite:
+        def attend(
+            self, q, kv, pages, lens, q_len, bmm1, bmm2, ws, layer, fb, min_bs=None
+        ):
+            calls.append(
+                (
+                    tuple(q.shape),
+                    tuple(pages.shape),
+                    tuple(lens.shape),
+                    q_len,
+                    fb is st.fb,
+                    min_bs,
+                )
+            )
+            return out if served else None
+
+    monkeypatch.setattr(split_kv, "cp_lite", CpLite)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    with (
+        _skv2_kernels(log, label="split_kv_stock"),
+        patch("sglang.srt.runtime_context.get_buffer", lambda name, make: None),
+    ):
+        got = split_kv.core(attn, q8, st)
+
+    assert calls == [((rows, 4, 256), (requests, 4), (requests,), 7, True, None)]
+    if served:
+        assert got.shape == (rows, 1024) and bool((got == 1).all())
+        assert not log
+    else:
+        assert got == "stock_o" and log[-1][0] == "attention"
+
+
+def test_draft_only_cp_slots_do_not_enable_target_multi_request(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    monkeypatch.setattr(split_kv, "cp_lite", lambda: object())
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"draft_q1_cp", "draft_skv2_cp"}))
+    assert not split_kv.cp_multi(56)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    assert split_kv.cp_multi(56)
+
+
+@pytest.mark.parametrize(
+    ("requests", "eligible"),
+    [(5, True), (32, True), (128, True), (129, False)],
+)
+def test_target_cp_multi_request_honors_fused_batch_cap(
+    monkeypatch, requests, eligible
+):
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+    monkeypatch.setattr(split_kv, "cp_lite", lambda: object())
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"skv2_cp"}))
+    assert split_kv.cp_multi(requests * split_kv.ROWS) is eligible
 
 
 @pytest.mark.parametrize(
@@ -1683,6 +2827,29 @@ def test_the_skv2_slot_runs_the_attention_step_through_the_slot():
     stock, slot = runs
     assert stock == ["prepare", "attention", "sigmoid_mul", "o_proj"]
     assert slot == ["prepare", "skv2_attend", "sigmoid_mul", "o_proj"]
+
+
+def test_multi_request_cp_routes_the_stock_attention_step_through_the_plugin():
+    x = torch.zeros(56, 4)
+    log = _log(x=x, positions="pos", batch="fb")
+    layer = _attention_layer(log, x)
+    mul = log.op("sigmoid_mul", "gated")
+    st = SimpleNamespace(positions="pos", fb="fb", slots=plan.Slots())
+    with (
+        patch.object(qwen3_5, "_is_cuda", True),
+        patch("sglang.kernels.ops.elementwise.elementwise.fused_sigmoid_mul", mul),
+        patch(
+            "sgl_nvidia_mega.qwen3_5.attention.split_kv.cp_multi",
+            return_value=True,
+        ),
+        patch(
+            "sgl_nvidia_mega.qwen3_5.attention.split_kv.attend",
+            log.op("cp_attend", log.known["o"]),
+        ),
+    ):
+        attention.step(layer, x, st)
+
+    assert [e[0] for e in log] == ["prepare", "cp_attend", "sigmoid_mul", "o_proj"]
 
 
 def test_the_executor_offers_the_verify_split_kv_variants_with_slot_skv2():
@@ -1842,6 +3009,108 @@ def test_the_mka_slot_runs_the_prologue_the_attention_and_the_epilogue(skv2):
     assert out.shape == (7, 4096) and out.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("consumed", [False, True])
+@pytest.mark.parametrize(
+    "heads,kv_heads,rows",
+    [(4, 1, 21), (16, 1, 7), (32, 2, 224)],
+)
+def test_the_mka_wide_path_offers_gate_quantization_to_cp_lite(
+    consumed, heads, kv_heads, rows
+):
+    from sglang.srt.layers.quantization import fp8_utils
+
+    from sgl_nvidia_mega.qwen3_5 import lowm, runtime
+    from sgl_nvidia_mega.qwen3_5.attention import mka, split_kv
+    from sgl_nvidia_mega.qwen3_5.sm103.attention import gate_quant as gate_module
+    from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
+    from sgl_nvidia_mega.qwen3_5.sm103.draft import front
+
+    log = _log()
+    attn, st = _skv2_setup(log, batch_size=rows // 7, rows=rows)
+    layer = _mka_layer(log, attn, num_heads=heads, num_kv_heads=kv_heads)
+    width = heads * 256
+    x = torch.zeros(rows, 4096, dtype=torch.bfloat16)
+    qkv = torch.zeros(rows, 2 * width + 2 * kv_heads * 256, dtype=torch.bfloat16)
+    q = torch.zeros(rows, width, dtype=torch.float8_e4m3fn)
+    gate = torch.zeros(rows, width, dtype=torch.bfloat16)
+    attention_out = torch.zeros(rows, width, dtype=torch.bfloat16)
+    fallback = torch.zeros(rows, width, dtype=torch.float8_e4m3fn)
+    result = torch.zeros(rows, 4096, dtype=torch.bfloat16)
+    qkv_linear = layer.qkv_proj
+    layer.qkv_proj = _Callable(lambda _: (qkv, None), **vars(qkv_linear))
+    attn._fn = lambda *args, **kwargs: attention_out
+    st.fb.out_cache_loc = torch.zeros(rows, dtype=torch.int64)
+    st.positions = torch.zeros(3, rows, dtype=torch.int64)
+    st.slots = plan.Slots(mka=True, lowm_oproj=True)
+    st.scratch = {}
+    calls = []
+
+    class GateEpilogue:
+        def offer_gate_epilogue(self, offered_gate, scale, out):
+            calls.append(("offer", offered_gate, scale, out))
+
+        def take_gate_epilogue(self):
+            calls.append(("take",))
+            return consumed
+
+    def quantize(o, offered_gate, scale):
+        calls.append(("gate_quant", o, offered_gate, scale))
+        return fallback
+
+    def row_parallel(linear, o_proj_input, dtype, what, hop):
+        calls.append(("o_proj", linear, o_proj_input, dtype, what, hop))
+        return result
+
+    with (
+        patch.object(CpLite, "_instance", GateEpilogue()),
+        patch.object(runtime, "SLOTS", frozenset({"skv2_cp"})),
+        patch.object(
+            front,
+            "fused_qk_gemma_rmsnorm_rope_gate",
+            return_value=(q, None, gate),
+        ),
+        patch.object(gate_module, "gate_quant", quantize),
+        patch.object(fp8_utils, "flashinfer_bmm_fp8", create=True),
+        patch.object(lowm, "take_fp8", return_value=None),
+        patch.object(lowm, "row_parallel", row_parallel),
+        patch.object(split_kv, "core", return_value=attention_out),
+    ):
+        out = mka.step(layer, x, st)
+
+    assert out is result
+    if rows == 7:
+        # CP multi needs more than one request: B1 quantizes its own gate
+        assert [call[0] for call in calls] == ["gate_quant", "o_proj"]
+        assert calls[1][2] is fallback
+        return
+    assert calls[0][0] == "offer"
+    offered_gate = calls[0][1]
+    assert offered_gate.shape == gate.shape
+    assert offered_gate.data_ptr() == gate.data_ptr()
+    assert calls[0][2] is layer.o_proj.input_scale
+    offered = calls[0][3]
+    assert tuple(offered.shape) == (rows, width)
+    assert offered.dtype == torch.float8_e4m3fn
+    assert calls[1] == ("take",)
+    if consumed:
+        assert [call[0] for call in calls] == ["offer", "take", "o_proj"]
+        assert calls[2][2] is offered
+    else:
+        assert [call[0] for call in calls] == [
+            "offer",
+            "take",
+            "gate_quant",
+            "o_proj",
+        ]
+        quant_input = calls[2][1]
+        assert quant_input.shape == attention_out.shape
+        assert quant_input.data_ptr() == attention_out.data_ptr()
+        quant_gate = calls[2][2]
+        assert quant_gate.shape == gate.shape
+        assert quant_gate.data_ptr() == gate.data_ptr()
+        assert calls[3][2] is fallback
+
+
 @pytest.mark.parametrize("consumes", [False, True])
 def test_the_mka_push_slot_pushes_where_the_moe_input_only_consumes(consumes):
     from sgl_nvidia_mega.qwen3_5.attention import mka
@@ -1905,6 +3174,8 @@ def test_the_mka_push_slot_pushes_where_the_moe_input_only_consumes(consumes):
     "kw, want",
     [
         (dict(), ""),
+        (dict(num_heads=16), ""),
+        (dict(num_heads=32, num_kv_heads=2), ""),
         (dict(attn_output_gate=False), "no attention output gate"),
         (dict(num_heads=2), "2 query / 1 KV heads a rank"),
         (dict(num_kv_heads=2), "4 query / 2 KV heads a rank"),
@@ -1962,9 +3233,20 @@ def test_the_mka_slot_is_built_with_its_weights_packed_for_every_attention_layer
     packed, why = [], {}
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"mka"}))
     monkeypatch.setattr(mka, "unsupported", lambda l: why.get(id(l), ""))
-    monkeypatch.setattr(mka, "pack", packed.append)
+    monkeypatch.setattr(
+        mka,
+        "pack",
+        lambda layer, route_lin=False: packed.append(layer) or "",
+    )
     ctx = SimpleNamespace(tokens_per_request=7)
-    assert attention.build(model, ctx) == attention.Bound(mka=True)
+    for made in layers[1:]:
+        made.num_heads = 8
+    # TP4's narrow kernels and the generic front at wider rows.
+    assert attention.build(model, ctx) == attention.Bound(mka=True, mka_wide=True)
+    packed.clear()
+    for made in layers[1:]:
+        made.num_heads = 4
+    assert attention.build(model, ctx) == attention.Bound(mka=True, mka_wide=True)
     assert packed == layers[1:]
     # a layer the slot cannot serve leaves the slot unbuilt, packs nothing more
     why[id(layers[2])] = "no attention output gate"
@@ -1987,10 +3269,38 @@ def test_the_mka_slot_names_the_pools_it_cannot_write():
     assert (
         mka.pool_reasons(kv(torch.zeros(64, 1, 256, dtype=torch.float8_e4m3fn))) == []
     )
-    assert mka.pool_reasons(kv(torch.zeros(64, 2, 256, dtype=torch.float8_e4m3fn))) == [
-        "a torch.float8_e4m3fn KV pool buffer of strides (512, 256, 1)"
+    assert (
+        mka.pool_reasons(kv(torch.zeros(64, 2, 256, dtype=torch.float8_e4m3fn))) == []
+    )
+    assert mka.pool_reasons(kv(torch.zeros(64, 4, 256, dtype=torch.float8_e4m3fn))) == [
+        "a torch.float8_e4m3fn KV pool buffer of strides (1024, 256, 1)"
     ]
+    assert mka.pool_reasons(
+        kv(torch.zeros(64, 1, 512, dtype=torch.float8_e4m3fn)[..., ::2])
+    )
     assert "torch.float32" in mka.pool_reasons(kv(torch.zeros(64, 1, 256)))[0]
+
+
+@pytest.mark.parametrize("missing", ["mka", "skv2"])
+def test_an_unavailable_attention_slot_keeps_the_independent_slot(monkeypatch, missing):
+    from sgl_nvidia_mega.qwen3_5.attention import mka, split_kv
+
+    layer = qwen3_5.Qwen3_5AttentionDecoderLayer.__new__(
+        qwen3_5.Qwen3_5AttentionDecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.attn = SimpleNamespace()
+    model = SimpleNamespace(
+        is_mrope_enabled=True,
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=[layer]),
+    )
+    monkeypatch.setattr(runtime, "SLOTS", frozenset({"mka", "skv2"}))
+    reasons = {missing: "unsupported"}
+    monkeypatch.setattr(mka, "unsupported", lambda _: reasons.get("mka", ""))
+    monkeypatch.setattr(split_kv, "unsupported", lambda *_: reasons.get("skv2", ""))
+    monkeypatch.setattr(mka, "pack", lambda *a, **k: "")
+    bound = attention.build(model, SimpleNamespace(tokens_per_request=7))
+    assert (bound.mka, bound.skv2) == (missing != "mka", missing != "skv2")
 
 
 class _Exit:
@@ -2019,10 +3329,12 @@ class _MoeBlock(qwen2_moe.Qwen2MoeSparseMoeBlock):
         return "moe_out"
 
 
-def _decoder_layer(kind, log, defer):
+def _decoder_layer(kind, log, defer, rows=7, tuple_input=False):
     layer = kind.__new__(kind)
     torch.nn.Module.__init__(layer)
-    a_in, m_in = torch.zeros(7, 4), torch.zeros(7, 4)
+    a_in, m_in = torch.zeros(rows, 4), torch.zeros(rows, 4)
+    if tuple_input:
+        a_in = (a_in, "scale")
     log.known.update(a_in=a_in, m_in=m_in)
     layer.mlp = _MoeBlock(log)
     layer.__dict__.update(
@@ -2044,12 +3356,17 @@ def _decoder_layer(kind, log, defer):
     "kind", [qwen3_5.Qwen3_5LinearDecoderLayer, qwen3_5.Qwen3_5AttentionDecoderLayer]
 )
 @pytest.mark.parametrize("defer", [False, True])
-def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
-    batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+@pytest.mark.parametrize(
+    "rows,idle,tuple_input", [(7, False, True), (0, False, False), (7, True, False)]
+)
+def test_a_layer_runs_what_sglangs_decoder_layer_runs(
+    kind, defer, rows, idle, tuple_input
+):
+    batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: idle))
     runs = []
     for which in ("sglang", "plugin"):
         log = _log(hidden="hidden", batch=batch, positions="pos", h1="h1", part="part")
-        layer = _decoder_layer(kind, log, defer)
+        layer = _decoder_layer(kind, log, defer, rows=rows, tuple_input=tuple_input)
         if which == "sglang":
             out = layer.forward(
                 positions="pos",
@@ -2074,6 +3391,7 @@ def test_a_layer_runs_what_sglangs_decoder_layer_runs(kind, defer):
         runs.append((log, out))
     (want_log, want), (got_log, got) = runs
     assert got_log == want_log and want == got == "layer_out"
+    assert any(entry[0] == "mixer" for entry in got_log) == (rows > 0 and not idle)
 
 
 def test_the_layer_loop_opens_the_stream_scopes_each_layer_and_closes_it(monkeypatch):
@@ -2270,7 +3588,7 @@ def _pushing_hop(log):
     from sgl_nvidia_mega.qwen3_5.sm103 import hop as sm103_hop
 
     hop = object.__new__(sm103_hop.Hop)
-    hop.max_m, hop._pushed = 8, None
+    hop.max_m, hop._pushed, hop._pushed_rl = 8, None, False
     hop._args = lambda m, residual, gamma, scale: (SimpleNamespace(m=m), ("out",))
     hop._launch = lambda name, args, ctas, cluster=None: log.append(name)
     hop._consume = lambda args: log.append("consume")
@@ -2331,7 +3649,9 @@ def test_the_hop_slot_runs_where_sglang_runs_its_cutedsl_kernel(cutedsl_gates, p
     for run in ("sglang", "plugin"):
         stream = ResidualStream(residual)
         fb = _verify_batch(stream)
-        st = SimpleNamespace(fb=fb, model=SimpleNamespace(norm=final))
+        st = SimpleNamespace(
+            fb=fb, model=SimpleNamespace(norm=final), slots=plan.Slots()
+        )
         if point == "MoE input":
             handle = layer.attn_boundary.finish(part, fb)
             x = (
@@ -2476,3 +3796,37 @@ def test_with_slot_hop_each_point_falls_back_to_sglang_where_the_hop_declines(
     assert log == [(p, "the hop") for p in ("layer_input", "moe_input", "final_norm")]
     # an auxiliary capture reads SGLang's own prepare
     assert boundary.pre(layer, "h", st, capture=[]) == "sglang layer input"
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_shared_expert_tail_uses_sglang_fp4_helpers(monkeypatch, fused):
+    from sglang.srt.models import utils
+
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    gate_up = torch.ones((2, 4))
+    calls = []
+    expert = SimpleNamespace(
+        act_fn=lambda x: calls.append(("activation", x)) or "activated",
+        down_proj=lambda x: (calls.append(("down", x)) or x, None),
+    )
+    monkeypatch.setattr(
+        utils,
+        "can_run_silu_fp4_quant_fusion",
+        lambda mlp, x: calls.append(("eligible", mlp, x)) or fused,
+    )
+    monkeypatch.setattr(
+        utils,
+        "silu_and_mul_fp4_quant",
+        lambda mlp, x: calls.append(("quantize", mlp, x)) or "quantized",
+    )
+    monkeypatch.setattr(route, "_down_takes_static_fp8", lambda _: False)
+    assert route.shared_expert_tail(expert, gate_up) == (
+        "quantized" if fused else "activated"
+    )
+    assert [c[0] for c in calls] == (
+        ["eligible", "quantize", "down"]
+        if fused
+        else ["eligible", "activation", "down"]
+    )
+    assert calls[0][1] is expert and calls[0][2] is gate_up

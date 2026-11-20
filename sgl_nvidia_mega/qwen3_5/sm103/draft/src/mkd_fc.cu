@@ -88,6 +88,24 @@ SGL_DEVICE void gemma_norm_row(
   __syncthreads();
 }
 
+/// \brief The dot of slice_dot from weights already in registers (the same order).
+template <int kW>
+SGL_DEVICE float slice_dot_regs(const device::AlignedVector<bf16_t, 8>* wv, const bf16_t* s_x) {
+  using namespace device;
+  using vec_t = AlignedVector<bf16_t, 8>;
+  constexpr int kDotVecs = kW / (8 * kWarpThreads);
+  const int lane = static_cast<int>(get_lane_id());
+  float acc = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kDotVecs; ++k) {
+    vec_t xv;
+    xv.load(s_x, k * kWarpThreads + lane);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(wv[k][j]), cast<fp32_t>(xv[j]), acc);
+  }
+  return warp::reduce_sum(acc);
+}
+
 /// \brief One slice partial: warp dot of a weight row segment [kW] with s_x[kW].
 template <int kW>
 SGL_DEVICE float slice_dot(const bf16_t* w_row, const bf16_t* s_x) {
@@ -272,19 +290,48 @@ struct MkdHiddenPartialParams {
  * the step-boundary exchange waits on the flag instead of a stream join, so it keeps its
  * programmatic early launch behind the lm_head.
  */
-template <int kH, int kWorld>
+template <int kH, int kWorld, int kRowsPerIter = 1>
 SGL_DEVICE void mkd_hidden_partial_kernel(const MkdHiddenPartialParams& p) {
   using namespace device;
+  using vec_t = AlignedVector<bf16_t, 8>;
   constexpr int kW = 2 * kH / kWorld;
   constexpr int kWarps = 8;
+  constexpr int kDotVecs = kW / (8 * kWarpThreads);
   __shared__ alignas(16) bf16_t s_x[kH];
   __shared__ float s_red[kWarps];
   const int warp = static_cast<int>(threadIdx.x / kWarpThreads);
   const int lane = static_cast<int>(get_lane_id());
   mkd_fc::gemma_norm_row<kH>(p.h, p.norm_w, p.eps, s_x, s_red);
-  for (int j = static_cast<int>(blockIdx.x) * kWarps + warp; j < kH; j += static_cast<int>(gridDim.x) * kWarps) {
-    const float acc = mkd_fc::slice_dot<kW>(p.w + static_cast<int64_t>(j) * kW, s_x + p.col);
-    if (lane == 0) p.out[j] = acc;
+  const int stride = static_cast<int>(gridDim.x) * kWarps;
+  if constexpr (kRowsPerIter == 1) {
+    for (int j = static_cast<int>(blockIdx.x) * kWarps + warp; j < kH; j += stride) {
+      const float acc = mkd_fc::slice_dot<kW>(p.w + static_cast<int64_t>(j) * kW, s_x + p.col);
+      if (lane == 0) p.out[j] = acc;
+    }
+  } else {
+    // The warp's rows are the same as above (j, j + stride, ...); the weight loads of kRowsPerIter of
+    // them are issued together (the partial runs beside the draft head, whose stream saturates HBM, so
+    // one row's load latency at a time left it the slowest input of the exchange). Each row's dot is
+    // slice_dot's arithmetic.
+    for (int j0 = static_cast<int>(blockIdx.x) * kWarps + warp; j0 < kH; j0 += stride * kRowsPerIter) {
+      vec_t wv[kRowsPerIter][kDotVecs];
+#pragma unroll
+      for (int r = 0; r < kRowsPerIter; ++r) {
+        const int j = j0 + r * stride;
+        if (j < kH) {
+#pragma unroll
+          for (int k = 0; k < kDotVecs; ++k) wv[r][k].load(p.w + static_cast<int64_t>(j) * kW, k * kWarpThreads + lane);
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < kRowsPerIter; ++r) {
+        const int j = j0 + r * stride;
+        if (j < kH) {
+          const float acc = mkd_fc::slice_dot_regs<kW>(wv[r], s_x + p.col);
+          if (lane == 0) p.out[j] = acc;
+        }
+      }
+    }
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -320,4 +367,9 @@ extern "C" __global__ void __launch_bounds__(256) mkd_fc_memo(const MkdFcMemoPar
 // ptxas holds NVRTC's build to 32 registers and splits each row's four weight loads into two batches (+24%).
 extern "C" __global__ void __launch_bounds__(256, 1) mkd_hidden_partial(const MkdHiddenPartialParams __grid_constant__ p) {
   sglang::mkd_hidden_partial_kernel<4096, MKD_WORLD>(p);
+}
+
+// Four rows' weight loads in flight per warp (same values).
+extern "C" __global__ void __launch_bounds__(256, 1) mkd_hidden_partial_r4(const MkdHiddenPartialParams __grid_constant__ p) {
+  sglang::mkd_hidden_partial_kernel<4096, MKD_WORLD, 4>(p);
 }

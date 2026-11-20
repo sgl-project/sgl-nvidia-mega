@@ -1,0 +1,18 @@
+# The end-to-end tests SGLang's pr-test-megakernel.yml runs on a PR here, by model.
+# gpu and gpus: the GPU and how many of them on one host the model's tests need.
+# A runner with another GPU or fewer GPUs skips the model and logs why. A new
+# model adds its entry here; SGLang's workflow needs no change.
+
+deepseek_v41:
+  gpu: GB300
+  gpus: 4
+  tests:
+    - test_deepseek_v41_server.py
+    - test_deepseek_v41_switch.py
+
+# TP8: needs a host with eight GPUs; one GB300 tray has four
+qwen3_5:
+  gpu: GB300
+  gpus: 8
+  tests:
+    - test_qwen3_5_stock_parity.py

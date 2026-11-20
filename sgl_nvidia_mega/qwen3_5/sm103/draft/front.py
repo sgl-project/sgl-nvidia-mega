@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang (Apache-2.0, SGLang Team):
 # python/sglang/kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py, as SGLang branch
-# nvidia/qwen35-agentx-gb300 extends it with the FP8 KV-cache write (SGLANG_Q35MF_ATTN_FRONT;
+# nvidia/qwen35-agentx-gb300 extends it with the FP8 KV-cache write (attention-front path;
 # 98573b3e69, 0d86b61136, 4115dd1469): copied verbatim.
 """Fused Q/K GemmaRMSNorm + NeoX RoPE + gate deinterleave (Triton), and with
 ``kv_cache`` 2.2's attention front (ATTN_FRONT): FP8 q, and K / V written straight

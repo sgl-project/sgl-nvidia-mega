@@ -27,7 +27,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Requirements,
     )
 
-from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime
+from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime, topology
 from sgl_nvidia_mega.qwen3_5.plan import MAX_ROWS
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -36,7 +36,9 @@ SGLANG_READS = {
         "Feature",
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
+        "DP_ATTENTION",
         "KV_OFFLOAD",
+        "PD_DISAGGREGATION",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -60,11 +62,19 @@ SGLANG_READS = {
         "linear_attn_verify_backend",
         "enable_linear_replayssm_spec",
         "mamba_ssm_dtype",
+        "tp_size",
+        "attn_cp_size",
+        "attn_dp_size",
         "startup_weight_load_mode",
+        "disaggregation_mode",
+        "pp_size",
+        "ep_size",
     ),
+    "srt/runtime_context.py": ("derive_attn_tp_size",),
     "srt/configs/qwen3_5.py": ("text_config",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "EagleForwardView",
+        "LinearPrefillView",
     ),
 }
 
@@ -75,7 +85,7 @@ API_VERSION = 2
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     # TP8 over the two 4-GPU trays of one NVL72 rack, TP4 on one tray
-    tp_sizes=frozenset({4, 8}),
+    tp_sizes=frozenset({1, 2, 4, 8}),
     dtypes=frozenset({"bfloat16"}),
     # the decode CUDA graphs the covered step is tested with (eager steps too)
     decode_graph_backends=frozenset({"full", "disabled"}),
@@ -86,17 +96,21 @@ REQUIREMENTS = Requirements(
         "speculative_eagle_topk": frozenset({1}),
         # SGLang's EAGLE entries serve a chain without rejection sampling
         "speculative_use_rejection_sampling": frozenset({False}),
-        "moe_a2a_backend": frozenset({"none"}),
+        # SGLang names the FlashInfer NVLink one-sided all-to-all
+        # "flashinfer_nvlink_one_sided"; older SGLang names it "flashinfer"
+        "moe_a2a_backend": frozenset(
+            {"none", "flashinfer", "flashinfer_nvlink_one_sided"}
+        ),
         # the deferred MoE finalize the boundary takes (the measured TP8 setup)
-        "moe_runner_backend": frozenset({"flashinfer_trtllm"}),
-        "flashinfer_allreduce_fusion_backend": frozenset({"cutedsl"}),
+        "moe_runner_backend": frozenset({"flashinfer_trtllm", "flashinfer_cutedsl"}),
+        "flashinfer_allreduce_fusion_backend": frozenset({None, "cutedsl"}),
         "attention_backend": frozenset({"trtllm_mha"}),
         "decode_attention_backend": frozenset({None, "trtllm_mha"}),
         # the Triton GDN verify on the ReplaySSM ring with BF16 checkpoints
         "linear_attn_backend": frozenset({"triton"}),
         "linear_attn_decode_backend": frozenset({None, "triton"}),
         "linear_attn_verify_backend": frozenset({None, "triton"}),
-        "enable_linear_replayssm_spec": frozenset({True}),
+        "enable_linear_replayssm_spec": frozenset({False, True}),
         "mamba_ssm_dtype": frozenset({"bfloat16"}),
         # the kernels read the weights SGLang loaded, after its last conversion
         "startup_weight_load_mode": frozenset({"serial"}),
@@ -106,10 +120,23 @@ REQUIREMENTS = Requirements(
 )
 
 # Against SGLang's forward on the same GPU (test/e2e/test_qwen3_5_stock_parity.py): the
-# stock step and the bitwise slots (route, mkm, gdn_verify, gdn_pdl, hop) reproduce it
-# bit for bit. A numeric slot's outputs are held to fp64 on the same quantized operands
-# (test/kernels), at most these multiples of the error of SGLang's own op.
+# stock step and the shipped slots reproduce it bit for bit. A numeric opt-in slot's
+# outputs are held to stock or fp64 on the same quantized operands (test/kernels), at
+# most these multiples of the error of SGLang's own op.
 NUMERIC_TOLERANCES = {
+    # Gumbel-max consumes a deterministic per-token stream different from the stock
+    # sampler.  It is categorical-distribution equivalent, not tokenwise close; the
+    # migrated chi-square test pools low-expectation bins and enforces this p-value.
+    "sharded_gumbel": {
+        "sharded_gumbel.categorical.chi_square_p_value_min": 1e-4,
+    },
+    # Same FP8 norm bound as v2 gdn_core; output-store layout can change the
+    # FP32 reduction and the final BF16 rounding at a midpoint.
+    "gdn_verify": {"gdn_verify.norm_fp8.rel_l2_vs_stock": 2e-2},
+    # Four router GEMV chains sum in another order than SGLang's cuBLAS GEMM.
+    "route": {"route.router_logits.bf16_ulp_vs_stock": 1.0},
+    # The tiled router front stays within one BF16 ULP of SGLang's whole-M GEMM.
+    "route_gemm": {"route_gemm.router_logits.bf16_ulp_vs_stock": 1.0},
     "gdn_push": {
         "gdn_push.out_proj.rel_l2_vs_stock": 1.05,
         "gdn_push.out_proj.max_abs_vs_stock": 2.0,
@@ -120,18 +147,59 @@ NUMERIC_TOLERANCES = {
         "gdn_front.in_proj_ba.rel_l2_vs_stock": 1.05,
         "gdn_front.in_proj_ba.max_abs_vs_stock": 2.0,
     },
+    "gdn_trt_front": {
+        "gdn_trt_front.in_proj_qkvz.rel_l2_vs_stock": 1.05,
+        "gdn_trt_front.in_proj_qkvz.max_abs_vs_stock": 2.0,
+        "gdn_trt_front.in_proj_ba.rel_l2_vs_stock": 1.05,
+        "gdn_trt_front.in_proj_ba.max_abs_vs_stock": 2.0,
+    },
+    # The fused ReplaySSM, gated norm and FP8 output against gdn_verify on the same
+    # inputs (test_core_is_gdn_verify_numerically).
+    "gdn_core": {
+        "gdn_core.replay.rel_l2_vs_gdn_verify": 2e-3,
+        "gdn_core.norm_fp8.rel_l2_vs_gdn_verify": 2e-2,
+        "gdn_core.ring_d.rel_l2_vs_gdn_verify": 5e-3,
+        "gdn_core.ring_k.rel_l2_vs_gdn_verify": 1e-5,
+        "gdn_core.ring_g.max_abs_vs_gdn_verify": 1e-5,
+    },
     "route_shared": {
         "route_shared.gate_up.rel_l2_vs_stock": 1.05,
         "route_shared.gate_up.max_abs_vs_stock": 2.0,
     },
+    # The hidden, norm, FP8 and NVFP4 paths are bitwise; only the router partial's
+    # FP32 reduction order changes. Its RMS error stayed within 1.05x stock against
+    # FP64 on the same quantized operands (the TP8 GDN and attention tests).
+    "route_lin": {
+        "route_lin.router_logits.rms_vs_fp64_relative_to_stock": 1.05,
+    },
     # SKV2 against SGLang's TRT-LLM MHA decode (test_skv2_is_within_twice_sglangs_error)
     "skv2": {"skv2.attention.rel_l2_vs_stock": 2.0},
+    # CP-lite's exact plugin path at one request, as skv2's bound
+    "skv2_cp": {"skv2_cp.attention.rel_l2_vs_stock": 2.0},
+    "draft_q1_cp": {"draft_q1_cp.attention.rel_l2_vs_stock": 2.0},
+    "draft_skv2_cp": {"draft_skv2_cp.attention.rel_l2_vs_stock": 2.0},
     # MKA's own qkv / o_proj GEMMs; the GEMM slots' bounds, no fp64 kernel test yet
     "mka": {
         "mka.qkv_proj.rel_l2_vs_stock": 1.05,
         "mka.qkv_proj.max_abs_vs_stock": 2.0,
         "mka.o_proj.rel_l2_vs_stock": 1.05,
         "mka.o_proj.max_abs_vs_stock": 2.0,
+    },
+    # the low-M launches against fp64 on the same E4M3 operands (test/kernels/test_qwen3_5_lowm.py)
+    "lowm_in": {
+        "lowm_in.in_proj_qkvz.rel_max_vs_stock": 1.05,
+        "lowm_in.in_proj_ba.rel_max_vs_stock": 1.05,
+        "lowm_in.qkv_proj.rel_max_vs_stock": 1.05,
+    },
+    "lowm_out": {
+        "lowm_out.out_proj.rel_max_vs_stock": 1.05,
+        "lowm_out.o_proj.rel_max_vs_stock": 1.05,
+    },
+    "lowm_se": {"lowm_se.shared_expert.rel_l2_vs_stock": 2e-2},
+    # the pushed partial is lowm_out's; the all-reduce that consumes it is the fusion's (test_qwen3_5_hop.py)
+    "lowm_push": {
+        "lowm_push.out_proj.rel_max_vs_stock": 1.05,
+        "lowm_push.o_proj.rel_max_vs_stock": 1.05,
     },
 }
 
@@ -149,7 +217,7 @@ def numerics(slots) -> Numerics:
     return Numerics(kind=NumericsKind.TOLERANCE, tolerances=tolerances)
 
 
-NUMERICS = numerics(runtime.SLOTS)
+NUMERICS = numerics(topology.plannable(runtime.SLOTS))
 
 
 def text_config_reasons(hf_config) -> list[str]:
@@ -177,8 +245,66 @@ def binding_reasons() -> list[str]:
     return []
 
 
+def pd_reasons(cfg) -> list[str]:
+    """The P role is TP1/PP4; decode retains its established TP/PP contract."""
+    if (cfg.disaggregation_mode or "null") != "prefill":
+        reasons = []
+        if cfg.tp_size not in (2, 4, 8):
+            reasons.append(f"tp_size {cfg.tp_size} is not a supported decode topology")
+        if cfg.pp_size != 1:
+            reasons.append(
+                "pipeline parallelism is in use outside the supported prefill role"
+            )
+        if not cfg.enable_linear_replayssm_spec:
+            reasons.append("enable_linear_replayssm_spec must be True for decode")
+        return reasons
+    reasons = []
+    if (cfg.tp_size, cfg.pp_size, cfg.ep_size or 1) != (1, 4, 1):
+        reasons.append("PD prefill requires TP1/PP4 without expert parallelism")
+    if cfg.enable_linear_replayssm_spec:
+        reasons.append("PD prefill does not use the speculative ReplaySSM ring")
+    try:
+        from sglang.srt.kernel_plugins.nvidia.eagle_binding import (  # noqa: F401
+            LinearPrefillView,
+        )
+    except ImportError:
+        reasons.append("PD prefill requires the data-only LinearPrefillView binding")
+    return reasons
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    return text_config_reasons(hf_config) + binding_reasons() + runtime.slot_reasons()
+    from sglang.srt.runtime_context import derive_attn_tp_size
+
+    runtime.apply_expert_parallel(cfg.ep_size or 1)
+    runtime.apply_cp_lite_topology(
+        derive_attn_tp_size(
+            tp_size=cfg.tp_size,
+            attn_cp_size=cfg.attn_cp_size,
+            attn_dp_size=cfg.attn_dp_size,
+        )
+    )
+    configured = topology.from_config(cfg)
+    topology_reasons = (
+        ["Qwen3.5 DP attention requires DEP8 (TP8, attention DP8, MoE EP8)"]
+        if configured.attn_dp_size > 1 and configured.name != "dep8"
+        else []
+    )
+    if configured.name != "dep8" and cfg.disaggregation_mode != "prefill":
+        for name, want in (
+            ("moe_a2a_backend", "none"),
+            ("moe_runner_backend", "flashinfer_trtllm"),
+            ("flashinfer_allreduce_fusion_backend", "cutedsl"),
+        ):
+            value = getattr(cfg, name)
+            if value != want:
+                topology_reasons.append(f"{name} {value!r} is not {want!r}")
+    return (
+        topology_reasons
+        + text_config_reasons(hf_config)
+        + binding_reasons()
+        + runtime.slot_reasons(topology.plan(runtime.SLOTS, topology.from_config(cfg)))
+        + pd_reasons(cfg)
+    )
 
 
 def _build(model, hf_config, ctx):
@@ -193,10 +319,16 @@ SPEC = MegakernelSpec(
     features=frozenset(
         {
             Feature.SPECULATIVE_DECODING,
+            Feature.PIPELINE_PARALLEL,
             # TP8 spans the two 4-GPU trays of one NVL72 rack
             Feature.MULTI_NODE_TP,
             # HiCache: covered steps read only running requests' pages
             Feature.KV_OFFLOAD,
+            # TEP (MoE TP x EP): the slots in runtime.EP_STOCK_SLOTS stay off
+            Feature.EXPERT_PARALLEL,
+            Feature.DP_ATTENTION,
+            # The decode side of PD; pd_reasons refuses the prefill side.
+            Feature.PD_DISAGGREGATION,
         }
     ),
     numerics=NUMERICS,

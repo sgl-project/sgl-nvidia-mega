@@ -10,12 +10,12 @@
 // batched GEMMs read. The result is that of FlashInfer's TRT-LLM-gen routing
 // kernel with precomputed ids and an 8-token tile:
 //
-//   * local experts (ids in [0, experts)) in ascending id order, each one's
-//   rows in
-//     ascending token order, every expert's segment padded to a multiple of the
-//     tile (8 rows);
-//   * permuted[t, k] = the slot's row in that order, -1 for an id outside
-//     [0, experts);
+//   * local experts (ids in [offset, offset + experts), with expert_offset the
+//     first id this rank holds under expert parallelism, 0 otherwise) in
+//     ascending id order, each one's rows in ascending token order, every
+//     expert's segment padded to a multiple of the tile (8 rows);
+//   * permuted[t, k] = the slot's row in that order, -1 for an id this rank
+//     does not hold;
 //   * route (int32, one buffer per call):
 //       [0]                       8 * CTAs (padded rows)
 //       [1]                       CTAs
@@ -35,6 +35,14 @@
 //
 // `barrier` (may be null): bit 31 flips once per record; the GEMMs here do not
 // read it.
+//
+// Balanced dealing (slot moe_balanced; expert_offset < 0, group = -1 -
+// expert_offset): the rank holds all the router's experts, and the step's
+// distinct experts, in id order, are dealt to two expert-parallel groups in turn
+// (the k-th to group k % 2), so each group serves half of them, up to one,
+// whatever the routing (the rule of muLLM's balanced groups). The
+// rank keeps its group's experts: its CTAs are those experts in id order, the
+// record names them by global id, and the other group's slots get -1.
 
 namespace route {
 
@@ -87,7 +95,8 @@ __device__ __forceinline__ void Build(Scratch &scratch, const int *ids,
                                       int *__restrict__ permuted,
                                       int *__restrict__ record,
                                       unsigned int *barrier, int rows,
-                                      int top_k, int experts, int thread) {
+                                      int top_k, int experts, int expert_offset,
+                                      int thread) {
   const int slots = rows * top_k;
   const int max_ctas = MaxCtas(rows, top_k, experts);
   const int cta_words = CtaWords(max_ctas);
@@ -95,10 +104,12 @@ __device__ __forceinline__ void Build(Scratch &scratch, const int *ids,
   const int token_offset = 4 + 2 * cta_words;
   if (thread == 0 && barrier != nullptr)
     atomicXor(barrier, 0x80000000U);
+  const bool deal = expert_offset < 0;
+  const int group = deal ? -1 - expert_offset : 0;
   const int row = thread / top_k;
   int expert = -1;
   if (thread < slots) {
-    expert = ids[thread];
+    expert = ids[thread] - (deal ? 0 : expert_offset);
     if (expert < 0 || expert >= experts)
       expert = -1;
   }
@@ -118,6 +129,16 @@ __device__ __forceinline__ void Build(Scratch &scratch, const int *ids,
     if (expert >= 0 && word < (expert >> 5))
       base_cta += bits;
   }
+  if (expert >= 0)
+    base_cta +=
+        __popc(scratch.present[expert >> 5] & ((1U << (expert & 31)) - 1U));
+  if (deal) {
+    // base_cta is the expert's deal rank; the group keeps ranks group, group + 2, ...
+    if (expert >= 0 && (base_cta & 1) != group)
+      expert = -1;
+    base_cta = (base_cta + 1 - group) >> 1;
+    total_ctas = (total_ctas + 1 - group) >> 1;
+  }
   if (thread == 0) {
     record[0] = total_ctas * kTile;
     record[1] = total_ctas;
@@ -126,8 +147,6 @@ __device__ __forceinline__ void Build(Scratch &scratch, const int *ids,
     permuted[thread] = -1;
     return;
   }
-  base_cta +=
-      __popc(scratch.present[expert >> 5] & ((1U << (expert & 31)) - 1U));
   const unsigned int chosen_by = scratch.rows_of[expert];
   const int count = __popc(chosen_by);
   const int rank = __popc(chosen_by & ((1U << row) - 1U));

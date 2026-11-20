@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The draft package's single-launch MoE (sm103/draft/moe.py) on one SM100-family GPU
-(GB300), at the TP8 draft shape (hidden 4096, 512 experts of intermediate 128, top-10):
+(GB300), at the TP8 / TP4 draft shapes (hidden 4096, 512 experts, intermediate 128 / 256, top-10):
 - the top-10 is exactly the kernel's own selection rule on the logits it published
   (bf16 order keys, ties to the lowest id), and the weights its renormalized softmax;
 - logits, weights and output match a float64 reference with the kernel's rounding
@@ -32,9 +32,10 @@ def _gpu_ready() -> bool:
 pytestmark = pytest.mark.skipif(not _gpu_ready(), reason="needs an SM100-family GPU")
 
 
-@pytest.fixture(scope="module")
-def weights():
-    """One TP8 draft MoE block's bf16 weights in checkpoint layout."""
+@pytest.fixture(scope="module", params=[128, 256], ids=["tp8", "tp4"])
+def weights(request):
+    """One BF16 draft MoE block's bf16 weights in checkpoint layout."""
+    inter = request.param
     g = torch.Generator(device="cuda").manual_seed(5)
 
     def randn(*shape, std):
@@ -44,10 +45,10 @@ def weights():
 
     return {
         "router_w": randn(E, H, std=0.02),
-        "w13": randn(E, 2 * I, H, std=0.02),
-        "w2": randn(E, H, I, std=0.05),
-        "w13_shared": randn(2 * I, H, std=0.02),
-        "w2_shared": randn(H, I, std=0.05),
+        "w13": randn(E, 2 * inter, H, std=0.02),
+        "w2": randn(E, H, inter, std=0.05),
+        "w13_shared": randn(2 * inter, H, std=0.02),
+        "w2_shared": randn(H, inter, std=0.05),
         "gate_w": randn(H, std=0.02),
     }
 
@@ -105,13 +106,18 @@ def _r(t: torch.Tensor) -> torch.Tensor:
     return t.to(torch.bfloat16).double()
 
 
+def _inter(w):
+    return w["w2"].shape[-1]
+
+
 def _reference(w, x, ids, weights):
     """float64 dots with the kernel's bf16 rounding points."""
+    inter = _inter(w)
     xd = x.double().view(-1)
     acts = []
     for s in range(K + 1):
         rows = w["w13_shared"] if s == K else w["w13"][int(ids[s])]
-        gate, up = _r(rows[:I].double() @ xd), _r(rows[I:].double() @ xd)
+        gate, up = _r(rows[:inter].double() @ xd), _r(rows[inter:].double() @ xd)
         acts.append(_r(gate / (1.0 + torch.exp(-gate)) * up))
     routed = torch.zeros(H, dtype=torch.float64, device="cuda")
     for s in range(K):
@@ -126,7 +132,7 @@ def _reference(w, x, ids, weights):
 def test_selection_weights_and_output(weights):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import moe
 
-    scratch = moe.draft_moe_fused_scratch(E, K, I, torch.device("cuda"))
+    scratch = moe.draft_moe_fused_scratch(E, K, _inter(weights), torch.device("cuda"))
     for seed in range(4):
         x = _x(seed)
         topk_weights, topk_ids, out = _run(weights, x, scratch, _outputs())
@@ -161,7 +167,7 @@ def test_selection_weights_and_output(weights):
 def test_repeat_and_graph_replay(weights):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import moe
 
-    scratch = moe.draft_moe_fused_scratch(E, K, I, torch.device("cuda"))
+    scratch = moe.draft_moe_fused_scratch(E, K, _inter(weights), torch.device("cuda"))
     eager = {}
     for seed in range(3):
         a = [t.clone() for t in _run(weights, _x(seed), scratch, _outputs())]
@@ -204,7 +210,7 @@ def test_draft_moe_two_tokens(weights):
     got = block(x)
     from sgl_nvidia_mega.qwen3_5.sm103.draft import moe
 
-    scratch = moe.draft_moe_fused_scratch(E, K, I, torch.device("cuda"))
+    scratch = moe.draft_moe_fused_scratch(E, K, _inter(weights), torch.device("cuda"))
     for m in range(2):
         *_, out = _run(weights, x[m : m + 1], scratch, _outputs())
         assert torch.equal(got[m : m + 1], out)
@@ -213,7 +219,7 @@ def test_draft_moe_two_tokens(weights):
 def test_rejects_bad_operands(weights):
     from sgl_nvidia_mega.qwen3_5.sm103.draft import moe
 
-    scratch = moe.draft_moe_fused_scratch(E, K, I, torch.device("cuda"))
+    scratch = moe.draft_moe_fused_scratch(E, K, _inter(weights), torch.device("cuda"))
     with pytest.raises(ValueError):
         _run(weights, _x(0).float(), scratch, _outputs())
     with pytest.raises(ValueError):

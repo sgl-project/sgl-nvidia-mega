@@ -646,8 +646,8 @@ def _selected_tactic(
     """The tactic for these operands, chosen without autotune state: the GB300 tactic
     pinned for the shape (mxfp8_ll), else FlashInfer's default for the low-latency
     GEMM, its first valid tactic."""
-    # mm_mxfp8's private runner and workspace (FlashInfer 0.7.x), so the valid
-    # tactics are the ones mm_mxfp8 enumerates
+    # mm_mxfp8's private runner (FlashInfer 0.7.x), so the valid tactics are the ones
+    # mm_mxfp8 enumerates; they depend on the shape and dtypes, not on the workspace
     from flashinfer.gemm import gemm_base
 
     from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
@@ -656,9 +656,7 @@ def _selected_tactic(
     runner = gemm_base._cutedsl_low_latency_blockscaled_gemm_runner(
         major * 10 + minor, True
     )
-    workspace = gemm_base._get_cache_buf(
-        "mm_mxfp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, a.device
-    )
+    workspace = torch.empty(0, dtype=torch.uint8, device=a.device)
     inputs = [a, weight, a_scale, weight_scale, out.dtype, out, workspace]
     tactics = [tuple(t) for t in runner.get_valid_tactics(inputs, None)]
     if not tactics:

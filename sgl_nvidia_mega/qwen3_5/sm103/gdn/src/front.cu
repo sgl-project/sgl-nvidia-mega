@@ -10,7 +10,9 @@
 //
 // Built with NVRTC: front_kernel is a device function, and the extern "C" entries at the end
 // instantiate its BF16-input form with the fused conv and the inline side projection, with the
-// projection weights in registers (q35_gdn_front) or by bulk copy into shared memory (q35_gdn_front_tma).
+// projection weights in registers (q35_gdn_front), by bulk copy into shared memory (q35_gdn_front_tma),
+// or in registers held ahead of the PDL wait (q35_gdn_front_pin: ptxas otherwise sinks q35_gdn_front's
+// non-coherent weight loads below griddepcontrol.wait).
 
 #include <cuda_bf16.h>
 
@@ -195,6 +197,21 @@ __device__ __forceinline__ uint4 ldg_nc_v4(const uint4* p) {
   return r;
 }
 
+// Holds every weight load named in `dep` (one word of each) ahead of griddepcontrol.wait: ptxas otherwise sinks the
+// loads below the wait (ACQBULK). The thread waits for its weights here; `never` is a launch constant that is never 0.
+__device__ __forceinline__ void pin_before_wait(uint32_t dep, uint64_t never) {
+  asm volatile("{ .reg .pred a, b; setp.eq.u64 a, %1, 0; setp.eq.u32 b, %0, 1; and.pred a, a, b; @a trap; }"
+               :: "r"(dep), "l"(never) : "memory");
+}
+__device__ __forceinline__ uint32_t weight_dep(const uint4 (&w)[16][2]) {
+  uint32_t dep = 0;
+#pragma unroll
+  for (int step = 0; step < 16; ++step)
+#pragma unroll
+    for (int block = 0; block < 2; ++block) dep ^= w[step][block].x;
+  return dep;
+}
+
 __device__ __forceinline__ uint32_t smem_u32(const void* ptr) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
@@ -245,6 +262,15 @@ __device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint4& a, uint32_t
 }
 
 // stock _static_quant_fp8: y * div.full(1, s), clamp +-448, cvt.rn.satfinite.e4m3
+// quant4_static of four BF16 already loaded
+__device__ __forceinline__ uint32_t quant4_raw(const uint2 raw, float inv) {
+  const __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+  const __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+  float f[4] = {__low2float(v01), __high2float(v01), __low2float(v23), __high2float(v23)};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) f[i] = fminf(fmaxf(__fmul_rn(f[i], inv), -448.f), 448.f);
+  return e4m3x2(f[0], f[1]) | (e4m3x2(f[2], f[3]) << 16);
+}
 __device__ __forceinline__ uint32_t quant4_static(const __nv_bfloat16* p, float inv) {
   const uint2 raw = *reinterpret_cast<const uint2*>(p);
   const __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
@@ -311,7 +337,8 @@ constexpr uint32_t kWeightBytes = 8 * 16 * 2 * 32 * 16;
 // Each cluster reduces its split-K partials in fixed rank order.
 // Tma: the CTA's weights arrive by one bulk copy into shared memory issued before the PDL wait (instead of 32
 // register loads per thread), then each thread reads the same A fragments; same MMAs, same bits.
-template <bool Quantized, bool FuseConv = false, bool InlineBa = false, bool Tma = false>
+// Early (register weights): every weight load is held ahead of the PDL wait by pin_before_wait.
+template <bool Quantized, bool FuseConv = false, bool InlineBa = false, bool Tma = false, bool Early = false>
 __device__ __forceinline__ void front_kernel(const Params& p) {
   if (threadIdx.x == 0) pdl_trigger();
   __shared__ __align__(16) float inbox[kCluster][256];
@@ -368,8 +395,28 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
       for (int block = 0; block < 2; ++block)
         weights[step][block] = ldg_nc_v4(wp + (step * 2 + block) * 32);
   }
+  static_assert(!(Tma && Early), "Early holds register weight loads");
   const float sx = __ldg(p.sx), alpha = __fmul_rn(sx, __ldg(p.sw));
+  float inverse = 0.f;
+  if constexpr (Early) {
+    // the static scales and 1 / sx ahead of the wait too (ptxas sinks the scale loads below it otherwise)
+    inverse = div_full(1.0f, sx);
+    pin_before_wait(weight_dep(weights) ^ __float_as_uint(inverse) ^ __float_as_uint(alpha), p.timeout);
+  }
   pdl_wait();
+  // Early: this thread's x loads go out first; warp 0 would otherwise wait out the sticky word and the conv slots (each
+  // consumed right after its load) before it issues them, and the CTA's x barrier with it.
+  uint2 raw[2][2] = {};
+  if constexpr (Early) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+      if (g < p.m) {
+        const auto* x = static_cast<const __nv_bfloat16*>(p.x) + g * 4096 + rank * 512 +
+                        (2 * warp + i) * 32 + 4 * t;
+        raw[i][0] = *reinterpret_cast<const uint2*>(x);
+        raw[i][1] = *reinterpret_cast<const uint2*>(x + 16);
+      }
+  }
   // Issued now, tested before the first push: no store precedes the check.
   const unsigned sticky = tid == 0 ? *reinterpret_cast<volatile unsigned*>(p.error) : 0u;
   // Both indices are read now (independently) and used only after the projection.
@@ -380,7 +427,7 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
     conv_replay = p.replay_index64 ? static_cast<const int64_t*>(p.replay_indices)[0]
                                    : static_cast<const int32_t*>(p.replay_indices)[0];
   }
-  const float inverse = div_full(1.0f, sx);
+  if constexpr (!Early) inverse = div_full(1.0f, sx);
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
     const int step = 2 * warp + i;
@@ -391,6 +438,8 @@ __device__ __forceinline__ void front_kernel(const Params& p) {
         const uint8_t* x = static_cast<const uint8_t*>(p.x) + offset;
         value = make_uint2(*reinterpret_cast<const uint32_t*>(x),
                            *reinterpret_cast<const uint32_t*>(x + 16));
+      } else if constexpr (Early) {
+        value = make_uint2(quant4_raw(raw[i][0], inverse), quant4_raw(raw[i][1], inverse));
       } else {
         const auto* x = static_cast<const __nv_bfloat16*>(p.x) + offset;
         value = make_uint2(quant4_static(x, inverse), quant4_static(x + 16, inverse));
@@ -538,4 +587,10 @@ extern "C" __global__ __launch_bounds__(sglang::gdn_pdl_front_ba_mkm_detail::kTh
 extern "C" __global__ __launch_bounds__(sglang::gdn_pdl_front_ba_mkm_detail::kThreads, 1) void q35_gdn_front_tma(
     const __grid_constant__ sglang::gdn_pdl_front_ba_mkm_detail::Params p) {
   sglang::gdn_pdl_front_ba_mkm_detail::front_kernel<false, true, true, true>(p);
+}
+
+// q35_gdn_front with its register weight loads held ahead of the PDL wait (same bits).
+extern "C" __global__ __launch_bounds__(sglang::gdn_pdl_front_ba_mkm_detail::kThreads, 1) void q35_gdn_front_pin(
+    const __grid_constant__ sglang::gdn_pdl_front_ba_mkm_detail::Params p) {
+  sglang::gdn_pdl_front_ba_mkm_detail::front_kernel<false, true, true, false, true>(p);
 }

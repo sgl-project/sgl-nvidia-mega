@@ -40,6 +40,8 @@ SGLANG_READS = {
     "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "SPECULATIVE_DECODING",
+        "MULTI_NODE_TP",
+        "EXPERT_PARALLEL",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -59,17 +61,31 @@ SGLANG_READS = {
         "dsv4_attn_backend",
         "enable_encoder_swa_bounded_replay",
         "startup_weight_load_mode",
+        "tp_size",
+        "ep_size",
+        "nnodes",
+        "moe_dp_size",
+        "ep_num_redundant_experts",
+        "init_expert_location",
+        "ep_dispatch_algorithm",
+        "ep_join_mode",
     ),
+    "srt/environ.py": ("SGLANG_SHARED_EXPERT_TP1",),
 }
 
 ARCHITECTURE = "DeepseekV4ForCausalLM"
 # the SGLang megakernel contract this spec is written against
 API_VERSION = 2
 # The FlashInfer low-latency GEMM file the wo_b publish epilogue subclasses, by the
-# sha256 of its source; it is byte-identical in FlashInfer 0.7.0, 0.7.1 and 0.7.2
+# sha256 of its source. FlashInfer 0.7.0-0.7.2 share one file; 0.7.3 only adds
+# tactic-enumeration caching, leaving the kernel class (including epilog_warp)
+# unchanged. Keep rejecting other source revisions until they are checked.
 FLASHINFER_LL_GEMM = "gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py"
 FLASHINFER_LL_GEMM_SHA256 = frozenset(
-    {"118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280"}
+    {
+        "118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280",  # 0.7.0-0.7.2
+        "c9d16930cc99c98d2de57e10882f52611a784268ba497b2b10d613a935a5596c",  # 0.7.3, 0.7.4
+    }
 )
 
 # Test-only switches that run the covered step eagerly: the composition check
@@ -107,9 +123,54 @@ def resident_blocks() -> int:
     return 148 if "sm148" in SLOTS else 152
 
 
+# (tp_size, ep_size) served: TP4 on one GB300 tray; attention TP8 + MoE TP4 x EP2 on
+# two trays of one NVLink domain (MoE-TP groups ranks 0-3 and 4-7, EP pairs i, i + 4)
+TOPOLOGIES = frozenset({(4, 1), (8, 2)})
+
+
+def topology_reasons(cfg) -> list[str]:
+    """Why the server's parallel layout is not one of ``TOPOLOGIES`` ([] when it is)."""
+    tp, ep = cfg.tp_size, cfg.ep_size or 1
+    reasons = []
+    if (tp, ep) not in TOPOLOGIES:
+        reasons.append(
+            f"tp_size {tp} with ep_size {ep}: DeepSeek-V4.1 serves TP4 without expert "
+            "parallelism, or TP8 with ep_size 2 (MoE TP4 x EP2)"
+        )
+    if tp == 4 and cfg.nnodes > 1:
+        reasons.append(f"TP4 serves one tray; nnodes is {cfg.nnodes}")
+    if (cfg.moe_dp_size or 1) != 1:
+        reasons.append(f"moe_dp_size {cfg.moe_dp_size} is not 1")
+    return reasons
+
+
+ENGRAM_CONFIG = '--engram-config \'{"placement": "cpu"}\''
+
+
+def engram_reasons(cfg) -> list[str]:
+    """Why the Engram tables are not the per-rank host tables slot engram reads ([]
+    when they are, and without the slot): --engram-config with placement cpu and no
+    replication (no per-table NUMA placement; SGLang's process membind,
+    SGLANG_NUMA_BIND_V2, only). The option is a dict before SGLang resolves it; an
+    SGLang without the option is left to the slot's own check of the table."""
+    if "engram" not in SLOTS or not hasattr(cfg, "engram_config"):
+        return []
+    config = cfg.engram_config or {}
+    if not isinstance(config, dict):
+        config = {k: getattr(config, k) for k in ("placement", "replication")}
+    placement = config.get("placement", "gpu")
+    replication = config.get("replication", "none")
+    if placement == "cpu" and replication == "none":
+        return []
+    return [
+        f"engram_config placement {placement!r}, replication {replication!r}: the "
+        f"Engram prefetch reads the per-rank host tables; pass {ENGRAM_CONFIG}"
+    ]
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
-    tp_sizes=frozenset({4}),
+    tp_sizes=frozenset(tp for tp, _ in TOPOLOGIES),
     resident_blocks=resident_blocks(),
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
@@ -125,21 +186,20 @@ REQUIREMENTS = Requirements(
         "enable_encoder_swa_bounded_replay": frozenset({False}),
         # the kernels read weights in place, after SGLang's last conversion
         "startup_weight_load_mode": frozenset({"serial"}),
+        # EP2: the trivial expert placement (rank r holds experts [r * 192, r * 192 +
+        # 192)), which the routed pair's expert window assumes
+        "ep_num_redundant_experts": frozenset({0}),
+        "init_expert_location": frozenset({"trivial"}),
+        "ep_dispatch_algorithm": frozenset({None}),
+        "ep_join_mode": frozenset({None}),
     },
     hf_config={**HF_CONFIG, "model_type": "deepseek_v41"},
     env={
         # the TP sync setting every measured launch ran with
         "SGLANG_SPEC_TP_SYNC": "rng,-dspark-accept-sample",
-        # slot engram reads the per-rank host table SGLang builds only with these (no
-        # per-table NUMA placement; SGLang's process membind, SGLANG_NUMA_BIND_V2, only)
-        **(
-            {
-                "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": True,
-                "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
-            }
-            if "engram" in SLOTS
-            else {}
-        ),
+        # the shared expert split over the whole TP group, as SGLang loads it by
+        # default: a TP partial the boundary's all-reduce sums (288 rows a rank at TP8)
+        "SGLANG_SHARED_EXPERT_TP1": False,
     },
 )
 
@@ -173,8 +233,15 @@ NUMERICS = Numerics(
             if {"attn_qkv_a", "draft_qkv_a_ll"} & SLOTS
             else {"attn.kv.max_abs": 0.0}
         ),
-        # wo_b's published partial, as FlashInfer's low-latency GEMM writes it
-        "wo_b.partial.max_abs": 0.0,
+        # wo_b's published partial, as FlashInfer's low-latency GEMM writes it; with slot
+        # wo_b_publish_split (a numerics change) muLLM's split-K FP8 projection against
+        # that GEMM on the same bytes, relative RMS (test_deepseek_v41_wo_b_split.py:
+        # 0 to 5e-5 at K 1024 and 2048, 1-8 rows; 1.64e-3 to 1.69e-3 against fp64 for both)
+        **(
+            {"wo_b.partial.rel": 5e-5}
+            if "wo_b_publish_split" in SLOTS
+            else {"wo_b.partial.max_abs": 0.0}
+        ),
         # the router's expert ids and weights, as moe_fused_gate picks them
         "gate.topk.max_abs": 0.0,
         # the prefetched Engram WKV rows, as SGLang's inline lookup + WKV writes them
@@ -217,6 +284,19 @@ NUMERICS = Numerics(
         # slot target_lm_head: the target's logits shard on the low-M kernel against
         # SGLang's matmul, checked at build on every rank (the K summation order differs)
         "target_lm_head.logits.rel": 2**-7,
+        # slot target_lm_head_mxfp8: the same check on the MXFP8 stream, whose weight is
+        # the shard quantized (test_deepseek_v41_lm_head_mxfp8.py)
+        "target_lm_head_mxfp8.logits.rel": 4e-2,
+        # slot attn_q_cluster (a numerics change): the query against attn_q_norm_gemm's
+        # pair on the same input, in BF16 ulps (test_deepseek_v41_q_cluster.py bounds it
+        # at 64; one of four runs reached 128 at 7 rows), and its error against fp64
+        # within 5 % of the pair's
+        "attn.q_cluster.bf16_ulp": 128,
+        "attn.q_cluster.rel_vs_pair_error": 1.05,
+        # slot attn_core_lean (opt-in, a numerics change): the core's output against an
+        # fp64 attention over the v41_new bytes it reads, relative RMS
+        # (test_deepseek_v41_core_lean.py: 0.0021 to 0.0023 measured)
+        "attn.core_lean.rel_fp64": 4e-3,
     },
 )
 
@@ -255,7 +335,12 @@ def flashinfer_ll_gemm_digest():
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    reasons = toolchain_reasons() + runtime.slot_reasons()
+    reasons = (
+        topology_reasons(cfg)
+        + engram_reasons(cfg)
+        + toolchain_reasons()
+        + runtime.slot_reasons()
+    )
     if cfg.cuda_graph_config.decode.backend == "disabled" and not eager_steps_allowed():
         reasons.append(
             "decode CUDA graphs are disabled: the eager forward is not supported yet; "
@@ -279,7 +364,14 @@ def _build(model, hf_config, ctx):
 SPEC = MegakernelSpec(
     name="DeepSeek-V4.1",
     requires=REQUIREMENTS,
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # TP8 spans two trays; its MoE runs TP4 x EP2 (topology_reasons admits only that)
+    features=frozenset(
+        {
+            Feature.SPECULATIVE_DECODING,
+            Feature.MULTI_NODE_TP,
+            Feature.EXPERT_PARALLEL,
+        }
+    ),
     numerics=NUMERICS,
     # the two-shot slot alone covers the widths past the routed-expert pair
     max_rows=max_rows("two_shot" in SLOTS),

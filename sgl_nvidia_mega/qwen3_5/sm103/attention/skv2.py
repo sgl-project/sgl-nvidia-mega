@@ -303,6 +303,7 @@ class StockSplitDecode:
         copy_s = tcgen05.make_tmem_copy(copy_atom, s_plane).get_slice(local_tid)
         rlayout = copy_s.partition_D(s_plane).layout
         # Stock split rule: pages_per_split = cdiv(cdiv(length, 64), SPLITS); split covers whole pages.
+        # lengths / table are read before the dependency wait: they must be written before the graph launch.
         length = lengths[0]
         pps = cute.ceil_div(cute.ceil_div(length, 64), self.splits)
         begin_tok = split * pps * 64

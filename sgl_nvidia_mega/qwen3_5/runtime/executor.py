@@ -38,7 +38,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, logits, moe
 from sgl_nvidia_mega.qwen3_5.attention import route as _attention_route  # noqa: F401
 from sgl_nvidia_mega.qwen3_5.gdn import verify as _gdn_verify  # noqa: F401
-from sgl_nvidia_mega.qwen3_5.runtime import embedding
+from sgl_nvidia_mega.qwen3_5.runtime import embedding, slot_failure
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -64,6 +64,9 @@ SGLANG_READS = {
         "model",
     ),
     "srt/model_executor/forward_batch_info.py": ("mrope_positions", "forward_mode"),
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
+        "is_idle",
+    ),
     "srt/models/qwen3_5.py": (
         "Qwen3_5LinearDecoderLayer",
         "layers",
@@ -85,7 +88,10 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_vl.py:Qwen3VLForConditionalGeneration.forward": "d394d79ba7fa7b31",
+    "srt/models/qwen3_vl.py:Qwen3VLForConditionalGeneration.forward": (
+        "d394d79ba7fa7b31",
+        "dbdcf4b88a2c0d40",
+    ),
     "srt/models/qwen3_5.py:Qwen3_5ForCausalLM.forward": "9e530b264ce30ad6",
     "srt/models/qwen3_5.py:Qwen3_5LinearDecoderLayer.forward": "2298a57111f9430e",
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward": "6473f673a1a0796b",
@@ -111,6 +117,7 @@ class Qwen35Verify:
         binding=None,
         summary: str = "",
         parity=None,
+        speculative_runtime_hooks=None,
     ):
         from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
 
@@ -119,10 +126,13 @@ class Qwen35Verify:
         self.binding = binding  # SGLang's EagleBinding (BuildContext.binding)
         self._summary = summary
         self.parity = parity  # runtime.parity.Parity under the test-only switch
+        # A factory over SGLang's stock strategy, or None.  The binding reads this
+        # optional BuiltMegakernel member once when it wires speculative verify.
+        self.speculative_runtime_hooks = speculative_runtime_hooks
         # the attention graph variants per SGLang runner ("target_verify"), which it
         # captures once it takes a megakernel's (attention/route.py)
         self.graph_variants = (
-            {"target_verify": attention.route.VERIFY}
+            {"target_verify": attention.route.verify_variants()}
             if any(s.skv2 for s in slots.values())
             else {}
         )
@@ -181,27 +191,38 @@ class Qwen35Verify:
                 view.mamba, self.binding.tokens_per_request
             )
             if reasons:
-                raise RuntimeError(
-                    "NVIDIA megakernel: slot gdn_verify cannot run: "
-                    + "; ".join(reasons)
-                )
+                raise RuntimeError(slot_failure("gdn_verify", "; ".join(reasons)))
+        if any(s.gdn_conv for s in self.slots.values()):
+            reasons = gdn.verify.conv_pool_reasons(
+                view.mamba, self.binding.tokens_per_request
+            )
+            if reasons:
+                raise RuntimeError(slot_failure("gdn_conv", "; ".join(reasons)))
+        if any(s.gdn_core for s in self.slots.values()):
+            reasons = gdn.verify.core_pool_reasons(view.mamba)
+            if reasons:
+                raise RuntimeError(slot_failure("gdn_core", "; ".join(reasons)))
         if any(s.gdn_front for s in self.slots.values()):
             from sgl_nvidia_mega.qwen3_5.gdn import front
 
             reasons = front.pool_reasons(view.mamba)
             if reasons:
-                raise RuntimeError(
-                    "NVIDIA megakernel: slot gdn_front cannot run: "
-                    + "; ".join(reasons)
-                )
+                raise RuntimeError(slot_failure("gdn_front", "; ".join(reasons)))
+            front.prepare(
+                self.lm,
+                view.mamba,
+                trt=any(s.gdn_trt_front for s in self.slots.values()),
+            )
         skv2 = any(s.skv2 for s in self.slots.values())
         mka = any(s.mka for s in self.slots.values())
         if skv2 or mka:
             reasons = attention.pool_reasons(view, self.binding, skv2=skv2, mka=mka)
             if reasons:
                 raise RuntimeError(
-                    "NVIDIA megakernel: the attention slots cannot run: "
-                    + "; ".join(reasons)
+                    slot_failure(
+                        {n for n, on in (("skv2", skv2), ("mka", mka)) if on},
+                        "; ".join(reasons),
+                    )
                 )
         self._pools_checked = True
 
@@ -246,7 +267,14 @@ class Qwen35Verify:
     def _layer(self, i, layer, hidden, st, capture):
         """A decoder layer's forward: the mixer stage, then the MoE stage."""
         x = boundary.pre(layer, hidden, st, capture)
-        part = self.mixers[i](layer, x, st)
+        # Idle DP ranks still cross the boundaries and run the MoE's collective,
+        # but the decoder layers skip their mixer (including empty FP4 GEMMs).
+        rows = (x[0] if isinstance(x, tuple) else x).shape[0]
+        part = (
+            self.mixers[i](layer, x, st)
+            if not st.fb.forward_mode.is_idle() and rows > 0
+            else x
+        )
         x = boundary.post_attn(layer, part, st)
         with boundary.ffn_exit(layer, st) as ffn_exit:
             out = moe.step(layer, x, st, defer=ffn_exit.defer_moe_finalize)

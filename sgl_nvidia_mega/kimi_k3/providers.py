@@ -3,8 +3,9 @@
 """Cache-independent Kimi K3 megakernel resources and runtime-pool binding.
 
 SGLang's megakernel framework imports this module only after configuration and
-all-rank validation.  It prepares the frozen B1-B8/B16/B32/B64 TP8 provider set
-and later binds it to SGLang-owned typed cache views.
+all-rank validation. It prepares the frozen TP8 token-row provider set and later
+binds it to SGLang-owned typed cache views. Fixed-q4-8 verification borrows separate
+checkpoint pools; only stock DSpark commits them to persistent recurrent state.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from sglang.srt.distributed.communication_op import (
@@ -26,19 +27,64 @@ from sglang.srt.distributed.communication_op import (
 )
 from sglang.srt.runtime_context import get_parallel
 
+try:
+    from sglang.srt.kernel_plugins.nvidia.binding import HybridPoolView
+except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
+    if error.name not in (
+        "sglang.srt.kernel_plugins",
+        "sglang.srt.kernel_plugins.nvidia",
+        "sglang.srt.kernel_plugins.nvidia.binding",
+    ):
+        raise
+    from sglang.srt.megakernels.binding import HybridPoolView
+
 from .projection_storage import (
     coalesce_kda_projection_storage,
     coalesce_mla_projection_storage,
 )
+from .shape_policy import MAX_ROWS, mla_max_seq_len, prepared_widths
 
-try:
-    from sglang.srt.kernel_plugins.nvidia.binding import HybridPoolView
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.binding import HybridPoolView
+if TYPE_CHECKING:
+    from .dcp_resources import DcpBuildOptions
 
-PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
-_BATCHES = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
-_MAX_BATCH = max(_BATCHES)
+PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.sm103"
+_MAX_BATCH = MAX_ROWS
+
+
+def _kda_policy(tokens_per_request: int, widths: tuple[int, ...] | None = None) -> dict:
+    # Verify keys are (requests, q), unlike all row-wise projection/MoE policies.
+    widths = prepared_widths(tokens_per_request, widths)
+    if tokens_per_request > 1:
+        return {
+            (rows // tokens_per_request, tokens_per_request): (6288, 1)
+            for rows in widths
+        }
+    return {rows: (6288, 1 if rows == 1 else 2 if rows <= 8 else 0) for rows in widths}
+
+
+def _projection_policies(pitch: int, widths: tuple[int, ...]) -> dict:
+    """Use the existing TP8 tactic at the next row bin, including odd q rows."""
+    if pitch not in (3648, 6288):
+        raise ValueError(f"unsupported Kimi K3 projection pitch: {pitch}")
+    policies = {}
+    for rows in widths:
+        if not 1 <= rows <= _MAX_BATCH:
+            raise ValueError(f"unsupported Kimi K3 projection rows: {rows}")
+        tile = next(size for size in (8, 16, 32, 64) if rows <= size)
+        if pitch == 6288:
+            tactic = (
+                (64, 64, 1, 6) if tile == 64 else (128, tile, 2, 5 if tile == 32 else 6)
+            )
+        else:
+            tactic = (
+                64,
+                tile,
+                4 if tile == 8 else 2,
+                {8: 8, 16: 10, 32: 8, 64: 5}[tile],
+            )
+        policies[rows] = tactic
+    return policies
+
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
@@ -50,6 +96,8 @@ SGLANG_READS = {
         "cache",
         "capacity",
         "conv",
+        "intermediate_conv_window",
+        "intermediate_ssm",
         "kda",
         "layer_mapping",
         "logical_dtype",
@@ -63,6 +111,7 @@ SGLANG_READS = {
         "temporal",
     ),
     "srt/runtime_context.py": ("get_parallel",),
+    "srt/models/kimi_k3.py": ("dspark_layers_to_capture",),
 }
 
 
@@ -398,6 +447,132 @@ def _prepare_mla_workspace(
     return workspace, counter
 
 
+def _validate_mla_core(core: str) -> None:
+    if core not in ("trtllm", "tokenspeed"):
+        raise ValueError(f"unsupported private MLA core: {core!r}")
+    if core == "tokenspeed":
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            installed = version("tokenspeed-mla")
+        except PackageNotFoundError as error:
+            raise RuntimeError(
+                "TokenSpeed MLA requires tokenspeed-mla==2.0.2"
+            ) from error
+        if installed != "2.0.2":
+            raise RuntimeError(
+                f"TokenSpeed MLA requires tokenspeed-mla==2.0.2, found {installed}"
+            )
+
+
+class _PreparedTokenSpeedMla:
+    """Retain the final shared workspace after all native MLA prewarms.
+
+    Calls use the caller's current stream, like the native prepared core. The
+    resource set owns one stream-ordered workspace, not concurrent MLA calls.
+    No module-global registry is changed; replacement by another owner is an
+    error at the next owned entry, while this strong reference keeps old graphs'
+    storage alive.
+    """
+
+    def __init__(self, core: Any, module: Any):
+        if core.dcp is not None or set(core.cores.values()) != {"tokenspeed"}:
+            raise ValueError("TokenSpeed preparation requires a DCP-off forced core")
+        self.core = core
+        # A lookup closure avoids treating arbitrary module globals as owned
+        # resources during the resource inventory's object traversal.
+        self._workspace_pool = lambda: module._WORKSPACE
+        self.workspace: torch.Tensor | None = None
+        self._prepared_geometry: tuple | None = None
+        self._workspace_identity: tuple | None = None
+
+    @property
+    def heads(self) -> int:
+        return self.core.heads
+
+    @property
+    def weights(self) -> tuple[torch.Tensor, ...]:
+        return self.core.weights
+
+    def _geometry(self) -> tuple:
+        core = self.core
+        return (
+            core.device,
+            core.heads,
+            core.max_seq,
+            core.dcp,
+            tuple(sorted(core.cores.items())),
+            tuple(sorted(core.pitches.items())),
+            tuple(sorted(core.kernels)),
+        )
+
+    @staticmethod
+    def _identity(workspace: torch.Tensor) -> tuple:
+        return (
+            workspace.device,
+            workspace.dtype,
+            tuple(workspace.shape),
+            tuple(workspace.stride()),
+            int(workspace.data_ptr()),
+            int(workspace.untyped_storage().data_ptr()),
+            int(workspace.untyped_storage().nbytes()),
+        )
+
+    def prepare_cache(self, cache: torch.Tensor) -> _PreparedTokenSpeedMla:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("TokenSpeed prewarm cannot run during capture")
+        if self.workspace is not None:
+            raise RuntimeError("TokenSpeed workspace is finalized; cannot reprepare")
+        self.core.prepare_cache(cache)
+        self._prepared_geometry = self._geometry()
+        return self
+
+    def finalize_workspace(self) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("TokenSpeed workspace cannot finalize during capture")
+        if self.workspace is not None:
+            self.check_workspace()
+            return self.workspace
+        if (
+            self._prepared_geometry is None
+            or self._geometry() != self._prepared_geometry
+        ):
+            raise RuntimeError(
+                "TokenSpeed shapes must be prewarmed before finalization"
+            )
+        workspace = self._workspace_pool().get((self.core.device, self.heads))
+        if (
+            not isinstance(workspace, torch.Tensor)
+            or workspace.device != self.core.device
+            or workspace.device.type != "cuda"
+            or workspace.dtype != torch.int8
+            or workspace.ndim != 1
+            or not workspace.is_contiguous()
+            or workspace.numel() == 0
+        ):
+            raise RuntimeError("TokenSpeed prewarm did not produce a valid workspace")
+        self.workspace = workspace
+        self._workspace_identity = self._identity(workspace)
+        return workspace
+
+    def check_workspace(self) -> None:
+        if self.workspace is None:
+            raise RuntimeError("TokenSpeed workspace must finalize before execution")
+        if (
+            self._workspace_pool().get((self.core.device, self.heads))
+            is not self.workspace
+            or self._identity(self.workspace) != self._workspace_identity
+            or self._geometry() != self._prepared_geometry
+        ):
+            raise RuntimeError("TokenSpeed prepared workspace or geometry changed")
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        self.check_workspace()
+        result = self.core.run(*args, **kwargs)
+        self.check_workspace()
+        return result
+
+
 @dataclass
 class PreparedAttention:
     layer_id: int
@@ -408,6 +583,7 @@ class PreparedAttention:
     output: Any
     cache: torch.Tensor | None = None
     caches: tuple[torch.Tensor, torch.Tensor] | None = None
+    intermediates: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -429,6 +605,12 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    dcp: Any | None = None
+    prefetch: Any | None = None
+    embedding: Any | None = None
+    tokens_per_request: int = 1
+    widths: tuple[int, ...] = ()
+    aux_capture_layers: tuple[int, ...] | None = None
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
@@ -454,6 +636,44 @@ class ResourceSet:
     def refresh_inventory(self) -> None:
         self.resource_inventory = _owned_resource_inventory(self, self.model)
         self.resource_digest = _pointer_free_digest(self.resource_inventory)
+
+    def prepare_aux_capture(self) -> None:
+        """Compile the configured pre-norm mixture taps before graph capture.
+
+        SGLang configures target taps after build but before preparation. The
+        next consumer owns each tap's mixture weights; the final consumer owns
+        a last-layer tap. No per-forward auxiliary storage is allocated here.
+        """
+        if self.tokens_per_request == 1:
+            return
+        configured = self.model.model.dspark_layers_to_capture
+        if configured is None:
+            raise ValueError("Kimi K3 DSPARK auxiliary capture was not configured")
+        taps = tuple(int(layer_id) for layer_id in configured)
+        if (
+            not taps
+            or tuple(sorted(set(taps))) != taps
+            or any(layer_id < 0 or layer_id >= len(self.layers) for layer_id in taps)
+        ):
+            raise ValueError(f"invalid Kimi K3 DSPARK auxiliary capture layers: {taps}")
+        if self.aux_capture_layers is not None:
+            if taps != self.aux_capture_layers:
+                raise RuntimeError("Kimi K3 DSPARK auxiliary capture layers changed")
+            return
+        consumers = [
+            self.final
+            if layer_id == len(self.layers) - 1
+            else self.before[layer_id + 1]
+            for layer_id in taps
+        ]
+        if any(consumer is None for consumer in consumers):
+            raise ValueError("Kimi K3 DSPARK tap has no next consumer")
+        for layer_id, consumer in zip(taps, consumers):
+            consumer.bind_aux(mixture=True)
+            self.compilation_inventory.append(
+                {"kind": "attn_res_aux", "layer_id": layer_id, "name": "mixture"}
+            )
+        self.aux_capture_layers = taps
 
     def _binding_candidate(self, hybrid: HybridPoolView) -> dict[str, Any]:
         full_ids = [int(v) for v in self.model.config.full_attention_layer_ids]
@@ -585,6 +805,54 @@ class ResourceSet:
                     },
                 )
             )
+            if self.tokens_per_request > 1:
+                if len(state.intermediate_conv_window) != 1:
+                    raise ValueError(
+                        f"layer {layer_id} needs one KDA intermediate convolution window"
+                    )
+                windows = state.intermediate_conv_window[0]
+                checkpoints = state.intermediate_ssm
+                if not isinstance(windows, torch.Tensor) or windows.ndim != 4:
+                    raise ValueError(f"layer {layer_id} KDA windows must have rank 4")
+                capacity, queries = map(int, windows.shape[:2])
+                if capacity <= 0 or queries < self.tokens_per_request:
+                    raise ValueError(
+                        f"layer {layer_id} KDA scratch cannot hold q{self.tokens_per_request}"
+                    )
+                for name, tensor, dtype, shape, stride in (
+                    (
+                        "kda_intermediate_conv",
+                        windows,
+                        torch.bfloat16,
+                        (capacity, queries, 3, 4608),
+                        (queries * 3 * 4608, 3 * 4608, 4608, 1),
+                    ),
+                    (
+                        "kda_intermediate_ssm",
+                        checkpoints,
+                        torch.float32,
+                        (capacity, queries, 12, 128, 128),
+                        (queries * 12 * 128 * 128, 12 * 128 * 128, 128 * 128, 128, 1),
+                    ),
+                ):
+                    _validate_pool_tensor(
+                        f"layer {layer_id} {name}",
+                        tensor,
+                        dtype=dtype,
+                        shape=shape,
+                        stride=stride,
+                        device=device,
+                    )
+                    local_identities[f"{name}.{layer_id}"] = int(tensor.data_ptr())
+                    local_layouts.append(
+                        {
+                            "kind": name,
+                            "layer_id": layer_id,
+                            "shape": list(tensor.shape),
+                            "stride": list(tensor.stride()),
+                            "dtype": str(tensor.dtype),
+                        }
+                    )
 
         binding = {
             # The live serving capacity may shrink after graph capture. The
@@ -592,6 +860,8 @@ class ResourceSet:
             "kv_reserved_capacity": reserved_capacity,
             "kv_post_capture_active": bool(hybrid.mla.post_capture_active),
             "kda_capacity": kda_capacity,
+            "tokens_per_request": self.tokens_per_request,
+            "aux_capture_layers": list(self.aux_capture_layers or ()),
             "page_size": page_size,
             "logical_dtype": str(hybrid.mla.logical_dtype),
             "storage_dtype": str(hybrid.mla.storage_dtype),
@@ -608,10 +878,38 @@ class ResourceSet:
         }
         return binding
 
+    def prepare_dcp_mla_caches(self, caches: dict[int, torch.Tensor]) -> None:
+        """Private MLA-only handoff, not a legacy or full-model pool binding."""
+        if self.dcp is None:
+            raise RuntimeError("DCP resources were not explicitly requested")
+        self.dcp.prepare_mla_caches(self.attention, caches)
+        workspace = self.dcp.workspace
+        self.workspaces["mla.dcp.tokenspeed.workspace"] = workspace
+        row = _tensor_row(
+            "workspace", "resources.workspaces.mla.dcp.tokenspeed.workspace", workspace
+        )
+        if not any(
+            item["data_ptr"] == row["data_ptr"] for item in self.resource_inventory
+        ):
+            self.resource_inventory.append(row)
+            self.resource_inventory.sort(key=lambda item: (item["kind"], item["name"]))
+        self.resource_digest = _pointer_free_digest(self.resource_inventory)
+        # Deliberately leave binding_fingerprint unset: no KDA/step binding exists
+        # in this resource-only checkpoint, and the full executor must refuse it.
+
     def bind(self, hybrid: HybridPoolView) -> None:
+        if self.dcp is not None:
+            raise RuntimeError("private DCP requires a separate native hybrid binding")
+        if self.tokens_per_request > 1 and self.aux_capture_layers is None:
+            raise RuntimeError(
+                "Kimi K3 DSPARK auxiliary taps must be prepared before binding"
+            )
         candidate = self._binding_candidate(hybrid)
         fingerprint = _digest(candidate)
         if self.binding_fingerprint is not None:
+            for provider in self.attention.values():
+                if isinstance(provider.core, _PreparedTokenSpeedMla):
+                    provider.core.check_workspace()
             if fingerprint != self.binding_fingerprint or candidate != self.binding:
                 raise RuntimeError("Kimi K3 megakernel pool binding changed")
             return
@@ -625,11 +923,50 @@ class ResourceSet:
             else:
                 state = hybrid.kda.state(layer_id)
                 caches = (state.conv[0], state.temporal)
-                provider.core.prepare_caches(caches)
+                if self.tokens_per_request > 1:
+                    intermediates = (
+                        state.intermediate_conv_window[0],
+                        state.intermediate_ssm,
+                    )
+                    provider.core.prepare_verify_caches(caches, intermediates)
+                    provider.intermediates = intermediates
+                else:
+                    provider.core.prepare_caches(caches)
                 provider.caches = caches
             self.compilation_inventory.append(
                 {"kind": "attention_core", "layer_id": layer_id, "name": provider.kind}
             )
+        tokenspeed = [
+            provider.core
+            for provider in self.attention.values()
+            if isinstance(provider.core, _PreparedTokenSpeedMla)
+        ]
+        if tokenspeed:
+            # Every layer and prepared shape has now warmed the module-global
+            # workspace. Retain its final maximum-size owner, never an earlier
+            # layer's buffer that a later warmup may have replaced.
+            workspace = tokenspeed[0].finalize_workspace()
+            for core in tokenspeed[1:]:
+                if core.finalize_workspace() is not workspace:
+                    raise RuntimeError(
+                        "TP8 MLA layers must share one TokenSpeed workspace"
+                    )
+            self.workspaces["mla.tokenspeed.workspace"] = workspace
+            # Native KV/KDA pools are borrowed by now. Do not re-walk providers
+            # after binding: register only this explicitly owned new storage.
+            row = _tensor_row(
+                "workspace", "resources.workspaces.mla.tokenspeed.workspace", workspace
+            )
+            if not any(
+                item["kind"] not in ("stream", "event")
+                and item["data_ptr"] == row["data_ptr"]
+                for item in self.resource_inventory
+            ):
+                self.resource_inventory.append(row)
+                self.resource_inventory.sort(
+                    key=lambda item: (item["kind"], item["name"])
+                )
+            self.resource_digest = _pointer_free_digest(self.resource_inventory)
         torch.cuda.synchronize()
         after = self._binding_candidate(hybrid)
         if after != candidate:
@@ -645,10 +982,48 @@ def build_resources(
     context_length: int,
     memory_before: dict[str, int],
     deadline_ns: int,
+    tokens_per_request: int = 1,
+    enable_prefetch: bool = False,
+    enable_embedding: bool = False,
+    widths: tuple[int, ...] | None = None,
+    mla_core: str = "trtllm",
+    dcp: DcpBuildOptions | None = None,
 ) -> ResourceSet:
-    """Build every frozen TP8/B1-B8/B16/B32/B64 provider after all-rank consensus."""
+    """Build TP8 resources before graph capture, without enabling a server mode.
 
+    Prefetch and specialized embedding default OFF; do not prepare their optional
+    resources unless requested. Omitted widths use the normal query-mode policy.
+    The default MLA core is TRTLLM. Explicit mla_core="tokenspeed" requires
+    tokenspeed-mla==2.0.2 and prewarming/finalizing its owned workspace; its
+    bounded q1/q6 evidence is at 8K, not arbitrary long contexts.
+
+    DCP requires both mla_core="tokenspeed" and typed DcpBuildOptions, with native
+    TP8/DCP8 groups already established. Supplying dcp alone is rejected. It does
+    not enable a registered spec or full-model binding: separate native framework
+    extensions and PreparedDcpHybrid/PreparedDcpVerify handoffs are required.
+    """
+
+    if type(enable_prefetch) is not bool:
+        raise ValueError("enable_prefetch must be a bool")
+    if type(enable_embedding) is not bool:
+        raise ValueError("enable_embedding must be a bool")
+    _validate_mla_core(mla_core)
+    batches = prepared_widths(tokens_per_request, widths)
+    max_seq_len = mla_max_seq_len(context_length, tokens_per_request)
     memory_before = dict(memory_before)
+    dcp_owner = None
+    if dcp is not None:
+        from .dcp_resources import DcpResources, NativeDcpOwner, PreparedDcpMla
+
+        dcp_owner = NativeDcpOwner.capture(
+            dcp,
+            device=next(model.parameters()).device,
+            tokens_per_request=tokens_per_request,
+            deadline_ns=deadline_ns,
+            widths=batches,
+            max_context=max_seq_len,
+            mla_core=mla_core,
+        )
     origins: dict[str, str] = {}
     projection_module = _module("gemm.projection", origins)
     mla_module = _module("mla.prepared", origins)
@@ -694,6 +1069,18 @@ def build_resources(
             "Kimi layer modules disagree with the configured attention split"
         )
 
+    embedding = None
+    if enable_embedding:
+        from .embedding import prepare_embedding
+
+        embedding = prepare_embedding(
+            backbone.embed_tokens,
+            tp_group=parallel.tp_group,
+            load_prepared=lambda: (
+                _module("common.embedding", origins).PreparedEmbedding
+            ),
+        )
+
     mailbox = oproj_module.OprojMailbox(*owner)
     oproj_twoshot = twoshot_module.TwoShot(*owner)
     front_box = oproj_module.OprojMailbox(*owner, (1, 64, 3584 + 2 * 896))
@@ -706,7 +1093,19 @@ def build_resources(
         "small_batch": small_box,
         "moe_tail": tail_box,
     }
-    moe_state = prepared_moe_module.MoEScratch(tp, device, _BATCHES)
+    dcp_resources = None
+    if dcp_owner is not None:
+        dcp_resources = DcpResources(
+            dcp_owner,
+            dcp,
+            _module("mla.dcp", origins),
+            widths=batches,
+            max_context=max_seq_len,
+            deadline_ns=deadline_ns,
+            tokens_per_request=tokens_per_request,
+        )
+        boxes["mla.dcp"] = dcp_resources.box
+    moe_state = prepared_moe_module.MoEScratch(tp, device, batches)
     # Materialize the state-owned event handles before resource inventory.  The
     # prepared MoE records them again at each execution boundary, so completing
     # an initialization record on its own stream does not alter runtime order.
@@ -741,6 +1140,29 @@ def build_resources(
         ),
         "moe": moe_state,
     }
+    if embedding is not None:
+        scratch["embedding.out"] = torch.empty(
+            (_MAX_BATCH, 7168), dtype=torch.bfloat16, device=device
+        )
+    if tokens_per_request > 1:
+        # Native graph padding uses physical KDA slots <= 0, but MLA requires
+        # zero lengths and negative write slots. Own the translated metadata
+        # before inventory/capture; never modify the framework's sealed views.
+        scratch.update(
+            {
+                "mla.verify_inactive": torch.empty(
+                    (_MAX_BATCH // tokens_per_request,), dtype=torch.bool, device=device
+                ),
+                "mla.verify_lengths": torch.empty(
+                    (_MAX_BATCH // tokens_per_request,),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                "mla.verify_slots": torch.empty(
+                    (_MAX_BATCH,), dtype=torch.int64, device=device
+                ),
+            }
+        )
     # Explicitly own the side-stream/event lifecycle used by the future executor.
     # Recording the event materializes its CUDA handle without entering a model
     # forward path.
@@ -758,6 +1180,8 @@ def build_resources(
     feed_forward: dict[int, Any] = {}
     moe_front_weights: dict[int, torch.Tensor] = {}
     compilation: list[dict[str, Any]] = []
+    if embedding is not None:
+        compilation.append({"kind": "embedding", "name": "prepared"})
 
     for layer in layers:
         layer_id = int(layer.layer_idx)
@@ -773,29 +1197,30 @@ def build_resources(
                 )
             projection = projection_module.PreparedProjection(
                 projection_weight,
-                {
-                    batch: (
-                        (64, 64, 2, 5)
-                        if batch == 64
-                        else (64, 32, 2, 8)
-                        if batch == 32
-                        else (64, 16, 2, 10)
-                        if batch == 16
-                        else (64, 8, 4, 8)
-                    )
-                    for batch in _BATCHES
-                },
+                _projection_policies(3648, batches),
             ).prepare()
             core = mla_module.PreparedMla(
                 proxy,
-                {batch: 3648 for batch in _BATCHES},
+                {batch: 3648 for batch in batches},
                 scratch["mla.query"],
-                max_context=int(context_length),
-                core="trtllm",
-                dcp=None,
-                queries=(1,),
+                max_context=max_seq_len,
+                core=mla_core,
+                dcp=None if dcp_resources is None else dcp_resources.box,
+                queries=(tokens_per_request,),
+                **(
+                    {}
+                    if dcp_resources is None
+                    else {
+                        "parity": full_ids.index(layer_id) % 2,
+                        "deadline_ns": deadline_ns,
+                    }
+                ),
             )
-            if not workspaces:
+            if dcp_resources is not None:
+                core = PreparedDcpMla(core, dcp_resources)
+            elif mla_core == "tokenspeed":
+                core = _PreparedTokenSpeedMla(core, _module("mla.dcp", origins))
+            elif not workspaces:
                 workspace, counter = _prepare_mla_workspace(
                     mla_module, device, int(core.heads)
                 )
@@ -814,28 +1239,11 @@ def build_resources(
                 )
             projection = projection_module.PreparedProjection(
                 projection_weight,
-                {
-                    batch: (
-                        (64, 64, 1, 6)
-                        if batch == 64
-                        else (128, 32, 2, 5)
-                        if batch == 32
-                        else (128, 16, 2, 6)
-                        if batch == 16
-                        else (128, 8, 2, 6)
-                    )
-                    for batch in _BATCHES
-                },
+                _projection_policies(6288, batches),
             ).prepare()
             core = kda_module.PreparedKda(
                 proxy,
-                {
-                    batch: (
-                        6288,
-                        0 if batch in (16, 32, 64) else 1 if batch == 1 else 2,
-                    )
-                    for batch in _BATCHES
-                },
+                _kda_policy(tokens_per_request, batches),
                 False,
             )
             kind = "kda"
@@ -851,7 +1259,7 @@ def build_resources(
         output = oproj_module.PreparedOproj(
             layer,
             mailbox,
-            _BATCHES,
+            batches,
             is_mla,
             front,
             oproj_twoshot,
@@ -870,7 +1278,7 @@ def build_resources(
         if not layer._is_moe_layer:
             feed_forward[layer_id] = dense_module.PreparedDenseMLP(
                 layer.mlp,
-                _BATCHES,
+                batches,
                 reduce=tensor_model_parallel_all_reduce,
             )
             compilation.append(
@@ -898,7 +1306,7 @@ def build_resources(
             op,
             layer.mlp.routed_expert_norm.weight,
             layer.mlp.routed_expert_up_proj.weight,
-            _BATCHES,
+            batches,
             (tail_box, ordinal, len(moe_layers)),
             deadline_ns=deadline_ns,
         )
@@ -922,25 +1330,27 @@ def build_resources(
             packed_front,
             front_box,
             moe_state.front,
-            _BATCHES,
+            batches,
             beta,
             linear_beta,
             plan=moe_state.plan,
             counters=moe_state.shared,
-            q=1,
+            q=tokens_per_request,
             deadline_ns=deadline_ns,
         )
-        chain = chain_module.SmallBatchChain(
-            small_box,
-            moe,
-            experts,
-            tail,
-            layer_id,
-            beta,
-            linear_beta,
-            None,
-            deadline_ns=deadline_ns,
-        )
+        chain = None
+        if 1 in batches:
+            chain = chain_module.SmallBatchChain(
+                small_box,
+                moe,
+                experts,
+                tail,
+                layer_id,
+                beta,
+                linear_beta,
+                None,
+                deadline_ns=deadline_ns,
+            )
         prepared_moe = prepared_moe_module.PreparedMoE(
             generic_front,
             experts,
@@ -960,7 +1370,11 @@ def build_resources(
                     "name": "b1_b8_b16_b32_b64",
                 },
                 {"kind": "moe_tail", "layer_id": layer_id, "name": "b1_b8_b16_b32_b64"},
-                {"kind": "moe_small_batch", "layer_id": layer_id, "name": "b1"},
+                *(
+                    ({"kind": "moe_small_batch", "layer_id": layer_id, "name": "b1"},)
+                    if chain is not None
+                    else ()
+                ),
                 {
                     "kind": "moe_prepared",
                     "layer_id": layer_id,
@@ -993,6 +1407,23 @@ def build_resources(
         consumer.bind_ring(tail_box.out.buffer)
         fused_before[int(layer.layer_idx)] = consumer
 
+    prefetch = None
+    if enable_prefetch:
+        from .weight_prefetch import PrefetchController
+
+        _module("common.prefetch", origins)
+        # Final coalesced attention and packed-front storage must precede range
+        # preparation. One retained controller owns all graph stream/event handles.
+        prefetch = PrefetchController(
+            attention, layers, moe_front_weights, device=device, batches=batches
+        )
+        for layer in moe_layers:
+            prepared = feed_forward[int(layer.layer_idx)]
+            prepared.prefetch = prefetch
+            if prepared.small_batch is not None:
+                prepared.small_batch.prefetch = prefetch
+        compilation.append({"kind": "weight_prefetch", "name": "tp8"})
+
     torch.cuda.synchronize()
     resources = ResourceSet(
         model=model,
@@ -1012,6 +1443,11 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        dcp=dcp_resources,
+        prefetch=prefetch,
+        embedding=embedding,
+        tokens_per_request=tokens_per_request,
+        widths=batches,
     )
     resources.refresh_inventory()
     return resources

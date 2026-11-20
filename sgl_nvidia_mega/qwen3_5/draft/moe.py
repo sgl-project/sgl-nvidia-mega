@@ -151,11 +151,9 @@ class DraftMoe:
                 )
             )
         if reason:
-            logger.warning(
-                "Single-launch draft MoE off for layer %d (%s); SGLang's MoE runs.",
-                mlp.layer_id,
-                reason,
-            )
+            from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
+
+            unavailable_slots("draft_moe", reason)
             return None
         logger.info("Single-launch draft MoE active for layer %d.", mlp.layer_id)
         return cls(mlp, torch.device("cuda", device_index))

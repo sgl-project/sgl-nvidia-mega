@@ -105,11 +105,11 @@ class Parity:
         if torch.cuda.is_current_stream_capturing():
             counts = self.counters[step.rows]
             counts[0:1].add_(1)
-            valid = (
-                None
-                if slots is None or step.rows % slots.numel()
-                else valid_rows(slots, step.rows)
-            )
+            valid = None
+            if slots is not None and (
+                slots.numel() == 0 or step.rows % slots.numel() == 0
+            ):
+                valid = valid_rows(slots, step.rows)
             for i, (a, b) in enumerate(pairs, start=1):
                 counts[i : i + 1].add_(differing(a, b))
                 counts[i + 2 : i + 3].add_(0 if a is None else a.numel())
@@ -232,16 +232,19 @@ def distance(logits_a, logits_b, hidden_a, hidden_b):
     logits."""
     if logits_a is None or logits_b is None:
         return None
+    hidden = (
+        torch.zeros((), device=logits_a.device)
+        if hidden_a is None or hidden_a.numel() == 0
+        else (hidden_a.float() - hidden_b.float()).abs().max()
+    )
+    if logits_a.numel() == 0:
+        zero = torch.zeros((), device=logits_a.device)
+        return torch.stack([zero, zero, zero, zero, hidden]).double()
     top = logits_a.argmax(-1, keepdim=True)
     dlp = (
         torch.log_softmax(logits_b.float(), -1).gather(-1, top)
         - torch.log_softmax(logits_a.float(), -1).gather(-1, top)
     ).abs()
-    hidden = (
-        torch.zeros((), device=logits_a.device)
-        if hidden_a is None
-        else (hidden_a.float() - hidden_b.float()).abs().max()
-    )
     # no host-to-device copy: this also runs inside graph capture
     return torch.stack(
         [
@@ -268,6 +271,8 @@ def _distance_text(apart) -> str:
 def valid_rows(slots: torch.Tensor, rows: int) -> torch.Tensor:
     """[rows] bool: the rows of requests with a mamba slot (not the pad slot), for a step
     of ``slots.numel()`` requests of equal rows."""
+    if slots.numel() == 0:
+        return torch.zeros(rows, dtype=torch.bool, device=slots.device)
     return (slots >= 0).repeat_interleave(rows // slots.numel())
 
 
@@ -284,7 +289,7 @@ def differing(a, b, valid=None):
         )
     bits = _BITS[a.element_size()]
     differ = a.contiguous().view(bits) != b.contiguous().view(bits)
-    if valid is not None:
+    if valid is not None and differ.numel() > 0:
         differ = differ & valid.view(-1, *([1] * (differ.dim() - 1)))
     return differ.sum()
 
@@ -296,4 +301,6 @@ def _clone(t):
 def _max_abs(a, b) -> str:
     if a is None:
         return "n/a"
+    if a.numel() == 0:
+        return "0"
     return f"{(a.float() - b.float()).abs().max().item():.3g}"

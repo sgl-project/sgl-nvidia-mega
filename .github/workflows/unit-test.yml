@@ -14,10 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Includes the hybrid preparation/views API from sgl-project/sglang#45406.
+  # Includes the hybrid preparation/views API from sgl-project/sglang#45406 and the
+  # speculative runtime hooks from sgl-project/sglang#47201.
   # Pin source until a published nightly contains this interface; updating the
   # pin is a normal PR and must pass the static mirror/contract tests.
-  SGLANG_COMMIT: aa3e34aaebf880d72482cea74dbbfef54da728e2
+  SGLANG_COMMIT: cf6133a16cd7b705077fa4e05366d3a2ce5e8e72
 
 jobs:
   unit:

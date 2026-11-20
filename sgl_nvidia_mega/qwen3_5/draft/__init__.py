@@ -3,9 +3,9 @@
 """Qwen3.5's MTP draft on SM103 (GB300): the megakernel draft spec and its built
 object.
 
-The draft's forward stays SGLang's (the built object covers no step width). Requested
-in ``SGLANG_NVIDIA_MEGAKERNEL_SLOTS``, the built object offers SGLang's EAGLE draft
-entries for one request (bs 1), which run inside SGLang's draft graphs:
+The draft's forward stays SGLang's (the built object covers no step width). Selected by
+the Qwen3.5 runtime policy, the built object offers SGLang's EAGLE draft entries, which
+run inside SGLang's draft graphs:
 
 - ``draft_loop`` (with ``begin_draft_round``): the whole draft loop of a served draft
   graph (``loop``);
@@ -70,6 +70,11 @@ SGLANG_READS = {
         "bind_extend_graphs",
         "begin_draft_round",
     ),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"attn_tp_size"',
+        '"moe_ep_size"',
+    ),
 }
 
 ARCHITECTURE = "Qwen3_5ForCausalLMMTP"
@@ -85,6 +90,7 @@ def numerics(slots: frozenset) -> Numerics:
         "draft_q1",
         "draft_xchg",
         "draft_hop",
+        "draft_fin",
         "draft_front",
         "draft_skv2",
     }:
@@ -98,6 +104,11 @@ SERVED_BS = 1
 # draft steps on 2.2's two-row kernels (the split fc, the hop's all-reduce points, the
 # two-token MoE), the rest SGLang's ops
 LOOP_BS = (1, 2)
+# with slot draft_multi, the draft graphs of two or more requests (every batch size up to
+# 128, as plan.REQUESTS) whose top-1 is the sharded exchange in place of the logits
+# all-gather; the steps of 3 to 128 run SGLang's ops but for the split fc (up to its widest
+# batch)
+MULTI_LOOP_BS = tuple(range(2, 129))
 
 
 class MtpDraft:
@@ -106,6 +117,7 @@ class MtpDraft:
 
     widths: tuple[int, ...] = ()
     draft_sampler = None  # SGLang's draft proposal
+    speculative_runtime_hooks = None
 
     def __init__(
         self,
@@ -138,15 +150,18 @@ class MtpDraft:
         # (2.2 routes the draft steps' q1 decode by KV length)
         self.graph_variants = None
         if "draft_loop" in slots and "draft_q1" in slots:
+            from sgl_nvidia_mega.qwen3_5.attention import route
             from sgl_nvidia_mega.qwen3_5.draft.attention import Q1Variants
 
-            self.graph_variants = {"draft_loop": Q1Variants()}
+            self.graph_variants = {
+                "draft_loop": Q1Variants(cp_min_length=route.cp_min_length("draft"))
+            }
         if "draft_extend" in slots and "draft_skv2" in slots:
             from sgl_nvidia_mega.qwen3_5.attention import route
 
             self.graph_variants = {
                 **(self.graph_variants or {}),
-                "draft_extend": route.EXTEND,
+                "draft_extend": route.extend_variants(),
             }
 
     def summary(self) -> str:
@@ -176,7 +191,10 @@ class MtpDraft:
     def _draft_loop(self, *, num_steps: int, max_bs: int, draft_tokens):
         from sgl_nvidia_mega.qwen3_5.draft.loop import DraftLoop
 
-        self._loop = DraftLoop(self._parts(), num_steps=num_steps)
+        parts = self._parts()
+        if parts is None:
+            return lambda bs: None
+        self._loop = DraftLoop(parts, num_steps=num_steps)
         return self._loop.step_for
 
     def _begin_draft_round(self, io) -> None:
@@ -188,18 +206,30 @@ class MtpDraft:
     ):
         from sgl_nvidia_mega.qwen3_5.draft.extend import DraftExtend
 
-        extend = DraftExtend(self._parts(), tokens_per_request=tokens_per_request)
+        parts = self._parts()
+        if parts is None:
+            return lambda bs: None
+        extend = DraftExtend(parts, tokens_per_request=tokens_per_request)
         return extend.step_for
 
 
 def _requested() -> frozenset:
-    """The draft's entries and slots in SGLANG_NVIDIA_MEGAKERNEL_SLOTS."""
+    """The draft entries and slots selected by the Qwen3.5 runtime policy."""
     from sgl_nvidia_mega.qwen3_5 import runtime
 
     return runtime.SLOTS & (set(runtime.DRAFT_ENTRIES) | set(runtime.DRAFT_SLOTS))
 
 
 def _build(model, hf_config, ctx) -> MtpDraft:
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5 import runtime
+
+    parallel = get_parallel()
+    runtime.apply_expert_parallel(parallel.moe_ep_size)
+    runtime.apply_cp_lite_topology(parallel.attn_tp_size)
+    runtime.apply_topology(parallel)
+    runtime.build_cp_lite(ctx.binding)
     return MtpDraft(
         model,
         binding=ctx.binding,
@@ -218,7 +248,9 @@ SPEC = MegakernelSpec(
         dtypes=target.REQUIREMENTS.dtypes,
         decode_graph_backends=target.REQUIREMENTS.decode_graph_backends,
     ),
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # under expert parallelism the draft MoE and the slots on it stay SGLang's
+    # (runtime.EP_STOCK_SLOTS)
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.EXPERT_PARALLEL}),
     numerics=numerics(_requested()),
     # the draft's forward stays SGLang's: no width is built
     max_rows=0,

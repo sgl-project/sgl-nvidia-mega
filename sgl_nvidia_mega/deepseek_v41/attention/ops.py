@@ -55,7 +55,7 @@ SGLANG_READS = {
 
 def normalize_q_lora(attn, q):
     """``MQALayer._normalize_q_lora``: the BF16 normed row (the indexer's) and wq_b's
-    input, quantized with SGLang's fused norm + MXFP8 epilogue at 1-8 rows."""
+    input, quantized with SGLang's fused norm + MXFP8 epilogue."""
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
@@ -68,7 +68,7 @@ def normalize_q_lora(attn, q):
         attn.is_dsv41
         and q.dtype == attn.q_norm.weight.dtype == torch.bfloat16
         and q.ndim == 2
-        and 0 < q.shape[0] <= 8
+        and q.shape[0] > 0
         and q.shape[1] == 1280
         and q.stride(1) == 1
         and getattr(method, "mxfp8_dense_backend", None)

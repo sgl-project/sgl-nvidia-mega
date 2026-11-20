@@ -15,6 +15,17 @@ from msgspec.structs import replace
 
 try:
     from sglang.kernels.plugin_kernels.nvidia.spec import BuildContext
+except ModuleNotFoundError as error:
+    if error.name not in (
+        "sglang.kernels",
+        "sglang.kernels.plugin_kernels",
+        "sglang.kernels.plugin_kernels.nvidia",
+        "sglang.kernels.plugin_kernels.nvidia.spec",
+    ):
+        raise
+    from sglang.srt.megakernels.spec import BuildContext
+
+try:
     from sglang.srt.kernel_plugins.nvidia.binding import (
         HybridPoolView,
         HybridStepView,
@@ -24,7 +35,13 @@ try:
         MlaPoolView,
         MlaStepView,
     )
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+except ModuleNotFoundError as error:
+    if error.name not in (
+        "sglang.srt.kernel_plugins",
+        "sglang.srt.kernel_plugins.nvidia",
+        "sglang.srt.kernel_plugins.nvidia.binding",
+    ):
+        raise
     from sglang.srt.megakernels.binding import (
         HybridPoolView,
         HybridStepView,
@@ -34,7 +51,6 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         MlaPoolView,
         MlaStepView,
     )
-    from sglang.srt.megakernels.spec import BuildContext
 
 
 class _ContractTensor(torch.Tensor):
@@ -298,7 +314,7 @@ class TestKimiK3RuntimeCompatibility(unittest.TestCase):
 
         def build(*args, **kwargs):
             events.append("build")
-            return object()
+            return SimpleNamespace(tokens_per_request=1)
 
         with (
             patch.object(

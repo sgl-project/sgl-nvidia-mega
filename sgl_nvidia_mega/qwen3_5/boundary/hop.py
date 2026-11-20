@@ -29,6 +29,8 @@ from typing import Optional
 import msgspec
 import torch
 
+from sgl_nvidia_mega.qwen3_5.runtime import slot_failure
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -140,6 +142,7 @@ class Bound(msgspec.Struct, frozen=True):
     """The boundary package's build result (``st.bound["boundary"]``)."""
 
     hop: Optional[object] = None  # sm103.hop.Hop for every covered width, or None
+    mid: bool = False  # its one-shot mailbox serves past 15 rows (slot hop_mid)
     reason: str = ""  # why there is no hop
 
 
@@ -157,8 +160,12 @@ def build(model, ctx) -> Bound:
 
     if "hop" not in runtime.SLOTS:
         return Bound(reason="slot off")
-    # the widest step the hop covers: its mailbox's rows
-    rows = plan.widest(ctx.widths, plan.HOP_MAX_ROWS)
+    # The widest step the one-shot mailbox covers. hop_mid extends it through four
+    # requests; without the opt-in, the shipped bitwise bound stays unchanged.
+    max_rows = (
+        plan.HOP_MID_MAX_ROWS if "hop_mid" in runtime.SLOTS else plan.HOP_MAX_ROWS
+    )
+    rows = plan.widest(ctx.widths, max_rows)
     if not rows:
         return Bound(reason=f"no width of {list(ctx.widths)} within its rows")
     m = model.model
@@ -168,16 +175,21 @@ def build(model, ctx) -> Bound:
     megakernel_agree(reasons, what="hop refusals")
     if reasons:
         return Bound(reason="; ".join(reasons))
-    hop = Hop(
-        max_m=rows,
-        eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
-        group=group.device_group,
-        device=torch.device("cuda", torch.cuda.current_device()),
-        deadline_s=ctx.deadline_s,
-    )
+    try:
+        hop = Hop(
+            max_m=rows,
+            eps=m.flashinfer_mnnvl_cutedsl_fusion.rms_epsilon,
+            group=group.device_group,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            deadline_s=ctx.deadline_s,
+            route_lin="route_lin" in runtime.SLOTS,
+        )
+    except runtime.SlotUnavailable as exc:
+        runtime.unavailable_slots(exc.slots, exc.reason)
+        return Bound(reason=exc.reason)
     global _ACTIVE
     _ACTIVE = hop
-    return Bound(hop=hop)
+    return Bound(hop=hop, mid=rows > plan.HOP_MAX_ROWS)
 
 
 def active() -> Optional[object]:
@@ -311,11 +323,19 @@ def layer_input(hop, layer, hidden, st):
         and plan.fusions._finalize_eligible(plan, st.fb, pending.owed.m)
     ):
         return None
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
     owed, residual = stream.input(hidden)
-    norm, residual = _finalize(
-        hop, "layer input", owed, residual, fused_norm_gamma(plan.norm)
+    scale = lowm.layer_input_fp8_scale(layer, st, owed.m)
+    norm, residual, *fp8 = _finalize(
+        hop, "layer input", owed, residual, fused_norm_gamma(plan.norm), scale
     )
+    if st.slots.route_lin:
+        # Slot route_lin: the layer input read by this rank's router partial.
+        st.scratch["rlin.h0"] = (layer.layer_id, residual)
     stream.write(residual)
+    if fp8:
+        lowm.stash_fp8(st, norm, fp8[0])
     return norm
 
 
@@ -360,11 +380,40 @@ def moe_input(hop, layer, hidden, st):
         and takes_moe_input(hop, layer, st, rows)
     ):
         return None
+    from sgl_nvidia_mega.qwen3_5 import lowm
+
     _engage("MoE input", rows)
-    norm, residual = hop.all_reduce_residual_rms_norm(
-        local_contribution=part, residual=residual, gamma=fused_norm_gamma(plan.norm)
-    )
+    scale = lowm.moe_input_fp8_scale(layer, st)
+    if st.slots.route_lin and hop._pushed_rl:
+        # Slot route_lin: the mixer pushed its router partial too; this hop also gives
+        # the MoE its logits and NVFP4 input (moe/route.py routed_lin).
+        lid, h0 = st.scratch.get("rlin.h0", (None, None))
+        if lid != layer.layer_id or h0 is None or h0.data_ptr() != residual.data_ptr():
+            raise RuntimeError(
+                slot_failure(
+                    "route_lin",
+                    f"layer {layer.layer_id}'s residual is not the one its router partials read",
+                )
+            )
+        _engage("MoE input + router (route-lin)", rows)
+        (norm, residual, *fp8), rl = hop.all_reduce_residual_rms_norm_rl(
+            local_contribution=part,
+            residual=residual,
+            gamma=fused_norm_gamma(plan.norm),
+            global_scale=layer.mlp.experts.w13_input_scale_quant.reshape(1),
+            **({} if scale is None else {"fp8_scale": scale}),
+        )
+        st.scratch["rlin.moe"] = (layer.layer_id, *rl)
+    else:
+        norm, residual, *fp8 = hop.all_reduce_residual_rms_norm(
+            local_contribution=part,
+            residual=residual,
+            gamma=fused_norm_gamma(plan.norm),
+            **({} if scale is None else {"fp8_scale": scale}),
+        )
     stream.write(residual)
+    if fp8:
+        lowm.stash_fp8(st, norm, fp8[0])
     return norm
 
 
@@ -412,7 +461,7 @@ def _takes(hop, owed) -> bool:
     )
 
 
-def _finalize(hop, point, owed, residual, gamma):
+def _finalize(hop, point, owed, residual, gamma, fp8_scale=None):
     _engage(point, owed.m)
     return hop.moe_finalize_all_reduce_rms_norm(
         routed_output=owed.routed_output,
@@ -421,6 +470,7 @@ def _finalize(hop, point, owed, residual, gamma):
         gated_shared_output=owed.gated_shared_output,
         residual=residual,
         gamma=gamma,
+        **({} if fp8_scale is None else {"fp8_scale": fp8_scale}),
     )
 
 

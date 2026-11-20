@@ -11,8 +11,14 @@ A module whose stock step mirrors an SGLang function lists it in ``SGLANG_MIRROR
 with the digest of its code, so a changed branch fails here too. A file that moved
 between SGLang versions is named newest first, ``"new.py|old.py"``; the first one
 present is checked. A read name such as "replication|layout" accepts either field.
+An explicitly guarded opt-in extension uses ``SGLANG_OPTIONAL_READS``: its
+file may be absent, but all declared names must match when it is installed.
+The feature's tests must cover rejection when its extension is unavailable.
 The checks are static (AST and tokens): no package module is
-imported. Run them against every supported SGLang and nightly against main.
+imported. Run them against every supported SGLang and nightly against main. The
+GLM-5.3 package reads SGLang's megakernel DSA binding view, and its draft spec
+SGLang's draft capture check marker; against an SGLang without them, those reads and
+pins are skipped, naming each.
 """
 
 import ast
@@ -74,11 +80,11 @@ def _provided(path: Path) -> frozenset:
     return frozenset(names)
 
 
-def _declared(path: Path) -> dict:
-    """The module's ``SGLANG_READS``, or {} without one."""
+def _declared(path: Path, kind: str = "SGLANG_READS") -> dict:
+    """The module's named source contract, or {} without one."""
     for node in _tree(path).body:
         if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "SGLANG_READS" for t in node.targets
+            isinstance(t, ast.Name) and t.id == kind for t in node.targets
         ):
             return ast.literal_eval(node.value)
     return {}
@@ -95,7 +101,9 @@ def _sglang_imports(path: Path) -> set:
 
 
 READERS = [
-    p for p in sorted(PACKAGE.rglob("*.py")) if _declared(p) or _sglang_imports(p)
+    p
+    for p in sorted(PACKAGE.rglob("*.py"))
+    if _declared(p) or _declared(p, "SGLANG_OPTIONAL_READS") or _sglang_imports(p)
 ]
 
 
@@ -105,18 +113,38 @@ def _id(path: Path) -> str:
 
 @pytest.mark.parametrize("path", READERS, ids=_id)
 def test_every_sglang_import_is_declared(path):
-    declared = {n for names in _declared(path).values() for n in names}
+    contracts = _declared(path) | _declared(path, "SGLANG_OPTIONAL_READS")
+    declared = {n for names in contracts.values() for n in names}
     undeclared = _sglang_imports(path) - declared
     assert not undeclared, f"{_id(path)}: declare {sorted(undeclared)} in SGLANG_READS"
 
 
 @pytest.mark.parametrize("path", READERS, ids=_id)
 def test_sglang_provides_what_the_plugin_reads(path):
-    missing = []
-    for pattern, names in _declared(path).items():
+    if _id(path).startswith(K31_PACKAGE) and not _has_k31_host():
+        pytest.skip(f"{NO_K31_HOST}: {_id(path)}")
+    missing, unchecked = [], []
+    required = _declared(path)
+    optional = _declared(path, "SGLANG_OPTIONAL_READS")
+    assert not required.keys() & optional.keys(), (
+        "contract cannot be both required and optional"
+    )
+    for pattern, names in (required | optional).items():
         files = _files(pattern)
+        if not files and pattern in optional:
+            continue
         assert files, f"{_id(path)}: no file matches any alternative in {pattern!r}"
         provided = frozenset().union(*map(_provided, files))
+        skipped = []
+        if files == _files(BINDING) and not _has_dsa_view():
+            skipped = [n for n in names if n.split("(", 1)[0] in DSA_VIEW_NAMES]
+            reason = NO_DSA_VIEW
+        if files == _files(DRAFT_CHECK) and not _has_draft_check():
+            skipped = [n for n in names if n in DRAFT_CHECK_NAMES]
+            reason = NO_DRAFT_CHECK
+        if skipped:
+            unchecked.append(f"{reason}: {_id(path)} reads {sorted(skipped)}")
+            names = [n for n in names if n not in skipped]
         missing += [
             f"{pattern}: {n}"
             for n in names
@@ -126,6 +154,8 @@ def test_sglang_provides_what_the_plugin_reads(path):
         f"SGLang no longer provides what {_id(path)} reads; repair it and its "
         "SGLANG_READS:\n  " + "\n  ".join(missing)
     )
+    if unchecked:
+        pytest.skip("; ".join(unchecked))
 
 
 # What SGLang's binding file tolerates the megakernel still calling, writing and
@@ -154,7 +184,77 @@ PINNED_TOLERATED = {
         "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph)",
         "MegakernelBinding.engram_host_table",
     ),
+    "TOLERATED_DSA_CALLABLES": (
+        "KvPoolView.set_mla_kv_buffer",
+        "DsaView.indexer_metadata",
+    ),
+    "TOLERATED_DSA_WRITES": (
+        "KvPoolView.get_key_buffer",
+        "KvPoolView.get_index_k_with_scale_buffer",
+    ),
 }
+# What SGLang's megakernel DSA binding view adds to binding.py (the DSA view and the
+# MLA pool members): an SGLang without it skips these reads and pins
+DSA_VIEW_PINS = ("TOLERATED_DSA_CALLABLES", "TOLERATED_DSA_WRITES")
+DSA_VIEW_NAMES = frozenset(
+    {
+        "dsa",
+        "DsaView",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "kv_cache_dim",
+        "physical_page_size",
+        "decode_impl",
+        "use_mha",
+        "kv_cache_dtype",
+        "use_fused_topk",
+        "topk_backend",
+        "dcp_size",
+        "index_kpool",
+        "hisparse",
+        "workspace_buffer",
+        "multi_ctas_kv_counter_buffer",
+        "indexer_metadata",
+        "get_key_buffer",
+        "get_index_k_with_scale_buffer",
+        "index_page_size",
+        "set_mla_kv_buffer",
+    }
+)
+NO_DSA_VIEW = "this SGLang has no megakernel DSA binding view (ForwardView.dsa)"
+# The EAGLE draft runners' capture check marker in spec.py
+DRAFT_CHECK, DRAFT_CHECK_NAMES = (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py",
+    ("EAGLE_DRAFT_CAPTURE_CHECK",),
+)
+NO_DRAFT_CHECK = "this SGLang's EAGLE draft graph runners run no draft capture check"
+
+
+# The Kimi K3.1 megakernel reads SGLang's K3.1 host bindings (sgl-project/sglang#48414);
+# against an SGLang without them its spec refuses every configuration, and its reads
+# are skipped here, naming each file.
+K31_PACKAGE = "sgl_nvidia_mega/kimi_k31/"
+K31_HOST = "srt/kernel_plugins/nvidia/kimi_k31_verify_binding.py"
+NO_K31_HOST = "this SGLang has no Kimi K3.1 megakernel host bindings"
+
+
+def _has_k31_host() -> bool:
+    return bool(_files(K31_HOST))
+
+
+def _has_draft_check() -> bool:
+    return DRAFT_CHECK_NAMES[0] in _provided(_files(DRAFT_CHECK)[0])
+
+
+def _has_dsa_view() -> bool:
+    return any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == DSA_VIEW_PINS[0] for t in node.targets
+        )
+        for node in _tree(_files(BINDING)[0]).body
+    )
 
 
 def _binding_tuple(name: str) -> tuple:
@@ -168,30 +268,49 @@ def _binding_tuple(name: str) -> tuple:
 
 @pytest.mark.parametrize("name", sorted(PINNED_TOLERATED))
 def test_the_binding_tolerates_exactly_the_pinned_sglang_code(name):
+    if name in DSA_VIEW_PINS and not _has_dsa_view():
+        pytest.skip(NO_DSA_VIEW)
     assert _binding_tuple(name) == PINNED_TOLERATED[name]
 
 
+def _binding_functions() -> frozenset:
+    """The public functions of SGLang's binding file: its megakernel API (in
+    guards.py and runtime.py before sgl-project/sglang#45389), not view members."""
+    return frozenset(
+        node.name
+        for node in _tree(_files(BINDING)[0]).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    )
+
+
 def test_every_binding_callable_the_plugin_reads_is_tolerated():
-    """A ForwardView / KvPoolView callable a module declares must be on SGLang's
-    tolerated list (the data fields and the pool's own getters need not be)."""
+    """A ForwardView / KvPoolView / DsaView callable a module declares must be on
+    SGLang's tolerated lists (the data fields, the pool's own getters and the
+    binding file's public functions need not be)."""
     callables = {
         name.split(".", 1)[1]
-        for name in PINNED_TOLERATED["TOLERATED_CALLABLES"]
-        if name.startswith(("ForwardView.", "KdaStepView.", "KvPoolView."))
+        for key in ("TOLERATED_CALLABLES", "TOLERATED_DSA_CALLABLES")
+        for name in PINNED_TOLERATED[key]
+        if name.startswith(("ForwardView.", "KdaStepView.", "KvPoolView.", "DsaView."))
     }
     data = {
         "ForwardView",
         "HybridPoolView",
         "HybridStepView",
         "PreparationView",
+        "aux_hidden_states",
         "block_table",
         "cache",
         "capacity",
         "conv",
+        "intermediate_conv_window",
+        "intermediate_ssm",
         "kda",
         "layer_mapping",
         "logical_dtype",
         "KvPoolView",
+        "DsaView",
         "MegakernelBinding",
         "metadata",
         "mla",
@@ -204,6 +323,8 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "state_indices",
         "storage_dtype",
         "temporal",
+        "tokens_per_request",
+        "verify_scratch_indices",
         "kv_pool",
         "trtllm_attn",
         "uniform_fp8",
@@ -212,12 +333,56 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "forward_view",
         "engram_history",
         "engram_host_table",
+        # the DSA backend's view: its layout and state, and the pool's MLA facts
+        "dsa",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "kv_cache_dim",
+        "physical_page_size",
+        "decode_impl",
+        "use_mha",
+        "kv_cache_dtype",
+        "use_fused_topk",
+        "topk_backend",
+        "dcp_size",
+        "index_kpool",
+        "hisparse",
+        "workspace_buffer",
+        "multi_ctas_kv_counter_buffer",
+        "index_page_size",
+        # the Kimi K3.1 binding's hybrid pool, DSA indexer and cache views
+        "hybrid",
+        "indexer",
+        "caches",
     }
+    # Startup agreement is a host preparation API, not a borrowed runtime-view
+    # callable to replace with data. Keep its exact signature covered separately.
+    preparation = {"megakernel_agree"}
     for path in READERS:
-        names = {n.split("(", 1)[0] for n in _declared(path).get(BINDING, ())}
-        untolerated = names - callables - data
+        names = {
+            n.split("(", 1)[0]
+            for pattern, declared in _declared(path).items()
+            if _files(pattern) == _files(BINDING)
+            for n in declared
+        }
+        untolerated = names - callables - data - preparation - _binding_functions()
         untolerated = {n for n in untolerated if not n.startswith("get_")}
         assert not untolerated, f"{_id(path)}: {sorted(untolerated)}"
+
+
+def test_native_preparation_agreement_signature():
+    binding = _tree(_files(BINDING)[0])
+    agree = next(
+        node
+        for node in binding.body
+        if isinstance(node, ast.FunctionDef) and node.name == "megakernel_agree"
+    )
+    assert [arg.arg for arg in agree.args.args] == ["value"]
+    assert [arg.arg for arg in agree.args.kwonlyargs] == ["what", "group"]
+    assert agree.args.kw_defaults[0] is None
+    assert ast.literal_eval(agree.args.kw_defaults[1]) is None
+    assert agree.args.vararg is None and agree.args.kwarg is None
 
 
 def _mirrors(path: Path) -> dict:
@@ -295,3 +460,140 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
         f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
         "supported SGLangs differ)"
     )
+
+
+def _built_classes() -> dict:
+    """Each package class SGLang may hold as a built megakernel (one with plan,
+    forward and summary, its own or a package base's), with what it assigns."""
+    classes = {}
+    for path in sorted(PACKAGE.rglob("*.py")):
+        for node in ast.walk(_tree(path)):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            names, methods = set(), set()
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign):
+                    names |= {
+                        n.id for n in ast.walk(item.target) if isinstance(n, ast.Name)
+                    }
+                elif isinstance(item, ast.Assign):
+                    names |= {
+                        n.id
+                        for target in item.targets
+                        for n in ast.walk(target)
+                        if isinstance(n, ast.Name)
+                    }
+                elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.add(item.name)
+                    names |= {
+                        n.attr
+                        for n in ast.walk(item)
+                        if isinstance(n, ast.Attribute)
+                        and isinstance(n.ctx, ast.Store)
+                        and isinstance(n.value, ast.Name)
+                        and n.value.id == "self"
+                    }
+            bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
+            classes[node.name] = (path, bases, names, methods)
+
+    def inherited(name: str, index: int) -> set:
+        if name not in classes:
+            return set()
+        entry = classes[name]
+        return set(entry[index]).union(*(inherited(b, index) for b in entry[1]))
+
+    return {
+        f"{_id(entry[0])}::{name}": inherited(name, 2)
+        for name, entry in classes.items()
+        if {"plan", "forward", "summary"} <= inherited(name, 3)
+    }
+
+
+BUILT = _built_classes()
+
+
+@pytest.mark.parametrize("name", sorted(BUILT))
+def test_every_built_object_defines_speculative_runtime_hooks(name):
+    # SGLang's BuiltMegakernel requires the member (None without a factory) and
+    # reads it unguarded under SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
+    assert "speculative_runtime_hooks" in BUILT[name], name
+
+
+def _plugin_imports_in_sglang() -> list:
+    """Each ``from sgl_nvidia_mega.<module> import <name>`` in SGLang's own code."""
+    sites = []
+    for path in sorted(ROOT.rglob("*.py")):
+        if "sgl_nvidia_mega" not in path.read_text(errors="ignore"):
+            continue
+        for node in ast.walk(_tree(path)):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "sgl_nvidia_mega."
+            ):
+                rel = path.relative_to(ROOT)
+                sites += [
+                    (f"{rel}:{node.lineno}", node.module, a.name) for a in node.names
+                ]
+    return sites
+
+
+def _module_level_names(module: str) -> Optional[frozenset]:
+    """The names a package module binds at module level (defs, assignments,
+    imports, submodules), from its source; None when there is no such module."""
+    rel = Path(*module.split(".")[1:])
+    for path in (PACKAGE / rel.with_suffix(".py"), PACKAGE / rel / "__init__.py"):
+        if not path.is_file():
+            continue
+        names = set()
+        if path.name == "__init__.py":  # a package's submodules import by name too
+            names |= {p.stem for p in path.parent.glob("*.py")}
+            names |= {p.parent.name for p in path.parent.glob("*/__init__.py")}
+        todo = list(_tree(path).body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.If, ast.Try)):
+                todo += node.body + node.orelse + getattr(node, "finalbody", [])
+                todo += [s for h in getattr(node, "handlers", []) for s in h.body]
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                names |= {
+                    n.id
+                    for t in targets
+                    for n in ast.walk(t)
+                    if isinstance(n, ast.Name)
+                }
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        return frozenset(names)
+    return None
+
+
+PLUGIN_IMPORTS = _plugin_imports_in_sglang()
+
+
+# SGLang's host bindings (the Kimi K3.1 ones) import package modules by path: a move
+# or rename here fails at a GPU server's first covered step, so pin each name.
+@pytest.mark.parametrize(
+    "site, module, name",
+    PLUGIN_IMPORTS
+    or [
+        pytest.param(
+            None,
+            None,
+            None,
+            marks=pytest.mark.skip(
+                reason="this SGLang imports nothing from the package by name"
+            ),
+        )
+    ],
+    ids=[f"{s}:{n}" for s, _, n in PLUGIN_IMPORTS] or None,
+)
+def test_the_package_defines_what_sglang_imports_from_it(site, module, name):
+    names = _module_level_names(module)
+    assert names is not None, f"SGLang {site} imports the missing module {module}"
+    assert name in names, f"SGLang {site} imports {module}.{name}, which is not defined"
