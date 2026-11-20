@@ -16,3 +16,17 @@ qwen3_5:
   gpus: 8
   tests:
     - test_qwen3_5_stock_parity.py
+
+# The runner: four GB300 on one host, in SGLang's cu134 image: it carries the MSA
+# kernels SGLang's MiniMax-M3.1 support imports, at SGLang's pinned commit (no other
+# SGLang branch is needed). The server compiles the package's kernels when it loads,
+# so it needs the CUDA 13.4 toolkit's nvcc then (CUDA_HOME). The tests set the plugin
+# whitelist (SGLANG_PLUGINS) themselves. acc and perf are the matched pair against
+# native SGLang; parity supplements acc.
+minimax_m31:
+  gpu: GB300
+  gpus: 4
+  tests:
+    - test_minimax_m31_acc.py
+    - test_minimax_m31_perf.py
+    - test_minimax_m31_parity.py

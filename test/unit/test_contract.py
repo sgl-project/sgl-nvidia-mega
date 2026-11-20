@@ -18,7 +18,9 @@ The checks are static (AST and tokens): no package module is
 imported. Run them against every supported SGLang and nightly against main. The
 GLM-5.3 package reads SGLang's megakernel DSA binding view, and its draft spec
 SGLang's draft capture check marker; against an SGLang without them, those reads and
-pins are skipped, naming each.
+pins are skipped, naming each. The Kimi K3.1 and MiniMax-M3.1 packages need SGLang
+support newer than the oldest supported SGLang; against an SGLang without it their
+reads and pins are skipped, naming each file.
 """
 
 import ast
@@ -121,6 +123,8 @@ def test_every_sglang_import_is_declared(path):
 def test_sglang_provides_what_the_plugin_reads(path):
     if _id(path).startswith(K31_PACKAGE) and not _has_k31_host():
         pytest.skip(f"{NO_K31_HOST}: {_id(path)}")
+    if _id(path).startswith(M31_PACKAGE) and not _has_m31_host():
+        pytest.skip(f"{NO_M31_HOST}: {_id(path)}")
     missing, unchecked = [], []
     required = _declared(path)
     optional = _declared(path, "SGLANG_OPTIONAL_READS")
@@ -239,6 +243,20 @@ NO_K31_HOST = "this SGLang has no Kimi K3.1 megakernel host bindings"
 
 def _has_k31_host() -> bool:
     return bool(_files(K31_HOST))
+
+
+# The MiniMax-M3.1 megakernel mirrors SGLang's M3.1 step code and reads its DSpark
+# switches as of sgl-project/sglang#46693, #42855 and #49595; against an older SGLang
+# its spec refuses every configuration (spec.host_reasons), and its reads and mirror
+# pins are skipped here, naming each file. The newest of the three is the marker.
+M31_PACKAGE = "sgl_nvidia_mega/minimax_m31/"
+M31_HOST = ("srt/arg_groups/fields/*.py", "speculative_dspark_lm_head_dtype")
+NO_M31_HOST = "this SGLang predates the MiniMax-M3.1 support the megakernel is built on"
+
+
+def _has_m31_host() -> bool:
+    pattern, name = M31_HOST
+    return name in frozenset().union(*map(_provided, _files(pattern)))
 
 
 def _has_draft_check() -> bool:
@@ -448,6 +466,8 @@ MIRRORS = [
     "path, key, digest", MIRRORS, ids=[f"{_id(p)}::{k}" for p, k, _ in MIRRORS]
 )
 def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
+    if _id(path).startswith(M31_PACKAGE) and not _has_m31_host():
+        pytest.skip(f"{NO_M31_HOST}: {_id(path)}")
     pattern, qualname = key.split(":")
     files = sorted(ROOT.glob(pattern))
     assert len(files) == 1, f"{_id(path)}: {pattern} matches {len(files)} files"

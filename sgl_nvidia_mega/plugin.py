@@ -28,6 +28,12 @@ SPECS = (
     # the NextN draft (ModelConfig names a GLM draft's architecture this way)
     ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
     ("MuseSparkForConditionalGeneration", "sgl_nvidia_mega.muse_spark.spec:SPEC"),
+    # MiniMax-M3.1-Flash (NVFP4) and its DSpark draft
+    (
+        "MiniMaxM3SparseForConditionalGeneration",
+        "sgl_nvidia_mega.minimax_m31.spec:SPEC",
+    ),
+    ("DSparkMiniMaxDraftModel", "sgl_nvidia_mega.minimax_m31.draft:SPEC"),
     # Kimi K3.1: the DFlash target verify step and the sparse decode step
     ("KimiK31ForConditionalGeneration", "sgl_nvidia_mega.kimi_k31.spec:SPEC"),
     # the Kimi K3.1 DFlash2 draft: its decoder layers on the megakernel chain
