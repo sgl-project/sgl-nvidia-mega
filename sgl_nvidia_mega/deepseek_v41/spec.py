@@ -144,6 +144,30 @@ def topology_reasons(cfg) -> list[str]:
     return reasons
 
 
+ENGRAM_CONFIG = '--engram-config \'{"placement": "cpu"}\''
+
+
+def engram_reasons(cfg) -> list[str]:
+    """Why the Engram tables are not the per-rank host tables slot engram reads ([]
+    when they are, and without the slot): --engram-config with placement cpu and no
+    replication (no per-table NUMA placement; SGLang's process membind,
+    SGLANG_NUMA_BIND_V2, only). The option is a dict before SGLang resolves it; an
+    SGLang without the option is left to the slot's own check of the table."""
+    if "engram" not in SLOTS or not hasattr(cfg, "engram_config"):
+        return []
+    config = cfg.engram_config or {}
+    if not isinstance(config, dict):
+        config = {k: getattr(config, k) for k in ("placement", "replication")}
+    placement = config.get("placement", "gpu")
+    replication = config.get("replication", "none")
+    if placement == "cpu" and replication == "none":
+        return []
+    return [
+        f"engram_config placement {placement!r}, replication {replication!r}: the "
+        f"Engram prefetch reads the per-rank host tables; pass {ENGRAM_CONFIG}"
+    ]
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
     tp_sizes=frozenset(tp for tp, _ in TOPOLOGIES),
@@ -176,16 +200,6 @@ REQUIREMENTS = Requirements(
         # the shared expert split over the whole TP group, as SGLang loads it by
         # default: a TP partial the boundary's all-reduce sums (288 rows a rank at TP8)
         "SGLANG_SHARED_EXPERT_TP1": False,
-        # slot engram reads the per-rank host table SGLang builds only with these (no
-        # per-table NUMA placement; SGLang's process membind, SGLANG_NUMA_BIND_V2, only)
-        **(
-            {
-                "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": True,
-                "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
-            }
-            if "engram" in SLOTS
-            else {}
-        ),
     },
 )
 
@@ -219,8 +233,15 @@ NUMERICS = Numerics(
             if {"attn_qkv_a", "draft_qkv_a_ll"} & SLOTS
             else {"attn.kv.max_abs": 0.0}
         ),
-        # wo_b's published partial, as FlashInfer's low-latency GEMM writes it
-        "wo_b.partial.max_abs": 0.0,
+        # wo_b's published partial, as FlashInfer's low-latency GEMM writes it; with slot
+        # wo_b_publish_split (a numerics change) muLLM's split-K FP8 projection against
+        # that GEMM on the same bytes, relative RMS (test_deepseek_v41_wo_b_split.py:
+        # 0 to 5e-5 at K 1024 and 2048, 1-8 rows; 1.64e-3 to 1.69e-3 against fp64 for both)
+        **(
+            {"wo_b.partial.rel": 5e-5}
+            if "wo_b_publish_split" in SLOTS
+            else {"wo_b.partial.max_abs": 0.0}
+        ),
         # the router's expert ids and weights, as moe_fused_gate picks them
         "gate.topk.max_abs": 0.0,
         # the prefetched Engram WKV rows, as SGLang's inline lookup + WKV writes them
@@ -266,6 +287,16 @@ NUMERICS = Numerics(
         # slot target_lm_head_mxfp8: the same check on the MXFP8 stream, whose weight is
         # the shard quantized (test_deepseek_v41_lm_head_mxfp8.py)
         "target_lm_head_mxfp8.logits.rel": 4e-2,
+        # slot attn_q_cluster (a numerics change): the query against attn_q_norm_gemm's
+        # pair on the same input, in BF16 ulps (test_deepseek_v41_q_cluster.py bounds it
+        # at 64; one of four runs reached 128 at 7 rows), and its error against fp64
+        # within 5 % of the pair's
+        "attn.q_cluster.bf16_ulp": 128,
+        "attn.q_cluster.rel_vs_pair_error": 1.05,
+        # slot attn_core_lean (opt-in, a numerics change): the core's output against an
+        # fp64 attention over the v41_new bytes it reads, relative RMS
+        # (test_deepseek_v41_core_lean.py: 0.0021 to 0.0023 measured)
+        "attn.core_lean.rel_fp64": 4e-3,
     },
 )
 
@@ -304,7 +335,12 @@ def flashinfer_ll_gemm_digest():
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    reasons = topology_reasons(cfg) + toolchain_reasons() + runtime.slot_reasons()
+    reasons = (
+        topology_reasons(cfg)
+        + engram_reasons(cfg)
+        + toolchain_reasons()
+        + runtime.slot_reasons()
+    )
     if cfg.cuda_graph_config.decode.backend == "disabled" and not eager_steps_allowed():
         reasons.append(
             "decode CUDA graphs are disabled: the eager forward is not supported yet; "

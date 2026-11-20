@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103 (and GB200/SM100, B300 with sm148), TP8 and API v2.
+"""Kimi K3 packed-MXFP4 megakernel spec for SM100/SM103, TP8 and API v2.
+
+The bounded serving evidence below is for 152-SM GB300. B200/GB200 (SM100)
+and 148-SM B300 (SM103) are admitted with sm148, not TP8 serving-qualified.
 
 Registered builds use TRTLLM MLA with DCP off. The plugin flag does not enable
 DSpark: explicit fixed speculation selects target verification, leaving draft

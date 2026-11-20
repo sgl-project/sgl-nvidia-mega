@@ -5,7 +5,8 @@
 - The premise: in a captured graph a PDL launch after a stream join depends on the
   joined stream's kernel by a programmatic edge, so it may start (and read) before that
   kernel's writes once the kernel triggers; eager, the join is a full dependency.
-- swap-AB with ``extra_after_wait`` is bit for bit the current launch, and in a graph
+- swap-AB with ``extra_after_wait`` (also merging in its CTA cluster, slot
+  attn_cluster_merge; 16 and 8 heads) is bit for bit the current launch, and in a graph
   behind a writer that triggers before it writes (as SGLang's top-k kernels and the c2
   compressor do) it reads the new selection and the new compressed rows on every
   replay; with only ``kv_before_wait``, it reads the old ones.
@@ -130,17 +131,17 @@ def _cache(pages, page=256, seed=0):
 class Attn:
     """One swap-AB call's operands: a 128-slot window and a 512-slot sparse range."""
 
-    def __init__(self, rows, ctx=20000, seed=0):
+    def __init__(self, rows, heads=16, ctx=20000, seed=0):
         torch.manual_seed(seed)
-        self.rows = rows
-        self.q = (torch.randn(rows, 1, 16, 512, device="cuda") * 0.5).bfloat16()
+        self.rows, self.heads = rows, heads
+        self.q = (torch.randn(rows, 1, heads, 512, device="cuda") * 0.5).bfloat16()
         self.swa, self.swa_raw = _cache(4, seed=seed)
         self.extra, self.extra_raw = _cache(-(-ctx // 256), seed=seed + 1)
         base = torch.randint(0, 600, (rows, 1, 1), device="cuda", dtype=torch.int32)
         self.ids = base + torch.arange(128, device="cuda", dtype=torch.int32)
         self.lengths = torch.full((rows,), 128, device="cuda", dtype=torch.int32)
         self.el = torch.randint(400, 513, (rows,), device="cuda", dtype=torch.int32)
-        self.sink = torch.randn(16, device="cuda")
+        self.sink = torch.randn(heads, device="cuda")
         angles = torch.rand(ctx, 32, device="cuda") * 6.3
         self.freqs = (
             torch.view_as_real(torch.polar(torch.ones_like(angles), angles))
@@ -183,12 +184,14 @@ def _bitwise(a, b):
 
 
 @needs_gpu
+@pytest.mark.parametrize("cluster", (False, True), ids=("combine", "cluster_merge"))
+@pytest.mark.parametrize("heads", (16, 8))
 @pytest.mark.parametrize("rows", (1, 2, 6, 8, 12, 24))
-def test_extra_after_wait_is_the_current_launch_bit_for_bit(rows):
-    a = Attn(rows, seed=rows)
+def test_extra_after_wait_is_the_current_launch_bit_for_bit(rows, heads, cluster):
+    a = Attn(rows, heads, seed=rows)
     sel = a.selection(rows)
     want = a.run(sel, kv_before_wait=True)
-    got = a.run(sel, kv_before_wait=True, extra_after_wait=True)
+    got = a.run(sel, kv_before_wait=True, extra_after_wait=True, cluster_merge=cluster)
     plain = a.run(sel)
     torch.cuda.synchronize()
     assert _bitwise(got, want)
@@ -201,9 +204,11 @@ def test_extra_after_wait_is_the_current_launch_bit_for_bit(rows):
 
 
 @needs_gpu
+@pytest.mark.parametrize("cluster", (False, True), ids=("combine", "cluster_merge"))
+@pytest.mark.parametrize("heads", (16, 8))
 @pytest.mark.parametrize("rows", (1, 6, 8))
-def test_a_late_selection_is_read_after_the_wait(rows):
-    a = Attn(rows, seed=7 + rows)
+def test_a_late_selection_is_read_after_the_wait(rows, heads, cluster):
+    a = Attn(rows, heads, seed=7 + rows)
     sel = torch.empty(rows, 1, 512, dtype=torch.int32, device="cuda")
     fresh = torch.empty_like(sel)
     side = torch.cuda.Stream()
@@ -212,7 +217,9 @@ def test_a_late_selection_is_read_after_the_wait(rows):
 
         def chain(after=after):
             _late_writer(fresh, sel, side)
-            return a.run(sel, kv_before_wait=True, extra_after_wait=after)
+            return a.run(
+                sel, kv_before_wait=True, extra_after_wait=after, cluster_merge=cluster
+            )
 
         sel.copy_(a.selection(0))
         fresh.copy_(a.selection(1))

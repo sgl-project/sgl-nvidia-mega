@@ -24,10 +24,41 @@ __device__ __forceinline__ int MaxCtas(int rows, int top_k, int experts) {
   const int filled = experts < slots ? experts : slots;
   return filled + (slots - filled) / kTile;
 }
+
+// Block-wide inclusive scan of `value` (thread order); `warp_total` ends holding
+// the warps' inclusive totals. Every thread calls it.
+__device__ __forceinline__ int BlockInclusiveScan(int value, int *warp_total,
+                                                  int lane, int warp) {
+  int inclusive = value;
+#pragma unroll
+  for (int offset = 1; offset < 32; offset <<= 1) {
+    const int up = __shfl_up_sync(0xffffffffU, inclusive, offset);
+    if (lane >= offset)
+      inclusive += up;
+  }
+  if (lane == 31)
+    warp_total[warp] = inclusive;
+  __syncthreads();
+  if (warp == 0) {
+    int total = lane < kWarps ? warp_total[lane] : 0;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+      const int up = __shfl_up_sync(0xffffffffU, total, offset);
+      if (lane >= offset)
+        total += up;
+    }
+    if (lane < kWarps)
+      warp_total[lane] = total;
+  }
+  __syncthreads();
+  return inclusive + (warp > 0 ? warp_total[warp - 1] : 0);
+}
 } // namespace
 
 // experts (local) <= 384; rows <= 64; rows * top_k <= 512. expert_offset: the
-// global id of local expert 0, as in route.cuh. barrier: unused.
+// global id of local expert 0, as in route.cuh; negative: balanced dealing to
+// group -1 - expert_offset of two (route.cuh), the rank holding every expert.
+// barrier: unused.
 extern "C" __global__
 __launch_bounds__(kThreads) void dsv41_routed_expert_route_wide(
     const int *ids, int *__restrict__ permuted, int *__restrict__ record,
@@ -53,16 +84,30 @@ __launch_bounds__(kThreads) void dsv41_routed_expert_route_wide(
   for (int word = thread; word < record_words; word += kThreads)
     record[word] = 0;
 
+  const bool deal = expert_offset < 0;
+  const int group = deal ? -1 - expert_offset : 0;
   const int row = thread / top_k;
   int expert = -1;
   if (thread < slots) {
-    expert = ids[thread] - expert_offset;
+    expert = ids[thread] - (deal ? 0 : expert_offset);
     if (expert < 0 || expert >= experts)
       expert = -1;
   }
   if (expert >= 0)
     atomicOr(&rows_of[expert], 1ULL << row);
   __syncthreads();
+  if (deal) {
+    // the expert's deal rank among the step's distinct experts; drop the other
+    // group's
+    const int present = thread < experts && rows_of[thread] != 0ULL ? 1 : 0;
+    const int rank =
+        BlockInclusiveScan(present, warp_total, lane, warp) - present;
+    if (present && (rank & 1) != group)
+      rows_of[thread] = 0ULL;
+    __syncthreads();
+    if (expert >= 0 && rows_of[expert] == 0ULL)
+      expert = -1;
+  }
 
   // Exclusive scan of tiles(e) = ceil(count(e) / 8) over e = thread.
   const int tiles =

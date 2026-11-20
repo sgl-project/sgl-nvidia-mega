@@ -19,6 +19,9 @@
 // bit on the dequantized W. Per tile: FP32 MMA accumulation in K order, the split parts
 // added in part order, one BF16 rounding.
 // Grid: CTAs <= SMs; tile t runs on CTA t % grid, slot t / grid. Block LH_WARPS * 32, PDL.
+// LH_XLOAD 1 (slot target_lm_head_xload): x comes in as 16-byte loads, all of a thread's
+// issued before its shared stores, when x's rows are 16-byte aligned (else the 8-byte
+// loop), so the first MMAs wait one L2 round trip for x, not several; the same bytes.
 
 #include <cuda_bf16.h>
 
@@ -36,6 +39,9 @@
 #endif
 #ifndef LH_WARPS
 #define LH_WARPS 16
+#endif
+#ifndef LH_XLOAD
+#define LH_XLOAD 0
 #endif
 
 namespace {
@@ -212,6 +218,33 @@ extern "C" __global__ void __launch_bounds__(kWarps * 32, 1)
 
   pdl_wait();
   // x into shared memory, each 4-column group as (0, 2, 1, 3); rows past `rows` zero
+#if LH_XLOAD
+  constexpr int kX16 = kMaxRows * (kK / 8);  // 16-byte units of x
+  static_assert(kX16 % (kWarps * 32) == 0, "whole 16-byte units a thread");
+  constexpr int kXPer = kX16 / (kWarps * 32);
+  if ((reinterpret_cast<unsigned long long>(x) & 15) == 0 && (x_stride & 7) == 0) {
+    uint4 v[kXPer];
+#pragma unroll
+    for (int j = 0; j < kXPer; ++j) {
+      const int i = threadIdx.x + j * kWarps * 32;
+      const int r = i / (kK / 8), q = i % (kK / 8);
+      v[j] = make_uint4(0, 0, 0, 0);
+      if (r < rows) v[j] = *reinterpret_cast<const uint4*>(x + (long long)r * x_stride + 8 * q);
+    }
+#pragma unroll
+    for (int j = 0; j < kXPer; ++j) {
+      const int i = threadIdx.x + j * kWarps * 32;
+      const int r = i / (kK / 8), q = i % (kK / 8);
+      // two 4-column groups, each as (0, 2, 1, 3)
+      uint4 s;
+      s.x = prmt(v[j].x, v[j].y, 0x5410);
+      s.y = prmt(v[j].x, v[j].y, 0x7632);
+      s.z = prmt(v[j].z, v[j].w, 0x5410);
+      s.w = prmt(v[j].z, v[j].w, 0x7632);
+      *reinterpret_cast<uint4*>(xs + r * (kXStride / 2) + 4 * q) = s;
+    }
+  } else
+#endif
   for (int i = threadIdx.x; i < kMaxRows * (kK / 4); i += kWarps * 32) {
     const int r = i / (kK / 4), q = i % (kK / 4);
     unsigned lo = 0, hi = 0;

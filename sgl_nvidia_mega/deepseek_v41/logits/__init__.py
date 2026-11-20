@@ -12,7 +12,8 @@ whose quant method runs the shard on FlashInfer's low-M BF16 kernel at
 scale and the output fields stay SGLang's. With slot target_lm_head_mxfp8 the 1-8 rows
 stream an MXFP8 copy of the shard instead (sm103/lm_head_mxfp8.py; the verifier's logits
 at lower precision, a numerics change), shared with the draft's head; more rows keep
-SGLang's matmul on the BF16 weight."""
+SGLang's matmul on the BF16 weight. Slot target_lm_head_xload builds that stream with x
+brought in as 16-byte loads issued together (bitwise)."""
 
 from __future__ import annotations
 
@@ -63,7 +64,14 @@ class LowMLmHeadMethod:
     any method outside its unquantized names, ahead of its FP32 and on-policy branches
     (so ``build`` refuses those)."""
 
-    def __init__(self, weight: torch.Tensor, *, pinned: bool = False, mxfp8=None):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        *,
+        pinned: bool = False,
+        mxfp8=None,
+        xload: bool = False,
+    ):
         self.weight = weight
         # the CuTe DSL kernels take operands over DLPack, which refuses grad tensors
         self.weight_t = weight.detach().t()
@@ -72,6 +80,8 @@ class LowMLmHeadMethod:
         self.pinned = pinned
         # slot target_lm_head_mxfp8: the shard's MXFP8 copy (lm_head_mxfp8.Mxfp8Weight)
         self.mxfp8 = mxfp8
+        # slot target_lm_head_xload: the stream's build that loads x 16 bytes at a time
+        self.xload = xload
 
     def low_m(self, x: torch.Tensor, bias) -> bool:
         return (
@@ -94,7 +104,7 @@ class LowMLmHeadMethod:
         if self.mxfp8 is not None:
             from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
 
-            return lm_head_mxfp8.matmul(x, self.mxfp8)
+            return lm_head_mxfp8.matmul(x, self.mxfp8, xload=self.xload)
         if self.pinned:
             from sgl_nvidia_mega.deepseek_v41.sampler.pinned import pinned_mm
 
@@ -109,7 +119,9 @@ class LowMLmHeadMethod:
         if self.mxfp8 is not None:
             from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
 
-            lm_head_mxfp8.precompile(*self.mxfp8.shape, self.weight.device)
+            lm_head_mxfp8.precompile(
+                *self.mxfp8.shape, self.weight.device, xload=self.xload
+            )
             return
         if self.pinned:
             return
@@ -126,9 +138,11 @@ class TargetLmHead:
     """What the logits processor gets for the LM head: SGLang's module, with the
     low-M quant method."""
 
-    def __init__(self, lm_head, *, pinned: bool = False, mxfp8=None):
+    def __init__(self, lm_head, *, pinned: bool = False, mxfp8=None, xload=False):
         self.lm_head, self.weight = lm_head, lm_head.weight
-        self.quant_method = LowMLmHeadMethod(lm_head.weight, pinned=pinned, mxfp8=mxfp8)
+        self.quant_method = LowMLmHeadMethod(
+            lm_head.weight, pinned=pinned, mxfp8=mxfp8, xload=xload
+        )
 
     def __getattr__(self, name):
         return getattr(self.lm_head, name)
@@ -200,7 +214,10 @@ def build(model, ctx, group):
             )
             return None
     head = TargetLmHead(
-        model.lm_head, pinned="lm_head_pinned_tactic" in SLOTS, mxfp8=copy
+        model.lm_head,
+        pinned="lm_head_pinned_tactic" in SLOTS,
+        mxfp8=copy,
+        xload="target_lm_head_xload" in SLOTS,
     )
     head.quant_method.tune()
     error = check_against_sglang(model, head)

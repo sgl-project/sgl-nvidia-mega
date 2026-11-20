@@ -68,6 +68,242 @@ def _load_v4(
 
 
 @gluon.jit
+def _globaltimer():
+    return gl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=gl.int64, is_pure=False, pack=1
+    )
+
+
+@gluon.jit
+def _stamp(STAMP, base, k: gl.constexpr):
+    gl.store(STAMP + base + k, _globaltimer())
+
+
+# Cluster merge (CLUSTER; the idea of muLLM's lean sparse attention, which merges a row's
+# splits inside its CTA cluster): a row's NT tile CTAs are one thread-block cluster
+# (swapab._launch_cluster). Each tile pushes its partial's 128-column units, straight
+# from the tcgen05.ld registers, to the CTA that merges them (unit u = head * 4 + column
+# quarter, merged by CTA u % NT in slot u // NT) with
+# st.shared::cluster into an exchange area past the compiler's shared memory (XOFF bytes
+# into the dynamic window), and its max / sum rows to every CTA; one cluster barrier
+# (release / acquire) and each CTA merges its units from its own shared memory with the
+# narrow combine's arithmetic. Exchange area per CTA: [ROUNDS * 4 slots][NT tiles][128]
+# f32 units, then [NT][16] max and [NT][16] sums.
+_CLUSTER_ARRIVE_RELAXED: gl.constexpr = gl.constexpr(
+    "barrier.cluster.arrive.relaxed.aligned; // $0"
+)
+_CLUSTER_ARRIVE: gl.constexpr = gl.constexpr("barrier.cluster.arrive.aligned; // $0")
+_CLUSTER_WAIT: gl.constexpr = gl.constexpr("barrier.cluster.wait.aligned; // $0")
+_ST_CLUSTER1: gl.constexpr = gl.constexpr(
+    "{\n"
+    ".reg .pred p;\n"
+    ".reg .b32 a;\n"
+    "setp.ne.b32 p, $4, 0;\n"
+    "mov.u32 a, global_smem;\n"
+    "add.u32 a, a, $2;\n"
+    "mapa.shared::cluster.u32 a, a, $3;\n"
+    "@p st.shared::cluster.f32 [a], $1;\n"
+    "mov.b32 $0, 0;\n"
+    "}"
+)
+# thread i < NT stores four consecutive values to CTA i (rank = thread index)
+_ST_CLUSTER4_TID: gl.constexpr = gl.constexpr(
+    "{\n"
+    ".reg .pred p;\n"
+    ".reg .b32 a, tid;\n"
+    "mov.u32 tid, %tid.x;\n"
+    "setp.lt.u32 p, tid, $12;\n"
+    "mov.u32 a, global_smem;\n"
+    "add.u32 a, a, $8;\n"
+    "mapa.shared::cluster.u32 a, a, tid;\n"
+    "@p st.shared::cluster.v4.f32 [a], {$4, $5, $6, $7};\n"
+    "mov.b32 $0, 0;\n"
+    "mov.b32 $1, 0;\n"
+    "mov.b32 $2, 0;\n"
+    "mov.b32 $3, 0;\n"
+    "}"
+)
+_LD_SHARED4: gl.constexpr = gl.constexpr(
+    "{\n"
+    ".reg .pred p;\n"
+    ".reg .b32 a;\n"
+    "setp.ne.b32 p, $8, 0;\n"
+    "mov.u32 a, global_smem;\n"
+    "add.u32 a, a, $4;\n"
+    "mov.f32 $0, 0f00000000;\n"
+    "mov.f32 $1, 0f00000000;\n"
+    "mov.f32 $2, 0f00000000;\n"
+    "mov.f32 $3, 0f00000000;\n"
+    "@p ld.shared.v4.f32 {$0, $1, $2, $3}, [a];\n"
+    "}"
+)
+_LD_SHARED1: gl.constexpr = gl.constexpr(
+    "{\n"
+    ".reg .pred p;\n"
+    ".reg .b32 a;\n"
+    "setp.ne.b32 p, $2, 0;\n"
+    "mov.u32 a, global_smem;\n"
+    "add.u32 a, a, $1;\n"
+    "mov.f32 $0, 0f00000000;\n"
+    "@p ld.shared.f32 $0, [a];\n"
+    "}"
+)
+
+
+@gluon.jit
+def _cluster_sync(asm: gl.constexpr):
+    gl.inline_asm_elementwise(asm, "=r", [], dtype=gl.int32, is_pure=False, pack=1)
+
+
+@gluon.jit
+def _lds(offset, mask):
+    # 0.0 where masked off, as gl.load's other
+    return gl.inline_asm_elementwise(
+        _LD_SHARED1,
+        "=f,r,r",
+        [offset, mask.to(gl.int32)],
+        dtype=gl.float32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _lds4(offset, mask):
+    # four consecutive f32 per thread (the layout's innermost 4); offset / mask of the first
+    return gl.inline_asm_elementwise(
+        _LD_SHARED4,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,r",
+        [offset, mask.to(gl.int32)],
+        dtype=gl.float32,
+        is_pure=False,
+        pack=4,
+    )
+
+
+@gluon.jit
+def _push_partial_rows(
+    value,
+    mx,
+    denom,
+    t,
+    XOFF,
+    XSTATS: gl.constexpr,
+    NT: gl.constexpr,
+    HQ: gl.constexpr,
+    H: gl.constexpr,
+):
+    # value [512, H] as tcgen05.ld leaves it (a thread holds one d row per 128-row block,
+    # all H heads): each element goes straight to its unit's owner, a warp's 32 lanes
+    # writing 128 consecutive bytes; no layout conversion through shared memory
+    row_layout: gl.constexpr = value.type.layout
+    d = gl.arange(0, 512, gl.SliceLayout(1, row_layout))[:, None]
+    h = gl.arange(0, H, gl.SliceLayout(0, row_layout))[None, :]
+    u = h * 4 + d // 128
+    offset = XOFF + (((u // NT) * NT + t) * 128 + d % 128) * 4
+    keep = (h < HQ) & (d >= 0)
+    gl.inline_asm_elementwise(
+        _ST_CLUSTER1,
+        "=r,f,r,r,r",
+        [value, offset, u % NT, keep.to(gl.int32)],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    # thread i < NT sends this tile's max / sum rows (all H) to CTA i
+    every: gl.constexpr = gl.BlockedLayout([H], [32], [4], [0])
+    hs = gl.arange(0, H, every)
+    moff = XOFF + XSTATS + (t * 16 + hs) * 4
+    nt = gl.full([H], NT, gl.int32, every)
+    gl.inline_asm_elementwise(
+        _ST_CLUSTER4_TID,
+        "=r,=r,=r,=r,f,f,f,f,r,r,r,r,r,r,r,r",
+        [gl.convert_layout(mx, every), moff, nt],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=4,
+    )
+    gl.inline_asm_elementwise(
+        _ST_CLUSTER4_TID,
+        "=r,=r,=r,=r,f,f,f,f,r,r,r,r,r,r,r,r",
+        [gl.convert_layout(denom, every), moff + NT * 64, nt],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=4,
+    )
+
+
+@gluon.jit
+def _merge_units(
+    SINK,
+    OUT,
+    b,
+    t,
+    XOFF,
+    XSTATS: gl.constexpr,
+    NT: gl.constexpr,
+    ST: gl.constexpr,
+    HQ: gl.constexpr,
+    ROUNDS: gl.constexpr,
+):
+    # swapab._combine's narrow program (one warp per head and 128 columns, the same
+    # layouts along the tiles) on the units this CTA received, its loads from the
+    # exchange area instead of PART / MAX / SUM
+    units: gl.constexpr = HQ * 4
+    stat: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
+    vals_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 4], [1, 1, 32], [4, 1, 1], [2, 1, 0]
+    )
+    wide: gl.constexpr = gl.SliceLayout(2, vals_layout)
+    out_layout: gl.constexpr = gl.SliceLayout(1, vals_layout)
+    wv = gl.arange(0, 4, gl.SliceLayout(1, stat))
+    tv = gl.arange(0, ST, gl.SliceLayout(0, stat))
+    w3 = gl.arange(0, 4, gl.SliceLayout(1, wide))
+    t3 = gl.arange(0, ST, gl.SliceLayout(0, wide))
+    d3 = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    wo = gl.arange(0, 4, gl.SliceLayout(1, out_layout))
+    for r in gl.static_range(ROUNDS):
+        u = (r * 4 + wv) * NT + t
+        ok = u < units
+        h = u // 4
+        smask = (tv[None, :] < NT) & ok[:, None]
+        moff = XOFF + XSTATS + (tv[None, :] * 16 + h[:, None]) * 4
+        den = _lds(moff + NT * 64, smask)
+        mx = _lds(moff, smask)
+        mx = gl.where(den > 0, mx, -float("inf"))
+        sink = gl.load(SINK + h, ok, 0.0)
+        m = gl.maximum(gl.max(mx, 1), sink)
+        m = gl.where(gl.abs(m) == float("inf"), 0.0, m)
+        factor = gl.exp(mx - m[:, None])
+        denominator = gl.sum(den * factor, 1) + gl.exp(sink - m)
+        keep = (denominator > 0) & (sink != float("inf"))
+        s3 = r * 4 + w3
+        ok3 = s3 * NT + t < units
+        off = (
+            XOFF
+            + ((s3[:, None] * NT + t3[None, :]) * 128)[:, :, None] * 4
+            + (d3 * 4)[None, None, :]
+        )
+        vmask = ((t3[None, :] < NT) & ok3[:, None])[:, :, None] & (d3 >= 0)[
+            None, None, :
+        ]
+        vals = _lds4(off, vmask)
+        f3 = gl.convert_layout(factor, wide)
+        acc = gl.sum(vals * f3[:, :, None], 1)
+        dn = gl.convert_layout(denominator, gl.SliceLayout(1, out_layout))
+        kp = gl.convert_layout(keep, gl.SliceLayout(1, out_layout))
+        o = acc / dn[:, None]
+        o = gl.where(kp[:, None], o, 0.0)
+        uo = (r * 4 + wo) * NT + t
+        ooff = (b * HQ + uo // 4) * 512 + (uo % 4) * 128
+        gl.store(
+            OUT + ooff[:, None] + d3[None, :],
+            o.to(gl.bfloat16),
+            (uo < units)[:, None],
+        )
+
+
+@gluon.jit
 def partial_gluon(
     Q,
     K,
@@ -107,11 +343,35 @@ def partial_gluon(
     ROPE_Q: gl.constexpr = False,
     KV_BEFORE_WAIT: gl.constexpr = False,
     HQ: gl.constexpr = 16,
+    SINK=None,
+    OUT=None,
+    ST: gl.constexpr = 16,
+    ROUNDS: gl.constexpr = 1,
+    STAMPS: gl.constexpr = False,
+    STAMP=None,
+    CLUSTER: gl.constexpr = False,
+    XOFF=0,
+    XSTATS: gl.constexpr = 0,
     EXTRA_AFTER_WAIT: gl.constexpr = False,
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
     gl.static_assert(HQ == H or HQ == 8)
     gl.static_assert(not EXTRA_AFTER_WAIT or KV_BEFORE_WAIT)
+    if CLUSTER:
+        # grid (rows * NT): a row's tiles are one cluster, tile t its CTA rank t
+        pid = gl.program_id(0)
+        b, t = pid // NT, pid % NT
+        # the cluster's first phase: every peer has started before any pushes to it
+        _cluster_sync(_CLUSTER_ARRIVE_RELAXED)
+    else:
+        b, t = gl.program_id(0), gl.program_id(1)
+    if STAMPS:
+        sbase = (b * NT + t) * 16
+        _stamp(STAMP, sbase, 0)
+        smid = gl.inline_asm_elementwise(
+            "mov.u32 $0, %smid;", "=r", [], dtype=gl.int32, is_pure=True, pack=1
+        )
+        gl.store(STAMP + sbase + 15, smid.to(gl.int64))
     if USE_GDC:
         if not KV_BEFORE_WAIT:
             # tl.extra.cuda.gdc_wait + gdc_launch_dependents; every input is read after the wait.
@@ -123,7 +383,6 @@ def partial_gluon(
                 is_pure=False,
                 pack=1,
             )
-    b, t = gl.program_id(0), gl.program_id(1)
     if USE_GDC:
         if EXTRA_AFTER_WAIT:
             if t < KT:
@@ -144,6 +403,8 @@ def partial_gluon(
                 is_pure=False,
                 pack=1,
             )
+    if STAMPS:
+        _stamp(STAMP, sbase, 1)
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
     if t < KT:
@@ -211,6 +472,8 @@ def partial_gluon(
             is_pure=False,
             pack=1,
         )
+        if STAMPS:
+            _stamp(STAMP, sbase, 2)
     q_ptr = Q + b * QS + qh[:, None] * QH + qd[None, :]
     if HQ < H:
         q = gl.load(q_ptr, (qh < HQ)[:, None], 0.0)
@@ -248,6 +511,8 @@ def partial_gluon(
         gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
         value=kv,
     )
+    if STAMPS:
+        _stamp(STAMP, sbase, 3)
     score_tmem = allocate_tensor_memory(
         gl.float32, [BT, H], TensorMemoryLayout(block=(BT, H), col_stride=1)
     )
@@ -260,6 +525,8 @@ def partial_gluon(
     score_layout: gl.constexpr = get_tmem_reg_layout(
         gl.float32, (BT, H), TensorMemoryLayout(block=(BT, H), col_stride=1), 4
     )
+    if STAMPS:
+        _stamp(STAMP, sbase, 4)
     scores = score_tmem.load(score_layout) * SCALE
     valid = gl.convert_layout(valid, gl.SliceLayout(1, score_layout))
     scores = gl.where(valid[:, None], scores, -float("inf"))
@@ -289,6 +556,8 @@ def partial_gluon(
         tcgen05_commit(bar)
         mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
+    if STAMPS:
+        _stamp(STAMP, sbase, 5)
     out_layout: gl.constexpr = get_tmem_reg_layout(
         gl.float32, (512, H), TensorMemoryLayout(block=(128, H), col_stride=1), 4
     )
@@ -300,7 +569,20 @@ def partial_gluon(
     stat_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
     hs = gl.arange(0, H, stat_layout)
     part_ptr = PART + ((b * NT + t) * HQ + h[:, None]) * 512 + d[None, :]
-    if HQ < H:
+    if CLUSTER:
+        _cluster_sync(_CLUSTER_WAIT)
+        _push_partial_rows(value, mx, denom, t, XOFF, XSTATS, NT, HQ, H)
+        if STAMPS:
+            _stamp(STAMP, sbase, 6)
+        # release the pushes, acquire every peer's
+        _cluster_sync(_CLUSTER_ARRIVE)
+        _cluster_sync(_CLUSTER_WAIT)
+        if STAMPS:
+            _stamp(STAMP, sbase, 7)
+        _merge_units(SINK, OUT, b, t, XOFF, XSTATS, NT, ST, HQ, ROUNDS)
+        if STAMPS:
+            _stamp(STAMP, sbase, 8)
+    elif HQ < H:
         gl.store(part_ptr, value_hd, (h < HQ)[:, None])
         gl.store(
             MAX + (b * NT + t) * HQ + hs, gl.convert_layout(mx, stat_layout), hs < HQ
@@ -312,3 +594,6 @@ def partial_gluon(
         gl.store(part_ptr, value_hd)
         gl.store(MAX + (b * NT + t) * H + hs, gl.convert_layout(mx, stat_layout))
         gl.store(SUM + (b * NT + t) * H + hs, gl.convert_layout(denom, stat_layout))
+    if STAMPS:
+        if not CLUSTER:
+            _stamp(STAMP, sbase, 6)

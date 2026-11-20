@@ -51,6 +51,28 @@ class MoeOperands(msgspec.Struct, frozen=True):
     return_moe_output: bool  # the MoE leaves its finalize to the post
 
 
+def _wo_b_split_default_takes(m, runtime) -> bool:
+    """Slot wo_b_publish_split on a default start (no slot list) only where wo_b has at
+    most wo_b_split.DEFAULT_MAX_INPUTS inputs per rank (attention TP8); listed, at every
+    shape the kernel takes."""
+    import logging
+
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_b_split
+
+    if not runtime.default_start():
+        return True
+    k = m.layers[m.start_layer].self_attn.wo_b.weight.shape[1]
+    if k <= wo_b_split.DEFAULT_MAX_INPUTS:
+        return True
+    logging.getLogger(__name__).info(
+        "NVIDIA megakernel: default slot wo_b_publish_split left off: wo_b has %d "
+        "inputs per rank (a default start takes it up to %d)",
+        k,
+        wo_b_split.DEFAULT_MAX_INPUTS,
+    )
+    return False
+
+
 def build(model, ctx, group) -> Boundaries:
     """Bind weights, allocate buffers, compile; the result is ``st.bound["boundary"]``.
     Its ``hop_a`` / ``hop_a_reason`` / ``hop_a.rows`` say where hop A serves."""
@@ -73,6 +95,8 @@ def build(model, ctx, group) -> Boundaries:
             hop_b_quad_trigger="hop_b_quad_trigger" in runtime.SLOTS,
             mbarrier_exchange="hop_mbar" in runtime.SLOTS,
             final_collapse="hop_final_collapse" in runtime.SLOTS,
+            wo_b_split="wo_b_publish_split" in runtime.SLOTS
+            and _wo_b_split_default_takes(m, runtime),
         )
     two_shot, two_shot_reason = None, "stock (slot off)"
     if "two_shot" in runtime.SLOTS:
@@ -159,11 +183,14 @@ def set_residual(st, residual) -> None:
     st.state = bs.hc
 
 
-def pre(layer, sublayer: str, st, aux=None):
+def pre(layer, sublayer: str, st, aux=None, need_input: bool = True):
     """The input of ``layer``'s ``sublayer`` ("attn"); sets ``st.x_quant``. With
-    ``aux``, appends the streams' mean (a DSpark capture layer)."""
+    ``aux``, appends the streams' mean (a DSpark capture layer). Without ``need_input``,
+    only opens the sublayer (the first attention of fresh streams; returns None)."""
     assert sublayer == "attn"
-    x, st.x_quant = st.bound["boundary"].pre(layer, "attn", _state(st), st.fb, aux)
+    x, st.x_quant = st.bound["boundary"].pre(
+        layer, "attn", _state(st), st.fb, aux, need_input=need_input
+    )
     return x
 
 
