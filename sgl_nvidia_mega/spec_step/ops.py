@@ -29,7 +29,10 @@ SGLANG_READS = {
         "_argmax_pair",
         "_medium_argmax_partial_kernel",
     ),
-    "kernels/jit/utils/compile/loader.py": ("load_jit", "load_jit(extra_include_paths)"),
+    "kernels/jit/utils/compile/loader.py": (
+        "load_jit",
+        "load_jit(extra_include_paths)",
+    ),
 }
 
 CSRC = Path(__file__).resolve().parent / "csrc"
@@ -189,7 +192,9 @@ def _module(vec_size: int, deterministic: bool, *, no_draft_probs=False, chunked
     if key not in _modules:
         det = "true" if deterministic else "false"
         if chunked:
-            wrapper = f"chain_speculative_sampling_target_only_two_pass<{vec_size}, {det}>"
+            wrapper = (
+                f"chain_speculative_sampling_target_only_two_pass<{vec_size}, {det}>"
+            )
             _modules[key] = _load("chunked", wrapper, vec_size, deterministic)
         else:
             ndp = "true" if no_draft_probs else "false"

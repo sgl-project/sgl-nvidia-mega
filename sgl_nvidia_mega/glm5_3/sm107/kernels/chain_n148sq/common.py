@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """nvvm / llvm dialect forms for the device operations cute.arch has no exact equivalent for."""
-import cutlass
-from cutlass._mlir.dialects import arith, llvm, nvvm, vector
-from cutlass._mlir import ir
-import cutlass.cute as cute
-from cutlass.cutlass_dsl import T, dsl_user_op
 
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import arith, llvm, nvvm, vector
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 ARENA_BYTES = 2469760
 ARENA_WORDS = ARENA_BYTES // 4
@@ -24,25 +24,41 @@ def as_ptr(space, value, loc, ip):
 
 
 def word_vector(words, loc, ip):
-    return vector.from_elements(ir.VectorType.get([len(words)], T.i32()),
-                                [cutlass.Uint32(w).ir_value(loc=loc, ip=ip) for w in words], loc=loc, ip=ip)
+    return vector.from_elements(
+        ir.VectorType.get([len(words)], T.i32()),
+        [cutlass.Uint32(w).ir_value(loc=loc, ip=ip) for w in words],
+        loc=loc,
+        ip=ip,
+    )
 
 
 def f32_intrinsic(name, *values, loc, ip):
     """One correctly specified PTX float op (rounding, ftz, approx) per intrinsic: no contraction, no range fix-ups."""
-    operands = [v if isinstance(v, ir.Value) else cutlass.Float32(v).ir_value(loc=loc, ip=ip) for v in values]
+    operands = [
+        v if isinstance(v, ir.Value) else cutlass.Float32(v).ir_value(loc=loc, ip=ip)
+        for v in values
+    ]
     return llvm.call_intrinsic(T.f32(), name, operands, [], [], loc=loc, ip=ip)
 
 
 def e4m3x2_to_f16x2_ir(bits16, loc, ip):
     """Two e4m3 bytes held in an i16 to an f16x2 vector."""
-    pair = llvm.bitcast(ir.VectorType.get([2], ir.IntegerType.get_signless(8)), bits16, loc=loc, ip=ip)
-    return nvvm.convert_f8x2_to_f16x2(ir.VectorType.get([2], ir.F16Type.get()), pair,
-                                      ir.TypeAttr.get(ir.Type.parse("f8E4M3FN")), loc=loc, ip=ip)
+    pair = llvm.bitcast(
+        ir.VectorType.get([2], ir.IntegerType.get_signless(8)), bits16, loc=loc, ip=ip
+    )
+    return nvvm.convert_f8x2_to_f16x2(
+        ir.VectorType.get([2], ir.F16Type.get()),
+        pair,
+        ir.TypeAttr.get(ir.Type.parse("f8E4M3FN")),
+        loc=loc,
+        ip=ip,
+    )
 
 
 def low_16(word, loc, ip):
-    return arith.trunci(T.i16(), cutlass.Uint32(word).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    return arith.trunci(
+        T.i16(), cutlass.Uint32(word).ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+    )
 
 
 @dsl_user_op
@@ -53,13 +69,27 @@ def evict_first(*, loc=None, ip=None):
 @dsl_user_op
 def store_empty(pointer: cute.Pointer, policy: cutlass.Uint64, *, loc=None, ip=None):
     empty = cutlass.Uint32(0x80000000)
-    nvvm.store_ext(word_vector((empty, empty, empty, empty), loc, ip), as_ptr(1, pointer, loc, ip),
-                   l2_cache_hint=policy.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    nvvm.store_ext(
+        word_vector((empty, empty, empty, empty), loc, ip),
+        as_ptr(1, pointer, loc, ip),
+        l2_cache_hint=policy.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def release_increment(pointer: cute.Pointer, *, loc=None, ip=None):
-    cute.arch.red(pointer, cutlass.Uint32(1), op="add", dtype="u32", sem="release", scope="gpu", loc=loc, ip=ip)
+    cute.arch.red(
+        pointer,
+        cutlass.Uint32(1),
+        op="add",
+        dtype="u32",
+        sem="release",
+        scope="gpu",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -72,8 +102,11 @@ def reset_next_counters(next_counters: cute.Tensor):
 
 
 @cute.jit
-def clear_assigned(next_arena: cute.Tensor, next_topk_exchange: cute.Tensor,
-                     current_clear_counter: cute.Tensor):
+def clear_assigned(
+    next_arena: cute.Tensor,
+    next_topk_exchange: cute.Tensor,
+    current_clear_counter: cute.Tensor,
+):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     if cta < 151:
@@ -96,52 +129,91 @@ def clear_assigned(next_arena: cute.Tensor, next_topk_exchange: cute.Tensor,
 
 
 def _emit_f32(mnemonic, values, loc, ip):
-    names = {'fma.rn.f32': 'llvm.nvvm.fma.rn.f', 'mul.rn.f32': 'llvm.nvvm.mul.rn.f',
-             'div.rn.ftz.f32': 'llvm.nvvm.div.rn.ftz.f', 'max.f32': 'llvm.nvvm.fmax.f'}
+    names = {
+        "fma.rn.f32": "llvm.nvvm.fma.rn.f",
+        "mul.rn.f32": "llvm.nvvm.mul.rn.f",
+        "div.rn.ftz.f32": "llvm.nvvm.div.rn.ftz.f",
+        "max.f32": "llvm.nvvm.fmax.f",
+    }
     return cutlass.Float32(f32_intrinsic(names[mnemonic], *values, loc=loc, ip=ip))
 
 
 @dsl_user_op
-def fma_rn(a: cutlass.Float32, b: cutlass.Float32, c: cutlass.Float32, *, loc=None, ip=None):
-    return _emit_f32('fma.rn.f32', (a, b, c), loc, ip)
+def fma_rn(
+    a: cutlass.Float32, b: cutlass.Float32, c: cutlass.Float32, *, loc=None, ip=None
+):
+    return _emit_f32("fma.rn.f32", (a, b, c), loc, ip)
 
 
 @dsl_user_op
 def mul_rn(a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None):
     """A separate rounding step: prevents FMA contraction with the consumer."""
-    return _emit_f32('mul.rn.f32', (a, b), loc, ip)
+    return _emit_f32("mul.rn.f32", (a, b), loc, ip)
 
 
 @dsl_user_op
 def div_rn_ftz(a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None):
-    return _emit_f32('div.rn.ftz.f32', (a, b), loc, ip)
+    return _emit_f32("div.rn.ftz.f32", (a, b), loc, ip)
 
 
 @dsl_user_op
 def max_num(a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None):
-    return _emit_f32('max.f32', (a, b), loc, ip)
+    return _emit_f32("max.f32", (a, b), loc, ip)
 
 
 @dsl_user_op
 def bits_f32(bits: cutlass.Uint32, *, loc=None, ip=None):
-    return cutlass.Float32(llvm.bitcast(T.f32(), bits.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+    return cutlass.Float32(
+        llvm.bitcast(T.f32(), bits.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    )
 
 
 @dsl_user_op
 def f32_bits(value: cutlass.Float32, *, loc=None, ip=None):
-    return cutlass.Uint32(llvm.bitcast(T.i32(), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+    return cutlass.Uint32(
+        llvm.bitcast(T.i32(), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    )
 
 
 @dsl_user_op
 def zero_shared_vector(address: cutlass.Uint32, *, loc=None, ip=None):
     zero = cutlass.Uint32(0)
-    llvm.store(word_vector((zero,) * 4, loc, ip), as_ptr(3, address, loc, ip), alignment=16, loc=loc, ip=ip)
+    llvm.store(
+        word_vector((zero,) * 4, loc, ip),
+        as_ptr(3, address, loc, ip),
+        alignment=16,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
-def store_shared_v4(address: cutlass.Uint32, a: cutlass.Uint32, b: cutlass.Uint32, c: cutlass.Uint32,
-                    d: cutlass.Uint32, *, loc=None, ip=None):
-    llvm.store(word_vector((a, b, c, d,), loc, ip), as_ptr(3, address, loc, ip), alignment=16, loc=loc, ip=ip)
+def store_shared_v4(
+    address: cutlass.Uint32,
+    a: cutlass.Uint32,
+    b: cutlass.Uint32,
+    c: cutlass.Uint32,
+    d: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    llvm.store(
+        word_vector(
+            (
+                a,
+                b,
+                c,
+                d,
+            ),
+            loc,
+            ip,
+        ),
+        as_ptr(3, address, loc, ip),
+        alignment=16,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -167,32 +239,63 @@ def allocate_tmem(dst: cute.Pointer, *, loc=None, ip=None):
 
 @dsl_user_op
 def deallocate_tmem(address: cutlass.Uint32, *, loc=None, ip=None):
-    cute.arch.dealloc_tmem(cute.make_ptr(cutlass.Float32, address, cute.AddressSpace.tmem, loc=loc, ip=ip), 512,
-                           loc=loc, ip=ip)
+    cute.arch.dealloc_tmem(
+        cute.make_ptr(cutlass.Float32, address, cute.AddressSpace.tmem, loc=loc, ip=ip),
+        512,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
-def copy_scales(tmem: cutlass.Uint32, src: cutlass.Uint32, rows8: bool = False, *, loc=None, ip=None):
+def copy_scales(
+    tmem: cutlass.Uint32, src: cutlass.Uint32, rows8: bool = False, *, loc=None, ip=None
+):
     descriptor = cutlass.Uint64(1 << 46)
     if not rows8:
         descriptor |= cutlass.Uint64(8 << 32)
     descriptor |= ((src & cutlass.Uint32(0x3FFFF)) >> 4).to(cutlass.Uint64)
-    nvvm.tcgen05_cp(nvvm.Tcgen05CpShape.SHAPE_32x128b, as_ptr(6, tmem, loc, ip), descriptor.ir_value(loc=loc, ip=ip),
-                    group=nvvm.CTAGroupKind.CTA_1, multicast=nvvm.Tcgen05CpMulticast.WARPX4, loc=loc, ip=ip)
+    nvvm.tcgen05_cp(
+        nvvm.Tcgen05CpShape.SHAPE_32x128b,
+        as_ptr(6, tmem, loc, ip),
+        descriptor.ir_value(loc=loc, ip=ip),
+        group=nvvm.CTAGroupKind.CTA_1,
+        multicast=nvvm.Tcgen05CpMulticast.WARPX4,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
-def mma_nvfp4(d: cutlass.Uint32, a: cutlass.Uint32, b: cutlass.Uint32,
-              sfa: cutlass.Uint32, sfb: cutlass.Uint32, accumulate: cutlass.Uint32, *, loc=None, ip=None):
+def mma_nvfp4(
+    d: cutlass.Uint32,
+    a: cutlass.Uint32,
+    b: cutlass.Uint32,
+    sfa: cutlass.Uint32,
+    sfb: cutlass.Uint32,
+    accumulate: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
     common = cutlass.Uint64((1 << 16) | (32 << 32) | (1 << 46) | (4 << 61))
     da = common | ((a & cutlass.Uint32(0x3FFFF)) >> 4).to(cutlass.Uint64)
     db = common | ((b & cutlass.Uint32(0x3FFFF)) >> 4).to(cutlass.Uint64)
     descriptor = cutlass.Uint32((1 << 7) | (1 << 10) | (1 << 17) | (8 << 24))
-    nvvm.tcgen05_mma_block_scale(nvvm.Tcgen05MMAKind.MXF4NVF4, nvvm.CTAGroupKind.CTA_1, as_ptr(6, d, loc, ip),
-                                 da.ir_value(loc=loc, ip=ip), db.ir_value(loc=loc, ip=ip),
-                                 descriptor.ir_value(loc=loc, ip=ip),
-                                 (accumulate != cutlass.Uint32(0)).ir_value(loc=loc, ip=ip), as_ptr(6, sfa, loc, ip),
-                                 as_ptr(6, sfb, loc, ip), block_scale=nvvm.Tcgen05MMABlockScale.BLOCK16, loc=loc, ip=ip)
+    nvvm.tcgen05_mma_block_scale(
+        nvvm.Tcgen05MMAKind.MXF4NVF4,
+        nvvm.CTAGroupKind.CTA_1,
+        as_ptr(6, d, loc, ip),
+        da.ir_value(loc=loc, ip=ip),
+        db.ir_value(loc=loc, ip=ip),
+        descriptor.ir_value(loc=loc, ip=ip),
+        (accumulate != cutlass.Uint32(0)).ir_value(loc=loc, ip=ip),
+        as_ptr(6, sfa, loc, ip),
+        as_ptr(6, sfb, loc, ip),
+        block_scale=nvvm.Tcgen05MMABlockScale.BLOCK16,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -202,44 +305,83 @@ def commit_mma(bar: cute.Pointer, *, loc=None, ip=None):
 
 @dsl_user_op
 def commit_mma_addr(bar: cutlass.Uint32, *, loc=None, ip=None):
-    nvvm.tcgen05_commit(as_ptr(3, bar, loc, ip), group=nvvm.CTAGroupKind.CTA_1, loc=loc, ip=ip)
+    nvvm.tcgen05_commit(
+        as_ptr(3, bar, loc, ip), group=nvvm.CTAGroupKind.CTA_1, loc=loc, ip=ip
+    )
 
 
 @dsl_user_op
-def bulk_piece(dst: cutlass.Uint32, src: cute.Pointer, bar: cute.Pointer, *, loc=None, ip=None):
-    nvvm.cp_async_bulk_shared_cluster_global(as_ptr(7, dst, loc, ip), as_ptr(1, src, loc, ip), as_ptr(3, bar, loc, ip),
-                                             cutlass.Uint32(55296).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+def bulk_piece(
+    dst: cutlass.Uint32, src: cute.Pointer, bar: cute.Pointer, *, loc=None, ip=None
+):
+    nvvm.cp_async_bulk_shared_cluster_global(
+        as_ptr(7, dst, loc, ip),
+        as_ptr(1, src, loc, ip),
+        as_ptr(3, bar, loc, ip),
+        cutlass.Uint32(55296).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def load_tmem8(address: cutlass.Uint32, *, loc=None, ip=None):
-    v = nvvm.tcgen05_ld(ir.VectorType.get([8], T.i32()), nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-                        as_ptr(6, address, loc, ip), loc=loc, ip=ip)
+    v = nvvm.tcgen05_ld(
+        ir.VectorType.get([8], T.i32()),
+        nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+        as_ptr(6, address, loc, ip),
+        loc=loc,
+        ip=ip,
+    )
     nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.LOAD, loc=loc, ip=ip)
-    return tuple(cutlass.Uint32(vector.extract(v, [], [i], loc=loc, ip=ip)) for i in range(8))
+    return tuple(
+        cutlass.Uint32(vector.extract(v, [], [i], loc=loc, ip=ip)) for i in range(8)
+    )
 
 
 @dsl_user_op
 def fp4_pair(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
-    b = nvvm.convert_f32x2_to_f4x2(hi.ir_value(loc=loc, ip=ip), lo.ir_value(loc=loc, ip=ip),
-                                   ir.TypeAttr.get(ir.Type.parse("f4E2M1FN")), rnd=nvvm.FPRoundingMode.RN,
-                                   loc=loc, ip=ip)
+    b = nvvm.convert_f32x2_to_f4x2(
+        hi.ir_value(loc=loc, ip=ip),
+        lo.ir_value(loc=loc, ip=ip),
+        ir.TypeAttr.get(ir.Type.parse("f4E2M1FN")),
+        rnd=nvvm.FPRoundingMode.RN,
+        loc=loc,
+        ip=ip,
+    )
     # the packed byte alone, zero-extended: callers OR pairs into a word at byte offsets
     return cutlass.Uint32(arith.extui(T.i32(), b, loc=loc, ip=ip))
 
 
 @dsl_user_op
 def e4m3_float(bits: cutlass.Uint32, *, loc=None, ip=None):
-    half = vector.extract(e4m3x2_to_f16x2_ir(low_16(bits, loc, ip), loc, ip), [], [0], loc=loc, ip=ip)
+    half = vector.extract(
+        e4m3x2_to_f16x2_ir(low_16(bits, loc, ip), loc, ip), [], [0], loc=loc, ip=ip
+    )
     return cutlass.Float32(arith.extf(T.f32(), half, loc=loc, ip=ip))
 
 
 @dsl_user_op
-def bulk_copy(dst: cutlass.Uint32, src: cute.Pointer, size: cutlass.Uint32, bar: cute.Pointer,
-              policy=None, *, loc=None, ip=None):
+def bulk_copy(
+    dst: cutlass.Uint32,
+    src: cute.Pointer,
+    size: cutlass.Uint32,
+    bar: cute.Pointer,
+    policy=None,
+    *,
+    loc=None,
+    ip=None,
+):
     hint = None if policy is None else policy.ir_value(loc=loc, ip=ip)
-    nvvm.cp_async_bulk_shared_cluster_global(as_ptr(7, dst, loc, ip), as_ptr(1, src, loc, ip), as_ptr(3, bar, loc, ip),
-                                             size.ir_value(loc=loc, ip=ip), l2_cache_hint=hint, loc=loc, ip=ip)
+    nvvm.cp_async_bulk_shared_cluster_global(
+        as_ptr(7, dst, loc, ip),
+        as_ptr(1, src, loc, ip),
+        as_ptr(3, bar, loc, ip),
+        size.ir_value(loc=loc, ip=ip),
+        l2_cache_hint=hint,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -249,19 +391,30 @@ def hop1_word_offset(token: cutlass.Int32, rank: cutlass.Int32, col: cutlass.Int
 
 @cute.jit
 def xfrag_word_offset(token: cutlass.Int32, col: cutlass.Int32):
-    return (col >> 6) * 256 + ((col >> 3) & 1) * 128 + (4 * token + ((col >> 4) & 3)) * 4 + (col & 7) // 2
+    return (
+        (col >> 6) * 256
+        + ((col >> 3) & 1) * 128
+        + (4 * token + ((col >> 4) & 3)) * 4
+        + (col & 7) // 2
+    )
 
 
 @cute.jit
-def reduce_rank16(buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32,
-                   first: cutlass.Constexpr):
+def reduce_rank16(
+    buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32, first: cutlass.Constexpr
+):
     payload = cute.make_rmem_tensor((16, 4), cutlass.Uint32)
     for rank in cutlass.range_constexpr(16):
         offset = (token * 16 + rank) * 3072 + col // 2
         if cutlass.const_expr(first):
             offset = hop1_word_offset(token, rank, col)
         a, b, c, d = volatile_vector(buf.iterator + offset)
-        payload[rank, 0], payload[rank, 1], payload[rank, 2], payload[rank, 3] = a, b, c, d
+        payload[rank, 0], payload[rank, 1], payload[rank, 2], payload[rank, 3] = (
+            a,
+            b,
+            c,
+            d,
+        )
     waiting = cutlass.Boolean(True)
     while waiting:
         full = cutlass.Boolean(True)
@@ -280,7 +433,12 @@ def reduce_rank16(buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32,
                     if cutlass.const_expr(first):
                         offset = hop1_word_offset(token, rank, col)
                     a, b, c, d = volatile_vector(buf.iterator + offset)
-                    payload[rank, 0], payload[rank, 1], payload[rank, 2], payload[rank, 3] = a, b, c, d
+                    (
+                        payload[rank, 0],
+                        payload[rank, 1],
+                        payload[rank, 2],
+                        payload[rank, 3],
+                    ) = a, b, c, d
     low = cute.make_rmem_tensor((8,), cutlass.Float32)
     high = cute.make_rmem_tensor((8,), cutlass.Float32)
     for j in cutlass.range_constexpr(8):
@@ -299,24 +457,46 @@ def reduce_rank16(buf: cute.Tensor, token: cutlass.Int32, col: cutlass.Int32,
 
 
 @cute.jit
-def self_clear(hop1: cute.Tensor, previous_hop2: cute.Tensor,
-                token: cutlass.Int32, col: cutlass.Int32):
+def self_clear(
+    hop1: cute.Tensor,
+    previous_hop2: cute.Tensor,
+    token: cutlass.Int32,
+    col: cutlass.Int32,
+):
     policy = evict_first()
     for rank in cutlass.range_constexpr(16):
         store_empty(hop1.iterator + hop1_word_offset(token, rank, col), policy)
-        store_empty(previous_hop2.iterator + (token * 16 + rank) * 3072 + col // 2, policy)
+        store_empty(
+            previous_hop2.iterator + (token * 16 + rank) * 3072 + col // 2, policy
+        )
 
 
 @cute.jit
-def stage_hop(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Boolean,
-                hop1: cute.Tensor, hop2: cute.Tensor, previous_hop2: cute.Tensor,
-                residual_input: cute.Tensor, gamma: cute.Tensor, in_scale: cutlass.Float32,
-                shared_residual: cute.Tensor, scalars: cute.Tensor,
-                ssq1: cute.Tensor, ssq2: cute.Tensor,
-                h: cute.Tensor, hp: cute.Tensor, hfp4: cute.Tensor,
-                next_x: cute.Tensor, next_ssq: cute.Tensor,
-                normalized_output: cute.Tensor, residual_output: cute.Tensor,
-                warm_region=None, warm_tmem=None, warm_bar=None):
+def stage_hop(
+    unit: cutlass.Int32,
+    second: cutlass.Constexpr,
+    x_only: cutlass.Boolean,
+    hop1: cute.Tensor,
+    hop2: cute.Tensor,
+    previous_hop2: cute.Tensor,
+    residual_input: cute.Tensor,
+    gamma: cute.Tensor,
+    in_scale: cutlass.Float32,
+    shared_residual: cute.Tensor,
+    scalars: cute.Tensor,
+    ssq1: cute.Tensor,
+    ssq2: cute.Tensor,
+    h: cute.Tensor,
+    hp: cute.Tensor,
+    hfp4: cute.Tensor,
+    next_x: cute.Tensor,
+    next_ssq: cute.Tensor,
+    normalized_output: cute.Tensor,
+    residual_output: cute.Tensor,
+    warm_region=None,
+    warm_tmem=None,
+    warm_bar=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     token, quarter = unit // 4, unit % 4
     col = 1536 * quarter + 8 * tid
@@ -344,23 +524,49 @@ def stage_hop(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Bo
         else:
             sums = reduce_rank16(hop1, token, col, True)
         for j in cutlass.range_constexpr(4):
-            residual[2 * j] = round_bf16(round_bf16(sums[2 * j]) + bf16_from_word(res_prev[j], False))
-            residual[2 * j + 1] = round_bf16(round_bf16(sums[2 * j + 1]) + bf16_from_word(res_prev[j], True))
+            residual[2 * j] = round_bf16(
+                round_bf16(sums[2 * j]) + bf16_from_word(res_prev[j], False)
+            )
+            residual[2 * j + 1] = round_bf16(
+                round_bf16(sums[2 * j + 1]) + bf16_from_word(res_prev[j], True)
+            )
         for j in cutlass.range_constexpr(8):
             ssq += round_bf16(residual[j] * residual[j])
         prime = cute.make_rmem_tensor((4,), cutlass.Uint32)
         for j in cutlass.range_constexpr(4):
-            prime[j] = published_word(bf16_pair(round_bf16(residual[2 * j] * bf16_from_word(gam[j], False)),
-                                               round_bf16(residual[2 * j + 1] * bf16_from_word(gam[j], True))))
+            prime[j] = published_word(
+                bf16_pair(
+                    round_bf16(residual[2 * j] * bf16_from_word(gam[j], False)),
+                    round_bf16(residual[2 * j + 1] * bf16_from_word(gam[j], True)),
+                )
+            )
         if cutlass.const_expr(second):
-            store_vector(next_x.iterator + xfrag_word_offset(token, col), prime[0], prime[1], prime[2], prime[3])
+            store_vector(
+                next_x.iterator + xfrag_word_offset(token, col),
+                prime[0],
+                prime[1],
+                prime[2],
+                prime[3],
+            )
         else:
-            store_vector(hp.iterator + token * 3072 + col // 2, prime[0], prime[1], prime[2], prime[3])
+            store_vector(
+                hp.iterator + token * 3072 + col // 2,
+                prime[0],
+                prime[1],
+                prime[2],
+                prime[3],
+            )
         packed_res = cute.make_rmem_tensor((4,), cutlass.Uint32)
         for j in cutlass.range_constexpr(4):
             packed_res[j] = bf16_pair(residual[2 * j], residual[2 * j + 1])
         if cutlass.const_expr(second):
-            store_vector(residual_output.iterator + token * 3072 + col // 2, packed_res[0], packed_res[1], packed_res[2], packed_res[3])
+            store_vector(
+                residual_output.iterator + token * 3072 + col // 2,
+                packed_res[0],
+                packed_res[1],
+                packed_res[2],
+                packed_res[3],
+            )
         else:
             for j in cutlass.range_constexpr(4):
                 shared_residual[4 * tid + j] = packed_res[j]
@@ -379,22 +585,41 @@ def stage_hop(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Bo
         for warp in cutlass.range_constexpr(8):
             partial += scalars[warp]
         if cutlass.const_expr(second):
-            store_word(next_ssq.iterator + 4 * token + quarter, published_word(f32_bits(partial)))
+            store_word(
+                next_ssq.iterator + 4 * token + quarter,
+                published_word(f32_bits(partial)),
+            )
         rendezvous = cutlass.Boolean(True)
         if cutlass.const_expr(second):
             rendezvous = not x_only
         if rendezvous:
             if cutlass.const_expr(second):
-                store_word(ssq2.iterator + 4 * token + quarter, published_word(f32_bits(partial)))
+                store_word(
+                    ssq2.iterator + 4 * token + quarter,
+                    published_word(f32_bits(partial)),
+                )
                 src = ssq2.iterator + 4 * token
             else:
-                store_word(ssq1.iterator + 4 * token + quarter, published_word(f32_bits(partial)))
+                store_word(
+                    ssq1.iterator + 4 * token + quarter,
+                    published_word(f32_bits(partial)),
+                )
                 src = ssq1.iterator + 4 * token
             waiting = cutlass.Boolean(True)
             while waiting:
                 a, b, c, d = volatile_vector(src)
-                if (a != cutlass.Uint32(0x80000000)) & (b != cutlass.Uint32(0x80000000)) & (c != cutlass.Uint32(0x80000000)) & (d != cutlass.Uint32(0x80000000)):
-                    scalars[8], scalars[9], scalars[10], scalars[11] = bits_f32(a), bits_f32(b), bits_f32(c), bits_f32(d)
+                if (
+                    (a != cutlass.Uint32(0x80000000))
+                    & (b != cutlass.Uint32(0x80000000))
+                    & (c != cutlass.Uint32(0x80000000))
+                    & (d != cutlass.Uint32(0x80000000))
+                ):
+                    scalars[8], scalars[9], scalars[10], scalars[11] = (
+                        bits_f32(a),
+                        bits_f32(b),
+                        bits_f32(c),
+                        bits_f32(d),
+                    )
                     waiting = cutlass.Boolean(False)
     cute.arch.sync_threads()
     materialize = cutlass.Boolean(True)
@@ -410,13 +635,29 @@ def stage_hop(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Bo
             hv = cute.make_rmem_tensor((8,), cutlass.Float32)
             packed_h = cute.make_rmem_tensor((4,), cutlass.Uint32)
             for j in cutlass.range_constexpr(4):
-                hv[2 * j] = round_bf16((residual[2 * j] * rstd) * bf16_from_word(gam[j], False))
-                hv[2 * j + 1] = round_bf16((residual[2 * j + 1] * rstd) * bf16_from_word(gam[j], True))
+                hv[2 * j] = round_bf16(
+                    (residual[2 * j] * rstd) * bf16_from_word(gam[j], False)
+                )
+                hv[2 * j + 1] = round_bf16(
+                    (residual[2 * j + 1] * rstd) * bf16_from_word(gam[j], True)
+                )
                 packed_h[j] = bf16_pair(hv[2 * j], hv[2 * j + 1])
             if cutlass.const_expr(second):
-                store_vector(normalized_output.iterator + token * 3072 + col // 2, packed_h[0], packed_h[1], packed_h[2], packed_h[3])
+                store_vector(
+                    normalized_output.iterator + token * 3072 + col // 2,
+                    packed_h[0],
+                    packed_h[1],
+                    packed_h[2],
+                    packed_h[3],
+                )
             else:
-                store_vector(h.iterator + token * 3072 + col // 2, published_word(packed_h[0]), published_word(packed_h[1]), published_word(packed_h[2]), published_word(packed_h[3]))
+                store_vector(
+                    h.iterator + token * 3072 + col // 2,
+                    published_word(packed_h[0]),
+                    published_word(packed_h[1]),
+                    published_word(packed_h[2]),
+                    published_word(packed_h[3]),
+                )
                 maximum = cutlass.Float32(0)
                 for j in cutlass.range_constexpr(8):
                     maximum = max_num(maximum, cute.math.abs(hv[j]))
@@ -429,17 +670,30 @@ def stage_hop(unit: cutlass.Int32, second: cutlass.Constexpr, x_only: cutlass.Bo
                     output_scale = cute.arch.rcp_approx(sf_float * in_rcp)
                 packed = cutlass.Uint32(0)
                 for j in cutlass.range_constexpr(4):
-                    packed |= fp4_pair(hv[2 * j] * output_scale, hv[2 * j + 1] * output_scale) << (8 * j)
-                store_word(hfp4.iterator + token * 768 + col // 8, published_word(packed))
+                    packed |= fp4_pair(
+                        hv[2 * j] * output_scale, hv[2 * j + 1] * output_scale
+                    ) << (8 * j)
+                store_word(
+                    hfp4.iterator + token * 768 + col // 8, published_word(packed)
+                )
                 s1 = cute.arch.shuffle_sync_down(sf, 2)
                 s2 = cute.arch.shuffle_sync_down(sf, 4)
                 s3 = cute.arch.shuffle_sync_down(sf, 6)
                 if (tid & 7) == 0:
-                    store_word(hfp4.iterator + 6144 + token * 96 + col // 64, published_word(sf | (s1 << 8) | (s2 << 16) | (s3 << 24)))
+                    store_word(
+                        hfp4.iterator + 6144 + token * 96 + col // 64,
+                        published_word(sf | (s1 << 8) | (s2 << 16) | (s3 << 24)),
+                    )
 
 
 # Imported last: the role modules import each other, and their names are used only when a kernel is traced.
-from .attention import bf16_pair, e4m3_pair, published_word, bf16_from_word, volatile_vector
-from .gpu_publication import global_pair, readonly_vector, store_word, store_vector
+from .attention import (
+    bf16_from_word,
+    bf16_pair,
+    e4m3_pair,
+    published_word,
+    volatile_vector,
+)
+from .gpu_publication import global_pair, readonly_vector, store_vector, store_word
 from .indexer import round_bf16
 from .moe import warm_moe

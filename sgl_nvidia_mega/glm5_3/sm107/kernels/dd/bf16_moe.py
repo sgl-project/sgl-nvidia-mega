@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import cutlass
-from cutlass._mlir.dialects import arith, llvm
 import cutlass.cute as cute
+from cutlass._mlir.dialects import arith, llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
-
 
 HIDDEN = 6144
 EXPERTS = 256
@@ -29,16 +28,27 @@ FC2_REGION = TOPK * FC2_SLICE
 REGION_BYTES = FC1_REGION + FC2_REGION
 ACT_WORDS = FC1_UNITS
 LOGIT_WORDS = EXPERTS
-SM_ROUTE, SM_SIG, SM_ROWSUM, SM_RSUM, SM_TERMS, SM_OUT, SM_ACT = 0, 16, 272, 368, 384, 640, 1024
+SM_ROUTE, SM_SIG, SM_ROWSUM, SM_RSUM, SM_TERMS, SM_OUT, SM_ACT = (
+    0,
+    16,
+    272,
+    368,
+    384,
+    640,
+    1024,
+)
 SM_WORDS = 1536
 BARS = 1 + FC1_MAX_ROWS + 1
 
 
 def routing_scale(routed_scaling_factor):
     import struct
+
     vf = struct.unpack(">f", struct.pack(">f", routed_scaling_factor))[0]
     bits = struct.unpack(">I", struct.pack(">f", routed_scaling_factor))[0]
-    fast = vf == routed_scaling_factor and (bits & 0xF) == 0 and 2.0 ** -20 <= vf <= 2.0 ** 20
+    fast = (
+        vf == routed_scaling_factor and (bits & 0xF) == 0 and 2.0**-20 <= vf <= 2.0**20
+    )
     return float(routed_scaling_factor), vf, fast
 
 
@@ -55,20 +65,34 @@ def sigmoid_accurate(x: cutlass.Float32, *, loc=None, ip=None):
 
     h = op("llvm.nvvm.mul.rn.f", x, k(0.5))
     a = op("llvm.nvvm.fabs.f", h)
-    e = op("llvm.nvvm.ex2.approx.ftz.f", op("llvm.nvvm.mul.rn.f", a, k(2.885390043258667)))
+    e = op(
+        "llvm.nvvm.ex2.approx.ftz.f", op("llvm.nvvm.mul.rn.f", a, k(2.885390043258667))
+    )
     e = op("llvm.nvvm.add.rn.f", e, k(1.0))
     f = fma(op("llvm.nvvm.rcp.approx.ftz.f", e), k(-2.0), k(1.0))
-    f = arith.select(arith.cmpf(arith.CmpFPredicate.OGE, a, k(9.010913848876953), loc=loc, ip=ip), k(1.0), f,
-                     loc=loc, ip=ip)
-    s = llvm.call_intrinsic(T.f32(), "llvm.copysign.f32", [f, h], [], [], loc=loc, ip=ip)
+    f = arith.select(
+        arith.cmpf(arith.CmpFPredicate.OGE, a, k(9.010913848876953), loc=loc, ip=ip),
+        k(1.0),
+        f,
+        loc=loc,
+        ip=ip,
+    )
+    s = llvm.call_intrinsic(
+        T.f32(), "llvm.copysign.f32", [f, h], [], [], loc=loc, ip=ip
+    )
     q = op("llvm.nvvm.mul.rn.f", h, h)
     p = fma(q, k(0.01573968306183815), k(-0.05230396240949631))
     p = fma(p, q, k(0.13315297663211823))
     p = fma(p, q, k(-0.33332768082618713))
     p = fma(p, q, k(0.0))
     p = fma(p, h, h)
-    p = arith.select(arith.cmpf(arith.CmpFPredicate.OGE, a, k(0.6000000238418579), loc=loc, ip=ip), s, p,
-                     loc=loc, ip=ip)
+    p = arith.select(
+        arith.cmpf(arith.CmpFPredicate.OGE, a, k(0.6000000238418579), loc=loc, ip=ip),
+        s,
+        p,
+        loc=loc,
+        ip=ip,
+    )
     return cutlass.Float32(fma(p, k(0.5), k(0.5)))
 
 
@@ -85,18 +109,40 @@ def silu_mul(gate: cutlass.Float32, up: cutlass.Float32, *, loc=None, ip=None):
 
     x = cutlass.Float32(gate).ir_value(loc=loc, ip=ip)
     # clamp to [0, 1]; NaN goes to 0 because max returns the non-NaN operand
-    a = op("llvm.nvvm.fmin.f", op("llvm.nvvm.fmax.f", fma(x, k(-0.005724980030208826), k(0.5)), k(0.0)), k(1.0))
+    a = op(
+        "llvm.nvvm.fmin.f",
+        op("llvm.nvvm.fmax.f", fma(x, k(-0.005724980030208826), k(0.5)), k(0.0)),
+        k(1.0),
+    )
     # a * 252 + C rounded toward -inf: C is an integer with unit ulp, so the result is C + floor(a * 252).
     # Round to nearest, then step down one when the exact residual shows it rounded up.
     r = fma(a, k(252.0), k(12582913.0))
-    residual = fma(a, k(252.0), op("llvm.nvvm.add.rn.f", k(12582913.0), arith.negf(r, loc=loc, ip=ip)))
-    below = arith.cmpf(arith.CmpFPredicate.OLT, residual, k(0.0), loc=loc, ip=ip)
+    residual = fma(
+        a,
+        k(252.0),
+        op("llvm.nvvm.add.rn.f", k(12582913.0), arith.negf(r, loc=loc, ip=ip)),
+    )
+    below = arith.cmpf(
+        arith.CmpFPredicate.OLT,  # codespell:ignore
+        residual,
+        k(0.0),
+        loc=loc,
+        ip=ip,
+    )
     b = arith.select(below, op("llvm.nvvm.add.rn.f", r, k(-1.0)), r, loc=loc, ip=ip)
     c = arith.negf(op("llvm.nvvm.add.rn.f", b, k(-12583039.0)), loc=loc, ip=ip)
     d = fma(x, k(-1.925963033500011e-08), fma(x, k(-1.4426950216293335), c))
-    scale = arith.shli(llvm.bitcast(T.i32(), b, loc=loc, ip=ip), cutlass.Uint32(23).ir_value(loc=loc, ip=ip),
-                       loc=loc, ip=ip)
-    g = fma(op("llvm.nvvm.ex2.approx.ftz.f", d), llvm.bitcast(T.f32(), scale, loc=loc, ip=ip), k(1.0))
+    scale = arith.shli(
+        llvm.bitcast(T.i32(), b, loc=loc, ip=ip),
+        cutlass.Uint32(23).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    g = fma(
+        op("llvm.nvvm.ex2.approx.ftz.f", d),
+        llvm.bitcast(T.f32(), scale, loc=loc, ip=ip),
+        k(1.0),
+    )
     h = op("llvm.nvvm.rcp.rn.f", g)
     return cutlass.Float32(op("llvm.nvvm.mul.rn.f", up, op("llvm.nvvm.mul.rn.f", x, h)))
 
@@ -115,19 +161,32 @@ def add_rn(a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None):
 def sub_rn(a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None):
     # a - b is a + (-b) exactly, signed zeros included
     minus_b = arith.negf(cutlass.Float32(b).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    return cutlass.Float32(f32_intrinsic("llvm.nvvm.add.rn.f", a, minus_b, loc=loc, ip=ip))
+    return cutlass.Float32(
+        f32_intrinsic("llvm.nvvm.add.rn.f", a, minus_b, loc=loc, ip=ip)
+    )
 
 
 @dsl_user_op
-def routing_weight_fp64(s: cutlass.Float32, total: cutlass.Float32, c: cutlass.Constexpr, *, loc=None, ip=None):
+def routing_weight_fp64(
+    s: cutlass.Float32,
+    total: cutlass.Float32,
+    c: cutlass.Constexpr,
+    *,
+    loc=None,
+    ip=None,
+):
     def f64(name, x, y):
         return llvm.call_intrinsic(T.f64(), name, [x, y], [], [], loc=loc, ip=ip)
 
     a = arith.extf(T.f64(), cutlass.Float32(s).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    b = arith.extf(T.f64(), cutlass.Float32(total).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    b = arith.extf(
+        T.f64(), cutlass.Float32(total).ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+    )
     n = f64("llvm.nvvm.mul.rn.d", a, arith.constant(T.f64(), float(c), loc=loc, ip=ip))
     d = f64("llvm.nvvm.add.rn.d", b, arith.constant(T.f64(), 1e-20, loc=loc, ip=ip))
-    return cutlass.Float32(arith.truncf(T.f32(), f64("llvm.nvvm.div.rn.d", n, d), loc=loc, ip=ip))
+    return cutlass.Float32(
+        arith.truncf(T.f32(), f64("llvm.nvvm.div.rn.d", n, d), loc=loc, ip=ip)
+    )
 
 
 @cute.jit
@@ -136,7 +195,7 @@ def routing_weight(s: cutlass.Float32, total: cutlass.Float32, c: cutlass.Conste
     result = cutlass.Float32(0.0)
     done = cutlass.Boolean(False)
     if cutlass.const_expr(fast):
-        if (total >= cutlass.Float32(2.0 ** -13)) & (s >= cutlass.Float32(2.0 ** -60)):
+        if (total >= cutlass.Float32(2.0**-13)) & (s >= cutlass.Float32(2.0**-60)):
             p_hi = mul_rn(s, cutlass.Float32(cf))
             p_lo = fma_rn(s, cutlass.Float32(cf), -p_hi)
             q = div_rn(p_hi, total)
@@ -144,11 +203,20 @@ def routing_weight(s: cutlass.Float32, total: cutlass.Float32, c: cutlass.Conste
             e = div_rn(add_rn(r, p_lo), total)
             y = add_rn(q, e)
             bits = f32_bits(y)
-            if (y > cutlass.Float32(0.0)) & ((bits & cutlass.Uint32(0x7FFFFF)) != cutlass.Uint32(0)) & \
-                    ((bits & cutlass.Uint32(0x7F800000)) != cutlass.Uint32(0x7F800000)):
-                ulp = mul_rn(bits_f32(bits & cutlass.Uint32(0x7F800000)), cutlass.Float32(2.0 ** -23))
+            if (
+                (y > cutlass.Float32(0.0))
+                & ((bits & cutlass.Uint32(0x7FFFFF)) != cutlass.Uint32(0))
+                & ((bits & cutlass.Uint32(0x7F800000)) != cutlass.Uint32(0x7F800000))
+            ):
+                ulp = mul_rn(
+                    bits_f32(bits & cutlass.Uint32(0x7F800000)),
+                    cutlass.Float32(2.0**-23),
+                )
                 g = sub_rn(e, sub_rn(y, q))
-                bound = sub_rn(mul_rn(cutlass.Float32(0.5), ulp), mul_rn(cutlass.Float32(2.0 ** -20), ulp))
+                bound = sub_rn(
+                    mul_rn(cutlass.Float32(0.5), ulp),
+                    mul_rn(cutlass.Float32(2.0**-20), ulp),
+                )
                 if cute.math.abs(g) < bound:
                     result = y
                     done = cutlass.Boolean(True)
@@ -196,18 +264,33 @@ def bf16_word(value: cutlass.Float32):
 
 
 @cute.jit
-def issue_router(unit: cutlass.Int32, w_router: cute.Tensor, base: cutlass.Uint32, bar: cute.Pointer):
+def issue_router(
+    unit: cutlass.Int32, w_router: cute.Tensor, base: cutlass.Uint32, bar: cute.Pointer
+):
     tid, _, _ = cute.arch.thread_idx()
     if tid == 0:
         cute.arch.mbarrier_arrive_and_expect_tx(bar, 2 * ROW_BYTES)
         for h in cutlass.range_constexpr(2):
-            bulk_copy(base + cutlass.Uint32(h * ROW_BYTES), w_router.iterator + (2 * unit + h) * HIDDEN,
-                      cutlass.Uint32(ROW_BYTES), bar, evict_first())
+            bulk_copy(
+                base + cutlass.Uint32(h * ROW_BYTES),
+                w_router.iterator + (2 * unit + h) * HIDDEN,
+                cutlass.Uint32(ROW_BYTES),
+                bar,
+                evict_first(),
+            )
 
 
 @cute.jit
-def router_unit(unit: cutlass.Int32, x: cute.Tensor, x_off: cutlass.Int32, base: cutlass.Uint32, sm: cute.Tensor,
-                logits: cute.Tensor, bar: cute.Pointer, poll: cutlass.Constexpr):
+def router_unit(
+    unit: cutlass.Int32,
+    x: cute.Tensor,
+    x_off: cutlass.Int32,
+    base: cutlass.Uint32,
+    sm: cute.Tensor,
+    logits: cute.Tensor,
+    bar: cute.Pointer,
+    poll: cutlass.Constexpr,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     half, t = tid >> 7, tid & 127
@@ -230,8 +313,11 @@ def router_unit(unit: cutlass.Int32, x: cute.Tensor, x_off: cutlass.Int32, base:
         bw = (b0, b1, b2, b3)
         for i in cutlass.range_constexpr(4):
             acc = fma_rn(bits_f32(xv[ki, i] << 16), bits_f32(bw[i] << 16), acc)
-            acc = fma_rn(bits_f32(xv[ki, i] & cutlass.Uint32(0xFFFF0000)),
-                         bits_f32(bw[i] & cutlass.Uint32(0xFFFF0000)), acc)
+            acc = fma_rn(
+                bits_f32(xv[ki, i] & cutlass.Uint32(0xFFFF0000)),
+                bits_f32(bw[i] & cutlass.Uint32(0xFFFF0000)),
+                acc,
+            )
     for sh in cutlass.range_constexpr(5):
         acc = acc + cute.arch.shuffle_sync_bfly(acc, 16 >> sh)
     if lane == 0:
@@ -246,7 +332,9 @@ def router_unit(unit: cutlass.Int32, x: cute.Tensor, x_off: cutlass.Int32, base:
 
 
 @cute.jit
-def route_moe(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cutlass.Constexpr):
+def route_moe(
+    logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cutlass.Constexpr
+):
     tid, _, _ = cute.arch.thread_idx()
     lane = tid & 31
     if tid < 32:
@@ -313,8 +401,14 @@ ROUTE_PARALLEL = True
 
 
 @cute.jit
-def route_moe_parallel(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, scale: cutlass.Constexpr,
-                       ssq=None, after_select=None):
+def route_moe_parallel(
+    logits: cute.Tensor,
+    bias: cute.Tensor,
+    sm: cute.Tensor,
+    scale: cutlass.Constexpr,
+    ssq=None,
+    after_select=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     bv = bias[tid]
@@ -330,8 +424,9 @@ def route_moe_parallel(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, 
                 sw = volatile_word(ssq.iterator + tid)
             sm[SM_RSUM + tid] = sw
         cute.arch.sync_threads()
-        ssq_total = ((cutlass.Float32(0) + bits_f32(sm[SM_RSUM])) + bits_f32(sm[SM_RSUM + 1])) + \
-            bits_f32(sm[SM_RSUM + 2])
+        ssq_total = (
+            (cutlass.Float32(0) + bits_f32(sm[SM_RSUM])) + bits_f32(sm[SM_RSUM + 1])
+        ) + bits_f32(sm[SM_RSUM + 2])
         ssq_total += bits_f32(sm[SM_RSUM + 3])
         rstd = cute.math.rsqrt(ssq_total / 6144.0 + 1.0e-5, fastmath=True)
         lw = f32_bits((cutlass.Float32(0.0) + bits_f32(lw)) * rstd)
@@ -377,15 +472,26 @@ def route_moe_parallel(logits: cute.Tensor, bias: cute.Tensor, sm: cute.Tensor, 
 
 
 @cute.jit
-def fc1_range(fc1_cta: cutlass.Int32, fc1_ctas: cutlass.Constexpr, pairs: cutlass.Constexpr = FC1_PAIRS):
+def fc1_range(
+    fc1_cta: cutlass.Int32,
+    fc1_ctas: cutlass.Constexpr,
+    pairs: cutlass.Constexpr = FC1_PAIRS,
+):
     pb = (fc1_cta * pairs) // fc1_ctas
     pe = ((fc1_cta + 1) * pairs) // fc1_ctas
     return 2 * pb, 2 * (pe - pb)
 
 
 @cute.jit
-def issue_fc1(fc1_cta: cutlass.Int32, fc1_ctas: cutlass.Constexpr, w3w1: cute.Tensor, sm: cute.Tensor,
-              base: cutlass.Uint32, bars: cute.Pointer, w_shared=None):
+def issue_fc1(
+    fc1_cta: cutlass.Int32,
+    fc1_ctas: cutlass.Constexpr,
+    w3w1: cute.Tensor,
+    sm: cute.Tensor,
+    base: cutlass.Uint32,
+    bars: cute.Pointer,
+    w_shared=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     pairs = FC1_PAIRS
     if cutlass.const_expr(w_shared is not None):
@@ -405,24 +511,46 @@ def issue_fc1(fc1_cta: cutlass.Int32, fc1_ctas: cutlass.Constexpr, w3w1: cute.Te
                     srow = j + INTER
                     if r % 2 == 0:
                         srow = j
-                    bulk_copy(base + (r * ROW_BYTES).to(cutlass.Uint32), w_shared.iterator + srow * HIDDEN,
-                              cutlass.Uint32(ROW_BYTES), bars + r, policy)
+                    bulk_copy(
+                        base + (r * ROW_BYTES).to(cutlass.Uint32),
+                        w_shared.iterator + srow * HIDDEN,
+                        cutlass.Uint32(ROW_BYTES),
+                        bars + r,
+                        policy,
+                    )
                 else:
                     expert = sm[SM_ROUTE + slot].to(cutlass.Int32)
-                    bulk_copy(base + (r * ROW_BYTES).to(cutlass.Uint32),
-                              w3w1.iterator + (expert * (2 * INTER) + row) * HIDDEN,
-                              cutlass.Uint32(ROW_BYTES), bars + r, policy)
+                    bulk_copy(
+                        base + (r * ROW_BYTES).to(cutlass.Uint32),
+                        w3w1.iterator + (expert * (2 * INTER) + row) * HIDDEN,
+                        cutlass.Uint32(ROW_BYTES),
+                        bars + r,
+                        policy,
+                    )
             else:
                 expert = sm[SM_ROUTE + slot].to(cutlass.Int32)
-                bulk_copy(base + (r * ROW_BYTES).to(cutlass.Uint32),
-                          w3w1.iterator + (expert * (2 * INTER) + row) * HIDDEN,
-                          cutlass.Uint32(ROW_BYTES), bars + r, policy)
+                bulk_copy(
+                    base + (r * ROW_BYTES).to(cutlass.Uint32),
+                    w3w1.iterator + (expert * (2 * INTER) + row) * HIDDEN,
+                    cutlass.Uint32(ROW_BYTES),
+                    bars + r,
+                    policy,
+                )
 
 
 @cute.jit
-def fc1_unit(fc1_cta: cutlass.Int32, fc1_ctas: cutlass.Constexpr, x: cute.Tensor, x_off: cutlass.Int32,
-             base: cutlass.Uint32, sm: cute.Tensor, act: cute.Tensor, bars: cute.Pointer, poll: cutlass.Constexpr,
-             pairs: cutlass.Constexpr = FC1_PAIRS):
+def fc1_unit(
+    fc1_cta: cutlass.Int32,
+    fc1_ctas: cutlass.Constexpr,
+    x: cute.Tensor,
+    x_off: cutlass.Int32,
+    base: cutlass.Uint32,
+    sm: cute.Tensor,
+    act: cute.Tensor,
+    bars: cute.Pointer,
+    poll: cutlass.Constexpr,
+    pairs: cutlass.Constexpr = FC1_PAIRS,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     u0, nu = fc1_range(fc1_cta, fc1_ctas, pairs)
@@ -455,7 +583,11 @@ def fc1_unit(fc1_cta: cutlass.Int32, fc1_ctas: cutlass.Constexpr, x: cute.Tensor
                 d = fma_rn(bits_f32(pw[0] & cutlass.Uint32(0xFFFF0000)), xf[i, 1], d)
                 for q in cutlass.range_constexpr(1, 4):
                     d = fma_rn(bits_f32(pw[q] << 16), xf[i, 2 * q], d)
-                    d = fma_rn(bits_f32(pw[q] & cutlass.Uint32(0xFFFF0000)), xf[i, 2 * q + 1], d)
+                    d = fma_rn(
+                        bits_f32(pw[q] & cutlass.Uint32(0xFFFF0000)),
+                        xf[i, 2 * q + 1],
+                        d,
+                    )
                 if cutlass.const_expr(i == 0):
                     dot = d
                 else:
@@ -483,29 +615,52 @@ def fc1_unit(fc1_cta: cutlass.Int32, fc1_ctas: cutlass.Constexpr, x: cute.Tensor
 
 
 @cute.jit
-def issue_fc2(unit: cutlass.Int32, w2: cute.Tensor, sm: cute.Tensor, base: cutlass.Uint32, bar: cute.Pointer):
+def issue_fc2(
+    unit: cutlass.Int32,
+    w2: cute.Tensor,
+    sm: cute.Tensor,
+    base: cutlass.Uint32,
+    bar: cute.Pointer,
+):
     tid, _, _ = cute.arch.thread_idx()
     if tid == 0:
         policy = evict_first()
         cute.arch.mbarrier_arrive_and_expect_tx(bar, FC2_REGION)
         for k in cutlass.range_constexpr(TOPK):
             expert = sm[SM_ROUTE + k].to(cutlass.Int32)
-            bulk_copy(base + cutlass.Uint32(k * FC2_SLICE),
-                      w2.iterator + (expert * HIDDEN + unit * FC2_ROWS) * INTER,
-                      cutlass.Uint32(FC2_SLICE), bar, policy)
+            bulk_copy(
+                base + cutlass.Uint32(k * FC2_SLICE),
+                w2.iterator + (expert * HIDDEN + unit * FC2_ROWS) * INTER,
+                cutlass.Uint32(FC2_SLICE),
+                bar,
+                policy,
+            )
 
 
 @cute.jit
-def fc2_unit(unit: cutlass.Int32, act: cute.Tensor, base: cutlass.Uint32, sm: cute.Tensor, out: cute.Tensor,
-             out_off: cutlass.Int32, bar: cute.Pointer, addend=None, addend_rows=None):
+def fc2_unit(
+    unit: cutlass.Int32,
+    act: cute.Tensor,
+    base: cutlass.Uint32,
+    sm: cute.Tensor,
+    out: cute.Tensor,
+    out_off: cutlass.Int32,
+    bar: cute.Pointer,
+    addend=None,
+    addend_rows=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     g, t = lane >> 2, lane & 3
     swap = g & 1
     a0, a1, a2, a3 = poll_words(act, warp * INTER + 4 * lane)
     act_base = sm.iterator.toint().to(cutlass.Uint32) + cutlass.Uint32(SM_ACT * 4)
-    sm[SM_ACT + warp * 64 + 2 * lane] = (a0 >> cutlass.Uint32(16)) | (a1 & cutlass.Uint32(0xFFFF0000))
-    sm[SM_ACT + warp * 64 + 2 * lane + 1] = (a2 >> cutlass.Uint32(16)) | (a3 & cutlass.Uint32(0xFFFF0000))
+    sm[SM_ACT + warp * 64 + 2 * lane] = (a0 >> cutlass.Uint32(16)) | (
+        a1 & cutlass.Uint32(0xFFFF0000)
+    )
+    sm[SM_ACT + warp * 64 + 2 * lane + 1] = (a2 >> cutlass.Uint32(16)) | (
+        a3 & cutlass.Uint32(0xFFFF0000)
+    )
     cute.arch.sync_warp()
     acc = cute.make_rmem_tensor((FC2_TILES, 2, 4), cutlass.Float32)
     for ti in cutlass.range_constexpr(FC2_TILES):
@@ -517,14 +672,36 @@ def fc2_unit(unit: cutlass.Int32, act: cute.Tensor, base: cutlass.Uint32, sm: cu
     for j0 in cutlass.range_constexpr(0, INTER, 64):
         for hf in cutlass.range_constexpr(2):
             j = j0 + (hf ^ swap) * 32 + 8 * t
-            v0, v1, v2, v3 = lds128(act_base + ((warp * 64 + j // 2) * 4).to(cutlass.Uint32))
+            v0, v1, v2, v3 = lds128(
+                act_base + ((warp * 64 + j // 2) * 4).to(cutlass.Uint32)
+            )
             for ti in cutlass.range_constexpr(FC2_TILES):
-                lo0, lo1, lo2, lo3 = lds128(slice_base + (((ti * 16 + g) * INTER + j) * 2).to(cutlass.Uint32))
-                hi0, hi1, hi2, hi3 = lds128(slice_base + (((ti * 16 + g + 8) * INTER + j) * 2).to(cutlass.Uint32))
-                c0, c1, c2, c3 = mma_bf16(acc[ti, hf, 0], acc[ti, hf, 1], acc[ti, hf, 2], acc[ti, hf, 3],
-                                          lo0, hi0, lo1, hi1, v0, v1)
+                lo0, lo1, lo2, lo3 = lds128(
+                    slice_base + (((ti * 16 + g) * INTER + j) * 2).to(cutlass.Uint32)
+                )
+                hi0, hi1, hi2, hi3 = lds128(
+                    slice_base
+                    + (((ti * 16 + g + 8) * INTER + j) * 2).to(cutlass.Uint32)
+                )
+                c0, c1, c2, c3 = mma_bf16(
+                    acc[ti, hf, 0],
+                    acc[ti, hf, 1],
+                    acc[ti, hf, 2],
+                    acc[ti, hf, 3],
+                    lo0,
+                    hi0,
+                    lo1,
+                    hi1,
+                    v0,
+                    v1,
+                )
                 c0, c1, c2, c3 = mma_bf16(c0, c1, c2, c3, lo2, hi2, lo3, hi3, v2, v3)
-                acc[ti, hf, 0], acc[ti, hf, 1], acc[ti, hf, 2], acc[ti, hf, 3] = c0, c1, c2, c3
+                acc[ti, hf, 0], acc[ti, hf, 1], acc[ti, hf, 2], acc[ti, hf, 3] = (
+                    c0,
+                    c1,
+                    c2,
+                    c3,
+                )
     weight = bits_f32(sm[SM_ROUTE + 8 + warp])
     if t == 0:
         for ti in cutlass.range_constexpr(FC2_TILES):
@@ -549,22 +726,52 @@ def fc2_unit(unit: cutlass.Int32, act: cute.Tensor, base: cutlass.Uint32, sm: cu
         sm[SM_OUT + tid] = f32_bits(total)
     cute.arch.sync_threads()
     if tid < FC2_ROWS // 2:
-        word = bf16_pair(bits_f32(sm[SM_OUT + 2 * tid]), bits_f32(sm[SM_OUT + 2 * tid + 1]))
+        word = bf16_pair(
+            bits_f32(sm[SM_OUT + 2 * tid]), bits_f32(sm[SM_OUT + 2 * tid + 1])
+        )
         if cutlass.const_expr(addend_rows is not None):
-            word = bf16_pair(add_rn(round_bf16_value(addend_rows[2 * tid]), bf16_from_word(word, False)),
-                             add_rn(round_bf16_value(addend_rows[2 * tid + 1]), bf16_from_word(word, True)))
+            word = bf16_pair(
+                add_rn(
+                    round_bf16_value(addend_rows[2 * tid]), bf16_from_word(word, False)
+                ),
+                add_rn(
+                    round_bf16_value(addend_rows[2 * tid + 1]),
+                    bf16_from_word(word, True),
+                ),
+            )
         if cutlass.const_expr(addend is not None):
             sw = volatile_word(addend.iterator + unit * (FC2_ROWS // 2) + tid)
             while sw == cutlass.Uint32(EMPTY):
                 sw = volatile_word(addend.iterator + unit * (FC2_ROWS // 2) + tid)
-            word = bf16_pair(add_rn(bf16_from_word(sw, False), bf16_from_word(word, False)),
-                             add_rn(bf16_from_word(sw, True), bf16_from_word(word, True)))
-        store_word(out.iterator + out_off + unit * (FC2_ROWS // 2) + tid, published_word(word))
+            word = bf16_pair(
+                add_rn(bf16_from_word(sw, False), bf16_from_word(word, False)),
+                add_rn(bf16_from_word(sw, True), bf16_from_word(word, True)),
+            )
+        store_word(
+            out.iterator + out_off + unit * (FC2_ROWS // 2) + tid, published_word(word)
+        )
     cute.arch.sync_threads()
 
 
+from .attention import (
+    EMPTY,
+    bf16_from_word,
+    bf16_pair,
+    mma_bf16,
+    published_word,
+    volatile_vector,
+)
+from .common import (
+    bits_f32,
+    bulk_copy,
+    evict_first,
+    f32_bits,
+    f32_const,
+    f32_intrinsic,
+    fma_rn,
+    mul_rn,
+)
+from .gpu_publication import lds128, store_word
+
 # Imported last: the role modules import each other, and their names are used only when a kernel is traced.
 from .moe import poll_words, redux_max, volatile_word
-from .common import f32_intrinsic, f32_const, evict_first, bits_f32, f32_bits, fma_rn, mul_rn, bulk_copy
-from .attention import bf16_pair, mma_bf16, published_word, bf16_from_word, volatile_vector, EMPTY
-from .gpu_publication import lds128, store_word

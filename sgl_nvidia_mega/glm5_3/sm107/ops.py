@@ -12,13 +12,17 @@ from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 def at(t, offset):
     return cute.make_tensor(t.iterator + offset, cute.make_layout((1,)))
 
+
 def div64(v):
     return (v + ((v >> 31) & c.Int32(63))) >> 6
+
 
 class FillStepAll:
     @cute.jit
     def __call__(self, r2t, req, pos, bt, kvl, stream):
-        self.kernel(r2t, req, pos, bt, kvl).launch(grid=(24, 1, 1), block=(256, 1, 1), stream=stream)
+        self.kernel(r2t, req, pos, bt, kvl).launch(
+            grid=(24, 1, 1), block=(256, 1, 1), stream=stream
+        )
 
     @cute.kernel
     def kernel(self, r2t, req, pos, bt, kvl):
@@ -40,13 +44,62 @@ class FillStepAll:
 
 class PostVerify:
     @cute.jit
-    def __call__(self, acc, na, am, cand, seq_lens, sim_l, predict, ai, al, nsl, at_, bonus, s0_acc, s0_na, sel,
-                 stream):
-        self.kernel(acc, na, am, cand, seq_lens, sim_l, predict, ai, al, nsl, at_, bonus, s0_acc, s0_na,
-                    sel).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+    def __call__(
+        self,
+        acc,
+        na,
+        am,
+        cand,
+        seq_lens,
+        sim_l,
+        predict,
+        ai,
+        al,
+        nsl,
+        at_,
+        bonus,
+        s0_acc,
+        s0_na,
+        sel,
+        stream,
+    ):
+        self.kernel(
+            acc,
+            na,
+            am,
+            cand,
+            seq_lens,
+            sim_l,
+            predict,
+            ai,
+            al,
+            nsl,
+            at_,
+            bonus,
+            s0_acc,
+            s0_na,
+            sel,
+        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, acc, na, am, cand, seq_lens, sim_l, predict, ai, al, nsl, at_, bonus, s0_acc, s0_na, sel):
+    def kernel(
+        self,
+        acc,
+        na,
+        am,
+        cand,
+        seq_lens,
+        sim_l,
+        predict,
+        ai,
+        al,
+        nsl,
+        at_,
+        bonus,
+        s0_acc,
+        s0_na,
+        sel,
+    ):
         tid, _, _ = cute.arch.thread_idx()
         if tid == 0:
             p, m = [], []
@@ -79,7 +132,9 @@ class PostVerify:
 class DraftPages:
     @cute.jit
     def __call__(self, r2t, req, sl, bt, stream):
-        self.kernel(r2t, req, sl, bt).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        self.kernel(r2t, req, sl, bt).launch(
+            grid=(1, 1, 1), block=(32, 1, 1), stream=stream
+        )
 
     @cute.kernel
     def kernel(self, r2t, req, sl, bt):
@@ -93,9 +148,12 @@ class DraftPages:
 
 class ChainTree:
     @cute.jit
-    def __call__(self, bonus, drafts, sl, mask, mode, positions, rbuf, draft_out, stream):
+    def __call__(
+        self, bonus, drafts, sl, mask, mode, positions, rbuf, draft_out, stream
+    ):
         self.kernel(bonus, drafts, sl, mask, mode, positions, rbuf, draft_out).launch(
-            grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+            grid=(1, 1, 1), block=(32, 1, 1), stream=stream
+        )
 
     @cute.kernel
     def kernel(self, bonus, drafts, sl, mask, mode, positions, rbuf, draft_out):
@@ -128,28 +186,102 @@ def _compiled(name, dtype=None):
     i32, i64 = torch.int32, torch.int64
     r2t = fake(i32, (None, None), (cute.sym_int(), 1))
     if name == "fill_step_all":
-        fn, args = FillStepAll(), (r2t, fake(i64, (None,)), fake(i64, (None,)), fake(i32, (None,)), fake(i32, (1,)))
+        fn, args = (
+            FillStepAll(),
+            (
+                r2t,
+                fake(i64, (None,)),
+                fake(i64, (None,)),
+                fake(i32, (None,)),
+                fake(i32, (1,)),
+            ),
+        )
     elif name == "post_verify":
         v8, v1, m8 = fake(i32, (8,)), fake(i32, (1,)), fake(i32, (1, 8), (8, 1))
-        fn, args = PostVerify(), (v8, v1, v8, fake(dtype, (None,)), fake(i64, (1,)), c.Int32(0), v8, m8, v1,
-                                  fake(i64, (1,)), m8, v1, v8, v1, fake(i64, (1,)))
+        fn, args = (
+            PostVerify(),
+            (
+                v8,
+                v1,
+                v8,
+                fake(dtype, (None,)),
+                fake(i64, (1,)),
+                c.Int32(0),
+                v8,
+                m8,
+                v1,
+                fake(i64, (1,)),
+                m8,
+                v1,
+                v8,
+                v1,
+                fake(i64, (1,)),
+            ),
+        )
     elif name == "draft_pages":
-        fn, args = DraftPages(), (r2t, fake(i64, (None,)), fake(i64, (None,)), fake(i32, (None,)))
+        fn, args = (
+            DraftPages(),
+            (r2t, fake(i64, (None,)), fake(i64, (None,)), fake(i32, (None,))),
+        )
     else:
-        fn, args = ChainTree(), (fake(dtype, (None,)), fake(i64, (7,)), fake(i64, (None,)), fake(torch.uint8, (None,)),
-                                 c.Int32(0), fake(i64, (8,)), fake(i64, (24,)), fake(i64, (8,)))
+        fn, args = (
+            ChainTree(),
+            (
+                fake(dtype, (None,)),
+                fake(i64, (7,)),
+                fake(i64, (None,)),
+                fake(torch.uint8, (None,)),
+                c.Int32(0),
+                fake(i64, (8,)),
+                fake(i64, (24,)),
+                fake(i64, (8,)),
+            ),
+        )
     major, minor = torch.cuda.get_device_capability()
     stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(fn, *args, stream, options=f"--gpu-arch=sm_{major}{minor}a --enable-tvm-ffi")
+    return cute.compile(
+        fn, *args, stream, options=f"--gpu-arch=sm_{major}{minor}a --enable-tvm-ffi"
+    )
 
 
 def fill_step_all(r2t, req, pos, bt, kvl):
     _compiled("fill_step_all")(r2t, req, pos, bt, kvl)
 
 
-def post_verify(acc, na, am, cand, seq_lens, sim_l, predict, ai, al, nsl, at_, bonus, s0_acc, s0_na, sel):
-    _compiled("post_verify", cand.dtype)(acc, na, am, cand, seq_lens, int(sim_l), predict, ai, al, nsl, at_, bonus,
-                                         s0_acc, s0_na, sel)
+def post_verify(
+    acc,
+    na,
+    am,
+    cand,
+    seq_lens,
+    sim_l,
+    predict,
+    ai,
+    al,
+    nsl,
+    at_,
+    bonus,
+    s0_acc,
+    s0_na,
+    sel,
+):
+    _compiled("post_verify", cand.dtype)(
+        acc,
+        na,
+        am,
+        cand,
+        seq_lens,
+        int(sim_l),
+        predict,
+        ai,
+        al,
+        nsl,
+        at_,
+        bonus,
+        s0_acc,
+        s0_na,
+        sel,
+    )
 
 
 def draft_pages(r2t, req, sl, bt):
@@ -157,22 +289,53 @@ def draft_pages(r2t, req, sl, bt):
 
 
 def chain_tree(bonus, drafts, sl, mask, mode, positions, rbuf, draft_out):
-    _compiled("chain_tree", bonus.dtype)(bonus.view(-1), drafts.view(-1), sl.view(-1), mask.view(-1).view(torch.uint8),
-                                         int(mode), positions, rbuf.view(-1), draft_out)
+    _compiled("chain_tree", bonus.dtype)(
+        bonus.view(-1),
+        drafts.view(-1),
+        sl.view(-1),
+        mask.view(-1).view(torch.uint8),
+        int(mode),
+        positions,
+        rbuf.view(-1),
+        draft_out,
+    )
 
 
 def warm_up(device):
     """Compiles and launches every variant once before graph capture, so no module is loaded while capturing."""
-    i32, i64 = dict(dtype=torch.int32, device=device), dict(dtype=torch.int64, device=device)
+    i32, i64 = (
+        dict(dtype=torch.int32, device=device),
+        dict(dtype=torch.int64, device=device),
+    )
     r2t = torch.zeros((2, 128), **i32)
     z64, z32 = torch.zeros((8,), **i64), torch.zeros((8,), **i32)
     fill_step_all(r2t, z64[:1], z64, torch.zeros((4,), **i32), torch.zeros((1,), **i32))
     draft_pages(r2t, z64[:1], z64[:1], torch.zeros((4,), **i32))
     for dt in (torch.int32, torch.int64):
-        post_verify(torch.ones((8,), **i32), torch.ones((1,), **i32), z32, torch.zeros((8,), dtype=dt, device=device),
-                    z64[:1], 0, torch.empty((8,), **i32), torch.empty((1, 8), **i32), torch.empty((1,), **i32),
-                    torch.empty((1,), **i64), torch.empty((1, 8), **i32), torch.empty((1,), **i32),
-                    torch.empty((8,), **i32), torch.empty((1,), **i32), torch.empty((1,), **i64))
-        chain_tree(torch.zeros((1,), dtype=dt, device=device), torch.zeros((7,), **i64), z64[:1],
-                   torch.zeros((64,), dtype=torch.bool, device=device), 1, torch.empty((8,), **i64),
-                   torch.empty((3, 1, 8), **i64), torch.empty((8,), **i64))
+        post_verify(
+            torch.ones((8,), **i32),
+            torch.ones((1,), **i32),
+            z32,
+            torch.zeros((8,), dtype=dt, device=device),
+            z64[:1],
+            0,
+            torch.empty((8,), **i32),
+            torch.empty((1, 8), **i32),
+            torch.empty((1,), **i32),
+            torch.empty((1,), **i64),
+            torch.empty((1, 8), **i32),
+            torch.empty((1,), **i32),
+            torch.empty((8,), **i32),
+            torch.empty((1,), **i32),
+            torch.empty((1,), **i64),
+        )
+        chain_tree(
+            torch.zeros((1,), dtype=dt, device=device),
+            torch.zeros((7,), **i64),
+            z64[:1],
+            torch.zeros((64,), dtype=torch.bool, device=device),
+            1,
+            torch.empty((8,), **i64),
+            torch.empty((3, 1, 8), **i64),
+            torch.empty((8,), **i64),
+        )

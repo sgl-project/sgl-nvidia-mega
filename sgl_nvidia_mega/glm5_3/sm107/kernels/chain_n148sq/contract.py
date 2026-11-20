@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class BuildConfig:
-
     static_flags: int = 2752
     include_indexer: bool = True
     slot_mode: str = "reference_logical"
@@ -14,7 +13,6 @@ class BuildConfig:
 
 @dataclass(frozen=True)
 class LayerInputs:
-
     x: object
     residual: object
     topk: object
@@ -24,7 +22,6 @@ class LayerInputs:
 
 @dataclass(frozen=True)
 class PreparedLayer:
-
     weights: object
     cache: object
     workspace: object
@@ -34,7 +31,6 @@ class PreparedLayer:
 
 @dataclass(frozen=True)
 class LayerOutputs:
-
     residual: object
     normalized: object | None
     topk: object | None

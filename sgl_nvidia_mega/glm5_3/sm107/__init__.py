@@ -65,7 +65,11 @@ ENV = {"SGLANG_DSA_FUSE_TOPK": False}
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/model_executor/model_runner.py": ("ModelRunner", "init_cuda_graphs", "is_draft_worker"),
+    "srt/model_executor/model_runner.py": (
+        "ModelRunner",
+        "init_cuda_graphs",
+        "is_draft_worker",
+    ),
     "srt/runtime_context.py": ("get_server_args",),
     "srt/arg_groups/fields/*.py": ("model_path", "speculative_draft_model_path"),
     "srt/kernel_plugins/nvidia/binding.py": ("device_isa",),
@@ -76,7 +80,9 @@ SGLANG_READS = {
 def artifact_reasons() -> list[str]:
     root = os.environ.get(ARTIFACTS_ENV)
     if not root:
-        return [f"{ARTIFACTS_ENV} is not set; set it to the directory of the glm5_3/sm107 cubins"]
+        return [
+            f"{ARTIFACTS_ENV} is not set; set it to the directory of the glm5_3/sm107 cubins"
+        ]
     missing = [
         os.path.join(part, name)
         for part in ARTIFACT_PARTS
@@ -99,7 +105,10 @@ def config_reasons(cfg, hf_config) -> list[str]:
     if isa != ISA:
         reasons.append(f"TP{TP_SIZE} runs on {ISA} (Rubin) only, not {isa}")
     reasons += pinned_reasons(cfg, SERVER_ARGS, ENV)
-    for module, what in (("cutlass", "CuTe DSL (nvidia-cutlass-dsl)"), ("cuda.bindings", "the CUDA Python bindings")):
+    for module, what in (
+        ("cutlass", "CuTe DSL (nvidia-cutlass-dsl)"),
+        ("cuda.bindings", "the CUDA Python bindings"),
+    ):
         if importlib.util.find_spec(module) is None:
             reasons.append(f"needs {what}")
     mode = getattr(cfg, "disaggregation_mode", None) or "null"
@@ -115,7 +124,9 @@ def model_reasons(model) -> list[str]:
         return []
     inner = getattr(model, "model", None)
     if type(inner).__name__ != "DeepseekV2Model":
-        return [f"glm5_3/sm107: the decoder is {type(inner).__name__}, not DeepseekV2Model"]
+        return [
+            f"glm5_3/sm107: the decoder is {type(inner).__name__}, not DeepseekV2Model"
+        ]
     return []
 
 
@@ -133,7 +144,9 @@ class Built:
     chain (target) and the fused draft run inside the model's own forward and
     SGLang's draft worker, so a covered step calls the original forward."""
 
-    draft_sampler = draft_loop = draft_extend = begin_draft_round = graph_variants = None
+    draft_sampler = draft_loop = draft_extend = begin_draft_round = graph_variants = (
+        None
+    )
     speculative_runtime_hooks = None
 
     def __init__(self, what: str, is_draft: bool):
@@ -149,7 +162,11 @@ class Built:
         mode = forward_batch.forward_mode
         if self.is_draft:
             # one request's draft extend and draft decodes run the fused draft
-            return None if mode.is_idle() else _step_class()(mode="decode", rows=int(input_ids.shape[0]))
+            return (
+                None
+                if mode.is_idle()
+                else _step_class()(mode="decode", rows=int(input_ids.shape[0]))
+            )
         if mode.is_target_verify() and input_ids.shape[0] == TOKENS_PER_REQUEST:
             return _step_class()(mode="target_verify", rows=TOKENS_PER_REQUEST)
         return None
@@ -182,7 +199,10 @@ def _bind_before_graphs() -> None:
 
 
 def _check_context(ctx) -> None:
-    if ctx.tokens_per_request != TOKENS_PER_REQUEST or TOKENS_PER_REQUEST not in ctx.widths:
+    if (
+        ctx.tokens_per_request != TOKENS_PER_REQUEST
+        or TOKENS_PER_REQUEST not in ctx.widths
+    ):
         raise ValueError(
             f"glm5_3/sm107 builds {TOKENS_PER_REQUEST} tokens a request, not "
             f"{ctx.tokens_per_request} (widths {list(ctx.widths)})"
@@ -206,8 +226,12 @@ def _model_path(hf_config) -> str:
         path = args.speculative_draft_model_path or args.model_path
     except Exception:
         path = getattr(hf_config, "_name_or_path", None)
-    if not path or not os.path.isfile(os.path.join(path, "model.safetensors.index.json")):
-        raise ValueError(f"glm5_3/sm107: the draft weights need a local checkpoint directory, not {path!r}")
+    if not path or not os.path.isfile(
+        os.path.join(path, "model.safetensors.index.json")
+    ):
+        raise ValueError(
+            f"glm5_3/sm107: the draft weights need a local checkpoint directory, not {path!r}"
+        )
     return path
 
 

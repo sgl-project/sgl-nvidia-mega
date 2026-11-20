@@ -280,6 +280,7 @@ def _tp_size() -> int:
 
     return int(get_parallel().tp_size)
 
+
 # Per kernel output against SGLang's op (or an fp64 reference, where SGLang's own op
 # carries the same error) on the same GPU; each key names the test (test/kernels) that
 # measures it, and those tests read their bounds from here
@@ -495,7 +496,12 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         return sm107.config_reasons(cfg, hf_config)
     from sgl_nvidia_mega.glm5_3 import runtime
 
-    reasons = pinned_reasons(cfg, SERVER_ARGS, ENV) + toolchain_reasons() + binding_reasons() + runtime.slot_reasons()
+    reasons = (
+        pinned_reasons(cfg, SERVER_ARGS, ENV)
+        + toolchain_reasons()
+        + binding_reasons()
+        + runtime.slot_reasons()
+    )
     reasons += draft_capture_reasons() + deadline_reasons(cfg) + profile_reasons(cfg)
     reasons += pd_reasons(cfg)
     if (

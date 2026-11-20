@@ -44,7 +44,6 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     InvalidGrammarObject,
@@ -317,7 +316,6 @@ def _host_copies_in_capture(stream: torch.cuda.Stream) -> List[Tuple[str, int]]:
     captured on ``stream`` (child graphs excluded) that touches host memory. A
     replay would repeat such a copy with the values or addresses of capture time."""
     from cuda.bindings import runtime as rt
-
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
         checkCudaErrors,
     )
@@ -558,8 +556,7 @@ class EagleStepCudaGraphRunner:
         self.disabled_reason = self._construction_unsupported_reason()
         if self.disabled_reason is not None:
             logger.warning(
-                "%s disabled: %s. "
-                "Falling back to the per-stage CUDA graphs.",
+                "%s disabled: %s. Falling back to the per-stage CUDA graphs.",
                 switches.STEP_GRAPH,
                 self.disabled_reason,
             )

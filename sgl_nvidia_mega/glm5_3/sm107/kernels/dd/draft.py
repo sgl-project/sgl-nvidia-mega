@@ -1,16 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import cutlass
-from cutlass._mlir.dialects import llvm
 import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.memory import SmemAllocator
-from cutlass.cute.nvgpu import cpasync
+
 from . import bf16_moe as moe
 from . import draft_s0 as s0
 from . import lm_head as lm
-from .preparation import ARENA_WORDS, HOP_WORDS, TK_WORDS, LG_WORDS, Y_WORDS, COUNTER_WORDS, COPIES, TRANSPORT_WORDS
-
+from .preparation import (
+    ARENA_WORDS,
+    COPIES,
+    COUNTER_WORDS,
+    HOP_WORDS,
+    LG_WORDS,
+    TK_WORDS,
+    TRANSPORT_WORDS,
+    Y_WORDS,
+)
 
 HIDDEN = 6144
 RANKS = 16
@@ -49,8 +58,14 @@ if LM_FP8_STAGES != lm.STAGES:
         raise TypeError("LM_FP8_STAGES must be 3..5 (REL_SYNC ring)")
     lm.STAGES8 = LM_FP8_STAGES
     lm.BARS = lm.STAGES + lm.X_STAGES + (LM_FP8_STAGES - lm.STAGES)
-B_ROUTER, B_FC1, B_FC2, B_SD, B_LM, B_HH = 0, 1, 1 + moe.FC1_MAX_ROWS, 2 + moe.FC1_MAX_ROWS, 3 + moe.FC1_MAX_ROWS, \
-    3 + moe.FC1_MAX_ROWS + lm.BARS
+B_ROUTER, B_FC1, B_FC2, B_SD, B_LM, B_HH = (
+    0,
+    1,
+    1 + moe.FC1_MAX_ROWS,
+    2 + moe.FC1_MAX_ROWS,
+    3 + moe.FC1_MAX_ROWS,
+    3 + moe.FC1_MAX_ROWS + lm.BARS,
+)
 HH_SLOTS = 16
 B_EH = B_HH + HH_SLOTS
 DSM_BARS = B_EH + s0.EH_BARS
@@ -81,8 +96,11 @@ LM_FP4_DOT = True
 if LM_FP4_DOT:
     lm.FP4_DOT = True
     lm.FP4_UNROLL = 4
-W_LM_ELEMS = VOCAB_SHARD * HIDDEN + ((VOCAB_SHARD * HIDDEN) // 2 + 2 * VOCAB_SHARD if LM_FP8 else 0) + \
-    ((VOCAB_SHARD * lm.FP4_ROW_BYTES + 4 * VOCAB_SHARD) // 2 if LM_FP4 else 0)
+W_LM_ELEMS = (
+    VOCAB_SHARD * HIDDEN
+    + ((VOCAB_SHARD * HIDDEN) // 2 + 2 * VOCAB_SHARD if LM_FP8 else 0)
+    + ((VOCAB_SHARD * lm.FP4_ROW_BYTES + 4 * VOCAB_SHARD) // 2 if LM_FP4 else 0)
+)
 LM_TABLE_PF = False
 HOP_LEAN = True
 # Idle H1 / H2 units run one pre-pass of the hop on scratch, so its run-once code is instruction-cache warm when the
@@ -145,16 +163,32 @@ lds64 = lm.lds64w
 
 
 @cute.jit
-def shared_rows32(unit: cutlass.Int32, act: cute.Tensor, w_sdn: cute.Tensor, base: cutlass.Uint32,
-                  rows_out: cute.Tensor, bar: cute.Pointer):
+def shared_rows32(
+    unit: cutlass.Int32,
+    act: cute.Tensor,
+    w_sdn: cute.Tensor,
+    base: cutlass.Uint32,
+    rows_out: cute.Tensor,
+    bar: cute.Pointer,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     if tid == 0:
         cute.arch.mbarrier_arrive_and_expect_tx(bar, 32 * moe.INTER * 2)
-        bulk_copy(base, w_sdn.iterator + unit * 32 * moe.INTER, cutlass.Uint32(32 * moe.INTER * 2), bar, evict_first())
+        bulk_copy(
+            base,
+            w_sdn.iterator + unit * 32 * moe.INTER,
+            cutlass.Uint32(32 * moe.INTER * 2),
+            bar,
+            evict_first(),
+        )
     a0, a1, a2, a3 = moe.poll_words(act, moe.TOPK * moe.INTER + 4 * lane)
-    av = (bits_f32(a0 & cutlass.Uint32(0xFFFF0000)), bits_f32(a1 & cutlass.Uint32(0xFFFF0000)),
-          bits_f32(a2 & cutlass.Uint32(0xFFFF0000)), bits_f32(a3 & cutlass.Uint32(0xFFFF0000)))
+    av = (
+        bits_f32(a0 & cutlass.Uint32(0xFFFF0000)),
+        bits_f32(a1 & cutlass.Uint32(0xFFFF0000)),
+        bits_f32(a2 & cutlass.Uint32(0xFFFF0000)),
+        bits_f32(a3 & cutlass.Uint32(0xFFFF0000)),
+    )
     cute.arch.mbarrier_wait(bar, 0)
     for i in cutlass.range_constexpr(4):
         r = 4 * warp + i
@@ -171,20 +205,36 @@ def shared_rows32(unit: cutlass.Int32, act: cute.Tensor, w_sdn: cute.Tensor, bas
 
 
 @cute.jit
-def lm_prefetch_chunks(cta: cutlass.Int32, w_lm: cute.Tensor, chunks: cutlass.Constexpr = LM_PF_CHUNKS):
+def lm_prefetch_chunks(
+    cta: cutlass.Int32, w_lm: cute.Tensor, chunks: cutlass.Constexpr = LM_PF_CHUNKS
+):
     tid, _, _ = cute.arch.thread_idx()
     if tid < 3 * 16:
         row = (cta * lm.TILES_PER_CTA + tid // 16) * 16 + tid % 16
         if row < VOCAB_SHARD:
             for c in cutlass.range_constexpr(1, 1 + chunks):
                 if cutlass.const_expr(c < lm.CHUNKS):
-                    prefetch_bulk_l2(w_lm.iterator + row * HIDDEN + c * lm.CHUNK_K, cutlass.Uint32(lm.ROW_BYTES))
+                    prefetch_bulk_l2(
+                        w_lm.iterator + row * HIDDEN + c * lm.CHUNK_K,
+                        cutlass.Uint32(lm.ROW_BYTES),
+                    )
 
 
 @cute.jit
-def row_hop(second: cutlass.Constexpr, sel: cutlass.Int32, hop1: cute.Tensor, hop2: cute.Tensor,
-            previous_hop2: cute.Tensor, residual_input: cute.Tensor, gamma: cute.Tensor, keep: cute.Tensor,
-            scalars: cute.Tensor, out_main: cute.Tensor, rout: cute.Tensor, done: cute.Tensor):
+def row_hop(
+    second: cutlass.Constexpr,
+    sel: cutlass.Int32,
+    hop1: cute.Tensor,
+    hop2: cute.Tensor,
+    previous_hop2: cute.Tensor,
+    residual_input: cute.Tensor,
+    gamma: cute.Tensor,
+    keep: cute.Tensor,
+    scalars: cute.Tensor,
+    out_main: cute.Tensor,
+    rout: cute.Tensor,
+    done: cute.Tensor,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     xs = cute.make_rmem_tensor((24,), cutlass.Float32)
@@ -196,7 +246,10 @@ def row_hop(second: cutlass.Constexpr, sel: cutlass.Int32, hop1: cute.Tensor, ho
             sums = reduce_rank16(hop2, sel, col, False)
             if cutlass.const_expr(H2_CLEAR_CURRENT):
                 for r in cutlass.range_constexpr(RANKS):
-                    store_empty(hop2.iterator + (sel * RANKS + r) * 3072 + col // 2, evict_first())
+                    store_empty(
+                        hop2.iterator + (sel * RANKS + r) * 3072 + col // 2,
+                        evict_first(),
+                    )
         else:
             sums = reduce_rank16(hop1, sel, col, True)
         prev = cute.make_rmem_tensor((4,), cutlass.Uint32)
@@ -208,15 +261,25 @@ def row_hop(second: cutlass.Constexpr, sel: cutlass.Int32, hop1: cute.Tensor, ho
             r2, r3 = global_pair(residual_input.iterator + sel * 3072 + col // 2 + 2)
             prev[0], prev[1], prev[2], prev[3] = r0, r1, r2, r3
         for q in cutlass.range_constexpr(4):
-            xs[8 * j + 2 * q] = round_bf16(round_bf16(sums[2 * q]) + bf16_from_word(prev[q], False))
-            xs[8 * j + 2 * q + 1] = round_bf16(round_bf16(sums[2 * q + 1]) + bf16_from_word(prev[q], True))
+            xs[8 * j + 2 * q] = round_bf16(
+                round_bf16(sums[2 * q]) + bf16_from_word(prev[q], False)
+            )
+            xs[8 * j + 2 * q + 1] = round_bf16(
+                round_bf16(sums[2 * q + 1]) + bf16_from_word(prev[q], True)
+            )
         for q in cutlass.range_constexpr(8):
             ssq += round_bf16(xs[8 * j + q] * xs[8 * j + q])
         words = cute.make_rmem_tensor((4,), cutlass.Uint32)
         for q in cutlass.range_constexpr(4):
             words[q] = bf16_pair(xs[8 * j + 2 * q], xs[8 * j + 2 * q + 1])
         if cutlass.const_expr(second):
-            store_vector(rout.iterator + sel * 3072 + col // 2, words[0], words[1], words[2], words[3])
+            store_vector(
+                rout.iterator + sel * 3072 + col // 2,
+                words[0],
+                words[1],
+                words[2],
+                words[3],
+            )
         else:
             for q in cutlass.range_constexpr(4):
                 keep[(j * 256 + tid) * 4 + q] = bits_f32(words[q])
@@ -236,11 +299,15 @@ def row_hop(second: cutlass.Constexpr, sel: cutlass.Int32, hop1: cute.Tensor, ho
         out = cute.make_rmem_tensor((4,), cutlass.Uint32)
         for q in cutlass.range_constexpr(4):
             lo = round_bf16((xs[8 * j + 2 * q] * rstd) * bf16_from_word(gw[q], False))
-            hi = round_bf16((xs[8 * j + 2 * q + 1] * rstd) * bf16_from_word(gw[q], True))
+            hi = round_bf16(
+                (xs[8 * j + 2 * q + 1] * rstd) * bf16_from_word(gw[q], True)
+            )
             out[q] = bf16_pair(lo, hi)
             if cutlass.const_expr(not second):
                 out[q] = published_word(out[q])
-        store_vector(out_main.iterator + sel * 3072 + col // 2, out[0], out[1], out[2], out[3])
+        store_vector(
+            out_main.iterator + sel * 3072 + col // 2, out[0], out[1], out[2], out[3]
+        )
     cute.arch.sync_threads()
     if tid == 0:
         for _ in cutlass.range_constexpr(4 if second else 1):
@@ -260,7 +327,9 @@ def o_warm(passes):
 
 
 @cute.jit
-def prefetch_slice(src: cute.Tensor, total_bytes: cutlass.Constexpr, cta: cutlass.Int32):
+def prefetch_slice(
+    src: cute.Tensor, total_bytes: cutlass.Constexpr, cta: cutlass.Int32
+):
     tid, _, _ = cute.arch.thread_idx()
     chunk = ((total_bytes // 212 + 15) // 16) * 16
     lo = cta * chunk
@@ -274,13 +343,19 @@ def prefetch_slice(src: cute.Tensor, total_bytes: cutlass.Constexpr, cta: cutlas
 @cute.jit
 def head_words(gkey: cutlass.Uint64, gidx: cutlass.Int32):
     hi = (gkey >> cutlass.Uint64(32)).to(cutlass.Uint32)
-    return ((gkey & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32), (hi & cutlass.Uint32(0xFFFF)) | cutlass.Uint32(0x10000),
-            gidx.to(cutlass.Uint32), (hi >> cutlass.Uint32(16)) | cutlass.Uint32(0x10000))
+    return (
+        (gkey & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32),
+        (hi & cutlass.Uint32(0xFFFF)) | cutlass.Uint32(0x10000),
+        gidx.to(cutlass.Uint32),
+        (hi >> cutlass.Uint32(16)) | cutlass.Uint32(0x10000),
+    )
 
 
 @cute.jit
 def head_key(w0: cutlass.Uint32, w1: cutlass.Uint32, w3: cutlass.Uint32):
-    hi = ((w3 & cutlass.Uint32(0xFFFF)) << cutlass.Uint32(16)) | (w1 & cutlass.Uint32(0xFFFF))
+    hi = ((w3 & cutlass.Uint32(0xFFFF)) << cutlass.Uint32(16)) | (
+        w1 & cutlass.Uint32(0xFFFF)
+    )
     return (hi.to(cutlass.Uint64) << cutlass.Uint64(32)) | w0.to(cutlass.Uint64)
 
 
@@ -297,12 +372,20 @@ def wait_count(counter: cute.Tensor, target: cutlass.Uint32):
 @cute.jit
 def poll_vector(pointer: cute.Pointer):
     a, b, c, d = volatile_vector(pointer)
-    waiting = (a == cutlass.Uint32(EMPTY)) | (b == cutlass.Uint32(EMPTY)) | \
-        (c == cutlass.Uint32(EMPTY)) | (d == cutlass.Uint32(EMPTY))
+    waiting = (
+        (a == cutlass.Uint32(EMPTY))
+        | (b == cutlass.Uint32(EMPTY))
+        | (c == cutlass.Uint32(EMPTY))
+        | (d == cutlass.Uint32(EMPTY))
+    )
     while waiting:
         a, b, c, d = volatile_vector(pointer)
-        waiting = (a == cutlass.Uint32(EMPTY)) | (b == cutlass.Uint32(EMPTY)) | \
-            (c == cutlass.Uint32(EMPTY)) | (d == cutlass.Uint32(EMPTY))
+        waiting = (
+            (a == cutlass.Uint32(EMPTY))
+            | (b == cutlass.Uint32(EMPTY))
+            | (c == cutlass.Uint32(EMPTY))
+            | (d == cutlass.Uint32(EMPTY))
+        )
     return a, b, c, d
 
 
@@ -314,9 +397,20 @@ def global_key(key: cutlass.Uint64, rank: cutlass.Int32):
 
 
 @cute.jit
-def draft_front_unit(unit: cutlass.Int32, packets: cute.Tensor, gamma_in: cute.Tensor, residual0: cute.Tensor,
-                     x_frag: cute.Tensor, x_ssq: cute.Tensor, scalars: cute.Tensor, front_done: cute.Tensor,
-                     draft_tokens: cute.Tensor, step: cutlass.Int32, xn=None, ns=None):
+def draft_front_unit(
+    unit: cutlass.Int32,
+    packets: cute.Tensor,
+    gamma_in: cute.Tensor,
+    residual0: cute.Tensor,
+    x_frag: cute.Tensor,
+    x_ssq: cute.Tensor,
+    scalars: cute.Tensor,
+    front_done: cute.Tensor,
+    draft_tokens: cute.Tensor,
+    step: cutlass.Int32,
+    xn=None,
+    ns=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     token, quarter = unit // 4, unit % 4
     col = 1536 * quarter + 8 * tid
@@ -328,28 +422,38 @@ def draft_front_unit(unit: cutlass.Int32, packets: cute.Tensor, gamma_in: cute.T
         if tid < RANKS:
             w0, w1, gidx, w3 = poll_vector(packets.iterator + tid * PK_SLOT + PK_HEAD)
             key = head_key(w0, w1, w3)
-            scalars[16 + 2 * tid] = bits_f32((key & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32))
-            scalars[17 + 2 * tid] = bits_f32((key >> cutlass.Uint64(32)).to(cutlass.Uint32))
+            scalars[16 + 2 * tid] = bits_f32(
+                (key & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32)
+            )
+            scalars[17 + 2 * tid] = bits_f32(
+                (key >> cutlass.Uint64(32)).to(cutlass.Uint32)
+            )
             scalars[48 + tid] = bits_f32(gidx)
         cute.arch.sync_threads()
         if tid == 0:
             best = cutlass.Uint64(0)
             winner = cutlass.Int32(0)
             for r in cutlass.range_constexpr(RANKS):
-                key = (f32_bits(scalars[17 + 2 * r]).to(cutlass.Uint64) << cutlass.Uint64(32)) | \
-                    f32_bits(scalars[16 + 2 * r]).to(cutlass.Uint64)
+                key = (
+                    f32_bits(scalars[17 + 2 * r]).to(cutlass.Uint64)
+                    << cutlass.Uint64(32)
+                ) | f32_bits(scalars[16 + 2 * r]).to(cutlass.Uint64)
                 if key > best:
                     best = key
                     winner = cutlass.Int32(r)
             scalars[64] = bits_f32(winner.to(cutlass.Uint32))
             if quarter == 0:
-                draft_tokens[step - 1] = f32_bits(scalars[48 + winner]).to(cutlass.Int32)
+                draft_tokens[step - 1] = f32_bits(scalars[48 + winner]).to(
+                    cutlass.Int32
+                )
         cute.arch.sync_threads()
         winner = f32_bits(scalars[64]).to(cutlass.Int32)
         if tid < 192:
             rows = cute.make_rmem_tensor((RANKS, 4), cutlass.Uint32)
             for r in cutlass.range_constexpr(RANKS):
-                a, b, c, d = volatile_vector(packets.iterator + r * PK_SLOT + PK_ROW + col // 2)
+                a, b, c, d = volatile_vector(
+                    packets.iterator + r * PK_SLOT + PK_ROW + col // 2
+                )
                 rows[r, 0], rows[r, 1], rows[r, 2], rows[r, 3] = a, b, c, d
             waiting = cutlass.Boolean(True)
             while waiting:
@@ -365,7 +469,9 @@ def draft_front_unit(unit: cutlass.Int32, packets: cute.Tensor, gamma_in: cute.T
                         for j in cutlass.range_constexpr(4):
                             ready = ready & (rows[r, j] != cutlass.Uint32(EMPTY))
                         if not ready:
-                            a, b, c, d = volatile_vector(packets.iterator + r * PK_SLOT + PK_ROW + col // 2)
+                            a, b, c, d = volatile_vector(
+                                packets.iterator + r * PK_SLOT + PK_ROW + col // 2
+                            )
                             rows[r, 0], rows[r, 1], rows[r, 2], rows[r, 3] = a, b, c, d
             qw = cute.make_rmem_tensor((4,), cutlass.Uint32)
             for j in cutlass.range_constexpr(4):
@@ -376,19 +482,27 @@ def draft_front_unit(unit: cutlass.Int32, packets: cute.Tensor, gamma_in: cute.T
                         qw[j] = rows[r, j]
             owner = col // SHARE
             offset = col - owner * SHARE
-            h0, h1, h2, h3 = poll_vector(packets.iterator + owner * PK_SLOT + PK_HID + offset)
-            h4, h5, h6, h7 = poll_vector(packets.iterator + owner * PK_SLOT + PK_HID + offset + 4)
+            h0, h1, h2, h3 = poll_vector(
+                packets.iterator + owner * PK_SLOT + PK_HID + offset
+            )
+            h4, h5, h6, h7 = poll_vector(
+                packets.iterator + owner * PK_SLOT + PK_HID + offset + 4
+            )
             hw = (h0, h1, h2, h3, h4, h5, h6, h7)
             for j in cutlass.range_constexpr(4):
-                xw[j] = bf16_pair(add_rn(bf16_from_word(qw[j], False), bits_f32(hw[2 * j])),
-                                  add_rn(bf16_from_word(qw[j], True), bits_f32(hw[2 * j + 1])))
+                xw[j] = bf16_pair(
+                    add_rn(bf16_from_word(qw[j], False), bits_f32(hw[2 * j])),
+                    add_rn(bf16_from_word(qw[j], True), bits_f32(hw[2 * j + 1])),
+                )
     if cutlass.const_expr(xn is not None):
         xv = cute.make_rmem_tensor((8,), cutlass.Float32)
         for j in cutlass.range_constexpr(4):
             xv[2 * j] = bf16_from_word(xw[j], False)
             xv[2 * j + 1] = bf16_from_word(xw[j], True)
         if tid < 192:
-            store_vector(residual0.iterator + token * 3072 + col // 2, xw[0], xw[1], xw[2], xw[3])
+            store_vector(
+                residual0.iterator + token * 3072 + col // 2, xw[0], xw[1], xw[2], xw[3]
+            )
         s0.xnorm_publish(unit, xv, gamma_in, xn, ns, scalars, False)
         if tid == 0:
             if live:
@@ -397,7 +511,9 @@ def draft_front_unit(unit: cutlass.Int32, packets: cute.Tensor, gamma_in: cute.T
     else:
         ssq = cutlass.Float32(0)
         if tid < 192:
-            store_vector(residual0.iterator + token * 3072 + col // 2, xw[0], xw[1], xw[2], xw[3])
+            store_vector(
+                residual0.iterator + token * 3072 + col // 2, xw[0], xw[1], xw[2], xw[3]
+            )
             g0, g1, g2, g3 = readonly_vector(gamma_in.iterator + col // 2)
             gw = (g0, g1, g2, g3)
             prime = cute.make_rmem_tensor((4,), cutlass.Uint32)
@@ -406,9 +522,19 @@ def draft_front_unit(unit: cutlass.Int32, packets: cute.Tensor, gamma_in: cute.T
                 hi = bf16_from_word(xw[j], True)
                 ssq += round_bf16(lo * lo)
                 ssq += round_bf16(hi * hi)
-                prime[j] = published_word(bf16_pair(round_bf16(lo * bf16_from_word(gw[j], False)),
-                                                    round_bf16(hi * bf16_from_word(gw[j], True))))
-            store_vector(x_frag.iterator + xfrag_word_offset(token, col), prime[0], prime[1], prime[2], prime[3])
+                prime[j] = published_word(
+                    bf16_pair(
+                        round_bf16(lo * bf16_from_word(gw[j], False)),
+                        round_bf16(hi * bf16_from_word(gw[j], True)),
+                    )
+                )
+            store_vector(
+                x_frag.iterator + xfrag_word_offset(token, col),
+                prime[0],
+                prime[1],
+                prime[2],
+                prime[3],
+            )
         for sh in cutlass.range_constexpr(5):
             ssq += cute.arch.shuffle_sync_bfly(ssq, 16 >> sh)
         if (tid & 31) == 0:
@@ -418,7 +544,9 @@ def draft_front_unit(unit: cutlass.Int32, packets: cute.Tensor, gamma_in: cute.T
             partial = cutlass.Float32(0)
             for w in cutlass.range_constexpr(8):
                 partial += scalars[w]
-            store_word(x_ssq.iterator + 4 * token + quarter, published_word(f32_bits(partial)))
+            store_word(
+                x_ssq.iterator + 4 * token + quarter, published_word(f32_bits(partial))
+            )
             if live:
                 release_increment(front_done.iterator)
         cute.arch.sync_threads()
@@ -436,9 +564,17 @@ def clear_packets(index: cutlass.Int32, packets: cute.Tensor, front_done: cute.T
 
 
 @cute.jit
-def shared_down(index: cutlass.Int32, act: cute.Tensor, w_sdn: cute.Tensor, region: cute.Tensor,
-                red: cute.Tensor, out: cute.Tensor, out_off: cutlass.Int32, bar: cute.Pointer,
-                clear_counter=None):
+def shared_down(
+    index: cutlass.Int32,
+    act: cute.Tensor,
+    w_sdn: cute.Tensor,
+    region: cute.Tensor,
+    red: cute.Tensor,
+    out: cute.Tensor,
+    out_off: cutlass.Int32,
+    bar: cute.Pointer,
+    clear_counter=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     r0 = 2 * ((index * (HIDDEN // 2)) // SD_CTAS)
@@ -446,14 +582,25 @@ def shared_down(index: cutlass.Int32, act: cute.Tensor, w_sdn: cute.Tensor, regi
     base = region.iterator.toint().to(cutlass.Uint32)
     if tid == 0:
         cute.arch.mbarrier_arrive_and_expect_tx(bar, (r1 - r0) * moe.INTER * 2)
-        bulk_copy(base, w_sdn.iterator + r0 * moe.INTER, ((r1 - r0) * moe.INTER * 2).to(cutlass.Uint32), bar,
-                  evict_first())
+        bulk_copy(
+            base,
+            w_sdn.iterator + r0 * moe.INTER,
+            ((r1 - r0) * moe.INTER * 2).to(cutlass.Uint32),
+            bar,
+            evict_first(),
+        )
     a0, a1, a2, a3 = moe.poll_words(act, moe.TOPK * moe.INTER + 4 * lane)
-    av = (bits_f32(a0 & cutlass.Uint32(0xFFFF0000)), bits_f32(a1 & cutlass.Uint32(0xFFFF0000)),
-          bits_f32(a2 & cutlass.Uint32(0xFFFF0000)), bits_f32(a3 & cutlass.Uint32(0xFFFF0000)))
+    av = (
+        bits_f32(a0 & cutlass.Uint32(0xFFFF0000)),
+        bits_f32(a1 & cutlass.Uint32(0xFFFF0000)),
+        bits_f32(a2 & cutlass.Uint32(0xFFFF0000)),
+        bits_f32(a3 & cutlass.Uint32(0xFFFF0000)),
+    )
     cute.arch.mbarrier_wait(bar, 0)
     for r in cutlass.range(r0 + warp, r1, 8, unroll=1):
-        lo, hi = lds64(base + (((r - r0) * moe.INTER + 4 * lane) * 2).to(cutlass.Uint32))
+        lo, hi = lds64(
+            base + (((r - r0) * moe.INTER + 4 * lane) * 2).to(cutlass.Uint32)
+        )
         v = bf16_from_word(lo, False) * av[0]
         v = fma_rn(bf16_from_word(lo, True), av[1], v)
         v = fma_rn(bf16_from_word(hi, False), av[2], v)
@@ -470,12 +617,17 @@ def shared_down(index: cutlass.Int32, act: cute.Tensor, w_sdn: cute.Tensor, regi
                 ready = acquire_word(clear_counter.iterator)
         cute.arch.sync_threads()
     for p in cutlass.range(tid, (r1 - r0) // 2, 256, unroll=1):
-        store_word(out.iterator + out_off + r0 // 2 + p, published_word(bf16_pair(red[2 * p], red[2 * p + 1])))
+        store_word(
+            out.iterator + out_off + r0 // 2 + p,
+            published_word(bf16_pair(red[2 * p], red[2 * p + 1])),
+        )
     cute.arch.sync_threads()
 
 
 @cute.jit
-def issue_hidden_rows(index: cutlass.Int32, rows: cute.Tensor, region: cute.Tensor, bars: cute.Tensor):
+def issue_hidden_rows(
+    index: cutlass.Int32, rows: cute.Tensor, region: cute.Tensor, bars: cute.Tensor
+):
     tid, _, _ = cute.arch.thread_idx()
     r0 = (index * SHARE) // HH_CTAS
     r1 = ((index + 1) * SHARE) // HH_CTAS
@@ -483,14 +635,29 @@ def issue_hidden_rows(index: cutlass.Int32, rows: cute.Tensor, region: cute.Tens
     if tid == 0:
         for s in cutlass.range_constexpr(HH_SLOTS):
             if r0 + s < r1:
-                cute.arch.mbarrier_arrive_and_expect_tx(bars.iterator + s, moe.ROW_BYTES)
-                bulk_copy(base + cutlass.Uint32(s * moe.ROW_BYTES), rows.iterator + (r0 + s) * HIDDEN,
-                          cutlass.Uint32(moe.ROW_BYTES), bars.iterator + s, evict_first())
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    bars.iterator + s, moe.ROW_BYTES
+                )
+                bulk_copy(
+                    base + cutlass.Uint32(s * moe.ROW_BYTES),
+                    rows.iterator + (r0 + s) * HIDDEN,
+                    cutlass.Uint32(moe.ROW_BYTES),
+                    bars.iterator + s,
+                    evict_first(),
+                )
 
 
 @cute.jit
-def hidden_half(index: cutlass.Int32, xn: cute.Tensor, gamma_h: cute.Tensor, rows: cute.Tensor,
-                region: cute.Tensor, red: cute.Tensor, bars: cute.Tensor, dst: cute.Tensor):
+def hidden_half(
+    index: cutlass.Int32,
+    xn: cute.Tensor,
+    gamma_h: cute.Tensor,
+    rows: cute.Tensor,
+    region: cute.Tensor,
+    red: cute.Tensor,
+    bars: cute.Tensor,
+    dst: cute.Tensor,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     r0 = (index * SHARE) // HH_CTAS
@@ -518,15 +685,21 @@ def hidden_half(index: cutlass.Int32, xn: cute.Tensor, gamma_h: cute.Tensor, row
         g0, g1, g2, g3 = readonly_vector(gamma_h.iterator + 12 * tid + 4 * i)
         g = (g0, g1, g2, g3)
         for q in cutlass.range_constexpr(4):
-            hv[8 * i + 2 * q] = round_bf16((hv[8 * i + 2 * q] * rstd) * bf16_from_word(g[q], False))
-            hv[8 * i + 2 * q + 1] = round_bf16((hv[8 * i + 2 * q + 1] * rstd) * bf16_from_word(g[q], True))
+            hv[8 * i + 2 * q] = round_bf16(
+                (hv[8 * i + 2 * q] * rstd) * bf16_from_word(g[q], False)
+            )
+            hv[8 * i + 2 * q + 1] = round_bf16(
+                (hv[8 * i + 2 * q + 1] * rstd) * bf16_from_word(g[q], True)
+            )
     base = region.iterator.toint().to(cutlass.Uint32)
     for r in cutlass.range(r0, r1, unroll=1):
         s = (r - r0) % HH_SLOTS
         cute.arch.mbarrier_wait(bars.iterator + s, ((r - r0) // HH_SLOTS) % 2)
         acc = cutlass.Float32(0)
         for i in cutlass.range_constexpr(3):
-            w0, w1, w2, w3 = moe.lds128(base + (s * moe.ROW_BYTES + 48 * tid + 16 * i).to(cutlass.Uint32))
+            w0, w1, w2, w3 = moe.lds128(
+                base + (s * moe.ROW_BYTES + 48 * tid + 16 * i).to(cutlass.Uint32)
+            )
             ww = (w0, w1, w2, w3)
             for q in cutlass.range_constexpr(4):
                 acc = fma_rn(bf16_from_word(ww[q], False), hv[8 * i + 2 * q], acc)
@@ -542,17 +715,35 @@ def hidden_half(index: cutlass.Int32, xn: cute.Tensor, gamma_h: cute.Tensor, row
                 v += red[w]
             store_word(dst.iterator + r, published_word(f32_bits(v)))
             if r + HH_SLOTS < r1:
-                cute.arch.mbarrier_arrive_and_expect_tx(bars.iterator + s, moe.ROW_BYTES)
-                bulk_copy(base + (s * moe.ROW_BYTES).to(cutlass.Uint32), rows.iterator + (r + HH_SLOTS) * HIDDEN,
-                          cutlass.Uint32(moe.ROW_BYTES), bars.iterator + s, evict_first())
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    bars.iterator + s, moe.ROW_BYTES
+                )
+                bulk_copy(
+                    base + (s * moe.ROW_BYTES).to(cutlass.Uint32),
+                    rows.iterator + (r + HH_SLOTS) * HIDDEN,
+                    cutlass.Uint32(moe.ROW_BYTES),
+                    bars.iterator + s,
+                    evict_first(),
+                )
         cute.arch.sync_threads()
 
 
 @cute.jit
-def publish_packet(rank: cutlass.Int32, step: cutlass.Int32, last: cutlass.Boolean, keys: cute.Tensor,
-                   arrivals: cute.Tensor, token_table: cute.Tensor, slot_mc: cute.Tensor, local_copy: cute.Tensor,
-                   scalars: cute.Tensor, draft_tokens: cute.Tensor, next_new_tokens: cute.Tensor,
-                   accepted: cute.Tensor, num_accepted: cute.Tensor):
+def publish_packet(
+    rank: cutlass.Int32,
+    step: cutlass.Int32,
+    last: cutlass.Boolean,
+    keys: cute.Tensor,
+    arrivals: cute.Tensor,
+    token_table: cute.Tensor,
+    slot_mc: cute.Tensor,
+    local_copy: cute.Tensor,
+    scalars: cute.Tensor,
+    draft_tokens: cute.Tensor,
+    next_new_tokens: cute.Tensor,
+    accepted: cute.Tensor,
+    num_accepted: cute.Tensor,
+):
     tid, _, _ = cute.arch.thread_idx()
     wait_count(arrivals, cutlass.Uint32(lm.LM_CTAS))
     if tid == 0:
@@ -560,15 +751,24 @@ def publish_packet(rank: cutlass.Int32, step: cutlass.Int32, last: cutlass.Boole
         scalars[16] = bits_f32(k0)
         scalars[17] = bits_f32(k1)
     cute.arch.sync_threads()
-    key = (f32_bits(scalars[17]).to(cutlass.Uint64) << cutlass.Uint64(32)) | f32_bits(scalars[16]).to(cutlass.Uint64)
+    key = (f32_bits(scalars[17]).to(cutlass.Uint64) << cutlass.Uint64(32)) | f32_bits(
+        scalars[16]
+    ).to(cutlass.Uint64)
     gkey, gidx = global_key(key, rank)
     local = gidx - rank * VOCAB_SHARD
     if not last:
         for i in cutlass.range_constexpr(3):
             word = 12 * tid + 4 * i
-            a, b, c, d = readonly_vector(token_table.iterator + local * (HIDDEN // 2) + word)
-            store_vector(slot_mc.iterator + PK_ROW + word, published_word(a), published_word(b), published_word(c),
-                         published_word(d))
+            a, b, c, d = readonly_vector(
+                token_table.iterator + local * (HIDDEN // 2) + word
+            )
+            store_vector(
+                slot_mc.iterator + PK_ROW + word,
+                published_word(a),
+                published_word(b),
+                published_word(c),
+                published_word(d),
+            )
     if tid == 0:
         h0, h1, h2, h3 = head_words(gkey, gidx)
         store_vector(slot_mc.iterator + PK_HEAD, h0, h1, h2, h3)
@@ -576,8 +776,12 @@ def publish_packet(rank: cutlass.Int32, step: cutlass.Int32, last: cutlass.Boole
         if tid < RANKS:
             w0, w1, g, w3 = poll_vector(local_copy.iterator + tid * PK_SLOT + PK_HEAD)
             k = head_key(w0, w1, w3)
-            scalars[32 + 2 * tid] = bits_f32((k & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32))
-            scalars[33 + 2 * tid] = bits_f32((k >> cutlass.Uint64(32)).to(cutlass.Uint32))
+            scalars[32 + 2 * tid] = bits_f32(
+                (k & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32)
+            )
+            scalars[33 + 2 * tid] = bits_f32(
+                (k >> cutlass.Uint64(32)).to(cutlass.Uint32)
+            )
             scalars[64 + tid] = bits_f32(g)
         cute.arch.sync_threads()
         if tid < RANKS:
@@ -586,8 +790,10 @@ def publish_packet(rank: cutlass.Int32, step: cutlass.Int32, last: cutlass.Boole
             best = cutlass.Uint64(0)
             winner = cutlass.Int32(0)
             for r in cutlass.range_constexpr(RANKS):
-                k = (f32_bits(scalars[33 + 2 * r]).to(cutlass.Uint64) << cutlass.Uint64(32)) | \
-                    f32_bits(scalars[32 + 2 * r]).to(cutlass.Uint64)
+                k = (
+                    f32_bits(scalars[33 + 2 * r]).to(cutlass.Uint64)
+                    << cutlass.Uint64(32)
+                ) | f32_bits(scalars[32 + 2 * r]).to(cutlass.Uint64)
                 if k > best:
                     best = k
                     winner = cutlass.Int32(r)
@@ -601,11 +807,26 @@ def publish_packet(rank: cutlass.Int32, step: cutlass.Int32, last: cutlass.Boole
 
 
 @cute.jit
-def target_tail(rank: cutlass.Int32, x8: cute.Tensor, w_lm: cute.Tensor, region: cute.Tensor, red: cute.Tensor,
-                lm_bars: cute.Tensor, keys: cute.Tensor, key_words: cute.Tensor, arrivals: cute.Tensor,
-                heads_mc: cute.Tensor, heads_uc: cute.Tensor, draft_in: cute.Tensor, accepted_out: cute.Tensor,
-                num_accepted_out: cute.Tensor, next_arena: cute.Tensor, next_tk: cute.Tensor,
-                clear_counter: cute.Tensor, next_counters: cute.Tensor):
+def target_tail(
+    rank: cutlass.Int32,
+    x8: cute.Tensor,
+    w_lm: cute.Tensor,
+    region: cute.Tensor,
+    red: cute.Tensor,
+    lm_bars: cute.Tensor,
+    keys: cute.Tensor,
+    key_words: cute.Tensor,
+    arrivals: cute.Tensor,
+    heads_mc: cute.Tensor,
+    heads_uc: cute.Tensor,
+    draft_in: cute.Tensor,
+    accepted_out: cute.Tensor,
+    num_accepted_out: cute.Tensor,
+    next_arena: cute.Tensor,
+    next_tk: cute.Tensor,
+    clear_counter: cute.Tensor,
+    next_counters: cute.Tensor,
+):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     cute.arch.griddepcontrol_wait()
@@ -615,7 +836,20 @@ def target_tail(rank: cutlass.Int32, x8: cute.Tensor, w_lm: cute.Tensor, region:
         lm.issue_lm_prologue(cta, w_lm, region, lm_bars)
         fence_proxy_global()
         lm.issue_lm_x(x8, cutlass.Int32(8), region, lm_bars)
-        lm.lm_head_stage(cta, x8, w_lm, region, red, lm_bars, keys, arrivals, cutlass.Int32(8), red, False, False)
+        lm.lm_head_stage(
+            cta,
+            x8,
+            w_lm,
+            region,
+            red,
+            lm_bars,
+            keys,
+            arrivals,
+            cutlass.Int32(8),
+            red,
+            False,
+            False,
+        )
     clear_assigned(next_arena, next_tk, clear_counter)
     if cta == lm.LM_CTAS - 1:
         wait_count(arrivals, cutlass.Uint32(lm.LM_CTAS))
@@ -642,8 +876,9 @@ def target_tail(rank: cutlass.Int32, x8: cute.Tensor, w_lm: cute.Tensor, region:
             token = cutlass.Uint32(0)
             for r in cutlass.range_constexpr(RANKS):
                 j = tid * RANKS + r
-                kk = (f32_bits(red[3 * j + 1]).to(cutlass.Uint64) << cutlass.Uint64(32)) | \
-                    f32_bits(red[3 * j]).to(cutlass.Uint64)
+                kk = (
+                    f32_bits(red[3 * j + 1]).to(cutlass.Uint64) << cutlass.Uint64(32)
+                ) | f32_bits(red[3 * j]).to(cutlass.Uint64)
                 if kk > best:
                     best = kk
                     token = f32_bits(red[3 * j + 2])
@@ -665,7 +900,9 @@ def target_tail(rank: cutlass.Int32, x8: cute.Tensor, w_lm: cute.Tensor, region:
 
 
 @cute.jit
-def ts_bridge_reset(tgt_counters: cute.Tensor, cnt_counters: cute.Tensor, flag: cute.Tensor):
+def ts_bridge_reset(
+    tgt_counters: cute.Tensor, cnt_counters: cute.Tensor, flag: cute.Tensor
+):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     if cta < TS_BRIDGE_ZERO_CTAS:
@@ -680,8 +917,12 @@ def ts_bridge_reset(tgt_counters: cute.Tensor, cnt_counters: cute.Tensor, flag: 
 
 
 @cute.jit
-def ts_bridge_clear(next_arena: cute.Tensor, next_topk_exchange: cute.Tensor, current_clear_counter: cute.Tensor,
-                    flag: cute.Tensor):
+def ts_bridge_clear(
+    next_arena: cute.Tensor,
+    next_topk_exchange: cute.Tensor,
+    current_clear_counter: cute.Tensor,
+    flag: cute.Tensor,
+):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     clears = (cta < 151) | ((cta >= 192) & (cta < 196))
@@ -706,11 +947,25 @@ def ts_bridge_clear(next_arena: cute.Tensor, next_topk_exchange: cute.Tensor, cu
 
 
 @cute.jit
-def target_argmax(rank: cutlass.Int32, logits: cute.Tensor, red: cute.Tensor, keys: cute.Tensor,
-                  key_words: cute.Tensor, arrivals: cute.Tensor, heads_mc: cute.Tensor, heads_uc: cute.Tensor,
-                  draft_in: cute.Tensor, accepted_out: cute.Tensor, num_accepted_out: cute.Tensor, argmax_out: cute.Tensor,
-                  next_arena: cute.Tensor, next_tk: cute.Tensor, clear_counter: cute.Tensor,
-                  next_counters: cute.Tensor, bridge=None):
+def target_argmax(
+    rank: cutlass.Int32,
+    logits: cute.Tensor,
+    red: cute.Tensor,
+    keys: cute.Tensor,
+    key_words: cute.Tensor,
+    arrivals: cute.Tensor,
+    heads_mc: cute.Tensor,
+    heads_uc: cute.Tensor,
+    draft_in: cute.Tensor,
+    accepted_out: cute.Tensor,
+    num_accepted_out: cute.Tensor,
+    argmax_out: cute.Tensor,
+    next_arena: cute.Tensor,
+    next_tk: cute.Tensor,
+    clear_counter: cute.Tensor,
+    next_counters: cute.Tensor,
+    bridge=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     cute.arch.griddepcontrol_wait()
@@ -730,13 +985,18 @@ def target_argmax(rank: cutlass.Int32, logits: cute.Tensor, red: cute.Tensor, ke
             if e < 8 * cols:
                 row = e // cols
                 col = cta * cols + e % cols
-                bits = logits[row * VOCAB_SHARD + col].to(cutlass.Uint32) << cutlass.Uint32(16)
-                lm.shared_max_u64(kaddr + (row * 8).to(cutlass.Uint32), lm.argmax_key(bits, col))
+                bits = logits[row * VOCAB_SHARD + col].to(
+                    cutlass.Uint32
+                ) << cutlass.Uint32(16)
+                lm.shared_max_u64(
+                    kaddr + (row * 8).to(cutlass.Uint32), lm.argmax_key(bits, col)
+                )
         cute.arch.sync_threads()
         if tid == 0:
             for r in cutlass.range_constexpr(8):
-                k = (f32_bits(red[2 * r + 1]).to(cutlass.Uint64) << cutlass.Uint64(32)) | \
-                    f32_bits(red[2 * r]).to(cutlass.Uint64)
+                k = (
+                    f32_bits(red[2 * r + 1]).to(cutlass.Uint64) << cutlass.Uint64(32)
+                ) | f32_bits(red[2 * r]).to(cutlass.Uint64)
                 lm.atom_max_u64(keys.iterator + r * lm.KEY_STRIDE, k)
             lm.release_add_u32(arrivals.iterator, cutlass.Uint32(1))
     if cutlass.const_expr(bridge is None):
@@ -757,8 +1017,12 @@ def target_argmax(rank: cutlass.Int32, logits: cute.Tensor, red: cute.Tensor, ke
         if tid < 8 * RANKS:
             w0, w1, g, w3 = poll_vector(heads_uc.iterator + 4 * tid)
             k = head_key(w0, w1, w3)
-            red[64 + 3 * tid] = bits_f32((k & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32))
-            red[64 + 3 * tid + 1] = bits_f32((k >> cutlass.Uint64(32)).to(cutlass.Uint32))
+            red[64 + 3 * tid] = bits_f32(
+                (k & cutlass.Uint64(0xFFFFFFFF)).to(cutlass.Uint32)
+            )
+            red[64 + 3 * tid + 1] = bits_f32(
+                (k >> cutlass.Uint64(32)).to(cutlass.Uint32)
+            )
             red[64 + 3 * tid + 2] = bits_f32(g)
         cute.arch.sync_threads()
         if tid < 8 * RANKS:
@@ -768,8 +1032,10 @@ def target_argmax(rank: cutlass.Int32, logits: cute.Tensor, red: cute.Tensor, ke
             token = cutlass.Uint32(0)
             for r in cutlass.range_constexpr(RANKS):
                 jj = tid * RANKS + r
-                kk = (f32_bits(red[64 + 3 * jj + 1]).to(cutlass.Uint64) << cutlass.Uint64(32)) | \
-                    f32_bits(red[64 + 3 * jj]).to(cutlass.Uint64)
+                kk = (
+                    f32_bits(red[64 + 3 * jj + 1]).to(cutlass.Uint64)
+                    << cutlass.Uint64(32)
+                ) | f32_bits(red[64 + 3 * jj]).to(cutlass.Uint64)
                 if kk > best:
                     best = kk
                     token = f32_bits(red[64 + 3 * jj + 2])
@@ -797,13 +1063,24 @@ def target_argmax(rank: cutlass.Int32, logits: cute.Tensor, red: cute.Tensor, ke
 
 @dsl_user_op
 def ts_ex2(x: cutlass.Float32, *, loc=None, ip=None):
-    return cutlass.Float32(f32_intrinsic("llvm.nvvm.ex2.approx.ftz.f", x, loc=loc, ip=ip))
+    return cutlass.Float32(
+        f32_intrinsic("llvm.nvvm.ex2.approx.ftz.f", x, loc=loc, ip=ip)
+    )
 
 
 @dsl_user_op
-def ts_shared_add_u32(address: cutlass.Uint32, value: cutlass.Uint32, *, loc=None, ip=None):
-    llvm.atomicrmw(llvm.AtomicBinOp.add, as_ptr(3, address, loc, ip), value.ir_value(loc=loc, ip=ip),
-                   llvm.AtomicOrdering.monotonic, syncscope='block', loc=loc, ip=ip)
+def ts_shared_add_u32(
+    address: cutlass.Uint32, value: cutlass.Uint32, *, loc=None, ip=None
+):
+    llvm.atomicrmw(
+        llvm.AtomicBinOp.add,
+        as_ptr(3, address, loc, ip),
+        value.ir_value(loc=loc, ip=ip),
+        llvm.AtomicOrdering.monotonic,
+        syncscope="block",
+        loc=loc,
+        ip=ip,
+    )
 
 
 TS_LFIX = 8388608.0
@@ -815,7 +1092,9 @@ def ts_lfix(e: cutlass.Float32):
 
 
 @cute.jit
-def ts_philox(c0: cutlass.Uint32, c1: cutlass.Uint32, k0: cutlass.Uint32, k1: cutlass.Uint32):
+def ts_philox(
+    c0: cutlass.Uint32, c1: cutlass.Uint32, k0: cutlass.Uint32, k1: cutlass.Uint32
+):
     x0, x1, x2, x3 = c0, c1, cutlass.Uint32(0), cutlass.Uint32(0)
     a, b = k0, k1
     for _ in cutlass.range_constexpr(10):
@@ -831,7 +1110,9 @@ def ts_philox(c0: cutlass.Uint32, c1: cutlass.Uint32, k0: cutlass.Uint32, k1: cu
 
 @cute.jit
 def ts_uniform(x: cutlass.Uint32):
-    return (x >> cutlass.Uint32(8)).to(cutlass.Float32) * cutlass.Float32(1.0 / 16777216.0)
+    return (x >> cutlass.Uint32(8)).to(cutlass.Float32) * cutlass.Float32(
+        1.0 / 16777216.0
+    )
 
 
 @cute.jit
@@ -864,7 +1145,12 @@ def ts_poll16(base: cute.Pointer, stride: cutlass.Constexpr, out: cute.Tensor):
 
 
 @cute.jit
-def ts_block_reduce(v: cutlass.Float32, red: cute.Tensor, base: cutlass.Constexpr, is_max: cutlass.Constexpr):
+def ts_block_reduce(
+    v: cutlass.Float32,
+    red: cute.Tensor,
+    base: cutlass.Constexpr,
+    is_max: cutlass.Constexpr,
+):
     tid, _, _ = cute.arch.thread_idx()
     warp, lane = tid >> 5, tid & 31
     x = v
@@ -921,11 +1207,28 @@ def ts_vj(vals: cute.Tensor, rowbuf: cute.Tensor, index, j):
 
 
 @cute.jit
-def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor, red: cute.Tensor,
-                  hist: cute.Tensor, arrivals: cute.Tensor, r1_mc: cute.Tensor, r1_uc: cute.Tensor, r2_mc: cute.Tensor,
-                  r2_uc: cute.Tensor, res: cute.Tensor, draft_in: cute.Tensor, accepted_out: cute.Tensor,
-                  num_accepted_out: cute.Tensor, argmax_out: cute.Tensor, next_arena: cute.Tensor, next_tk: cute.Tensor,
-                  clear_counter: cute.Tensor, next_counters: cute.Tensor, bridge=None):
+def target_sample(
+    rank: cutlass.Int32,
+    logits: cute.Tensor,
+    params: cute.Tensor,
+    red: cute.Tensor,
+    hist: cute.Tensor,
+    arrivals: cute.Tensor,
+    r1_mc: cute.Tensor,
+    r1_uc: cute.Tensor,
+    r2_mc: cute.Tensor,
+    r2_uc: cute.Tensor,
+    res: cute.Tensor,
+    draft_in: cute.Tensor,
+    accepted_out: cute.Tensor,
+    num_accepted_out: cute.Tensor,
+    argmax_out: cute.Tensor,
+    next_arena: cute.Tensor,
+    next_tk: cute.Tensor,
+    clear_counter: cute.Tensor,
+    next_counters: cute.Tensor,
+    bridge=None,
+):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     warp, lane = tid >> 5, tid & 31
@@ -965,8 +1268,10 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                 hist[tid + 256 * i] = cutlass.Float32(0)
         cute.arch.sync_threads()
         vals = cute.make_rmem_tensor((per,), cutlass.Uint32)
-        rowbuf = cute.make_tensor(cute.recast_ptr(hist.iterator + 2 * TS_LANE_HIST, dtype=cutlass.Uint16),
-                                  cute.make_layout((per * 256,)))
+        rowbuf = cute.make_tensor(
+            cute.recast_ptr(hist.iterator + 2 * TS_LANE_HIST, dtype=cutlass.Uint16),
+            cute.make_layout((per * 256,)),
+        )
         mx = bits_f32(cutlass.Uint32(0xFF800000))
         if cutlass.const_expr(TS_ROLLED):
             for i in range((per * 256) // 256):
@@ -1004,18 +1309,42 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
         if cutlass.const_expr(TS_ROLLED):
             col = cutlass.Int32(0)
             for j in range(per):
-                e = ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - mx) * scale_c)
+                e = ts_ex2(
+                    (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - mx) * scale_c
+                )
                 total = total + e
                 if e >= cutlass.Float32(TS_PRUNE):
-                    ts_shared_add_u32(haddr + 4 * (lane.to(cutlass.Uint32) * cutlass.Uint32(257) +
-                                                   (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >> cutlass.Uint32(8))), ts_lfix(e))
+                    ts_shared_add_u32(
+                        haddr
+                        + 4
+                        * (
+                            lane.to(cutlass.Uint32) * cutlass.Uint32(257)
+                            + (
+                                ts_key16(ts_vj(vals, rowbuf, per * tid + j, j))
+                                >> cutlass.Uint32(8)
+                            )
+                        ),
+                        ts_lfix(e),
+                    )
         else:
             for j in cutlass.range_constexpr(per):
-                e = ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - mx) * scale_c)
+                e = ts_ex2(
+                    (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - mx) * scale_c
+                )
                 total = total + e
                 if e >= cutlass.Float32(TS_PRUNE):
-                    ts_shared_add_u32(haddr + 4 * (lane.to(cutlass.Uint32) * cutlass.Uint32(257) +
-                                                   (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >> cutlass.Uint32(8))), ts_lfix(e))
+                    ts_shared_add_u32(
+                        haddr
+                        + 4
+                        * (
+                            lane.to(cutlass.Uint32) * cutlass.Uint32(257)
+                            + (
+                                ts_key16(ts_vj(vals, rowbuf, per * tid + j, j))
+                                >> cutlass.Uint32(8)
+                            )
+                        ),
+                        ts_lfix(e),
+                    )
         total = ts_block_reduce(total, red, 560, False)
         hsum = cutlass.Uint64(0)
         for l in cutlass.range_constexpr(32):
@@ -1039,10 +1368,17 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                     if t < 7:
                         d = f32_bits(red[3024 + t]).to(cutlass.Int32)
                         if d // VOCAB_SHARD == rank:
-                            v = logits[t * VOCAB_SHARD + d - rank * VOCAB_SHARD].to(cutlass.Uint32) | \
-                                cutlass.Uint32(0x10000)
+                            v = logits[t * VOCAB_SHARD + d - rank * VOCAB_SHARD].to(
+                                cutlass.Uint32
+                            ) | cutlass.Uint32(0x10000)
                 w[k] = v
-            store_vector(r1_mc.iterator + rank * PK_SLOT + t * TS_ROW + 4 * tid, w[0], w[1], w[2], w[3])
+            store_vector(
+                r1_mc.iterator + rank * PK_SLOT + t * TS_ROW + 4 * tid,
+                w[0],
+                w[1],
+                w[2],
+                w[3],
+            )
         if tid < RANKS:
             a, b, _c, _d = poll_vector(r1_uc.iterator + tid * PK_SLOT + t * TS_ROW)
             red[512 + tid] = bits_f32(a)
@@ -1084,31 +1420,66 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                 if (owner_a < 0) & (red[512 + r] == gm):
                     owner_a = cutlass.Int32(r)
             acol = ts_poll(r1_uc.iterator + owner_a * PK_SLOT + t * TS_ROW + 259)
-            store_vector(res.iterator + t * TS_RES_ROW + 20,
-                         (owner_a * VOCAB_SHARD).to(cutlass.Uint32) + acol, cutlass.Uint32(0x10000),
-                         cutlass.Uint32(0x10000), cutlass.Uint32(0x10000))
+            store_vector(
+                res.iterator + t * TS_RES_ROW + 20,
+                (owner_a * VOCAB_SHARD).to(cutlass.Uint32) + acol,
+                cutlass.Uint32(0x10000),
+                cutlass.Uint32(0x10000),
+                cutlass.Uint32(0x10000),
+            )
         draft_word = cutlass.Uint32(0x10000)
         if t < 7:
-            draft_word = ts_poll(r1_uc.iterator + (f32_bits(red[3024 + t]).to(cutlass.Int32) // VOCAB_SHARD) * PK_SLOT + t * TS_ROW + 258)
+            draft_word = ts_poll(
+                r1_uc.iterator
+                + (f32_bits(red[3024 + t]).to(cutlass.Int32) // VOCAB_SHARD) * PK_SLOT
+                + t * TS_ROW
+                + 258
+            )
         if cutlass.const_expr(TS_ROLLED):
             col = cutlass.Int32(0)
             for j in range(per):
                 kk = ts_key16(ts_vj(vals, rowbuf, per * tid + j, j))
                 if (kk >> cutlass.Uint32(8)) == bstar:
-                    ts_shared_add_u32(haddr + 4 * (TS_LANE_HIST + lane.to(cutlass.Uint32) * cutlass.Uint32(257) +
-                                                   (kk & cutlass.Uint32(255))),
-                                      ts_lfix(ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c)))
+                    ts_shared_add_u32(
+                        haddr
+                        + 4
+                        * (
+                            TS_LANE_HIST
+                            + lane.to(cutlass.Uint32) * cutlass.Uint32(257)
+                            + (kk & cutlass.Uint32(255))
+                        ),
+                        ts_lfix(
+                            ts_ex2(
+                                (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm)
+                                * scale_c
+                            )
+                        ),
+                    )
         else:
             for j in cutlass.range_constexpr(per):
                 kk = ts_key16(ts_vj(vals, rowbuf, per * tid + j, j))
                 if (kk >> cutlass.Uint32(8)) == bstar:
-                    ts_shared_add_u32(haddr + 4 * (TS_LANE_HIST + lane.to(cutlass.Uint32) * cutlass.Uint32(257) +
-                                                   (kk & cutlass.Uint32(255))),
-                                      ts_lfix(ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c)))
+                    ts_shared_add_u32(
+                        haddr
+                        + 4
+                        * (
+                            TS_LANE_HIST
+                            + lane.to(cutlass.Uint32) * cutlass.Uint32(257)
+                            + (kk & cutlass.Uint32(255))
+                        ),
+                        ts_lfix(
+                            ts_ex2(
+                                (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm)
+                                * scale_c
+                            )
+                        ),
+                    )
         cute.arch.sync_threads()
         hsum2 = cutlass.Uint64(0)
         for l in cutlass.range_constexpr(32):
-            hsum2 = hsum2 + f32_bits(hist[TS_LANE_HIST + l * 257 + tid]).to(cutlass.Uint64)
+            hsum2 = hsum2 + f32_bits(hist[TS_LANE_HIST + l * 257 + tid]).to(
+                cutlass.Uint64
+            )
         red[256 + tid] = hsum2.to(cutlass.Float32) * cutlass.Float32(1.0 / TS_LFIX)
         cute.arch.sync_threads()
         if tid < TS_ROW // 4:
@@ -1119,7 +1490,13 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                 if i < 256:
                     v2 = published_word(f32_bits(red[256 + i]))
                 w2[k] = v2
-            store_vector(r2_mc.iterator + rank * PK_SLOT + t * TS_ROW + 4 * tid, w2[0], w2[1], w2[2], w2[3])
+            store_vector(
+                r2_mc.iterator + rank * PK_SLOT + t * TS_ROW + 4 * tid,
+                w2[0],
+                w2[1],
+                w2[2],
+                w2[3],
+            )
         fine = cute.make_rmem_tensor((RANKS,), cutlass.Float32)
         bin_f = 255 - tid
         fsum = cutlass.Float32(0)
@@ -1151,8 +1528,13 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                 red[640 + 16 * warp + r] = x
         cute.arch.sync_threads()
         if tid == 0:
-            store_vector(res.iterator + t * TS_RES_ROW, f32_bits(gm), f32_bits(kept),
-                         (bstar << cutlass.Uint32(8)) | vstar, draft_word)
+            store_vector(
+                res.iterator + t * TS_RES_ROW,
+                f32_bits(gm),
+                f32_bits(kept),
+                (bstar << cutlass.Uint32(8)) | vstar,
+                draft_word,
+            )
         elif tid < 5:
             ms = cute.make_rmem_tensor((4,), cutlass.Float32)
             for k in cutlass.range_constexpr(4):
@@ -1161,13 +1543,22 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                 for w8 in cutlass.range_constexpr(1, 8):
                     acc = acc + red[640 + 16 * w8 + r]
                 ms[k] = acc
-            store_vector(res.iterator + t * TS_RES_ROW + 4 * tid, f32_bits(ms[0]), f32_bits(ms[1]),
-                         f32_bits(ms[2]), f32_bits(ms[3]))
+            store_vector(
+                res.iterator + t * TS_RES_ROW + 4 * tid,
+                f32_bits(ms[0]),
+                f32_bits(ms[1]),
+                f32_bits(ms[2]),
+                f32_bits(ms[3]),
+            )
         cute.arch.sync_threads()
         for i in cutlass.range_constexpr((RANKS * (TS_ROW // 4) + 255) // 256):
             q = tid + 256 * i
             if q < RANKS * (TS_ROW // 4):
-                off = (q // (TS_ROW // 4)) * PK_SLOT + t * TS_ROW + 4 * (q % (TS_ROW // 4))
+                off = (
+                    (q // (TS_ROW // 4)) * PK_SLOT
+                    + t * TS_ROW
+                    + 4 * (q % (TS_ROW // 4))
+                )
                 store_empty(r1_uc.iterator + off, evict_first())
                 store_empty(r2_uc.iterator + off, evict_first())
         dloc = cutlass.Int32(-1)
@@ -1181,14 +1572,26 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
             col = cutlass.Int32(0)
             for j in range(per):
                 col = per * tid + j
-                if (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t) & (col != dloc) & (col < VOCAB_SHARD):
-                    rmass = rmass + ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c)
+                if (
+                    (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t)
+                    & (col != dloc)
+                    & (col < VOCAB_SHARD)
+                ):
+                    rmass = rmass + ts_ex2(
+                        (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c
+                    )
                     lastv = cutlass.Int32(col)
         else:
             for j in cutlass.range_constexpr(per):
                 col = per * tid + j
-                if (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t) & (col != dloc) & (col < VOCAB_SHARD):
-                    rmass = rmass + ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c)
+                if (
+                    (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t)
+                    & (col != dloc)
+                    & (col < VOCAB_SHARD)
+                ):
+                    rmass = rmass + ts_ex2(
+                        (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c
+                    )
                     lastv = cutlass.Int32(col)
         rincl = ts_block_scan(rmass, red, 576)
         cute.arch.sync_threads()
@@ -1217,7 +1620,9 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                         for s2 in cutlass.range_constexpr(RANKS):
                             k_r = k_r + red[2304 + r * TS_RES_ROW + 4 + s2]
                         lam = f32_bits(red[2304 + r * TS_RES_ROW + 2])
-                        lb = f32_bits(red[2304 + r * TS_RES_ROW + 3]) & cutlass.Uint32(0xFFFF)
+                        lb = f32_bits(red[2304 + r * TS_RES_ROW + 3]) & cutlass.Uint32(
+                            0xFFFF
+                        )
                         qv = cutlass.Float32(0)
                         if ts_key16(lb) >= lam:
                             qv = ts_ex2((ts_value(lb) - m_r) * scale_c) / k_r
@@ -1235,7 +1640,9 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                 d_f = cutlass.Int32(-1)
                 if f < 7:
                     d_f = f32_bits(red[3024 + f]).to(cutlass.Int32)
-                    lbf = f32_bits(red[2304 + f * TS_RES_ROW + 3]) & cutlass.Uint32(0xFFFF)
+                    lbf = f32_bits(red[2304 + f * TS_RES_ROW + 3]) & cutlass.Uint32(
+                        0xFFFF
+                    )
                     if ts_key16(lbf) >= lam_f:
                         e_d = ts_ex2((ts_value(lbf) - m_f) * scale_c)
                 u = red[3008 + 8] * (k_f - e_d)
@@ -1259,8 +1666,13 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                     cum = cum + msv
                 if sstar < 0:
                     sstar, ulocal = last_s, last_m
-                store_vector(res.iterator + 8 * TS_RES_ROW, n.to(cutlass.Uint32), sstar.to(cutlass.Uint32),
-                             f32_bits(ulocal), cutlass.Uint32(1))
+                store_vector(
+                    res.iterator + 8 * TS_RES_ROW,
+                    n.to(cutlass.Uint32),
+                    sstar.to(cutlass.Uint32),
+                    f32_bits(ulocal),
+                    cutlass.Uint32(1),
+                )
         if tid == 0:
             dn, ds, du, _d1 = poll_vector(res.iterator + 8 * TS_RES_ROW)
             red[2048] = bits_f32(dn)
@@ -1280,15 +1692,31 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                     col = cutlass.Int32(0)
                     for j in range(per):
                         col = per * tid + j
-                        if (pick < 0) & (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t) & (col != dloc) & (col < VOCAB_SHARD):
-                            run = run + ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c)
+                        if (
+                            (pick < 0)
+                            & (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t)
+                            & (col != dloc)
+                            & (col < VOCAB_SHARD)
+                        ):
+                            run = run + ts_ex2(
+                                (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm)
+                                * scale_c
+                            )
                             if run > ulocal_s:
                                 pick = cutlass.Int32(col)
                 else:
                     for j in cutlass.range_constexpr(per):
                         col = per * tid + j
-                        if (pick < 0) & (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t) & (col != dloc) & (col < VOCAB_SHARD):
-                            run = run + ts_ex2((ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm) * scale_c)
+                        if (
+                            (pick < 0)
+                            & (ts_key16(ts_vj(vals, rowbuf, per * tid + j, j)) >= lam_t)
+                            & (col != dloc)
+                            & (col < VOCAB_SHARD)
+                        ):
+                            run = run + ts_ex2(
+                                (ts_value(ts_vj(vals, rowbuf, per * tid + j, j)) - gm)
+                                * scale_c
+                            )
                             if run > ulocal_s:
                                 pick = cutlass.Int32(col)
                 if pick < 0:
@@ -1302,15 +1730,22 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                         lv = f32_bits(red[2560 + w9]).to(cutlass.Int32)
                         if lv >= 0:
                             pk = lv
-                store_vector(r1_mc.iterator + rank * PK_SLOT + TS_R3, (rank * VOCAB_SHARD + pk).to(cutlass.Uint32),
-                             n_s.to(cutlass.Uint32), cutlass.Uint32(1), cutlass.Uint32(1))
+                store_vector(
+                    r1_mc.iterator + rank * PK_SLOT + TS_R3,
+                    (rank * VOCAB_SHARD + pk).to(cutlass.Uint32),
+                    n_s.to(cutlass.Uint32),
+                    cutlass.Uint32(1),
+                    cutlass.Uint32(1),
+                )
         cute.arch.sync_threads()
         if tid == 0:
             lm.release_add_u32(arrivals.iterator, cutlass.Uint32(1))
         if t == 7:
             wait_count(arrivals, cutlass.Uint32(16))
             if tid == 0:
-                tok, _n2, _a, _b = poll_vector(r1_uc.iterator + sstar_s * PK_SLOT + TS_R3)
+                tok, _n2, _a, _b = poll_vector(
+                    r1_uc.iterator + sstar_s * PK_SLOT + TS_R3
+                )
                 for j in cutlass.range_constexpr(8):
                     out = cutlass.Int32(-1)
                     if cutlass.const_expr(TS_PREDICT_ZERO):
@@ -1322,7 +1757,9 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
                     accepted_out[j] = out
                 num_accepted_out[0] = n_s + 1
                 for j in cutlass.range_constexpr(8):
-                    argmax_out[j] = f32_bits(red[2304 + j * TS_RES_ROW + 20]).to(cutlass.Int32)
+                    argmax_out[j] = f32_bits(red[2304 + j * TS_RES_ROW + 20]).to(
+                        cutlass.Int32
+                    )
                 store_empty(r1_uc.iterator + sstar_s * PK_SLOT + TS_R3, evict_first())
                 if phil:
                     params[14] = bits_f32(step_w + cutlass.Uint32(1))
@@ -1340,34 +1777,88 @@ def target_sample(rank: cutlass.Int32, logits: cute.Tensor, params: cute.Tensor,
 
 @cute.kernel
 def draft_kernel(
-    x_raw_ptr: cute.Pointer, residual_raw: cute.Tensor, residual_out_raw: cute.Tensor, normalized_raw: cute.Tensor,
-    wfa_raw_ptr: cute.Pointer, wqb_raw: cute.Tensor, wo_raw: cute.Tensor,
-    w_router: cute.Tensor, bias: cute.Tensor, w3w1: cute.Tensor, w2: cute.Tensor, w_sgu: cute.Tensor,
-    w_sdn: cute.Tensor, gamma_kv: cute.Tensor, gamma_in_raw: cute.Tensor, gamma_post_raw: cute.Tensor,
-    gamma_head_raw: cute.Tensor, gamma_hnorm_raw: cute.Tensor, rope_raw: cute.Tensor, length: cute.Tensor,
-    table_raw: cute.Tensor, cache_raw: cute.Tensor, topk_raw: cute.Tensor, arena_raw: cute.Tensor,
-    partials_raw: cute.Tensor, stats_raw: cute.Tensor, counters_raw: cute.Tensor, uc_raw: cute.Tensor,
-    mc_raw: cute.Tensor, lm_w: cute.Tensor, token_table: cute.Tensor, hidden_rows: cute.Tensor,
-    draft_tokens: cute.Tensor, next_new_tokens: cute.Tensor, accepted: cute.Tensor, num_accepted: cute.Tensor,
-    copy: cutlass.Int32, rank: cutlass.Int32, step: cutlass.Int32, last: cutlass.Boolean,
-    stride_rows: cutlass.Int64, layer_rows: cutlass.Int64, max_blocks: cutlass.Int32, clear_first: cutlass.Boolean,
+    x_raw_ptr: cute.Pointer,
+    residual_raw: cute.Tensor,
+    residual_out_raw: cute.Tensor,
+    normalized_raw: cute.Tensor,
+    wfa_raw_ptr: cute.Pointer,
+    wqb_raw: cute.Tensor,
+    wo_raw: cute.Tensor,
+    w_router: cute.Tensor,
+    bias: cute.Tensor,
+    w3w1: cute.Tensor,
+    w2: cute.Tensor,
+    w_sgu: cute.Tensor,
+    w_sdn: cute.Tensor,
+    gamma_kv: cute.Tensor,
+    gamma_in_raw: cute.Tensor,
+    gamma_post_raw: cute.Tensor,
+    gamma_head_raw: cute.Tensor,
+    gamma_hnorm_raw: cute.Tensor,
+    rope_raw: cute.Tensor,
+    length: cute.Tensor,
+    table_raw: cute.Tensor,
+    cache_raw: cute.Tensor,
+    topk_raw: cute.Tensor,
+    arena_raw: cute.Tensor,
+    partials_raw: cute.Tensor,
+    stats_raw: cute.Tensor,
+    counters_raw: cute.Tensor,
+    uc_raw: cute.Tensor,
+    mc_raw: cute.Tensor,
+    lm_w: cute.Tensor,
+    token_table: cute.Tensor,
+    hidden_rows: cute.Tensor,
+    draft_tokens: cute.Tensor,
+    next_new_tokens: cute.Tensor,
+    accepted: cute.Tensor,
+    num_accepted: cute.Tensor,
+    copy: cutlass.Int32,
+    rank: cutlass.Int32,
+    step: cutlass.Int32,
+    last: cutlass.Boolean,
+    stride_rows: cutlass.Int64,
+    layer_rows: cutlass.Int64,
+    max_blocks: cutlass.Int32,
+    clear_first: cutlass.Boolean,
     kind: cutlass.Int32,
-    wfa_leader_ptr: cute.Pointer, widx_raw_ptr: cute.Pointer, idx_kn_w_ptr: cute.Pointer, idx_kn_b_ptr: cute.Pointer,
-    idx_rope_raw_ptr: cute.Pointer, idx_pool_raw_ptr: cute.Pointer, idx_blocks_raw_ptr: cute.Pointer,
-    idx_stride_bytes: cutlass.Int64, idx_pages: cutlass.Int64, idx_candidates_raw: cute.Tensor,
-    key_atom: cute.CopyAtom, embed_raw: cute.Tensor, embed_sharded: cutlass.Boolean, gamma_enorm_raw: cute.Tensor,
-    eh_atom: cute.CopyAtom, scale: cutlass.Constexpr,
-    with_target_argmax: cutlass.Constexpr, with_target_sample: cutlass.Constexpr,
+    wfa_leader_ptr: cute.Pointer,
+    widx_raw_ptr: cute.Pointer,
+    idx_kn_w_ptr: cute.Pointer,
+    idx_kn_b_ptr: cute.Pointer,
+    idx_rope_raw_ptr: cute.Pointer,
+    idx_pool_raw_ptr: cute.Pointer,
+    idx_blocks_raw_ptr: cute.Pointer,
+    idx_stride_bytes: cutlass.Int64,
+    idx_pages: cutlass.Int64,
+    idx_candidates_raw: cute.Tensor,
+    key_atom: cute.CopyAtom,
+    embed_raw: cute.Tensor,
+    embed_sharded: cutlass.Boolean,
+    gamma_enorm_raw: cute.Tensor,
+    eh_atom: cute.CopyAtom,
+    scale: cutlass.Constexpr,
+    with_target_argmax: cutlass.Constexpr,
+    with_target_sample: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     allocator = SmemAllocator()
-    storage = allocator.allocate_tensor(cutlass.Uint32, cute.make_layout((SHARED_WORDS,)), byte_alignment=1024)
-    dsm = allocator.allocate_tensor(cutlass.Uint32, cute.make_layout((DSM_WORDS,)), byte_alignment=16)
+    storage = allocator.allocate_tensor(
+        cutlass.Uint32, cute.make_layout((SHARED_WORDS,)), byte_alignment=1024
+    )
+    dsm = allocator.allocate_tensor(
+        cutlass.Uint32, cute.make_layout((DSM_WORDS,)), byte_alignment=16
+    )
     sm = cute.make_tensor(dsm.iterator, cute.make_layout((moe.SM_WORDS,)))
-    dbars = cute.make_tensor(cute.recast_ptr(dsm.iterator + moe.SM_WORDS, dtype=cutlass.Uint64),
-                             cute.make_layout((DSM_BARS,)))
-    bias_sm = cute.make_tensor(cute.recast_ptr(dsm.iterator + DSM_BIAS, dtype=cutlass.Float32), cute.make_layout((256,)))
+    dbars = cute.make_tensor(
+        cute.recast_ptr(dsm.iterator + moe.SM_WORDS, dtype=cutlass.Uint64),
+        cute.make_layout((DSM_BARS,)),
+    )
+    bias_sm = cute.make_tensor(
+        cute.recast_ptr(dsm.iterator + DSM_BIAS, dtype=cutlass.Float32),
+        cute.make_layout((256,)),
+    )
     if tid < DSM_BARS:
         cute.arch.mbarrier_init(dbars.iterator + tid, 1)
     if cutlass.const_expr(BIAS_SMEM):
@@ -1381,15 +1872,26 @@ def draft_kernel(
     following = next_copy * ARENA_WORDS
     x_raw = cute.make_tensor(x_raw_ptr, cute.make_layout((24576,)))
     x = word_view(x_raw, 0, (8, 3072), (3072, 1))
-    wfa = word_view(cute.make_tensor(wfa_raw_ptr, cute.make_layout((8060928,))), 0, (8060928,), (1,))
+    wfa = word_view(
+        cute.make_tensor(wfa_raw_ptr, cute.make_layout((8060928,))), 0, (8060928,), (1,)
+    )
     wqb = word_view(wqb_raw, 0, (2359296,), (1,))
     wo = word_view(wo_raw, 0, (6291456,), (1,))
     w_lg = word_view(w_router, moe.EXPERTS * HIDDEN // 2, (LG_W_WORDS,), (1,))
-    rope = cute.make_tensor(rope_raw.iterator, cute.make_layout((cute.size(rope_raw) // 128, 64), stride=(128, 1)))
-    table = cute.make_tensor(table_raw.iterator, cute.make_layout((cute.size(table_raw),)))
-    cache = cute.make_tensor(cute.recast_ptr(cache_raw.iterator, dtype=cutlass.Uint32),
-                             cute.make_layout((cute.size(cache_raw) // 576, 144), stride=(144, 1)))
-    topk = cute.make_tensor(topk_raw.iterator, cute.make_layout((8, 2048), stride=(2048, 1)))
+    rope = cute.make_tensor(
+        rope_raw.iterator,
+        cute.make_layout((cute.size(rope_raw) // 128, 64), stride=(128, 1)),
+    )
+    table = cute.make_tensor(
+        table_raw.iterator, cute.make_layout((cute.size(table_raw),))
+    )
+    cache = cute.make_tensor(
+        cute.recast_ptr(cache_raw.iterator, dtype=cutlass.Uint32),
+        cute.make_layout((cute.size(cache_raw) // 576, 144), stride=(144, 1)),
+    )
+    topk = cute.make_tensor(
+        topk_raw.iterator, cute.make_layout((8, 2048), stride=(2048, 1))
+    )
     residual_input = word_view(residual_raw, 0, (8, 3072), (3072, 1))
     xout = word_view(normalized_raw, 0, (8, 3072), (3072, 1))
     rout = word_view(residual_out_raw, 0, (8, 3072), (3072, 1))
@@ -1400,7 +1902,9 @@ def draft_kernel(
     q8 = word_view(arena_raw, current + 41984 // 4, (8, 576), (576, 1))
     kv_arena = word_view(arena_raw, current + 60416 // 4, (8, 144), (144, 1))
     o = word_view(arena_raw, current + 65024 // 4, (8, 4, 256), (1024, 256, 1))
-    replicas = word_view(arena_raw, current + 2273024 // 4, (3, 8, 4, 256), (8192, 1024, 256, 1))
+    replicas = word_view(
+        arena_raw, current + 2273024 // 4, (3, 8, 4, 256), (8192, 1024, 256, 1)
+    )
     o_logits = word_view(arena_raw, current + 105600 // 4, (8, 256), (256, 1))
     h = word_view(arena_raw, current + 114176 // 4, (24576,), (1,))
     hp = word_view(arena_raw, current + 2371328 // 4, (24576,), (1,))
@@ -1418,41 +1922,71 @@ def draft_kernel(
     stats = word_view(stats_raw, 0, (1024,), (1,))
     clear_counter = word_view(counters_raw, copy * COUNTER_WORDS, (1,), (1,))
     previous_clear = word_view(counters_raw, previous_copy * COUNTER_WORDS, (1,), (1,))
-    next_counters = word_view(counters_raw, next_copy * COUNTER_WORDS, (COUNTER_WORDS,), (1,))
-    keys = cute.make_tensor(cute.recast_ptr(counters_raw.iterator + (copy * COUNTER_WORDS + C_KEYS),
-                                            dtype=cutlass.Uint64), cute.make_layout((8,)))
+    next_counters = word_view(
+        counters_raw, next_copy * COUNTER_WORDS, (COUNTER_WORDS,), (1,)
+    )
+    keys = cute.make_tensor(
+        cute.recast_ptr(
+            counters_raw.iterator + (copy * COUNTER_WORDS + C_KEYS),
+            dtype=cutlass.Uint64,
+        ),
+        cute.make_layout((8,)),
+    )
     key_words = word_view(counters_raw, copy * COUNTER_WORDS + C_KEYS, (16,), (1,))
     arrivals = word_view(counters_raw, copy * COUNTER_WORDS + C_ARR, (1,), (1,))
     x_ready = word_view(counters_raw, copy * COUNTER_WORDS + C_XREADY, (1,), (1,))
     front_done = word_view(counters_raw, copy * COUNTER_WORDS + C_FRONT, (1,), (1,))
     hop1 = word_view(uc_raw, copy * HOP_WORDS, (HOP_WORDS,), (1,))
     h1_mc = word_view(mc_raw, copy * HOP_WORDS, (HOP_WORDS,), (1,))
-    hop2 = word_view(uc_raw, (COPIES + copy) * HOP_WORDS, (8, 16, 3072), (49152, 3072, 1))
-    previous_hop2 = word_view(uc_raw, (COPIES + previous_copy) * HOP_WORDS, (8, 16, 3072), (49152, 3072, 1))
+    hop2 = word_view(
+        uc_raw, (COPIES + copy) * HOP_WORDS, (8, 16, 3072), (49152, 3072, 1)
+    )
+    previous_hop2 = word_view(
+        uc_raw, (COPIES + previous_copy) * HOP_WORDS, (8, 16, 3072), (49152, 3072, 1)
+    )
     h2_flat = word_view(mc_raw, (COPIES + copy) * HOP_WORDS, (HOP_WORDS,), (1,))
-    next_tk = word_view(uc_raw, 2 * COPIES * HOP_WORDS + next_copy * TK_WORDS, (TK_WORDS,), (1,))
+    next_tk = word_view(
+        uc_raw, 2 * COPIES * HOP_WORDS + next_copy * TK_WORDS, (TK_WORDS,), (1,)
+    )
     lg_offset = 2 * COPIES * HOP_WORDS + COPIES * TK_WORDS + copy * LG_WORDS
     lg_uc = word_view(uc_raw, lg_offset, (LG_WORDS,), (1,))
     lg_mc = word_view(mc_raw, lg_offset, (LG_WORDS,), (1,))
-    exchange = word_view(uc_raw, 2 * COPIES * HOP_WORDS + copy * TK_WORDS, (TK_WORDS,), (1,))
-    y_offset = 2 * COPIES * HOP_WORDS + COPIES * TK_WORDS + COPIES * LG_WORDS + copy * Y_WORDS
+    exchange = word_view(
+        uc_raw, 2 * COPIES * HOP_WORDS + copy * TK_WORDS, (TK_WORDS,), (1,)
+    )
+    y_offset = (
+        2 * COPIES * HOP_WORDS + COPIES * TK_WORDS + COPIES * LG_WORDS + copy * Y_WORDS
+    )
     y = word_view(uc_raw, y_offset, (8, 1312), (1312, 1))
     y_mc = word_view(mc_raw, y_offset, (8, 1312), (1312, 1))
     y_clear = word_view(uc_raw, y_offset, (8 * 1312,), (1,))
-    read_packets = word_view(uc_raw, PK_BASE + previous_copy * PK_COPY, (PK_COPY,), (1,))
+    read_packets = word_view(
+        uc_raw, PK_BASE + previous_copy * PK_COPY, (PK_COPY,), (1,)
+    )
     own_packets = word_view(uc_raw, PK_BASE + copy * PK_COPY, (PK_COPY,), (1,))
-    slot_mc = word_view(mc_raw, PK_BASE + copy * PK_COPY + rank * PK_SLOT, (PK_SLOT,), (1,))
+    slot_mc = word_view(
+        mc_raw, PK_BASE + copy * PK_COPY + rank * PK_SLOT, (PK_SLOT,), (1,)
+    )
     w_lm = cute.make_tensor(lm_w.iterator, cute.make_layout((VOCAB_SHARD * HIDDEN,)))
-    w_lm8 = cute.make_tensor(cute.recast_ptr(lm_w.iterator, dtype=cutlass.Uint8) + 2 * VOCAB_SHARD * HIDDEN,
-                             cute.make_layout((VOCAB_SHARD * HIDDEN,)))
-    lm_scales = cute.make_tensor(cute.recast_ptr(lm_w.iterator, dtype=cutlass.Float32) + (3 * VOCAB_SHARD * HIDDEN) // 4,
-                                 cute.make_layout((VOCAB_SHARD,)))
+    w_lm8 = cute.make_tensor(
+        cute.recast_ptr(lm_w.iterator, dtype=cutlass.Uint8) + 2 * VOCAB_SHARD * HIDDEN,
+        cute.make_layout((VOCAB_SHARD * HIDDEN,)),
+    )
+    lm_scales = cute.make_tensor(
+        cute.recast_ptr(lm_w.iterator, dtype=cutlass.Float32)
+        + (3 * VOCAB_SHARD * HIDDEN) // 4,
+        cute.make_layout((VOCAB_SHARD,)),
+    )
     w_lm_words = word_view(lm_w, 0, (VOCAB_SHARD * HIDDEN // 2,), (1,))
-    w_lm4 = cute.make_tensor(cute.recast_ptr(lm_w.iterator, dtype=cutlass.Uint8) + 2 * VOCAB_SHARD * HIDDEN,
-                             cute.make_layout((VOCAB_SHARD * lm.FP4_ROW_BYTES,)))
-    lm_scales4 = cute.make_tensor(cute.recast_ptr(lm_w.iterator, dtype=cutlass.Float32)
-                                  + (2 * VOCAB_SHARD * HIDDEN + VOCAB_SHARD * lm.FP4_ROW_BYTES) // 4,
-                                  cute.make_layout((VOCAB_SHARD,)))
+    w_lm4 = cute.make_tensor(
+        cute.recast_ptr(lm_w.iterator, dtype=cutlass.Uint8) + 2 * VOCAB_SHARD * HIDDEN,
+        cute.make_layout((VOCAB_SHARD * lm.FP4_ROW_BYTES,)),
+    )
+    lm_scales4 = cute.make_tensor(
+        cute.recast_ptr(lm_w.iterator, dtype=cutlass.Float32)
+        + (2 * VOCAB_SHARD * HIDDEN + VOCAB_SHARD * lm.FP4_ROW_BYTES) // 4,
+        cute.make_layout((VOCAB_SHARD,)),
+    )
     loff = cutlass.Int32(0)
     if kind == KIND_SK:
         loff = step
@@ -1463,11 +1997,15 @@ def draft_kernel(
     if cutlass.const_expr(TS_BRIDGE):
         b_tgt, b_cnt = (copy + 2) % COPIES, (copy + 1) % COPIES
         tb_arena = word_view(arena_raw, b_tgt * ARENA_WORDS, (ARENA_WORDS,), (1,))
-        tb_tk = word_view(uc_raw, 2 * COPIES * HOP_WORDS + b_tgt * TK_WORDS, (TK_WORDS,), (1,))
+        tb_tk = word_view(
+            uc_raw, 2 * COPIES * HOP_WORDS + b_tgt * TK_WORDS, (TK_WORDS,), (1,)
+        )
         tb_clear = word_view(counters_raw, b_cnt * COUNTER_WORDS, (1,), (1,))
-        tb = (word_view(counters_raw, b_tgt * COUNTER_WORDS, (COUNTER_WORDS,), (1,)),
-              word_view(counters_raw, b_cnt * COUNTER_WORDS, (COUNTER_WORDS,), (1,)),
-              word_view(counters_raw, copy * COUNTER_WORDS + TS_BRIDGE_FLAG, (1,), (1,)))
+        tb = (
+            word_view(counters_raw, b_tgt * COUNTER_WORDS, (COUNTER_WORDS,), (1,)),
+            word_view(counters_raw, b_cnt * COUNTER_WORDS, (COUNTER_WORDS,), (1,)),
+            word_view(counters_raw, copy * COUNTER_WORDS + TS_BRIDGE_FLAG, (1,), (1,)),
+        )
     is_ta = False
     if cutlass.const_expr(with_target_argmax):
         is_ta = kind == KIND_TA
@@ -1480,82 +2018,262 @@ def draft_kernel(
                 cute.arch.griddepcontrol_wait()
                 if cta >= 180:
                     if tid < 192:
-                        self_clear(hop1, previous_hop2, (cta - 180) // 4, 1536 * ((cta - 180) % 4) + 8 * tid)
-            target_argmax(rank, cute.make_tensor(cute.recast_ptr(normalized_raw.iterator, dtype=cutlass.Uint16),
-                                                 cute.make_layout((8 * VOCAB_SHARD,))), red, keys, key_words, arrivals,
-                          word_view(mc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)),
-                          word_view(uc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)), draft_tokens, accepted,
-                          num_accepted, next_new_tokens, tb_arena, tb_tk, tb_clear, next_counters, bridge=tb)
+                        self_clear(
+                            hop1,
+                            previous_hop2,
+                            (cta - 180) // 4,
+                            1536 * ((cta - 180) % 4) + 8 * tid,
+                        )
+            target_argmax(
+                rank,
+                cute.make_tensor(
+                    cute.recast_ptr(normalized_raw.iterator, dtype=cutlass.Uint16),
+                    cute.make_layout((8 * VOCAB_SHARD,)),
+                ),
+                red,
+                keys,
+                key_words,
+                arrivals,
+                word_view(mc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)),
+                word_view(uc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)),
+                draft_tokens,
+                accepted,
+                num_accepted,
+                next_new_tokens,
+                tb_arena,
+                tb_tk,
+                tb_clear,
+                next_counters,
+                bridge=tb,
+            )
     elif is_ts:
         if cutlass.const_expr(with_target_sample):
             if cutlass.const_expr(T_CLEAR_PREVIOUS_HOP2):
                 cute.arch.griddepcontrol_wait()
                 if cta >= 180:
                     if tid < 192:
-                        self_clear(hop1, previous_hop2, (cta - 180) // 4, 1536 * ((cta - 180) % 4) + 8 * tid)
-            target_sample(rank, cute.make_tensor(cute.recast_ptr(normalized_raw.iterator, dtype=cutlass.Uint16),
-                                                 cute.make_layout((8 * VOCAB_SHARD,))),
-                          cute.make_tensor(cute.recast_ptr(x_raw.iterator, dtype=cutlass.Float32),
-                                           cute.make_layout((16,))), red,
-                          cute.make_tensor(cute.recast_ptr(region.iterator, dtype=cutlass.Float32),
-                                           cute.make_layout((2 * TS_LANE_HIST,))), arrivals,
-                          word_view(mc_raw, PK_BASE, (PK_COPY,), (1,)), word_view(uc_raw, PK_BASE, (PK_COPY,), (1,)),
-                          word_view(mc_raw, PK_BASE + 2 * PK_COPY, (PK_COPY,), (1,)),
-                          word_view(uc_raw, PK_BASE + 2 * PK_COPY, (PK_COPY,), (1,)),
-                          word_view(uc_raw, PK_BASE + 2 * PK_COPY + rank * PK_SLOT + TS_RES, (8 * TS_RES_ROW + 4,), (1,)),
-                          draft_tokens, accepted, num_accepted, next_new_tokens, tb_arena, tb_tk, tb_clear,
-                          next_counters, bridge=tb)
+                        self_clear(
+                            hop1,
+                            previous_hop2,
+                            (cta - 180) // 4,
+                            1536 * ((cta - 180) % 4) + 8 * tid,
+                        )
+            target_sample(
+                rank,
+                cute.make_tensor(
+                    cute.recast_ptr(normalized_raw.iterator, dtype=cutlass.Uint16),
+                    cute.make_layout((8 * VOCAB_SHARD,)),
+                ),
+                cute.make_tensor(
+                    cute.recast_ptr(x_raw.iterator, dtype=cutlass.Float32),
+                    cute.make_layout((16,)),
+                ),
+                red,
+                cute.make_tensor(
+                    cute.recast_ptr(region.iterator, dtype=cutlass.Float32),
+                    cute.make_layout((2 * TS_LANE_HIST,)),
+                ),
+                arrivals,
+                word_view(mc_raw, PK_BASE, (PK_COPY,), (1,)),
+                word_view(uc_raw, PK_BASE, (PK_COPY,), (1,)),
+                word_view(mc_raw, PK_BASE + 2 * PK_COPY, (PK_COPY,), (1,)),
+                word_view(uc_raw, PK_BASE + 2 * PK_COPY, (PK_COPY,), (1,)),
+                word_view(
+                    uc_raw,
+                    PK_BASE + 2 * PK_COPY + rank * PK_SLOT + TS_RES,
+                    (8 * TS_RES_ROW + 4,),
+                    (1,),
+                ),
+                draft_tokens,
+                accepted,
+                num_accepted,
+                next_new_tokens,
+                tb_arena,
+                tb_tk,
+                tb_clear,
+                next_counters,
+                bridge=tb,
+            )
     elif kind == KIND_T:
         if cutlass.const_expr(T_CLEAR_PREVIOUS_HOP2):
             cute.arch.griddepcontrol_wait()
             if cta >= 180:
                 if tid < 192:
-                    self_clear(hop1, previous_hop2, (cta - 180) // 4, 1536 * ((cta - 180) % 4) + 8 * tid)
-        target_tail(rank, word_view(normalized_raw, 0, (24576,), (1,)), w_lm, region, red,
-                    cute.make_tensor(dbars.iterator + B_LM, cute.make_layout((lm.BARS,))), keys, key_words, arrivals,
-                    word_view(mc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)),
-                    word_view(uc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)), draft_tokens, accepted,
-                    num_accepted, next_arena, next_tk, clear_counter, next_counters)
+                    self_clear(
+                        hop1,
+                        previous_hop2,
+                        (cta - 180) // 4,
+                        1536 * ((cta - 180) % 4) + 8 * tid,
+                    )
+        target_tail(
+            rank,
+            word_view(normalized_raw, 0, (24576,), (1,)),
+            w_lm,
+            region,
+            red,
+            cute.make_tensor(dbars.iterator + B_LM, cute.make_layout((lm.BARS,))),
+            keys,
+            key_words,
+            arrivals,
+            word_view(mc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)),
+            word_view(uc_raw, PK_BASE + copy * PK_COPY, (T_HEADS,), (1,)),
+            draft_tokens,
+            accepted,
+            num_accepted,
+            next_arena,
+            next_tk,
+            clear_counter,
+            next_counters,
+        )
     else:
         is_s0 = kind == KIND_S0
         xn_view = word_view(arena_raw, current + D_XN, (24576,), (1,))
-        xn_args = (xn_view, word_view(arena_raw, current + D_NS, (64,), (1,))) if s0.FA_STOCK else (None, None)
-        fa_kw = dict(x_carry=xn_view, scale_carry=cutlass.Boolean(False), fa_stock=True) if s0.FA_STOCK else {}
+        xn_args = (
+            (xn_view, word_view(arena_raw, current + D_NS, (64,), (1,)))
+            if s0.FA_STOCK
+            else (None, None)
+        )
+        fa_kw = (
+            dict(x_carry=xn_view, scale_carry=cutlass.Boolean(False), fa_stock=True)
+            if s0.FA_STOCK
+            else {}
+        )
         if is_s0:
-            s0.s0_front(cta, rank, accepted, word_view(embed_raw, 0, (cute.size(embed_raw) // 2,), (1,)),
-                        embed_sharded, word_view(uc_raw, EMB_BASE, (s0.EMB_WORDS,), (1,)),
-                        word_view(mc_raw, EMB_BASE, (s0.EMB_WORDS,), (1,)), word_view(x_raw, 0, (24576,), (1,)),
-                        word_view(gamma_enorm_raw, 0, (3072,), (1,)), gamma_hnorm, word_view(arena_raw,
-                        current + D_NW, (s0.NW_WORDS,), (1,)),
-                        word_view(uc_raw, EH_BASE, (s0.EH_WORDS,), (1,)),
-                        word_view(mc_raw, EH_BASE, (s0.EH_WORDS,), (1,)), gamma_in, residual_input, x_frag, x_ssq,
-                        region, red, scalars, cute.make_tensor(dbars.iterator + B_EH, cute.make_layout((s0.EH_BARS,))),
-                        eh_atom, tmem_slot, *xn_args)
+            s0.s0_front(
+                cta,
+                rank,
+                accepted,
+                word_view(embed_raw, 0, (cute.size(embed_raw) // 2,), (1,)),
+                embed_sharded,
+                word_view(uc_raw, EMB_BASE, (s0.EMB_WORDS,), (1,)),
+                word_view(mc_raw, EMB_BASE, (s0.EMB_WORDS,), (1,)),
+                word_view(x_raw, 0, (24576,), (1,)),
+                word_view(gamma_enorm_raw, 0, (3072,), (1,)),
+                gamma_hnorm,
+                word_view(arena_raw, current + D_NW, (s0.NW_WORDS,), (1,)),
+                word_view(uc_raw, EH_BASE, (s0.EH_WORDS,), (1,)),
+                word_view(mc_raw, EH_BASE, (s0.EH_WORDS,), (1,)),
+                gamma_in,
+                residual_input,
+                x_frag,
+                x_ssq,
+                region,
+                red,
+                scalars,
+                cute.make_tensor(
+                    dbars.iterator + B_EH, cute.make_layout((s0.EH_BARS,))
+                ),
+                eh_atom,
+                tmem_slot,
+                *xn_args,
+            )
             rope_rows = cute.size(rope_raw) // 128
-            leader_front_body(x_raw, cute.make_tensor(wfa_leader_ptr, cute.make_layout((174 * 196608,))), wqb_raw,
-                              cute.make_tensor(widx_raw_ptr, cute.make_layout((256 * 65536,))), gamma_kv, rope_raw,
-                              lview, table_raw, cache_raw, arena_raw, counters_raw, copy, rank, cutlass.Boolean(True),
-                              stride_rows, layer_rows, cute.make_tensor(idx_kn_w_ptr, cute.make_layout((128,))),
-                              cute.make_tensor(idx_kn_b_ptr, cute.make_layout((128,))),
-                              cute.make_tensor(idx_rope_raw_ptr, cute.make_layout((rope_rows * 64,))),
-                              cute.make_tensor(idx_pool_raw_ptr,
-                                               cute.make_layout(((idx_pages - 1) * idx_stride_bytes + 8448,))),
-                              cute.make_tensor(idx_blocks_raw_ptr, cute.make_layout((rope_rows // 64,))),
-                              idx_stride_bytes, idx_pages, idx_candidates_raw, mc_raw, uc_raw, topk_raw,
-                              partials_raw, stats_raw, max_blocks, clear_first, key_atom,
-                              residual_raw, residual_out_raw, normalized_raw, wo_raw, wo_raw,
-                              w_sgu, w_sdn, w_sgu, w_sdn, gamma_post_raw, gamma_head_raw,
-                              gamma_post_raw, partials_raw, partials_raw, partials_raw, cutlass.Boolean(False), storage, **fa_kw)
+            leader_front_body(
+                x_raw,
+                cute.make_tensor(wfa_leader_ptr, cute.make_layout((174 * 196608,))),
+                wqb_raw,
+                cute.make_tensor(widx_raw_ptr, cute.make_layout((256 * 65536,))),
+                gamma_kv,
+                rope_raw,
+                lview,
+                table_raw,
+                cache_raw,
+                arena_raw,
+                counters_raw,
+                copy,
+                rank,
+                cutlass.Boolean(True),
+                stride_rows,
+                layer_rows,
+                cute.make_tensor(idx_kn_w_ptr, cute.make_layout((128,))),
+                cute.make_tensor(idx_kn_b_ptr, cute.make_layout((128,))),
+                cute.make_tensor(idx_rope_raw_ptr, cute.make_layout((rope_rows * 64,))),
+                cute.make_tensor(
+                    idx_pool_raw_ptr,
+                    cute.make_layout(((idx_pages - 1) * idx_stride_bytes + 8448,)),
+                ),
+                cute.make_tensor(
+                    idx_blocks_raw_ptr, cute.make_layout((rope_rows // 64,))
+                ),
+                idx_stride_bytes,
+                idx_pages,
+                idx_candidates_raw,
+                mc_raw,
+                uc_raw,
+                topk_raw,
+                partials_raw,
+                stats_raw,
+                max_blocks,
+                clear_first,
+                key_atom,
+                residual_raw,
+                residual_out_raw,
+                normalized_raw,
+                wo_raw,
+                wo_raw,
+                w_sgu,
+                w_sdn,
+                w_sgu,
+                w_sdn,
+                gamma_post_raw,
+                gamma_head_raw,
+                gamma_post_raw,
+                partials_raw,
+                partials_raw,
+                partials_raw,
+                cutlass.Boolean(False),
+                storage,
+                **fa_kw,
+            )
         else:
             if cta >= 180:
                 cute.arch.griddepcontrol_wait()
-                draft_front_unit(cta - 180, read_packets, gamma_in, residual_input, x_frag, x_ssq, scalars,
-                                 front_done, draft_tokens, step, *xn_args)
-            plain_front_body(x, x_frag, x_ssq, previous_clear, cutlass.Boolean(True), wfa, wqb, y, q8, gamma_kv,
-                             rope, lview, table, cache, kv_arena, stride_rows, layer_rows, next_counters,
-                             y_mc, storage, append_from=cutlass.Int32(TOKEN),
-                             **({} if not s0.FA_STOCK else dict(fa_carry=xn_view, fa_scale_carry=cutlass.Boolean(False),
-                                                                fa_stock=True)), short_ctx=SHORT_CTX)
+                draft_front_unit(
+                    cta - 180,
+                    read_packets,
+                    gamma_in,
+                    residual_input,
+                    x_frag,
+                    x_ssq,
+                    scalars,
+                    front_done,
+                    draft_tokens,
+                    step,
+                    *xn_args,
+                )
+            plain_front_body(
+                x,
+                x_frag,
+                x_ssq,
+                previous_clear,
+                cutlass.Boolean(True),
+                wfa,
+                wqb,
+                y,
+                q8,
+                gamma_kv,
+                rope,
+                lview,
+                table,
+                cache,
+                kv_arena,
+                stride_rows,
+                layer_rows,
+                next_counters,
+                y_mc,
+                storage,
+                append_from=cutlass.Int32(TOKEN),
+                **(
+                    {}
+                    if not s0.FA_STOCK
+                    else dict(
+                        fa_carry=xn_view,
+                        fa_scale_carry=cutlass.Boolean(False),
+                        fa_stock=True,
+                    )
+                ),
+                short_ctx=SHORT_CTX,
+            )
         sel = cutlass.Int32(TOKEN)
         extra = cutlass.Int32(SHARED_TOKEN)
         window = cutlass.Int32(1)
@@ -1573,9 +2291,28 @@ def draft_kernel(
                 length[tid] = length[0] - 8 + (sel + 1) + tid
 
         if cta < 128:
-            attention_stage(cta, q8, kv_arena, lview, table, topk, cache, stride_rows, layer_rows, max_blocks, storage,
-                            all_bars, partials, stats, wo, all_bars.iterator + 1, exchange,
-                            is_s0, fresh_window=window, topk_select=sel)
+            attention_stage(
+                cta,
+                q8,
+                kv_arena,
+                lview,
+                table,
+                topk,
+                cache,
+                stride_rows,
+                layer_rows,
+                max_blocks,
+                storage,
+                all_bars,
+                partials,
+                stats,
+                wo,
+                all_bars.iterator + 1,
+                exchange,
+                is_s0,
+                fresh_window=window,
+                topk_select=sel,
+            )
             proxy_fence()
             cute.arch.sync_threads()
         elif cta < 192:
@@ -1589,7 +2326,9 @@ def draft_kernel(
                     issue_o(cta, wo, wo, storage, all_bars.iterator + 1, False)
         if cutlass.const_expr(L2_PREFETCH):
             if (cta < moe.ROUTER_UNITS) & (tid == 0) & (not ROUTER_LG):
-                prefetch_bulk_l2(w_router.iterator + 2 * cta * HIDDEN, cutlass.Uint32(2 * HIDDEN * 2))
+                prefetch_bulk_l2(
+                    w_router.iterator + 2 * cta * HIDDEN, cutlass.Uint32(2 * HIDDEN * 2)
+                )
             prefetch_slice(w_sgu, 2 * moe.INTER * HIDDEN * 2, cta)
             prefetch_slice(w_sdn, HIDDEN * moe.INTER * 2, cta)
         o_passes = cutlass.Int32(1)
@@ -1597,24 +2336,83 @@ def draft_kernel(
             if (cta >= 128) & (cta < (148 if ROUTER_LG else 164)):
                 o_passes = cutlass.Int32(2)
         if (cta >= 164) & (cta < 196):
-            merge_stage(cta - 164, partials, stats, o, replicas, red, clear_first,
-                        **(dict(passes=cutlass.Int32(2)) if WARM_MERGE else {}))
+            merge_stage(
+                cta - 164,
+                partials,
+                stats,
+                o,
+                replicas,
+                red,
+                clear_first,
+                **(dict(passes=cutlass.Int32(2)) if WARM_MERGE else {}),
+            )
             proxy_fence()
             cute.arch.sync_threads()
         if cta < 192:
             if cutlass.const_expr(ROUTER_LG):
                 if (cta >= 148) & (cta < 164):
-                    o_stage(cta, rank, o, replicas, residual_input, w_lg, region, red, all_bars.iterator + 2,
-                            h1_mc, lg_uc, lg_mc, o_logits, tmem_slot[0], all_bars.iterator + 27, True,
-                            only_token=sel if (ONE_ROW_H1 or SEL_H1) else None, warm=False)
+                    o_stage(
+                        cta,
+                        rank,
+                        o,
+                        replicas,
+                        residual_input,
+                        w_lg,
+                        region,
+                        red,
+                        all_bars.iterator + 2,
+                        h1_mc,
+                        lg_uc,
+                        lg_mc,
+                        o_logits,
+                        tmem_slot[0],
+                        all_bars.iterator + 27,
+                        True,
+                        only_token=sel if (ONE_ROW_H1 or SEL_H1) else None,
+                        warm=False,
+                    )
                 else:
-                    o_stage(cta, rank, o, replicas, residual_input, wo, region, red, all_bars.iterator + 1,
-                            h1_mc, lg_uc, lg_mc, o_logits, tmem_slot[0], all_bars.iterator + 27, False,
-                            only_token=sel if (ONE_ROW_H1 or SEL_H1) else None, **o_warm(o_passes))
+                    o_stage(
+                        cta,
+                        rank,
+                        o,
+                        replicas,
+                        residual_input,
+                        wo,
+                        region,
+                        red,
+                        all_bars.iterator + 1,
+                        h1_mc,
+                        lg_uc,
+                        lg_mc,
+                        o_logits,
+                        tmem_slot[0],
+                        all_bars.iterator + 27,
+                        False,
+                        only_token=sel if (ONE_ROW_H1 or SEL_H1) else None,
+                        **o_warm(o_passes),
+                    )
             else:
-                o_stage(cta, rank, o, replicas, residual_input, wo, region, red, all_bars.iterator + 1,
-                        h1_mc, lg_uc, lg_mc, o_logits, tmem_slot[0], all_bars.iterator + 27, False,
-                        only_token=sel if (ONE_ROW_H1 or ROW_HOP or SEL_H1) else None, **o_warm(o_passes))
+                o_stage(
+                    cta,
+                    rank,
+                    o,
+                    replicas,
+                    residual_input,
+                    wo,
+                    region,
+                    red,
+                    all_bars.iterator + 1,
+                    h1_mc,
+                    lg_uc,
+                    lg_mc,
+                    o_logits,
+                    tmem_slot[0],
+                    all_bars.iterator + 27,
+                    False,
+                    only_token=sel if (ONE_ROW_H1 or ROW_HOP or SEL_H1) else None,
+                    **o_warm(o_passes),
+                )
             proxy_fence()
             cute.arch.sync_threads()
 
@@ -1630,8 +2428,20 @@ def draft_kernel(
                 warm_passes = cutlass.Int32(2)
         if cutlass.const_expr(ROW_HOP):
             if cta == ROW_CTA:
-                row_hop(False, sel, hop1, hop2, previous_hop2, residual_input, gamma_post, red, scalars, h, rout,
-                        h1_done)
+                row_hop(
+                    False,
+                    sel,
+                    hop1,
+                    hop2,
+                    previous_hop2,
+                    residual_input,
+                    gamma_post,
+                    red,
+                    scalars,
+                    h,
+                    rout,
+                    h1_done,
+                )
         elif cta >= 180:
             is_sel = (cta - 180) // 4 == sel
             probe = cutlass.Boolean(False)
@@ -1639,15 +2449,55 @@ def draft_kernel(
                 probe = (cta >= 192) & ((cta - 180) // 4 != sel)
             if is_sel | probe | (not (ONE_ROW_H1 or SEL_H1)):
                 if cutlass.const_expr(WARM_L2_PROBE):
-                    stage_hop(cta - 180, False, cutlass.Boolean(False), hop1, hop2, previous_hop2, residual_input,
-                              gamma_post, cutlass.Float32(1), residual, scalars, ssq1, ssq2, h, hp, hfp4, dummy_x,
-                              dummy_ssq, xout, rout, lean=HOP_LEAN,
-                              warm=(cutlass.Int32(1), dummy_x, dummy_ssq, probe))
+                    stage_hop(
+                        cta - 180,
+                        False,
+                        cutlass.Boolean(False),
+                        hop1,
+                        hop2,
+                        previous_hop2,
+                        residual_input,
+                        gamma_post,
+                        cutlass.Float32(1),
+                        residual,
+                        scalars,
+                        ssq1,
+                        ssq2,
+                        h,
+                        hp,
+                        hfp4,
+                        dummy_x,
+                        dummy_ssq,
+                        xout,
+                        rout,
+                        lean=HOP_LEAN,
+                        warm=(cutlass.Int32(1), dummy_x, dummy_ssq, probe),
+                    )
                 else:
-                    stage_hop(cta - 180, False, cutlass.Boolean(False), hop1, hop2, previous_hop2, residual_input,
-                              gamma_post, cutlass.Float32(1), residual, scalars, ssq1, ssq2, h, hp, hfp4, dummy_x,
-                              dummy_ssq, xout, rout, lean=HOP_LEAN,
-                              **hop_warm(warm_passes, dummy_x, dummy_ssq))
+                    stage_hop(
+                        cta - 180,
+                        False,
+                        cutlass.Boolean(False),
+                        hop1,
+                        hop2,
+                        previous_hop2,
+                        residual_input,
+                        gamma_post,
+                        cutlass.Float32(1),
+                        residual,
+                        scalars,
+                        ssq1,
+                        ssq2,
+                        h,
+                        hp,
+                        hfp4,
+                        dummy_x,
+                        dummy_ssq,
+                        xout,
+                        rout,
+                        lean=HOP_LEAN,
+                        **hop_warm(warm_passes, dummy_x, dummy_ssq),
+                    )
                 if cutlass.const_expr(SEL_H1):
                     cute.arch.sync_threads()
                     if (tid == 0) & is_sel:
@@ -1659,20 +2509,35 @@ def draft_kernel(
             pass
         elif cta < moe.ROUTER_UNITS:
             moe.issue_router(cta, w_router, fc2_base, dbars.iterator + B_ROUTER)
-            moe.router_unit(cta, h, sel * 3072, fc2_base, sm, router_logits, dbars.iterator + B_ROUTER, True)
+            moe.router_unit(
+                cta,
+                h,
+                sel * 3072,
+                fc2_base,
+                sm,
+                router_logits,
+                dbars.iterator + B_ROUTER,
+                True,
+            )
         rbias = bias_sm if BIAS_SMEM else bias
         route_fn = moe.route_moe_parallel if moe.ROUTE_PARALLEL else moe.route_moe
         rlog = router_logits
         lgk = {}
         if cutlass.const_expr(ROUTER_LG):
             rlog = word_view(arena_raw, current + 105600 // 4 + sel * 256, (256,), (1,))
-            lgk = dict(ssq=word_view(arena_raw, current + 240128 // 4 + sel * 4, (4,), (1,)))
+            lgk = dict(
+                ssq=word_view(arena_raw, current + 240128 // 4 + sel * 4, (4,), (1,))
+            )
         if cutlass.const_expr(ROUTE_EARLY_ISSUE):
+
             def early_issue():
                 proxy_fence()
-                moe.issue_fc1(cta, FC1_CTAS, w3w1, sm, base, dbars.iterator + B_FC1, w_sgu)
+                moe.issue_fc1(
+                    cta, FC1_CTAS, w3w1, sm, base, dbars.iterator + B_FC1, w_sgu
+                )
                 if cta < moe.FC2_UNITS:
                     moe.issue_fc2(cta, w2, sm, fc2_base, dbars.iterator + B_FC2)
+
             lgk = dict(lgk, after_select=early_issue)
         in_moe = cutlass.Boolean(True)
         if cutlass.const_expr(H2_IDLE):
@@ -1684,11 +2549,23 @@ def draft_kernel(
                     lm_prefetch_chunks(cta, w_lm)
             proxy_fence()
             if cutlass.const_expr(not ROUTE_EARLY_ISSUE):
-                moe.issue_fc1(cta, FC1_CTAS, w3w1, sm, base, dbars.iterator + B_FC1, w_sgu)
+                moe.issue_fc1(
+                    cta, FC1_CTAS, w3w1, sm, base, dbars.iterator + B_FC1, w_sgu
+                )
                 if cta < moe.FC2_UNITS:
                     moe.issue_fc2(cta, w2, sm, fc2_base, dbars.iterator + B_FC2)
-            moe.fc1_unit(cta, FC1_CTAS, h, sel * 3072, base, sm, act, dbars.iterator + B_FC1, True,
-            9 * (moe.INTER // 2))
+            moe.fc1_unit(
+                cta,
+                FC1_CTAS,
+                h,
+                sel * 3072,
+                base,
+                sm,
+                act,
+                dbars.iterator + B_FC1,
+                True,
+                9 * (moe.INTER // 2),
+            )
         if cta < moe.FC2_UNITS:
             if tid == 0:
                 ready = acquire_word(clear_counter.iterator)
@@ -1698,15 +2575,41 @@ def draft_kernel(
             if cutlass.const_expr(SHARED_IN_FC2):
                 proxy_fence()
                 shared_rows32(cta, act, w_sdn, base, scalars, dbars.iterator + B_SD)
-                moe.fc2_unit(cta, act, fc2_base, sm, h2_flat, (sel * 16 + rank) * 3072, dbars.iterator + B_FC2,
-                             addend_rows=scalars)
+                moe.fc2_unit(
+                    cta,
+                    act,
+                    fc2_base,
+                    sm,
+                    h2_flat,
+                    (sel * 16 + rank) * 3072,
+                    dbars.iterator + B_FC2,
+                    addend_rows=scalars,
+                )
             else:
-                moe.fc2_unit(cta, act, fc2_base, sm, h2_flat, (sel * 16 + rank) * 3072, dbars.iterator + B_FC2,
-                             addend=shared_out)
+                moe.fc2_unit(
+                    cta,
+                    act,
+                    fc2_base,
+                    sm,
+                    h2_flat,
+                    (sel * 16 + rank) * 3072,
+                    dbars.iterator + B_FC2,
+                    addend=shared_out,
+                )
         else:
             if cutlass.const_expr(not SHARED_IN_FC2):
                 proxy_fence()
-                shared_down(cta - moe.FC2_UNITS, act, w_sdn, region, red, shared_out, 0, dbars.iterator + B_SD, None)
+                shared_down(
+                    cta - moe.FC2_UNITS,
+                    act,
+                    w_sdn,
+                    region,
+                    red,
+                    shared_out,
+                    0,
+                    dbars.iterator + B_SD,
+                    None,
+                )
         tc_before()
         cute.arch.sync_threads()
         if tid // 32 == 0:
@@ -1732,11 +2635,25 @@ def draft_kernel(
             if cta >= 180:
                 unit = cta - 180
                 if cta == ROW_CTA:
-                    row_hop(True, sel, hop1, hop2, previous_hop2, residual_input, gamma_head, red, scalars, xout, rout,
-                            x_ready)
+                    row_hop(
+                        True,
+                        sel,
+                        hop1,
+                        hop2,
+                        previous_hop2,
+                        residual_input,
+                        gamma_head,
+                        red,
+                        scalars,
+                        xout,
+                        rout,
+                        x_ready,
+                    )
                 if unit // 4 != sel:
                     if tid < 192:
-                        self_clear(hop1, previous_hop2, unit // 4, 1536 * (unit % 4) + 8 * tid)
+                        self_clear(
+                            hop1, previous_hop2, unit // 4, 1536 * (unit % 4) + 8 * tid
+                        )
                 if not is_s0:
                     if unit < 28:
                         clear_packets(unit, read_packets, front_done)
@@ -1748,28 +2665,61 @@ def draft_kernel(
         elif cta >= 180:
             unit = cta - 180
             if unit // 4 == sel:
-                stage_hop(unit, True, cutlass.Boolean(False), hop1, hop2, previous_hop2, residual_input, gamma_head,
-                          cutlass.Float32(1), residual, scalars, ssq1, ssq2, h, hp, hfp4, dummy_x, dummy_ssq, xout,
-                          rout,
-                          lean=HOP_LEAN,
-                          **hop_warm(h2_passes if H2_IDLE else warm_passes, dummy_x, dummy_ssq, True),
-                          amax_out=word_view(arena_raw, current + D_XAMAX, (32,), (1,)) if H2_XAMAX else None)
+                stage_hop(
+                    unit,
+                    True,
+                    cutlass.Boolean(False),
+                    hop1,
+                    hop2,
+                    previous_hop2,
+                    residual_input,
+                    gamma_head,
+                    cutlass.Float32(1),
+                    residual,
+                    scalars,
+                    ssq1,
+                    ssq2,
+                    h,
+                    hp,
+                    hfp4,
+                    dummy_x,
+                    dummy_ssq,
+                    xout,
+                    rout,
+                    lean=HOP_LEAN,
+                    **hop_warm(
+                        h2_passes if H2_IDLE else warm_passes, dummy_x, dummy_ssq, True
+                    ),
+                    amax_out=word_view(arena_raw, current + D_XAMAX, (32,), (1,))
+                    if H2_XAMAX
+                    else None,
+                )
                 if cutlass.const_expr(H2_CLEAR_CURRENT and not H2_CLEAR_LATE):
                     if tid < 192:
                         for r in cutlass.range_constexpr(RANKS):
-                            store_empty(hop2.iterator + (sel * RANKS + r) * 3072 + (1536 * (unit % 4) + 8 * tid) // 2,
-                                        evict_first())
+                            store_empty(
+                                hop2.iterator
+                                + (sel * RANKS + r) * 3072
+                                + (1536 * (unit % 4) + 8 * tid) // 2,
+                                evict_first(),
+                            )
                 cute.arch.sync_threads()
                 if tid == 0:
                     release_increment(x_ready.iterator)
                 if cutlass.const_expr(H2_CLEAR_CURRENT and H2_CLEAR_LATE):
                     if tid < 192:
                         for r in cutlass.range_constexpr(RANKS):
-                            store_empty(hop2.iterator + (sel * RANKS + r) * 3072 + (1536 * (unit % 4) + 8 * tid) // 2,
-                                        evict_first())
+                            store_empty(
+                                hop2.iterator
+                                + (sel * RANKS + r) * 3072
+                                + (1536 * (unit % 4) + 8 * tid) // 2,
+                                evict_first(),
+                            )
             else:
                 if tid < 192:
-                    self_clear(hop1, previous_hop2, unit // 4, 1536 * (unit % 4) + 8 * tid)
+                    self_clear(
+                        hop1, previous_hop2, unit // 4, 1536 * (unit % 4) + 8 * tid
+                    )
                 if not is_s0:
                     clear_packets(unit, read_packets, front_done)
             if not is_s0:
@@ -1785,133 +2735,365 @@ def draft_kernel(
             wait_count(x_ready, cutlass.Uint32(4))
             fence_proxy_global()
             if cutlass.const_expr(LM_FP4):
-                lm.lm_head_fp4_stage(cta, xrow, region, red, lm_bars.iterator, lm_bars.iterator + 1, keys, arrivals,
-                                     lm_scales4, w_lm_words)
+                lm.lm_head_fp4_stage(
+                    cta,
+                    xrow,
+                    region,
+                    red,
+                    lm_bars.iterator,
+                    lm_bars.iterator + 1,
+                    keys,
+                    arrivals,
+                    lm_scales4,
+                    w_lm_words,
+                )
             else:
                 lm.issue_lm_x(xrow, cutlass.Int32(1), region, lm_bars)
                 xsc = None
                 if cutlass.const_expr(LM_FP8X):
                     s0w, s1w, s2w, s3w = volatile_vector(ssq2.iterator + 4 * sel)
-                    m0, m1, m2, m3 = volatile_vector(word_view(arena_raw, current + D_XAMAX + 4 * sel, (4,), (1,)).iterator)
-                    tot = ((cutlass.Float32(0) + bits_f32(s0w)) + bits_f32(s1w)) + bits_f32(s2w)
+                    m0, m1, m2, m3 = volatile_vector(
+                        word_view(
+                            arena_raw, current + D_XAMAX + 4 * sel, (4,), (1,)
+                        ).iterator
+                    )
+                    tot = (
+                        (cutlass.Float32(0) + bits_f32(s0w)) + bits_f32(s1w)
+                    ) + bits_f32(s2w)
                     tot += bits_f32(s3w)
                     rstd_x = cute.math.rsqrt(tot / 6144.0 + 1.0e-5, fastmath=True)
-                    mx = max_num(max_num(bits_f32(m0), bits_f32(m1)), max_num(bits_f32(m2), bits_f32(m3))) * rstd_x
+                    mx = (
+                        max_num(
+                            max_num(bits_f32(m0), bits_f32(m1)),
+                            max_num(bits_f32(m2), bits_f32(m3)),
+                        )
+                        * rstd_x
+                    )
                     sx = max_num(mx, cutlass.Float32(1e-12)) / 448.0
                     xsc = (sx, 1.0 / sx)
-                lm.lm_head_stage(cta, xrow, w_lm8 if LM_FP8 else w_lm, region, red, lm_bars, keys, arrivals,
-                                 cutlass.Int32(1), red, False, False,
-                                 table_prefetch=tt if LM_TABLE_PF else None,
-                                 **(dict(fp8=True, scales=lm_scales, rescore=w_lm_words if LM_FP8_RESCORE else None,
-                                         xscale=xsc) if LM_FP8 else {}))
+                lm.lm_head_stage(
+                    cta,
+                    xrow,
+                    w_lm8 if LM_FP8 else w_lm,
+                    region,
+                    red,
+                    lm_bars,
+                    keys,
+                    arrivals,
+                    cutlass.Int32(1),
+                    red,
+                    False,
+                    False,
+                    table_prefetch=tt if LM_TABLE_PF else None,
+                    **(
+                        dict(
+                            fp8=True,
+                            scales=lm_scales,
+                            rescore=w_lm_words if LM_FP8_RESCORE else None,
+                            xscale=xsc,
+                        )
+                        if LM_FP8
+                        else {}
+                    ),
+                )
             if cta == lm.LM_CTAS - 1:
-                publish_packet(rank, step, last, key_words, arrivals, tt, slot_mc, own_packets, scalars, draft_tokens,
-                               next_new_tokens, accepted, num_accepted)
+                publish_packet(
+                    rank,
+                    step,
+                    last,
+                    key_words,
+                    arrivals,
+                    tt,
+                    slot_mc,
+                    own_packets,
+                    scalars,
+                    draft_tokens,
+                    next_new_tokens,
+                    accepted,
+                    num_accepted,
+                )
         else:
             if not last:
                 wait_count(x_ready, cutlass.Uint32(4))
-                hidden_half(cta - lm.LM_CTAS, xrow, gamma_hnorm, hidden_rows, region, red, hh_bars,
-                            word_view(slot_mc, PK_HID, (SHARE,), (1,)))
+                hidden_half(
+                    cta - lm.LM_CTAS,
+                    xrow,
+                    gamma_hnorm,
+                    hidden_rows,
+                    region,
+                    red,
+                    hh_bars,
+                    word_view(slot_mc, PK_HID, (SHARE,), (1,)),
+                )
 
 
 @cute.jit
 def draft_entry(
-    x_raw: cute.Tensor, residual_raw: cute.Tensor, residual_out_raw: cute.Tensor, normalized_raw: cute.Tensor,
-    wfa_raw: cute.Tensor, wqb_raw: cute.Tensor, wo_raw: cute.Tensor,
-    w_router: cute.Tensor, bias: cute.Tensor, w3w1: cute.Tensor, w2: cute.Tensor, w_sgu: cute.Tensor,
-    w_sdn: cute.Tensor, gamma_kv: cute.Tensor, gamma_in_raw: cute.Tensor, gamma_post_raw: cute.Tensor,
-    gamma_head_raw: cute.Tensor, gamma_hnorm_raw: cute.Tensor, rope_raw: cute.Tensor, length: cute.Tensor,
-    table_raw: cute.Tensor, cache_raw: cute.Tensor, topk_raw: cute.Tensor, arena_raw: cute.Tensor,
-    partials_raw: cute.Tensor, stats_raw: cute.Tensor, counters_raw: cute.Tensor, uc_raw: cute.Tensor,
-    mc_raw: cute.Tensor, lm_w: cute.Tensor, token_table: cute.Tensor, hidden_rows: cute.Tensor,
-    draft_tokens: cute.Tensor, next_new_tokens: cute.Tensor, accepted: cute.Tensor, num_accepted: cute.Tensor,
-    copy: cutlass.Int32, rank: cutlass.Int32, step: cutlass.Int32, last: cutlass.Boolean,
-    stride_rows: cutlass.Int64, layer_rows: cutlass.Int64, max_blocks: cutlass.Int32, clear_first: cutlass.Boolean,
+    x_raw: cute.Tensor,
+    residual_raw: cute.Tensor,
+    residual_out_raw: cute.Tensor,
+    normalized_raw: cute.Tensor,
+    wfa_raw: cute.Tensor,
+    wqb_raw: cute.Tensor,
+    wo_raw: cute.Tensor,
+    w_router: cute.Tensor,
+    bias: cute.Tensor,
+    w3w1: cute.Tensor,
+    w2: cute.Tensor,
+    w_sgu: cute.Tensor,
+    w_sdn: cute.Tensor,
+    gamma_kv: cute.Tensor,
+    gamma_in_raw: cute.Tensor,
+    gamma_post_raw: cute.Tensor,
+    gamma_head_raw: cute.Tensor,
+    gamma_hnorm_raw: cute.Tensor,
+    rope_raw: cute.Tensor,
+    length: cute.Tensor,
+    table_raw: cute.Tensor,
+    cache_raw: cute.Tensor,
+    topk_raw: cute.Tensor,
+    arena_raw: cute.Tensor,
+    partials_raw: cute.Tensor,
+    stats_raw: cute.Tensor,
+    counters_raw: cute.Tensor,
+    uc_raw: cute.Tensor,
+    mc_raw: cute.Tensor,
+    lm_w: cute.Tensor,
+    token_table: cute.Tensor,
+    hidden_rows: cute.Tensor,
+    draft_tokens: cute.Tensor,
+    next_new_tokens: cute.Tensor,
+    accepted: cute.Tensor,
+    num_accepted: cute.Tensor,
+    copy: cutlass.Int32,
+    rank: cutlass.Int32,
+    step: cutlass.Int32,
+    last: cutlass.Boolean,
+    stride_rows: cutlass.Int64,
+    layer_rows: cutlass.Int64,
+    max_blocks: cutlass.Int32,
+    clear_first: cutlass.Boolean,
     kind: cutlass.Int32,
-    wfa_leader_raw: cute.Tensor, widx_raw: cute.Tensor, idx_kn_w: cute.Tensor, idx_kn_b: cute.Tensor,
-    idx_rope_raw: cute.Tensor, idx_pool_raw: cute.Tensor, idx_blocks_raw: cute.Tensor, idx_stride_bytes: cutlass.Int64,
-    idx_pages: cutlass.Int64, idx_candidates_raw: cute.Tensor, embed_raw: cute.Tensor, embed_sharded: cutlass.Boolean,
-    eh_w: cute.Tensor, gamma_enorm_raw: cute.Tensor, scale: cutlass.Constexpr, stream, use_pdl: cutlass.Constexpr,
-    with_target_argmax: cutlass.Constexpr, with_target_sample: cutlass.Constexpr,
+    wfa_leader_raw: cute.Tensor,
+    widx_raw: cute.Tensor,
+    idx_kn_w: cute.Tensor,
+    idx_kn_b: cute.Tensor,
+    idx_rope_raw: cute.Tensor,
+    idx_pool_raw: cute.Tensor,
+    idx_blocks_raw: cute.Tensor,
+    idx_stride_bytes: cutlass.Int64,
+    idx_pages: cutlass.Int64,
+    idx_candidates_raw: cute.Tensor,
+    embed_raw: cute.Tensor,
+    embed_sharded: cutlass.Boolean,
+    eh_w: cute.Tensor,
+    gamma_enorm_raw: cute.Tensor,
+    scale: cutlass.Constexpr,
+    stream,
+    use_pdl: cutlass.Constexpr,
+    with_target_argmax: cutlass.Constexpr,
+    with_target_sample: cutlass.Constexpr,
 ):
-    sizes = (cute.size(w_router), cute.size(bias), cute.size(w3w1), cute.size(w2), cute.size(w_sgu), cute.size(w_sdn),
-             cute.size(lm_w), cute.size(token_table), cute.size(hidden_rows),
-             cute.size(mc_raw) >= DRAFT_TRANSPORT_WORDS,
-             cute.size(eh_w), cute.size(gamma_enorm_raw), cute.size(length))
+    sizes = (
+        cute.size(w_router),
+        cute.size(bias),
+        cute.size(w3w1),
+        cute.size(w2),
+        cute.size(w_sgu),
+        cute.size(w_sdn),
+        cute.size(lm_w),
+        cute.size(token_table),
+        cute.size(hidden_rows),
+        cute.size(mc_raw) >= DRAFT_TRANSPORT_WORDS,
+        cute.size(eh_w),
+        cute.size(gamma_enorm_raw),
+        cute.size(length),
+    )
     if cutlass.const_expr(LM_FP8X and not (LM_FP8 and H2_XAMAX)):
         raise TypeError("LM_FP8X needs LM_FP8 and H2_XAMAX")
     if cutlass.const_expr(ROUTE_EARLY_ISSUE and not moe.ROUTE_PARALLEL):
         raise TypeError("ROUTE_EARLY_ISSUE needs route_moe_parallel (ROUTE_PARALLEL)")
     if cutlass.const_expr(ROUTER_LG and (ROW_HOP or not moe.ROUTE_PARALLEL)):
-        raise TypeError("ROUTER_LG needs stage_hop H1 (its ssq1 words) and ROUTE_PARALLEL")
-    if cutlass.const_expr(LM_FP4 and (LM_FP8 or LM_PF_FC2_CHUNKS or LM_PF_CHUNKS or LM_L2_KEEP_CHUNKS
-                                       or LM_TABLE_PF)):
-        raise TypeError("LM_FP4 does not combine with LM_FP8 / the BF16 lm knobs / LM_TABLE_PF")
-    if cutlass.const_expr(LM_FP8 and (LM_PF_FC2_CHUNKS or LM_PF_CHUNKS or LM_L2_KEEP_CHUNKS)):
-        raise TypeError("LM_FP8 does not combine with the BF16 lm prefetch / keep / ablation knobs")
-    want = (W_ROUTER_ELEMS, moe.EXPERTS, moe.EXPERTS * 2 * moe.INTER * HIDDEN, moe.EXPERTS * HIDDEN * moe.INTER,
-            2 * moe.INTER * HIDDEN, HIDDEN * moe.INTER, W_LM_ELEMS, VOCAB_SHARD * HIDDEN, SHARE * HIDDEN, True,
-            HIDDEN * s0.WINDOW, HIDDEN, 7)
+        raise TypeError(
+            "ROUTER_LG needs stage_hop H1 (its ssq1 words) and ROUTE_PARALLEL"
+        )
+    if cutlass.const_expr(
+        LM_FP4
+        and (
+            LM_FP8
+            or LM_PF_FC2_CHUNKS
+            or LM_PF_CHUNKS
+            or LM_L2_KEEP_CHUNKS
+            or LM_TABLE_PF
+        )
+    ):
+        raise TypeError(
+            "LM_FP4 does not combine with LM_FP8 / the BF16 lm knobs / LM_TABLE_PF"
+        )
+    if cutlass.const_expr(
+        LM_FP8 and (LM_PF_FC2_CHUNKS or LM_PF_CHUNKS or LM_L2_KEEP_CHUNKS)
+    ):
+        raise TypeError(
+            "LM_FP8 does not combine with the BF16 lm prefetch / keep / ablation knobs"
+        )
+    want = (
+        W_ROUTER_ELEMS,
+        moe.EXPERTS,
+        moe.EXPERTS * 2 * moe.INTER * HIDDEN,
+        moe.EXPERTS * HIDDEN * moe.INTER,
+        2 * moe.INTER * HIDDEN,
+        HIDDEN * moe.INTER,
+        W_LM_ELEMS,
+        VOCAB_SHARD * HIDDEN,
+        SHARE * HIDDEN,
+        True,
+        HIDDEN * s0.WINDOW,
+        HIDDEN,
+        7,
+    )
     if cutlass.const_expr(sizes != want):
         raise TypeError(f"draft_entry: operand sizes {sizes} != {want}")
-    pool_rows = cute.make_tensor(idx_pool_raw.iterator,
-                                 cute.make_layout((128, ((idx_pages - 1) * idx_stride_bytes + 8448) // 128),
-                                                  stride=(1, 128)))
-    key_layout = cute.make_composed_layout(cute.make_swizzle(3, 4, 3), 0, cute.make_layout((128, 64), stride=(1, 128)))
-    key_atom, _ = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), pool_rows, key_layout, (128, 64))
+    pool_rows = cute.make_tensor(
+        idx_pool_raw.iterator,
+        cute.make_layout(
+            (128, ((idx_pages - 1) * idx_stride_bytes + 8448) // 128), stride=(1, 128)
+        ),
+    )
+    key_layout = cute.make_composed_layout(
+        cute.make_swizzle(3, 4, 3), 0, cute.make_layout((128, 64), stride=(1, 128))
+    )
+    key_atom, _ = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(), pool_rows, key_layout, (128, 64)
+    )
     eh_atom = s0.make_eh_atom(eh_w)
-    x_words = cute.make_ptr(cutlass.Uint32, x_raw.iterator.toint(), cute.AddressSpace.gmem, assumed_align=16)
-    wfa_words = cute.make_ptr(cutlass.Uint32, wfa_raw.iterator.toint(), cute.AddressSpace.gmem, assumed_align=16)
-    draft_kernel(x_words, residual_raw, residual_out_raw, normalized_raw, wfa_words, wqb_raw, wo_raw, w_router, bias,
-                 w3w1, w2, w_sgu, w_sdn, gamma_kv, gamma_in_raw, gamma_post_raw, gamma_head_raw, gamma_hnorm_raw,
-                 rope_raw, length, table_raw, cache_raw, topk_raw, arena_raw, partials_raw, stats_raw, counters_raw,
-                 uc_raw, mc_raw, lm_w, token_table, hidden_rows, draft_tokens, next_new_tokens, accepted,
-                 num_accepted, copy, rank, step, last, stride_rows, layer_rows, max_blocks, clear_first,
-                 kind, wfa_leader_raw.iterator, widx_raw.iterator, idx_kn_w.iterator,
-                 idx_kn_b.iterator, idx_rope_raw.iterator, idx_pool_raw.iterator, idx_blocks_raw.iterator,
-                 idx_stride_bytes, idx_pages, idx_candidates_raw, key_atom, embed_raw, embed_sharded, gamma_enorm_raw,
-                 eh_atom, scale, with_target_argmax, with_target_sample).launch(
-        grid=(212, 1, 1), block=(256, 1, 1), min_blocks_per_mp=1, stream=stream, use_pdl=use_pdl)
+    x_words = cute.make_ptr(
+        cutlass.Uint32, x_raw.iterator.toint(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    wfa_words = cute.make_ptr(
+        cutlass.Uint32,
+        wfa_raw.iterator.toint(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    draft_kernel(
+        x_words,
+        residual_raw,
+        residual_out_raw,
+        normalized_raw,
+        wfa_words,
+        wqb_raw,
+        wo_raw,
+        w_router,
+        bias,
+        w3w1,
+        w2,
+        w_sgu,
+        w_sdn,
+        gamma_kv,
+        gamma_in_raw,
+        gamma_post_raw,
+        gamma_head_raw,
+        gamma_hnorm_raw,
+        rope_raw,
+        length,
+        table_raw,
+        cache_raw,
+        topk_raw,
+        arena_raw,
+        partials_raw,
+        stats_raw,
+        counters_raw,
+        uc_raw,
+        mc_raw,
+        lm_w,
+        token_table,
+        hidden_rows,
+        draft_tokens,
+        next_new_tokens,
+        accepted,
+        num_accepted,
+        copy,
+        rank,
+        step,
+        last,
+        stride_rows,
+        layer_rows,
+        max_blocks,
+        clear_first,
+        kind,
+        wfa_leader_raw.iterator,
+        widx_raw.iterator,
+        idx_kn_w.iterator,
+        idx_kn_b.iterator,
+        idx_rope_raw.iterator,
+        idx_pool_raw.iterator,
+        idx_blocks_raw.iterator,
+        idx_stride_bytes,
+        idx_pages,
+        idx_candidates_raw,
+        key_atom,
+        embed_raw,
+        embed_sharded,
+        gamma_enorm_raw,
+        eh_atom,
+        scale,
+        with_target_argmax,
+        with_target_sample,
+    ).launch(
+        grid=(212, 1, 1),
+        block=(256, 1, 1),
+        min_blocks_per_mp=1,
+        stream=stream,
+        use_pdl=use_pdl,
+    )
 
+
+from .attention import (
+    EMPTY,
+    attention_stage,
+    bf16_from_word,
+    bf16_pair,
+    issue_o,
+    merge_stage,
+    o_stage,
+    published_word,
+    volatile_vector,
+)
 
 # Imported last: the role modules import each other, and their names are used only when a kernel is traced.
 from .bf16_moe import add_rn
-from .plain import word_view, leader_front_body, plain_front_body
 from .common import (
-    f32_intrinsic,
-    as_ptr,
-    clear_assigned,
-    evict_first,
-    release_increment,
-    reset_next_counters,
-    store_empty,
     COUNTED_CLEARS,
-    stage_hop,
-    self_clear,
-    xfrag_word_offset,
-    reduce_rank16,
+    as_ptr,
     bits_f32,
+    bulk_copy,
+    clear_assigned,
+    deallocate_tmem,
+    evict_first,
     f32_bits,
+    f32_intrinsic,
     fma_rn,
     max_num,
-    bulk_copy,
-    proxy_fence,
-    tc_before,
-    tc_after,
-    deallocate_tmem,
     prefetch_bulk_l2,
+    proxy_fence,
+    reduce_rank16,
+    release_increment,
+    reset_next_counters,
+    self_clear,
+    stage_hop,
+    store_empty,
+    tc_after,
+    tc_before,
+    xfrag_word_offset,
 )
-from .attention import (
-    bf16_pair,
-    published_word,
-    bf16_from_word,
-    volatile_vector,
-    EMPTY,
-    attention_stage,
-    merge_stage,
-    issue_o,
-    o_stage,
+from .gpu_publication import (
+    acquire_word,
+    cached_vector,
+    global_pair,
+    readonly_vector,
+    store_vector,
+    store_word,
 )
-from .gpu_publication import acquire_word, cached_vector, global_pair, readonly_vector, store_vector, store_word
 from .indexer import round_bf16
-from .moe import shared_views, SHARED_WORDS, volatile_word
+from .moe import SHARED_WORDS, shared_views, volatile_word
+from .plain import leader_front_body, plain_front_body, word_view

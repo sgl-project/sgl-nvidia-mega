@@ -387,7 +387,11 @@ def hooks():
         ]
     if switches.enabled(switches.FUSED_RELAY):
         out += [
-            (f"{_FUTURE_MAP}._resolve_spec_extras", "AROUND", around_resolve_spec_extras),
+            (
+                f"{_FUTURE_MAP}._resolve_spec_extras",
+                "AROUND",
+                around_resolve_spec_extras,
+            ),
             (f"{_FUTURE_MAP}.stash", "AROUND", around_stash),
         ]
     if any(
@@ -399,7 +403,11 @@ def hooks():
         )
     ):
         out += [
-            ("sglang.srt.speculative.eagle_utils.eagle_sample", "REPLACE", _lazy(_eagle_sample)),
+            (
+                "sglang.srt.speculative.eagle_utils.eagle_sample",
+                "REPLACE",
+                _lazy(_eagle_sample),
+            ),
             (
                 "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
                 "REPLACE",

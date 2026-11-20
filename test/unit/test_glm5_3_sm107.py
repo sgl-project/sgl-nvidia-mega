@@ -49,7 +49,9 @@ def test_the_flag_is_the_only_switch():
     assert not (PKG / "root").exists()
 
 
-def test_the_cubin_directory_is_refused_when_unset_or_incomplete(mk, monkeypatch, tmp_path):
+def test_the_cubin_directory_is_refused_when_unset_or_incomplete(
+    mk, monkeypatch, tmp_path
+):
     monkeypatch.delenv(mk.ARTIFACTS_ENV, raising=False)
     (reason,) = mk.artifact_reasons()
     assert mk.ARTIFACTS_ENV in reason and "not set" in reason
@@ -85,13 +87,19 @@ def _batch(bs, mode):
 
 
 def test_the_built_plans_one_request_only(mk, monkeypatch):
-    monkeypatch.setattr(mk, "_step_class", lambda: (lambda **k: k))
+    monkeypatch.setattr(mk, "_step_class", lambda: lambda **k: k)
     target, draft = mk.Built("t", is_draft=False), mk.Built("d", is_draft=True)
     assert target.widths == draft.widths == (mk.TOKENS_PER_REQUEST,)
-    assert target.plan(_Rows(8), _batch(1, "target_verify")) == {"mode": "target_verify", "rows": 8}
+    assert target.plan(_Rows(8), _batch(1, "target_verify")) == {
+        "mode": "target_verify",
+        "rows": 8,
+    }
     assert target.plan(_Rows(16), _batch(2, "target_verify")) is None
     assert target.plan(_Rows(1), _batch(1, "decode")) is None
-    assert draft.plan(_Rows(8), _batch(1, "draft_extend")) == {"mode": "decode", "rows": 8}
+    assert draft.plan(_Rows(8), _batch(1, "draft_extend")) == {
+        "mode": "decode",
+        "rows": 8,
+    }
     assert draft.plan(_Rows(1), _batch(1, "decode")) == {"mode": "decode", "rows": 1}
     assert draft.plan(_Rows(2), _batch(2, "decode")) is None
     assert draft.plan(_Rows(0), _batch(1, "idle")) is None
@@ -100,7 +108,9 @@ def test_the_built_plans_one_request_only(mk, monkeypatch):
 
 def test_the_runner_binds_before_its_graphs_once(mk, monkeypatch):
     calls = []
-    runner = type("ModelRunner", (), {"init_cuda_graphs": lambda self: calls.append("graphs")})
+    runner = type(
+        "ModelRunner", (), {"init_cuda_graphs": lambda self: calls.append("graphs")}
+    )
     module = types.ModuleType("sglang.srt.model_executor.model_runner")
     module.ModelRunner = runner
     for name in ("sglang", "sglang.srt", "sglang.srt.model_executor"):
@@ -130,7 +140,11 @@ def test_the_context_must_be_one_request_of_eight_tokens(mk):
 
 
 def test_no_binaries_and_no_cpp():
-    found = [p for p in PKG.rglob("*") if p.suffix in (".so", ".o", ".cubin", ".cu", ".cc", ".cuh", ".h", ".pyc")]
+    found = [
+        p
+        for p in PKG.rglob("*")
+        if p.suffix in (".so", ".o", ".cubin", ".cu", ".cc", ".cuh", ".h", ".pyc")
+    ]
     assert not found, found
 
 
@@ -139,7 +153,9 @@ KERNELS = [("chain_n148sq", "entry"), ("dd", "draft_bind"), ("dd", "d012_bind")]
 
 def _candidate(tmp_path, tree):
     out = tmp_path / "candidate"
-    shutil.copytree(PKG / "kernels" / tree, out, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(
+        PKG / "kernels" / tree, out, ignore=shutil.ignore_patterns("__pycache__")
+    )
     return out
 
 
@@ -155,16 +171,27 @@ def test_every_kernel_tree_import_resolves(tmp_path, tree, entry):
             if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
                 names.add(n.name)
             elif isinstance(n, ast.Assign):
-                names |= {x.id for tg in n.targets for x in ast.walk(tg) if isinstance(x, ast.Name)}
+                names |= {
+                    x.id
+                    for tg in n.targets
+                    for x in ast.walk(tg)
+                    if isinstance(x, ast.Name)
+                }
             elif isinstance(n, (ast.Import, ast.ImportFrom)):
                 names |= {(a.asname or a.name).split(".")[0] for a in n.names}
         bound[m] = names
     for m, t in trees.items():
         for n in ast.walk(t):
-            if isinstance(n, ast.ImportFrom) and (n.level or (n.module or "").startswith("candidate.")):
+            if isinstance(n, ast.ImportFrom) and (
+                n.level or (n.module or "").startswith("candidate.")
+            ):
                 mod = (n.module or "").split(".")[-1] if n.module else None
                 for a in n.names:
-                    assert (a.name in trees) if mod is None else (mod in trees and a.name in bound[mod]), (m, mod, a.name)
+                    assert (
+                        (a.name in trees)
+                        if mod is None
+                        else (mod in trees and a.name in bound[mod])
+                    ), (m, mod, a.name)
 
 
 def _load_order_errors(tree, entry):
@@ -174,7 +201,9 @@ def _load_order_errors(tree, entry):
     def run(m):
         state[m] = "loading"
         for n in bodies[m]:
-            if isinstance(n, ast.ImportFrom) and (n.level or (n.module or "").startswith("candidate")):
+            if isinstance(n, ast.ImportFrom) and (
+                n.level or (n.module or "").startswith("candidate")
+            ):
                 src = (n.module or "").split(".")[-1] if n.module else None
                 for a in n.names:
                     target = src or a.name
@@ -205,7 +234,9 @@ def test_the_kernel_trees_load_in_import_order(tmp_path, tree, entry):
 def test_the_kernel_entry_modules_import_with_cute_dsl(tmp_path, tree, entry):
     pytest.importorskip("cutlass")
     _candidate(tmp_path, tree)
-    code = f"import sys; sys.path.insert(0, {str(tmp_path)!r}); import candidate.{entry}"
+    code = (
+        f"import sys; sys.path.insert(0, {str(tmp_path)!r}); import candidate.{entry}"
+    )
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
@@ -214,7 +245,10 @@ def test_the_fc2_lists_follow_the_kernel_work_split():
 
     payload = schedule.fc2_lists_payload()
     # pins the device split (schedule constants + moe.precompute_cuts): a split change must change this on purpose
-    assert hashlib.sha256(payload).hexdigest() == "bca9d1e2e686eb265b5ac608ecf8c9cec09e77899a6e48027639d0e30e442018"
+    assert (
+        hashlib.sha256(payload).hexdigest()
+        == "bca9d1e2e686eb265b5ac608ecf8c9cec09e77899a6e48027639d0e30e442018"
+    )
     words = struct.unpack(f"<{3 * schedule.LIST_ROWS}I", payload)
     for experts in range(1, schedule.MAX_EXPERTS + 1):
         rows = range(experts * (experts - 1), experts * (experts + 1))
@@ -239,7 +273,23 @@ def fill_step_all_ref(r2t, req, pos, bt, kvl):
     kvl[0] = max(last + 1, 8)
 
 
-def post_verify_ref(acc, na, am, cand, seq_lens, sim_l, predict, ai, al, nsl, at, bonus, s0_acc, s0_na, sel):
+def post_verify_ref(
+    acc,
+    na,
+    am,
+    cand,
+    seq_lens,
+    sim_l,
+    predict,
+    ai,
+    al,
+    nsl,
+    at,
+    bonus,
+    s0_acc,
+    s0_na,
+    sel,
+):
     p = acc.clamp(min=0).clone()
     n = int(na[0])
     if sim_l > 0:
@@ -252,7 +302,13 @@ def post_verify_ref(acc, na, am, cand, seq_lens, sim_l, predict, ai, al, nsl, at
     ai.view(-1).copy_(a)
     at.view(-1).copy_(p[torch.where(a >= 0, a, torch.full_like(a, 7)).long()])
     s0_acc.copy_(p)
-    al[0], s0_na[0], nsl[0], bonus[0], sel[0] = n, n, seq_lens[0] + n, p[n - 1], min(max(n - 1, 0), 7)
+    al[0], s0_na[0], nsl[0], bonus[0], sel[0] = (
+        n,
+        n,
+        seq_lens[0] + n,
+        p[n - 1],
+        min(max(n - 1, 0), 7),
+    )
 
 
 def draft_pages_ref(r2t, req, sl, bt):
@@ -266,9 +322,11 @@ def chain_tree_ref(bonus, drafts, sl, mask, mode, positions, rbuf, draft_out):
     s = int(sl[0])
     for i in range(8):
         base = (s + 8) * i + s if mode == 0 else 8 * i
-        mask.view(-1)[base:base + 8] = torch.arange(8, device=mask.device) <= i
+        mask.view(-1)[base : base + 8] = torch.arange(8, device=mask.device) <= i
     positions.copy_(s + torch.arange(8, dtype=torch.int64, device=positions.device))
-    rbuf.view(3, 8).copy_(torch.tensor([list(range(8)), [1, 2, 3, 4, 5, 6, 7, -1], [-1] * 8]))
+    rbuf.view(3, 8).copy_(
+        torch.tensor([list(range(8)), [1, 2, 3, 4, 5, 6, 7, -1], [-1] * 8])
+    )
     draft_out[0] = bonus.view(-1)[0]
     draft_out[1:8] = drafts.view(-1)[:7]
 
@@ -281,19 +339,52 @@ def _post_verify_expected(acc, na, am, cand, seq_lens, sim_l):
             p[i] = cand[i + 1]
         p[al - 1] = am[al - 1]
     ai = [i if i < al else -1 for i in range(8)]
-    return p, ai, al, seq_lens + al, [p[a if a >= 0 else 7] for a in ai], p[al - 1], min(max(al - 1, 0), 7)
+    return (
+        p,
+        ai,
+        al,
+        seq_lens + al,
+        [p[a if a >= 0 else 7] for a in ai],
+        p[al - 1],
+        min(max(al - 1, 0), 7),
+    )
 
 
 def _pv_case(rng, device="cpu"):
-    i32, i64 = dict(dtype=torch.int32, device=device), dict(dtype=torch.int64, device=device)
+    i32, i64 = (
+        dict(dtype=torch.int32, device=device),
+        dict(dtype=torch.int64, device=device),
+    )
     n, sim = rng.randint(1, 8), rng.choice([0, 0, rng.randint(1, 8)])
-    acc = [rng.randint(1, 150000) for _ in range(n - 1)] + [rng.randint(-1, 150000)] + [rng.choice([0, -1])] * (8 - n)
-    am, cand, sl = [rng.randint(0, 150000) for _ in range(8)], [rng.randint(0, 150000) for _ in range(8)], rng.randint(8, 10**6)
-    ins = (torch.tensor(acc, **i32), torch.tensor([n], **i32), torch.tensor(am, **i32), torch.tensor(cand, **i64),
-           torch.tensor([sl], **i64), sim)
-    outs = lambda: (torch.empty(8, **i32), torch.empty((1, 8), **i32), torch.empty(1, **i32), torch.empty(1, **i64),
-                    torch.empty((1, 8), **i32), torch.empty(1, **i32), torch.empty(8, **i32), torch.empty(1, **i32),
-                    torch.empty(1, **i64))
+    acc = (
+        [rng.randint(1, 150000) for _ in range(n - 1)]
+        + [rng.randint(-1, 150000)]
+        + [rng.choice([0, -1])] * (8 - n)
+    )
+    am, cand, sl = (
+        [rng.randint(0, 150000) for _ in range(8)],
+        [rng.randint(0, 150000) for _ in range(8)],
+        rng.randint(8, 10**6),
+    )
+    ins = (
+        torch.tensor(acc, **i32),
+        torch.tensor([n], **i32),
+        torch.tensor(am, **i32),
+        torch.tensor(cand, **i64),
+        torch.tensor([sl], **i64),
+        sim,
+    )
+    outs = lambda: (
+        torch.empty(8, **i32),
+        torch.empty((1, 8), **i32),
+        torch.empty(1, **i32),
+        torch.empty(1, **i64),
+        torch.empty((1, 8), **i32),
+        torch.empty(1, **i32),
+        torch.empty(8, **i32),
+        torch.empty(1, **i32),
+        torch.empty(1, **i64),
+    )
     return (acc, n, am, cand, sl, sim), ins, outs
 
 
@@ -305,8 +396,18 @@ def test_the_post_verify_reference_gives_the_expected_values():
         o = outs()
         post_verify_ref(*ins, *o)
         p, ai, al, nsl, at, bonus, sel = _post_verify_expected(*raw)
-        assert o[0].tolist() == p and o[1].view(-1).tolist() == ai and int(o[2]) == al and int(o[3]) == nsl
-        assert o[4].view(-1).tolist() == at and int(o[5]) == bonus and o[6].tolist() == p and int(o[7]) == al
+        assert (
+            o[0].tolist() == p
+            and o[1].view(-1).tolist() == ai
+            and int(o[2]) == al
+            and int(o[3]) == nsl
+        )
+        assert (
+            o[4].view(-1).tolist() == at
+            and int(o[5]) == bonus
+            and o[6].tolist() == p
+            and int(o[7]) == al
+        )
         assert int(o[8]) == sel
 
 
@@ -317,15 +418,29 @@ def test_the_page_table_references_give_the_expected_values():
     for _ in range(300):
         req, last = rng.randint(0, 2), rng.randint(0, 4095)
         bt, kvl = torch.zeros(48, dtype=torch.int32), torch.zeros(1, dtype=torch.int32)
-        fill_step_all_ref(r2t, torch.tensor([req]), torch.arange(last - 7, last + 1), bt, kvl)
+        fill_step_all_ref(
+            r2t, torch.tensor([req]), torch.arange(last - 7, last + 1), bt, kvl
+        )
         n = min((last >> 6) + 1, 48)
-        want = [int(r2t[req, 64 * k]) // 64 if r2t[req, 64 * k] >= 0 else -((-int(r2t[req, 64 * k])) // 64) for k in range(n)]
-        assert bt[:n].tolist() == want and bt[n:].eq(0).all() and int(kvl) == max(last + 1, 8)
+        want = [
+            int(r2t[req, 64 * k]) // 64
+            if r2t[req, 64 * k] >= 0
+            else -((-int(r2t[req, 64 * k])) // 64)
+            for k in range(n)
+        ]
+        assert (
+            bt[:n].tolist() == want
+            and bt[n:].eq(0).all()
+            and int(kvl) == max(last + 1, 8)
+        )
         bt.zero_()
         sl = rng.randint(0, 4000)
         draft_pages_ref(r2t, torch.tensor([req]), torch.tensor([sl]), bt)
         pages = {(sl + i) >> 6 for i in range(8)} & set(range(48))
-        assert all(int(bt[p]) == int(torch.div(r2t[req, 64 * p], 64, rounding_mode="trunc")) for p in pages)
+        assert all(
+            int(bt[p]) == int(torch.div(r2t[req, 64 * p], 64, rounding_mode="trunc"))
+            for p in pages
+        )
 
 
 @needs_torch
@@ -334,18 +449,36 @@ def test_the_chain_tree_reference_gives_the_expected_values():
     for _ in range(300):
         s, mode = rng.randint(1, 5000), rng.choice([0, 1])
         mask = torch.ones((s * 8 + 64) if mode == 0 else 64, dtype=torch.bool)
-        pos, rbuf, dout = torch.empty(8, dtype=torch.int64), torch.empty((3, 1, 8), dtype=torch.int64), torch.empty(8, dtype=torch.int64)
-        bonus, drafts = torch.tensor([rng.randint(0, 150000)]), torch.randint(0, 150000, (1, 7))
+        pos, rbuf, dout = (
+            torch.empty(8, dtype=torch.int64),
+            torch.empty((3, 1, 8), dtype=torch.int64),
+            torch.empty(8, dtype=torch.int64),
+        )
+        bonus, drafts = (
+            torch.tensor([rng.randint(0, 150000)]),
+            torch.randint(0, 150000, (1, 7)),
+        )
         chain_tree_ref(bonus, drafts, torch.tensor([s]), mask, mode, pos, rbuf, dout)
         for i in range(8):
             base = (s + 8) * i + s if mode == 0 else 8 * i
-            assert mask[base:base + 8].tolist() == [k <= i for k in range(8)]
-        assert pos.tolist() == [s + i for i in range(8)] and rbuf[1, 0].tolist() == [1, 2, 3, 4, 5, 6, 7, -1]
+            assert mask[base : base + 8].tolist() == [k <= i for k in range(8)]
+        assert pos.tolist() == [s + i for i in range(8)] and rbuf[1, 0].tolist() == [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            -1,
+        ]
         assert rbuf[0, 0].tolist() == list(range(8)) and rbuf[2, 0].tolist() == [-1] * 8
         assert dout.tolist() == [int(bonus)] + drafts.view(-1).tolist()
 
 
-@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="needs a GPU with CuTe DSL")
+@pytest.mark.skipif(
+    torch is None or not torch.cuda.is_available(), reason="needs a GPU with CuTe DSL"
+)
 def test_the_cute_dsl_ops_are_bitwise_equal_to_the_references():
     pytest.importorskip("cutlass")
     from sgl_nvidia_mega.glm5_3.sm107 import ops
@@ -361,11 +494,18 @@ def test_the_cute_dsl_ops_are_bitwise_equal_to_the_references():
             post_verify_ref(*args, *b)
             assert all(torch.equal(x, y) for x, y in zip(a, b))
     w = 1100000
-    r2t = (torch.arange(4 * w, dtype=torch.int64, device=d).view(4, w) * 3 % (1 << 20)).to(torch.int32)
-    for last in [19, 70, 335000, 335063] + [rng.randint(20, 1048000) for _ in range(500)]:
+    r2t = (
+        torch.arange(4 * w, dtype=torch.int64, device=d).view(4, w) * 3 % (1 << 20)
+    ).to(torch.int32)
+    for last in [19, 70, 335000, 335063] + [
+        rng.randint(20, 1048000) for _ in range(500)
+    ]:
         req = torch.tensor([rng.randint(0, 3)], device=d)
         pos = torch.arange(last - 7, last + 1, device=d)
-        a = (torch.zeros(16388, dtype=torch.int32, device=d), torch.zeros(1, dtype=torch.int32, device=d))
+        a = (
+            torch.zeros(16388, dtype=torch.int32, device=d),
+            torch.zeros(1, dtype=torch.int32, device=d),
+        )
         b = (a[0].clone(), a[1].clone())
         ops.fill_step_all(r2t, req, pos, *a)
         fill_step_all_ref(r2t, req, pos, *b)
@@ -378,12 +518,19 @@ def test_the_cute_dsl_ops_are_bitwise_equal_to_the_references():
         s, mode = rng.randint(1, 5000), rng.choice([0, 1])
         for bdt in (torch.int32, torch.int64):
             bonus = torch.tensor([rng.randint(0, 150000)], dtype=bdt, device=d)
-            drafts, sl = torch.randint(0, 150000, (7,), device=d), torch.tensor([s], device=d)
+            drafts, sl = (
+                torch.randint(0, 150000, (7,), device=d),
+                torch.tensor([s], device=d),
+            )
             n = (s * 8 + 64) if mode == 0 else 64
             res = []
             for f in (ops.chain_tree, chain_tree_ref):
-                o = (torch.ones(n, dtype=torch.bool, device=d), torch.empty(8, dtype=torch.int64, device=d),
-                     torch.full((3, 1, 8), -7, dtype=torch.int64, device=d), torch.empty(8, dtype=torch.int64, device=d))
+                o = (
+                    torch.ones(n, dtype=torch.bool, device=d),
+                    torch.empty(8, dtype=torch.int64, device=d),
+                    torch.full((3, 1, 8), -7, dtype=torch.int64, device=d),
+                    torch.empty(8, dtype=torch.int64, device=d),
+                )
                 f(bonus, drafts, sl, o[0], mode, o[1], o[2], o[3])
                 res.append(o)
             assert all(torch.equal(x, y) for x, y in zip(*res))

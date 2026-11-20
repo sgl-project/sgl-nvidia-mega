@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The routed-MoE work split shared by the device code (moe.py) and the host, which derives the FC2 lists from it."""
+
 import struct
 
 CTAS = 212
@@ -18,7 +19,9 @@ def _clipped(c, start, end):
 
 
 def _cut_weight(c):
-    return CUT_RATE * c - sum(k * _clipped(c, start, end) for start, end, k in CUT_DISCOUNTS)
+    return CUT_RATE * c - sum(
+        k * _clipped(c, start, end) for start, end, k in CUT_DISCOUNTS
+    )
 
 
 def _aligned_f2(c, experts):

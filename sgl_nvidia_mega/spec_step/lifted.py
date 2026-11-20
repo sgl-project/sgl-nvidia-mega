@@ -497,9 +497,7 @@ def _fused_draft_extend_tail_eligible(
     ):
         reason = "seed buffer is not 2-D row-major"
     if reason is not None:
-        _log_draft_tail_once(
-            f"SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL declined: {reason}"
-        )
+        _log_draft_tail_once(f"SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL declined: {reason}")
         return False
     _log_draft_tail_once("SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL on")
     return True
@@ -521,12 +519,10 @@ def _draft_extend_for_decode(
     elif batch_result.accept_lens.is_cuda:
         from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
 
-        num_correct_drafts, select_index, next_token_ids = (
-            prepare_draft_extend_inputs(
-                batch_result.accept_lens,
-                batch_result.next_token_ids,
-                self.speculative_num_draft_tokens,
-            )
+        num_correct_drafts, select_index, next_token_ids = prepare_draft_extend_inputs(
+            batch_result.accept_lens,
+            batch_result.next_token_ids,
+            self.speculative_num_draft_tokens,
         )
     else:
         num_correct_drafts = batch_result.accept_lens - 1
@@ -585,8 +581,8 @@ def _draft_extend_for_decode(
     # Eager path publishes the indexer top-k into a worker buffer (the graph
     # path uses the runner's static buffer). Gathered at select_index below.
     if self.seed_dsa_topk_from_draft_extend and not can_run_decode_cuda_graph:
-        forward_batch.spec_info.dsa_seed_topk_capture = (
-            self._get_dsa_extend_topk_buf(forward_batch.input_ids.shape[0])
+        forward_batch.spec_info.dsa_seed_topk_capture = self._get_dsa_extend_topk_buf(
+            forward_batch.input_ids.shape[0]
         )
 
     canary_ctx = (
@@ -606,9 +602,7 @@ def _draft_extend_for_decode(
                 forward_batch, select_index
             )
         else:
-            draft_logits_output = self.draft_runner.forward(
-                forward_batch
-            ).logits_output
+            draft_logits_output = self.draft_runner.forward(forward_batch).logits_output
 
     maybe_detect_nan(
         draft_logits_output.next_token_logits,
@@ -625,12 +619,13 @@ def _draft_extend_for_decode(
     dsa_extend_topk_capture = None
     if self.seed_dsa_topk_from_draft_extend:
         if can_run_decode_cuda_graph:
-            dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
+            dsa_extend_topk_capture = (
+                self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
+            )
         else:
             dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
     fused_tail = _fused_draft_extend_tail_eligible(
-            self,
-        draft_logits_output.next_token_logits, dsa_extend_topk_capture
+        self, draft_logits_output.next_token_logits, dsa_extend_topk_capture
     )
     if dsa_extend_topk_capture is not None and not fused_tail:
         # Fancy indexing returns a fresh tensor (detached from the buffer).
@@ -638,9 +633,9 @@ def _draft_extend_for_decode(
 
     # Reorganize the spec info for the next batch
     if not can_run_decode_cuda_graph:
-        draft_logits_output.next_token_logits = (
-            draft_logits_output.next_token_logits[select_index]
-        )
+        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+            select_index
+        ]
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
