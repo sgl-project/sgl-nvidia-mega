@@ -140,10 +140,12 @@ def test_the_context_must_be_one_request_of_eight_tokens(mk):
 
 
 def test_no_binaries_and_no_cpp():
+    # __pycache__ (git-ignored) is written by any test that imported the package first
     found = [
         p
         for p in PKG.rglob("*")
         if p.suffix in (".so", ".o", ".cubin", ".cu", ".cc", ".cuh", ".h", ".pyc")
+        and "__pycache__" not in p.parts
     ]
     assert not found, found
 
