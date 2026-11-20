@@ -19,6 +19,12 @@
 // for the current phase, then polls its own slots until no word holds the empty marker, reduces, and restores the
 // marker. The block that pushes a vector is the block that consumes the same vector on every rank, so no block
 // waits on another block of its own grid.
+//
+// kMcPush (default off): the vector is stored once through the plane's multicast address (multimem.st.relaxed.sys),
+// which writes slot (dst = every rank, src = rank) of the same phase. The own slot is written too: it is polled until
+// that store has landed and then scrubbed like the peers' slots (the plane is shared with kernels that read it), while
+// the reduction takes this rank's vector from registers. Same values and reduction: the outputs are bit-identical to
+// the per-peer stores.
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
@@ -67,15 +73,31 @@ SGL_DEVICE uint8_t* slot_ptr(const Params<kWorld>& params, uint32_t phase, uint3
   return params.ws.workspaces[dst] + (src + phase * kWorld) * params.ws.slot_bytes;
 }
 
+// One 16-byte store through a multicast address, relaxed at system scope like the per-peer stores it replaces.
+template <typename V>
+SGL_DEVICE void st_multimem_relaxed_16B(const V& x, uint8_t* mc_base, uint32_t vid) {
+  static_assert(sizeof(V) == 16);
+  const float4 val = *reinterpret_cast<const float4*>(&x);
+  uint8_t* addr = mc_base + static_cast<int64_t>(vid) * 16;
+  asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%4], {%0, %1, %2, %3};"
+               :
+               : "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w), "l"(addr)
+               : "memory");
+}
+
 // Stores this rank's vector `vid` into every peer's slot and returns it with the empty marker cleared.
-template <uint32_t kWorld>
+template <uint32_t kWorld, bool kMcPush = false>
 SGL_DEVICE BF16Vec push_vector(const Params<kWorld>& params, uint32_t phase, uint32_t vid) {
   BF16Vec vec;
   vec.load(params.partial, vid);
   Lamport::clear_pos_zero(vec.data());
+  if constexpr (kMcPush) {
+    st_multimem_relaxed_16B(vec, params.ws.mc_workspace + (params.rank + phase * kWorld) * params.ws.slot_bytes, vid);
+  } else {
 #pragma unroll
-  for (uint32_t i = 0; i < kWorld; ++i) {
-    if (i != params.rank) device::ptx::st_relaxed_16B(vec, slot_ptr(params, phase, i, params.rank), vid);
+    for (uint32_t i = 0; i < kWorld; ++i) {
+      if (i != params.rank) device::ptx::st_relaxed_16B(vec, slot_ptr(params, phase, i, params.rank), vid);
+    }
   }
   return vec;
 }
@@ -84,14 +106,18 @@ SGL_DEVICE BF16Vec push_vector(const Params<kWorld>& params, uint32_t phase, uin
 // ranks 0..kWorld-1 rounded to bf16.
 // Upper bound on polls of one vector's slots. A peer that never delivers (a crashed or diverged rank) then ends the
 // kernel with a trap, which surfaces as a CUDA error, instead of leaving the process spinning.
-inline constexpr uint32_t kMaxPolls = 1u << 24;
+inline constexpr uint32_t kMaxPolls = 1u << 30;
 
 // Out of line so the poll loop's code stays as it was; reached only when the bound is hit.
 __device__ __noinline__ void poll_bound_exceeded() {
   __trap();
 }
 
-template <uint32_t kWorld>
+// kMcPush: the multicast store also filled this rank's own slot (dst = src = rank). Other kernels on the same plane
+// (SGLang's gather boundary reads its gathered rows from the phase's first slot onwards) need it empty again, so the
+// own slot is polled like a peer's (until this rank's own store has landed there) and then scrubbed; the reduction
+// still takes this rank's vector from registers.
+template <uint32_t kWorld, bool kMcPush = false>
 SGL_DEVICE BF16Vec reduce_vector(const Params<kWorld>& params, uint32_t phase, uint32_t vid, const BF16Vec& own) {
   BF16Vec vec[kWorld];
   uint32_t polls = 0;
@@ -99,11 +125,13 @@ SGL_DEVICE BF16Vec reduce_vector(const Params<kWorld>& params, uint32_t phase, u
     bool pending = false;
 #pragma unroll
     for (uint32_t i = 0; i < kWorld; ++i) {
-      if (i != params.rank) device::ptx::ld_relaxed_16B(vec[i], slot_ptr(params, phase, params.rank, i), vid);
+      if (kMcPush || i != params.rank) {
+        device::ptx::ld_relaxed_16B(vec[i], slot_ptr(params, phase, params.rank, i), vid);
+      }
     }
 #pragma unroll
     for (uint32_t i = 0; i < kWorld; ++i) {
-      if (i != params.rank) pending |= Lamport::has_pos_zero(vec[i].data());
+      if (kMcPush || i != params.rank) pending |= Lamport::has_pos_zero(vec[i].data());
     }
     if (!pending) break;
     if (++polls == kMaxPolls) [[unlikely]] poll_bound_exceeded();
@@ -116,7 +144,7 @@ SGL_DEVICE BF16Vec reduce_vector(const Params<kWorld>& params, uint32_t phase, u
   Lamport::fill_pos_zero(empty.data());
 #pragma unroll
   for (uint32_t i = 0; i < kWorld; ++i) {
-    if (i != params.rank) device::ptx::st_global_16B(empty, slot_ptr(params, phase, params.rank, i), vid);
+    if (kMcPush || i != params.rank) device::ptx::st_global_16B(empty, slot_ptr(params, phase, params.rank, i), vid);
   }
   return device::reduce_vec(vec);
 }
@@ -140,7 +168,9 @@ template <
     bool kPostNormIsInputScale,
     bool kHasRouter,
     bool kPostWeight,
-    bool kGate>
+    bool kGate,
+    bool kEarlyTrigger = false,
+    bool kMcPush = false>
 __global__ void __launch_bounds__(kNumThreads)
     muse_vr_ar_norm_residual_cluster(const __grid_constant__ muse_vr_ar_norm::Params<kWorld> params) {
   using namespace device;
@@ -190,11 +220,14 @@ __global__ void __launch_bounds__(kNumThreads)
   BF16Vec own[kPacks];
 
   PDLWaitPrimary<kUsePDL>();
+  // after this kernel's own wait: dependents launch during the exchange, never before the primary has completed
+  if constexpr (kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
   const uint32_t phase = muse_vr_ar_norm::begin_phase(params);
 #pragma unroll
   for (int pack = 0; pack < kPacks; ++pack) {
     const int index = cluster_rank * kNumThreads + threadIdx.x + pack * kTotalThreads;
-    own[pack] = muse_vr_ar_norm::push_vector(params, phase, static_cast<uint32_t>(row) * kRowVecs + index);
+    own[pack] =
+        muse_vr_ar_norm::push_vector<kWorld, kMcPush>(params, phase, static_cast<uint32_t>(row) * kRowVecs + index);
   }
 
   float branch_sum = 0.0f;
@@ -231,8 +264,8 @@ __global__ void __launch_bounds__(kNumThreads)
         }
       }
     }
-    const BF16Vec branch_values =
-        muse_vr_ar_norm::reduce_vector(params, phase, static_cast<uint32_t>(row) * kRowVecs + index, own[pack]);
+    const BF16Vec branch_values = muse_vr_ar_norm::reduce_vector<kWorld, kMcPush>(
+        params, phase, static_cast<uint32_t>(row) * kRowVecs + index, own[pack]);
 
 #pragma unroll
     for (int pair = 0; pair < kPairs; ++pair) {
@@ -284,7 +317,7 @@ __global__ void __launch_bounds__(kNumThreads)
       scaled_branch_sum = fmaf(scaled_branch.y, scaled_branch.y, scaled_branch_sum);
     }
   }
-  PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
 
   local_reduce(branch_sum, residual_sum, cross_sum, scaled_branch_sum, reduction);
   ptx::cluster_wait();
@@ -358,7 +391,9 @@ template <
     bool kPostNormIsInputScale,
     bool kHasRouter,
     bool kPostWeight,
-    bool kGate>
+    bool kGate,
+    bool kEarlyTrigger = false,
+    bool kMcPush = false>
 __global__ void __launch_bounds__(kNumThreads)
     muse_vr_ar_norm_residual_row(const __grid_constant__ muse_vr_ar_norm::Params<kWorld> params) {
   using namespace device;
@@ -386,13 +421,15 @@ __global__ void __launch_bounds__(kNumThreads)
   const bool pre_bf16 = norm.pre_norm_bf16;
 
   PDLWaitPrimary<kUsePDL>();
+  // after this kernel's own wait: dependents launch during the exchange, never before the primary has completed
+  if constexpr (kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
   const uint32_t phase = muse_vr_ar_norm::begin_phase(params);
   // Push every row this block owns before waiting on any of them.
   for (uint32_t row = blockIdx.x; row < params.num_rows; row += gridDim.x) {
 #pragma unroll
     for (int p = 0; p < kPacks; ++p) {
       const int idx = threadIdx.x + p * kNumThreads;
-      muse_vr_ar_norm::push_vector(params, phase, row * kRowVecs + idx);
+      muse_vr_ar_norm::push_vector<kWorld, kMcPush>(params, phase, row * kRowVecs + idx);
     }
   }
 
@@ -438,7 +475,7 @@ __global__ void __launch_bounds__(kNumThreads)
       BF16Vec own;
       own.load(params.partial, row * kRowVecs + idx);
       muse_vr_ar_norm::Lamport::clear_pos_zero(own.data());
-      const BF16Vec branch_v = muse_vr_ar_norm::reduce_vector(params, phase, row * kRowVecs + idx, own);
+      const BF16Vec branch_v = muse_vr_ar_norm::reduce_vector<kWorld, kMcPush>(params, phase, row * kRowVecs + idx, own);
 #pragma unroll
       for (int q = 0; q < kPairs; ++q) {
         auto v = cast<fp32x2_t>(branch_v[q]);
@@ -560,7 +597,7 @@ __global__ void __launch_bounds__(kNumThreads)
     }
   }
 
-  PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kEarlyTrigger) PDLTriggerSecondary<kUsePDL>();
   muse_vr_ar_norm::end_phase(params, phase);
 }
 
@@ -574,7 +611,9 @@ template <
     int kClusterSize,
     bool kUsePDL,
     bool kPostNormIsInputScale,
-    bool kHasRouter>
+    bool kHasRouter,
+    bool kEarlyTrigger = false,
+    bool kMcPush = false>
 struct MuseVrArNormResidual {
   static_assert(kClusterSize == 1 || kClusterSize == 2 || kClusterSize == 4 || kClusterSize == 8 || kClusterSize == 16);
 
@@ -665,6 +704,9 @@ struct MuseVrArNormResidual {
                 .pre_norm_bf16 = pre_norm_bf16,
             },
     };
+    if constexpr (kMcPush) {
+      RuntimeCheck(params.ws.mc_workspace != nullptr, "the multicast push needs a push plane with a multicast address");
+    }
     const auto device = device_.unwrap();
 
     const auto launch = [&]<bool kHasPostWeight, bool kHasGate>() {
@@ -680,7 +722,9 @@ struct MuseVrArNormResidual {
                     kPostNormIsInputScale,
                     kHasRouter,
                     kHasPostWeight,
-                    kHasGate>,
+                    kHasGate,
+                    kEarlyTrigger,
+                    kMcPush>,
                 params);
       } else {
         constexpr auto kernel = muse_vr_ar_norm_residual_cluster<
@@ -693,7 +737,9 @@ struct MuseVrArNormResidual {
             kPostNormIsInputScale,
             kHasRouter,
             kHasPostWeight,
-            kHasGate>;
+            kHasGate,
+            kEarlyTrigger,
+            kMcPush>;
         [[maybe_unused]] static const bool cluster_configured = [kernel] {
           if constexpr (kClusterSize > 8) {
             RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));

@@ -46,6 +46,29 @@ def _cache(fn):
     return lru_cache(maxsize=None)(fn)
 
 
+def _early_trigger() -> bool:
+    """``MUSE_VR_AR_EARLY_TRIGGER=1`` (default off): the kernel signals its PDL dependents right after its own wait on its
+    primary instead of after its exchange, so they launch and reach their own wait during the exchange (their reads still
+    wait for this kernel to complete, and no dependent starts before this kernel's primary has completed). Arithmetic
+    unchanged."""
+    from . import bed
+
+    return bed.flag("ar_early_trigger")
+
+
+def _mc_push() -> bool:
+    """``MUSE_VR_AR_NORM_MC=1`` (default off): each vector is pushed with one store through the push plane's multicast
+    address instead of one store per peer (csrc/ar_norm_residual.cuh, kMcPush). Same slots and values; outputs
+    bit-identical. Needs a plane with a multicast address."""
+    from . import bed
+
+    return bed.flag("ar_norm_mc")
+
+
+def _variant() -> str:
+    return ("_early_pw" if _early_trigger() else "") + ("_mc" if _mc_push() else "")
+
+
 @_cache
 def _jit_module(hidden: int, world: int, threads: int, prefetch: bool, cluster: int):
     from sglang.kernels.jit.utils import is_arch_support_pdl, load_jit, make_cpp_args
@@ -54,16 +77,42 @@ def _jit_module(hidden: int, world: int, threads: int, prefetch: bool, cluster: 
     args = make_cpp_args(
         hidden, world, threads, prefetch, cluster, is_arch_support_pdl()
     )
+    early, mc, suffix = _early_trigger(), _mc_push(), _variant()
+    tail = (
+        (", " + ("true" if early else "false") + ", true")
+        if mc
+        else (", true" if early else "")
+    )
+    wrappers = [
+        ("run_std", f"MuseVrArNormResidual<{args}, false, false>::run"),
+        ("run_std_router", f"MuseVrArNormResidual<{args}, false, true>::run"),
+        ("run_scale", f"MuseVrArNormResidual<{args}, true, false>::run"),
+        ("run_scale_router", f"MuseVrArNormResidual<{args}, true, true>::run"),
+    ]
+    if suffix:
+        wrappers += [
+            (
+                "run_std" + suffix,
+                f"MuseVrArNormResidual<{args}, false, false{tail}>::run",
+            ),
+            (
+                "run_std_router" + suffix,
+                f"MuseVrArNormResidual<{args}, false, true{tail}>::run",
+            ),
+            (
+                "run_scale" + suffix,
+                f"MuseVrArNormResidual<{args}, true, false{tail}>::run",
+            ),
+            (
+                "run_scale_router" + suffix,
+                f"MuseVrArNormResidual<{args}, true, true{tail}>::run",
+            ),
+        ]
     return load_jit(
-        "muse_vr_ar_norm_residual",
+        "muse_vr_ar_norm_residual" + suffix,
         *args,
         cuda_files=[str(_CUH)],
-        cuda_wrappers=[
-            ("run_std", f"MuseVrArNormResidual<{args}, false, false>::run"),
-            ("run_std_router", f"MuseVrArNormResidual<{args}, false, true>::run"),
-            ("run_scale", f"MuseVrArNormResidual<{args}, true, false>::run"),
-            ("run_scale_router", f"MuseVrArNormResidual<{args}, true, true>::run"),
-        ],
+        cuda_wrappers=wrappers,
         extra_include_paths=sgl_compat.csrc_include_paths(KERNEL_PATH / "csrc"),
     )
 
@@ -148,7 +197,8 @@ def ar_norm_residual(
     fn = getattr(
         module,
         ("run_scale" if post_norm_is_input_scale else "run_std")
-        + ("_router" if want_router else ""),
+        + ("_router" if want_router else "")
+        + _variant(),
     )
     fn(
         comm.obj,

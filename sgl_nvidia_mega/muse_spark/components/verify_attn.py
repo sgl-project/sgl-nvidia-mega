@@ -956,6 +956,9 @@ def _swa_path(attn, positions, qkv, forward_batch, backend):
             num_q_heads=hq,
         )
         bed.count(QK, f"fused_reqs{reqs}")
+        if op.kv_side_for(reqs):
+            # engagement record of the side K/V warps (MUSE_VR_SWA_VERIFY_ATTN_KV_SIDE)
+            bed.count(SWA, f"kv_side_reqs{reqs}")
         if eps is not None:
             bed.count(SWA, f"fused_norm_gate_reqs{reqs}")
             return out

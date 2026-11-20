@@ -70,9 +70,17 @@
  * the Triton kernel). The pages of a (request, KV-head pair) are split over its blocks without overlap, so only the
  * storing block reads (by TMA, completed before the store) the pool bytes it stores.
  *
- * Ordering: q, seq_lens and the page table may be written by the preceding kernels, so the kernel reads them only
- * after griddepcontrol.wait (with use_pdl); before that wait it only initializes its barriers and tensor memory. The K/V pool rows read here are written before this kernel by the
- * preceding kernels of the step or by earlier steps. Pool rows past the end of a request inside its last page,
+ * Ordering: q, the page table and this step's K/V rows may be written by the preceding kernels, so the kernel reads
+ * them only after griddepcontrol.wait (with use_pdl). seq_lens is a graph input (filled before the graph runs, never
+ * written by a kernel of the step): both kernels issue its load before the wait and use the value after it. Before
+ * the wait the main kernel otherwise only initializes its barriers and tensor memory. The K/V pool rows read here are
+ * written before this kernel by the preceding kernels of the step or by earlier steps.
+ * kStage > 0 (staging, used with use_pdl in captured decode graphs): seq_len, the split's page-table entries (graph
+ * inputs) and the first min(kStage, kStages) K/V tiles of the split are read BEFORE griddepcontrol.wait, except tiles
+ * holding keys of this step's 8 tokens when those rows come from a preceding kernel (kQk == 0; the prologue path
+ * replaces those rows in shared memory itself). These are the late-writer inputs: written by work ordered before the
+ * graph launch, or by earlier steps. Same tiles, same arithmetic: bitwise equal to kStage == 0.
+ * Pool rows past the end of a request inside its last page,
  * and rows before the window, are loaded with the page and masked out of the probabilities (their values are
  * finite: the pools are allocated zero-filled and only finite values are stored into them).
  */
@@ -168,8 +176,13 @@ __device__ __forceinline__ void mbar_arrive(uint32_t bar) {
   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(bar) : "memory");
 }
 // Upper bound on try_wait calls of one wait: every arrival comes from this block (or from its own MMAs and copies);
-// the bound turns a wait that can only hang through a defect into a trap.
-inline constexpr uint32_t kMaxPolls = 1u << 24;
+// the bound turns a wait that can only hang through a defect into a trap. (FVA_MAX_POLLS: a small cap for
+// compute-sanitizer builds, so an instrumented wait that cannot complete traps within the run.)
+#ifdef FVA_MAX_POLLS
+inline constexpr uint32_t kMaxPolls = FVA_MAX_POLLS;
+#else
+inline constexpr uint32_t kMaxPolls = 1u << 30;
+#endif
 __device__ __noinline__ void wait_bound_exceeded() { __trap(); }
 __device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
   uint32_t polls = 0;
@@ -438,7 +451,12 @@ __device__ __forceinline__ void norm_gate16(float (&x)[4], const __nv_bfloat16* 
   for (int i = 0; i < 4; ++i) x[i] = y[i];
 }
 
-template <bool kUsePDL, bool kClusterMerge, bool kNormGate, int kQk, bool kUnfused>
+// kMergePre (with the merge kernel, not kClusterMerge): the dependents (the merge kernel) may launch right after this
+// kernel's dependency wait instead of after its last store; the merge blocks take SMs as main blocks exit and do their
+// pre-wait part (seq_lens, gate) while the last main blocks finish. The merge kernel still reads the records only after its
+// own dependency wait (full completion of this grid). Bitwise equal either way.
+template <bool kUsePDL, bool kClusterMerge, bool kNormGate, int kQk, bool kUnfused, int kStage = 0,
+          bool kMergePre = false>
 __global__ void __launch_bounds__(kThreads, 1)
     full_verify_attn_kernel(const Params p, const __grid_constant__ CUtensorMap k_map,
                             const __grid_constant__ CUtensorMap v_map) {
@@ -501,8 +519,15 @@ __global__ void __launch_bounds__(kThreads, 1)
   // initialized its receive barrier before any block stores into another block's shared memory.
   if constexpr (kClusterMerge) asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
 
-  if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
-  const int seq_len = p.seq_lens[req];
+  // seq_lens is a graph input: its load is issued before the dependency and consumed after it (laundered below);
+  // kStage: consumed before it as well (late-writer input), the dependency comes after the first tile loads.
+  int seq_len_raw = p.seq_lens[req];
+  if constexpr (kStage == 0) {
+    if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    if constexpr (kUsePDL && kMergePre && !kClusterMerge) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    asm volatile("mov.b32 %0, %0;\n" : "+r"(seq_len_raw));
+  }
+  const int seq_len = seq_len_raw;
   int p0, p1, lo;
   split_pages(seq_len, p.window_left, p.num_splits, split, p0, p1, lo);
   const int ntiles = p1 - p0;
@@ -532,6 +557,11 @@ __global__ void __launch_bounds__(kThreads, 1)
     tma_load_2d(smem_u32(sm + kSmK + s * kStageBytes), &k_map, pair * 128, page * kTile, full_bar(s));
     tma_load_2d(smem_u32(sm + kSmV + s * kStageBytes), &v_map, pair * 128, page * kTile, full_bar(s));
   };
+  // Tiles issued before the loads loop: 2 (both in flight at once), or kStage of them with staging.
+  constexpr int kFirst = kStage > 0 ? (kStage < kStages ? kStage : kStages) : 2;
+  // kStage: tile t may be read before the dependency unless its keys reach this step's tokens and those rows are
+  // written by a preceding kernel (kQk == 0).
+  const auto early_ok = [&](int t) { return kQk > 0 || (p0 + t + 1) * kTile <= tnew; };
   if (warp == kSoftmaxWarps) {
     for (int t = lane; t < min(ntiles, kMaxTiles); t += 32) pages[t] = pt[t];
     __syncwarp();
@@ -540,9 +570,20 @@ __global__ void __launch_bounds__(kThreads, 1)
       // dependent launch only griddepcontrol.wait separates them from these async-proxy reads, so order the proxies
       // (PTX ISA, memory consistency model: proxy fences).
       asm volatile("fence.proxy.async.global;\n" ::: "memory");
-      for (int t = 0; t < min(ntiles, kStages); ++t) issue_tile(t);
+      for (int t = 0; t < min(ntiles, kFirst); ++t)  // the first tiles of every split go out first
+        if (kStage == 0 || early_ok(t)) issue_tile(t);
     }
-  } else if (warp < kSoftmaxWarps) {
+  }
+  if constexpr (kStage > 0) {
+    if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    if constexpr (kUsePDL && kMergePre && !kClusterMerge) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    if (warp == kSoftmaxWarps && lane == 0 && kQk == 0) {
+      asm volatile("fence.proxy.async.global;\n" ::: "memory");
+      for (int t = 0; t < min(ntiles, kFirst); ++t)
+        if (!early_ok(t)) issue_tile(t);  // this step's rows, written by the preceding kernel
+    }
+  }
+  if (warp < kSoftmaxWarps) {
     // Q rows of the two KV heads -> [head][row][64 B] in the 64-byte swizzle (16-byte chunk c of row r at
     // c ^ (r/2 % 4)).
     uint8_t* const sq = sm + kSmQ;
@@ -605,15 +646,16 @@ __global__ void __launch_bounds__(kThreads, 1)
         asm volatile("bar.sync 6, %0;\n" ::"r"(32 * kSoftmaxWarps) : "memory");
       }
     }
-  } else {
+  } else if (warp > kSoftmaxWarps) {
     asm volatile("bar.sync 5, %0;\n" ::"r"(32 * (kSoftmaxWarps + 1)) : "memory");
   }
 
   if (warp == kSoftmaxWarps) {
     // ------------------------------------------------------------------ loads
     if (lane == 0) {
-      for (int t = kStages; t < ntiles; ++t) {
-        mbar_wait(empty_bar(t % kStages), (t / kStages - 1) & 1);
+      for (int t = kFirst; t < ntiles; ++t) {  // tile t once tile t - 2 has landed (two tiles in flight per block)
+        mbar_wait(full_bar((t - 2) % kStages), ((t - 2) / kStages) & 1);
+        if (t >= kStages) mbar_wait(empty_bar(t % kStages), (t / kStages - 1) & 1);
         issue_tile(t);
       }
     }
@@ -789,13 +831,25 @@ __global__ void __launch_bounds__(kThreads, 1)
     const float lrowsum = red[(256 + lrow) * 2] + red[(256 + lrow) * 2 + 1];
     const int kvh = 2 * pair + hh;
     if constexpr (!kClusterMerge) {
-      // partial record of this row: [req][kvh][row][split][kRec]
-      float* rec = p.partial +
-                   (((static_cast<int64_t>(req) * p.num_kv_heads + kvh) * kRows + row) * p.num_splits + split) * kRec;
+      // partial records [req][kvh][row][split][kRec]: the block's 128 rows staged in shared memory (the K stages: every
+      // tile's MMAs have completed, see the last output-tile wait above), then one half-warp per 272-byte record
+      (void)kvh;
+      float* const rs = reinterpret_cast<float*>(sm + kSmK);
+      const int R = 64 * hh + row;
 #pragma unroll
       for (int d = 0; d < 32; d += 4)
-        *reinterpret_cast<float4*>(rec + 32 * half + d) = make_float4(o[d], o[d + 1], o[d + 2], o[d + 3]);
-      if (half == 0) *reinterpret_cast<float2*>(rec + kHeadDim) = make_float2(m, lrowsum);
+        *reinterpret_cast<float4*>(rs + R * kRec + 32 * half + d) = make_float4(o[d], o[d + 1], o[d + 2], o[d + 3]);
+      if (half == 0) *reinterpret_cast<float4*>(rs + R * kRec + kHeadDim) = make_float4(m, lrowsum, 0.0f, 0.0f);
+      asm volatile("bar.sync 7, %0;\n" ::"r"(32 * kSoftmaxWarps) : "memory");
+      const int hl = lane >> 4, c16 = lane & 15;
+      for (int r2 = 2 * warp; r2 < 128; r2 += 2 * kSoftmaxWarps) {
+        const int RR = r2 + hl, kv2 = 2 * pair + (RR >> 6), rw = RR & 63;
+        float* const g = p.partial +
+                         (((static_cast<int64_t>(req) * p.num_kv_heads + kv2) * kRows + rw) * p.num_splits + split) * kRec;
+        const float4* const src = reinterpret_cast<const float4*>(rs + RR * kRec);
+        reinterpret_cast<float4*>(g)[c16] = src[c16];
+        if (c16 == 0) reinterpret_cast<float4*>(g)[16] = src[16];
+      }
     } else {
       // record of this row -> slot R / S, source rank `split`, of rank R % S (R = 64 * head-in-pair + row)
       const int R = 64 * hh + row;
@@ -859,6 +913,422 @@ __global__ void __launch_bounds__(kThreads, 1)
   }
   tc_fence_before();
   __syncthreads();
+  if constexpr (kUsePDL && !(kMergePre && !kClusterMerge)) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+  if (warp == 0) {
+    tc_fence_after();
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;\n" ::"r"(tmem), "r"(kTmemCols) : "memory");
+  }
+}
+
+// ------------------------------------------------------------------------------------------- SR main kernel
+// kSr variant of the main kernel (MUSE_VR_FULL_VERIFY_ATTN_SR): the same work split, records, merge kernel and arithmetic,
+// with the softmax restructured so that two tiles are in flight per block. 16 warps:
+//   warps 0-7   softmax, ONE thread per query row (warp w: lane i -> KV head 2 * pair + i / 16, row 16 (w % 4) + i % 16 =
+//               tensor-memory lane 32 (w % 4) + i); group w / 4 takes the tiles of its parity (score buffer, P buffer and
+//               output buffer = tile parity). Per tile the thread computes both halves of the keys exactly as the two
+//               threads of the two-thread layout do (each half's maximum tree, then the maximum of the halves; each half's
+//               keys in four interleaved partial sums in key order, (0 + 2) + (1 + 3)), writes the e4m3 probabilities of its
+//               row to the P buffer and hands the tile maximum and the two half sums to the correction warps.
+//   warps 8-11  correction, one thread per row: per tile, in tile order, m' = max(m, mt), ar = exp2(m - m'),
+//               at = exp2(mt - m'), o = fma(o, ar, pv * at) for the 64 output dims, l_h = l_h * ar + part_h * at; then
+//               l = l_0 + l_1 and the row's record. These are the operations of the two-thread layout in the same order.
+//   warp 12     loads (TMA, the K / V ring), warp 13 QK MMAs, warp 14 PV MMAs, warp 15 idle.
+// Before the role split, warps 0-7 compute the q rows (and the new tokens' K / V rows) exactly as the main kernel does.
+// Registers: setmaxnreg 168 (softmax) / 120 (correction) / 56 (others) inside each role branch.
+// Hand-offs (mbarriers): full / empty (ring), s_full (QK -> group), s_free (group loaded its scores -> QK of tile + 2),
+// p_full (group's 128 threads wrote P -> PV), o_full (PV -> correction; also frees the P buffer for tile + 2),
+// o_free (correction read the output buffer -> PV of tile + 2; also frees stats slots), st_full (statistics slot t % 4),
+// patch[2] (kQk: new rows written into a loaded tile, by the owning group). Every wait is bounded (trap).
+inline constexpr int kSrThreads = 512;
+template <bool kUsePDL, bool kNormGate, int kQk, bool kUnfused, int kStage = 0>
+__global__ void __launch_bounds__(kSrThreads, 1)
+    full_verify_attn_sr_kernel(const Params p, const __grid_constant__ CUtensorMap k_map,
+                               const __grid_constant__ CUtensorMap v_map) {
+  extern __shared__ uint8_t smem_raw[];
+  uint8_t* const sm = smem_raw + ((1024u - (smem_u32(smem_raw) & 1023u)) & 1023u);
+  uint64_t* const bars = reinterpret_cast<uint64_t*>(sm + kSmBar);
+  // bars: full[4], empty[4], s_full[2], s_free[2], p_full[2], o_full[2], o_free[2], st_full[4], patch[2], tmem slot
+  const uint32_t bar0 = smem_u32(bars);
+  const auto full_bar = [&](int s) { return bar0 + 8u * s; };
+  const auto empty_bar = [&](int s) { return bar0 + 8u * (kStages + s); };
+  const auto s_full_bar = [&](int b) { return bar0 + 8u * (2 * kStages + b); };
+  const auto s_free_bar = [&](int b) { return bar0 + 8u * (2 * kStages + 2 + b); };
+  const auto p_full_bar = [&](int b) { return bar0 + 8u * (2 * kStages + 4 + b); };
+  const auto o_full_bar = [&](int b) { return bar0 + 8u * (2 * kStages + 6 + b); };
+  const auto o_free_bar = [&](int b) { return bar0 + 8u * (2 * kStages + 8 + b); };
+  const auto st_full_bar = [&](int s) { return bar0 + 8u * (2 * kStages + 10 + s); };
+  const auto patch_bar = [&](int b) { return bar0 + 8u * (2 * kStages + 14 + b); };
+  uint32_t* const tmem_slot = reinterpret_cast<uint32_t*>(sm + kSmBar + 8 * (2 * kStages + 16));
+  static_assert(8 * (2 * kStages + 16) + 4 <= 256, "barrier area");
+  static_assert(4 * 128 * 16 <= kRecvBytes, "statistics slots in the receive area");
+
+  const int split = blockIdx.x, pair = blockIdx.y, req = blockIdx.z;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  constexpr int kWLoad = 12, kWQk = 13, kWPv = 14;
+
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < kStages; ++s) {
+      mbar_init(full_bar(s), 1);
+      mbar_init(empty_bar(s), 1);
+    }
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+      mbar_init(s_full_bar(b), 1);
+      mbar_init(s_free_bar(b), 128);
+      mbar_init(p_full_bar(b), 128);
+      mbar_init(o_full_bar(b), 1);
+      mbar_init(o_free_bar(b), 128);
+      mbar_init(patch_bar(b), 128);
+    }
+#pragma unroll
+    for (int s = 0; s < 4; ++s) mbar_init(st_full_bar(s), 128);
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+  }
+  if (warp == 0) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n" ::"r"(smem_u32(tmem_slot)),
+                 "r"(kTmemCols)
+                 : "memory");
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n" ::: "memory");
+  }
+  tc_fence_before();
+  __syncthreads();
+  tc_fence_after();
+  const uint32_t tmem = *tmem_slot;
+
+  int seq_len_raw = p.seq_lens[req];
+  if constexpr (kStage == 0) {
+    if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    asm volatile("mov.b32 %0, %0;\n" : "+r"(seq_len_raw));
+  }
+  const int seq_len = seq_len_raw;
+  int p0, p1, lo;
+  split_pages(seq_len, p.window_left, p.num_splits, split, p0, p1, lo);
+  const int ntiles = p1 - p0;
+  const int tnew = seq_len - kTokens;
+  int tn0 = 0, ntn = 0;
+  if constexpr (kQk > 0) {
+    const int a = max(max(tnew, 0) / kTile, p0), b = min((max(seq_len, 1) - 1) / kTile, p1 - 1);
+    if (a <= b) {
+      tn0 = a - p0;
+      ntn = b - a + 1;
+    }
+  }
+  if (ntiles <= 0) {  // uniform over the block: no partial for this split
+    if (warp == 0)
+      asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;\n" ::"r"(tmem), "r"(kTmemCols) : "memory");
+    return;
+  }
+  int32_t* const pages = reinterpret_cast<int32_t*>(sm + kSmPages);
+  const int32_t* const pt = p.page_table + static_cast<int64_t>(req) * p.page_table_stride + p0;
+  const auto issue_tile = [&](int t) {
+    const int s = t % kStages;
+    const int page = t < kMaxTiles ? pages[t] : pt[t];
+    mbar_expect_tx(full_bar(s), 2 * kStageBytes);
+    tma_load_2d(smem_u32(sm + kSmK + s * kStageBytes), &k_map, pair * 128, page * kTile, full_bar(s));
+    tma_load_2d(smem_u32(sm + kSmV + s * kStageBytes), &v_map, pair * 128, page * kTile, full_bar(s));
+  };
+  constexpr int kFirst = kStage > 0 ? (kStage < kStages ? kStage : kStages) : 2;
+  const auto early_ok = [&](int t) { return kQk > 0 || (p0 + t + 1) * kTile <= tnew; };
+  if (warp == kWLoad) {
+    for (int t = lane; t < min(ntiles, kMaxTiles); t += 32) pages[t] = pt[t];
+    __syncwarp();
+    if (lane == 0) {
+      asm volatile("fence.proxy.async.global;\n" ::: "memory");
+      for (int t = 0; t < min(ntiles, kFirst); ++t)
+        if (kStage == 0 || early_ok(t)) issue_tile(t);
+    }
+  }
+  if constexpr (kStage > 0) {
+    if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    if (warp == kWLoad && lane == 0 && kQk == 0) {
+      asm volatile("fence.proxy.async.global;\n" ::: "memory");
+      for (int t = 0; t < min(ntiles, kFirst); ++t)
+        if (!early_ok(t)) issue_tile(t);
+    }
+  }
+  // q rows (and the new tokens' K / V rows) by warps 0-7, exactly as the main kernel
+  if (warp < kSoftmaxWarps) {
+    uint8_t* const sq = sm + kSmQ;
+    if constexpr (kQk == 0) {
+#pragma unroll
+      for (int i = tid; i < 2 * kRows * 4; i += 32 * kSoftmaxWarps) {
+        const int hh = i >> 8, r = (i >> 2) & 63, c = i & 3;
+        const int t = r >> 3, g = r & 7;
+        const uint4 v = *reinterpret_cast<const uint4*>(
+            p.q + (static_cast<int64_t>(req) * kTokens + t) * p.q_token_stride +
+            ((2 * pair + hh) * kQPerKv + g) * kHeadDim + 16 * c);
+        *reinterpret_cast<uint4*>(sq + hh * kRows * 64 + r * 64 + ((c ^ ((r >> 1) & 3)) << 4)) = v;
+      }
+    } else {
+      constexpr int E = kQk, kLanes = 64 / E, kRowsPass = 32 * kSoftmaxWarps / kLanes, kPasses = 2 * kRows / kRowsPass;
+      const int li = lane % kLanes;
+      uint32_t w[kPasses][E / 2];
+#pragma unroll
+      for (int ps = 0; ps < kPasses; ++ps) {
+        const int R = ps * kRowsPass + tid / kLanes, hh = R >> 6, r = R & 63;
+        ld_bf16_raw<E>(p.qkv + (static_cast<int64_t>(req) * kTokens + (r >> 3)) * p.qkv_token_stride +
+                           ((2 * pair + hh) * kQPerKv + (r & 7)) * kHeadDim + E * li,
+                       w[ps]);
+      }
+#pragma unroll
+      for (int ps = 0; ps < kPasses; ++ps) {
+        const int R = ps * kRowsPass + tid / kLanes, hh = R >> 6, r = R & 63;
+        uint16_t b[E / 2];
+        qk_finish<E, kUnfused>(w[ps], p.qk_eps, false, b);
+        const int c = E * li;
+        st_bytes<E>(sq + hh * kRows * 64 + r * 64 + ((((c >> 4) ^ ((r >> 1) & 3)) << 4) | (c & 15)), b);
+      }
+    }
+    fence_proxy_async();
+    asm volatile("bar.arrive 5, %0;\n" ::"r"(32 * (kSoftmaxWarps + 1)) : "memory");
+    if constexpr (kQk > 0) {
+      if (ntn > 0) {
+        constexpr int E = kQk, kLanes = 64 / E, kRowsPass = 32 * kSoftmaxWarps / kLanes, kPasses = 32 / kRowsPass;
+        const int li = lane % kLanes;
+        uint32_t w[kPasses][E / 2];
+#pragma unroll
+        for (int ps = 0; ps < kPasses; ++ps) {
+          const int J = ps * kRowsPass + tid / kLanes, kv = J >> 4, hh = (J >> 3) & 1, t = J & 7;
+          ld_bf16_raw<E>(p.qkv + (static_cast<int64_t>(req) * kTokens + t) * p.qkv_token_stride +
+                             (p.num_q_heads + kv * p.num_kv_heads + 2 * pair + hh) * kHeadDim + E * li,
+                         w[ps]);
+        }
+        uint8_t* const snew = sm + kSmNew;
+#pragma unroll
+        for (int ps = 0; ps < kPasses; ++ps) {
+          const int J = ps * kRowsPass + tid / kLanes, kv = J >> 4, hh = (J >> 3) & 1, t = J & 7;
+          uint16_t b[E / 2];
+          qk_finish<E, kUnfused>(w[ps], p.qk_eps, kv == 1, b);
+          st_bytes<E>(snew + kv * kTokens * 128 + t * 128 + hh * 64 + E * li, b);
+        }
+        asm volatile("bar.sync 6, %0;\n" ::"r"(32 * kSoftmaxWarps) : "memory");
+      }
+    }
+  } else if (warp == kWQk) {
+    asm volatile("bar.sync 5, %0;\n" ::"r"(32 * (kSoftmaxWarps + 1)) : "memory");
+  }
+
+  float4* const stats = reinterpret_cast<float4*>(sm + kSmRecv);  // [4 slots][128 rows] (mt, l part 0, l part 1, 0)
+  if (warp < kSoftmaxWarps) {
+    // ------------------------------------------------------------------ softmax (one thread per row, two groups)
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 168;\n" ::: "memory");
+    const int group = warp >> 2, q4 = warp & 3;
+    const int gtid = tid & 127;  // thread index within the group
+    const int hh = lane >> 4, row = 16 * q4 + (lane & 15);
+    const int rec_row = 64 * hh + row;
+    const int tok = row >> 3;
+    const int pos = seq_len - kTokens + tok;
+    const int klo = p.window_left >= 0 ? max(lo, pos - p.window_left) : 0;
+    const uint32_t lane_base = (32u * q4) << 16;
+    uint8_t* const prow0 = sm + kSmP + hh * kRows * 128 + row * 128;
+    const float2 sc = make_float2(p.scale_log2, p.scale_log2);
+    const float2 k448 = make_float2(kPScale, kPScale);
+    for (int t = group; t < ntiles; t += 2) {
+      const int bb = t & 1;
+      if constexpr (kQk > 0) {
+        if (t >= tn0 && t < tn0 + ntn) {  // uniform over the group
+          const int st = t % kStages, kp = (p0 + t) * kTile;
+          const int kb = max(tnew, kp), nk = min(seq_len, kp + kTile) - kb;
+          mbar_wait(full_bar(st), (t / kStages) & 1);
+          const uint8_t* const snew = sm + kSmNew;
+          for (int i = gtid; i < 2 * nk * 8; i += 128) {
+            const int kv = i / (nk * 8), rem = i - kv * nk * 8, key = kb + (rem >> 3), c = rem & 7;
+            const int rr = key - kp, tt = key - tnew;
+            const uint4 v = *reinterpret_cast<const uint4*>(snew + kv * kTokens * 128 + tt * 128 + 16 * c);
+            uint8_t* const stage = sm + (kv ? kSmV : kSmK) + st * kStageBytes;
+            *reinterpret_cast<uint4*>(stage + rr * 128 + ((c ^ (rr & 7)) << 4)) = v;
+            const int64_t loc = p.cache_loc[static_cast<int64_t>(req) * kTokens + tt];
+            uint8_t* const pool = kv ? p.v_store : p.k_store;
+            if (loc != 0) *reinterpret_cast<uint4*>(pool + loc * p.pool_row_bytes + pair * 128 + 16 * c) = v;
+          }
+          fence_proxy_async();
+          mbar_arrive(patch_bar(bb));
+        }
+      }
+      mbar_wait(s_full_bar(bb), (t >> 1) & 1);
+      tc_fence_after();
+      float x[128];
+#pragma unroll
+      for (int j = 0; j < 128; j += 32)
+        tmem_ld32(tmem + lane_base + 128u * bb + j, *reinterpret_cast<float(*)[32]>(x + j));
+      tmem_wait_ld();
+      tc_fence_before();
+      mbar_arrive(s_free_bar(bb));  // score buffer bb may take the QK of tile t + 2
+      float hmax[2];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        float* const xh = x + 64 * h;
+        const int key0 = (p0 + t) * kTile + 64 * h;
+        if (!(key0 >= klo && key0 + 63 <= pos)) {
+#pragma unroll
+          for (int i = 0; i < 64; ++i) {
+            const int key = key0 + i;
+            if (key < klo || key > pos) xh[i] = -INFINITY;
+          }
+        }
+        float mx[22];
+#pragma unroll
+        for (int i = 0; i < 21; ++i) mx[i] = max3(xh[3 * i], xh[3 * i + 1], xh[3 * i + 2]);
+        mx[21] = xh[63];
+#pragma unroll
+        for (int i = 0; i < 7; ++i) mx[i] = max3(mx[3 * i], mx[3 * i + 1], mx[3 * i + 2]);
+        hmax[h] = max3(max3(mx[0], mx[1], mx[2]), max3(mx[3], mx[4], mx[5]), fmaxf(mx[6], mx[21]));
+      }
+      const float smax = fmaxf(hmax[0], hmax[1]);
+      const float mtile = smax == -INFINITY ? -INFINITY : smax * p.scale_log2;
+      const float mu = mtile == -INFINITY ? 0.0f : mtile;
+      const float2 nmu = make_float2(-mu, -mu);
+      float lp[2];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        float* const xh = x + 64 * h;
+        float2 ls[2] = {make_float2(0.0f, 0.0f), make_float2(0.0f, 0.0f)};
+#pragma unroll
+        for (int i = 0; i < 64; i += 2) {
+          const float2 y = fma2(make_float2(xh[i], xh[i + 1]), sc, nmu);
+          const float2 pi = make_float2(fast_exp2(y.x), fast_exp2(y.y));
+          ls[(i >> 1) & 1] = add2(ls[(i >> 1) & 1], pi);
+          const float2 pq = mul2(pi, k448);
+          xh[i] = pq.x;
+          xh[i + 1] = pq.y;
+        }
+        lp[h] = (ls[0].x + ls[1].x) + (ls[0].y + ls[1].y);
+      }
+      // P buffer bb: last read by the PV MMAs of tile t - 2 (done once o_full of tile t - 2 completed)
+      if (t >= 2) {
+        mbar_wait(o_full_bar(bb), ((t >> 1) + 1) & 1);
+        tc_fence_after();
+      }
+      uint8_t* const prow = prow0 + bb * 2 * kRows * 128;
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        uint4 w;
+        w.x = e4m3x4(x[16 * c + 0], x[16 * c + 1], x[16 * c + 2], x[16 * c + 3]);
+        w.y = e4m3x4(x[16 * c + 4], x[16 * c + 5], x[16 * c + 6], x[16 * c + 7]);
+        w.z = e4m3x4(x[16 * c + 8], x[16 * c + 9], x[16 * c + 10], x[16 * c + 11]);
+        w.w = e4m3x4(x[16 * c + 12], x[16 * c + 13], x[16 * c + 14], x[16 * c + 15]);
+        *reinterpret_cast<uint4*>(prow + ((c ^ (row & 7)) << 4)) = w;
+      }
+      fence_proxy_async();
+      tc_fence_before();
+      mbar_arrive(p_full_bar(bb));
+      // statistics slot t % 4 (last used by tile t - 4): free once the correction finished tile t - 2
+      if (t >= 2) mbar_wait(o_free_bar(bb), ((t >> 1) + 1) & 1);
+      stats[(t & 3) * 128 + rec_row] = make_float4(mtile, lp[0], lp[1], 0.0f);
+      mbar_arrive(st_full_bar(t & 3));
+    }
+  } else if (warp < kSoftmaxWarps + 4) {
+    // ------------------------------------------------------------------ correction (one thread per row)
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 120;\n" ::: "memory");
+    const int q4 = warp & 3;
+    const int hh = lane >> 4, row = 16 * q4 + (lane & 15);
+    const int rec_row = 64 * hh + row;
+    const uint32_t lane_base = (32u * q4) << 16;
+    float o[64];
+#pragma unroll
+    for (int d = 0; d < 64; ++d) o[d] = 0.0f;
+    float m = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    for (int t = 0; t < ntiles; ++t) {
+      const int bb = t & 1;
+      mbar_wait(st_full_bar(t & 3), (t >> 2) & 1);
+      const float4 st = stats[(t & 3) * 128 + rec_row];
+      const float mtile = st.x;
+      const float mnew = fmaxf(m, mtile);
+      const float ar = m == -INFINITY ? 0.0f : fast_exp2(m - mnew);
+      const float at = mtile == -INFINITY ? 0.0f : fast_exp2(mtile - mnew);
+      mbar_wait(o_full_bar(bb), (t >> 1) & 1);
+      tc_fence_after();
+#pragma unroll
+      for (int hf = 0; hf < 2; ++hf) {
+        float v[32];
+        tmem_ld32(tmem + lane_base + 256u + 64u * bb + 32u * hf, v);
+        tmem_wait_ld();
+#pragma unroll
+        for (int i = 0; i < 32; ++i) o[32 * hf + i] = fmaf(o[32 * hf + i], ar, v[i] * at);
+      }
+      tc_fence_before();
+      mbar_arrive(o_free_bar(bb));  // output buffer bb read; statistics slot of tile t read
+      l0 = l0 * ar + st.y * at;
+      l1 = l1 * ar + st.z * at;
+      m = mnew;
+    }
+    const float lrowsum = l0 + l1;
+    // records: the block's 128 rows staged in shared memory (the K stages: every tile's MMAs completed before the last
+    // output-buffer wait above), then one half-warp per 272-byte record (coalesced), as the main kernel
+    float* const rs = reinterpret_cast<float*>(sm + kSmK);
+#pragma unroll
+    for (int d = 0; d < 64; d += 4)
+      *reinterpret_cast<float4*>(rs + rec_row * kRec + d) = make_float4(o[d], o[d + 1], o[d + 2], o[d + 3]);
+    *reinterpret_cast<float4*>(rs + rec_row * kRec + kHeadDim) = make_float4(m, lrowsum, 0.0f, 0.0f);
+    asm volatile("bar.sync 9, %0;\n" ::"r"(128) : "memory");
+    const int cw = warp - kSoftmaxWarps, hl = lane >> 4, c16 = lane & 15;
+    for (int r2 = 2 * cw; r2 < 128; r2 += 8) {
+      const int RR = r2 + hl, kv2 = 2 * pair + (RR >> 6), rw = RR & 63;
+      float* const g =
+          p.partial + (((static_cast<int64_t>(req) * p.num_kv_heads + kv2) * kRows + rw) * p.num_splits + split) * kRec;
+      const float4* const src = reinterpret_cast<const float4*>(rs + RR * kRec);
+      reinterpret_cast<float4*>(g)[c16] = src[c16];
+      if (c16 == 0) reinterpret_cast<float4*>(g)[16] = src[16];
+    }
+  } else {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 56;\n" ::: "memory");
+    if (warp == kWLoad) {
+      if (lane == 0) {
+        for (int t = kFirst; t < ntiles; ++t) {  // tile t once tile t - 2 has landed
+          mbar_wait(full_bar((t - 2) % kStages), ((t - 2) / kStages) & 1);
+          if (t >= kStages) mbar_wait(empty_bar(t % kStages), (t / kStages - 1) & 1);
+          issue_tile(t);
+        }
+      }
+    } else if (warp == kWQk) {
+      if (lane == 0) {
+        constexpr uint32_t id_qk = idesc_f8(64, 128, 0);
+        const uint32_t sq = smem_u32(sm + kSmQ);
+        for (int t = 0; t < ntiles; ++t) {
+          const int s = t % kStages, b = t & 1;
+          mbar_wait(full_bar(s), (t / kStages) & 1);
+          if constexpr (kQk > 0)
+            if (t >= tn0 && t < tn0 + ntn) mbar_wait(patch_bar(b), 0);
+          if (t >= 2) mbar_wait(s_free_bar(b), ((t >> 1) + 1) & 1);  // the group loaded tile t - 2's scores
+          tc_fence_after();
+          const uint32_t sk = smem_u32(sm + kSmK + s * kStageBytes);
+#pragma unroll
+          for (int hh = 0; hh < 2; ++hh) {
+#pragma unroll
+            for (int k = 0; k < 2; ++k)
+              mma_f8(tmem + ((16u * hh) << 16) + 128u * b, sdesc(sq + hh * kRows * 64 + 32 * k, 512, kSw64),
+                     sdesc(sk + 64 * hh + 32 * k, 1024, kSw128), id_qk, k);
+          }
+          mma_commit(s_full_bar(b));
+        }
+      }
+    } else if (warp == kWPv) {
+      if (lane == 0) {
+        constexpr uint32_t id_pv = idesc_f8(64, 64, 1);
+        const uint32_t sp = smem_u32(sm + kSmP);
+        for (int t = 0; t < ntiles; ++t) {
+          const int s = t % kStages, b = t & 1;
+          mbar_wait(p_full_bar(b), (t >> 1) & 1);
+          if (t >= 2) mbar_wait(o_free_bar(b), ((t >> 1) + 1) & 1);  // the correction read tile t - 2's output
+          tc_fence_after();
+          const uint32_t sv = smem_u32(sm + kSmV + s * kStageBytes);
+#pragma unroll
+          for (int hh = 0; hh < 2; ++hh) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+              mma_f8(tmem + ((16u * hh) << 16) + 256u + 64u * b,
+                     sdesc(sp + (b * 2 + hh) * kRows * 128 + 32 * k, 1024, kSw128),
+                     sdesc(sv + 64 * hh + 4096 * k, 1024, kSw128), id_pv, k);
+          }
+          mma_commit(o_full_bar(b));
+          mma_commit(empty_bar(s));
+        }
+      }
+    }
+  }
+  tc_fence_before();
+  __syncthreads();
   if constexpr (kUsePDL) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
   if (warp == 0) {
     tc_fence_after();
@@ -871,15 +1341,31 @@ __global__ void __launch_bounds__(kThreads, 1)
 // blockIdx.x * (8 / G) + w / G, group g = w % G merges the splits s = g, g + G, ... (lane j: output dims 2j, 2j + 1)
 // against its own maximum M_g: O_g = sum exp2(m_s - M_g) o_s, L_g = sum exp2(m_s - M_g) l_s, in split order; then with
 // M = max M_g: O = sum exp2(M_g - M) O_g, L likewise, in group order.
-template <bool kUsePDL, bool kNormGate>
+// kPre: this thread's gate values are loaded right AFTER the dependency wait, before the records, so their round trip
+// overlaps the records' instead of following the merge (with kMergePre the main kernel lets this grid launch right after its
+// own wait). Bitwise equal either way.
+template <bool kUsePDL, bool kNormGate, bool kEarlyTrigger = false, bool kPre = false>
 __global__ void __launch_bounds__(256) full_verify_attn_merge_kernel(const Params p, int merge_groups) {
   __shared__ float sums[8][kHeadDim + 2];
-  if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
   const int G = merge_groups;
   const int kvh = blockIdx.y, req = blockIdx.z;
+  int seq_len_raw = p.seq_lens[req];  // a graph input: its load overlaps the dependency
+  uint32_t gate_raw = 0u;
+  if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  if constexpr (kNormGate && kPre) {  // after the wait (written by the projection, a PDL-chained earlier kernel)
+    const int lane_ = threadIdx.x & 31, row_ = blockIdx.x * (8 / G) + (threadIdx.x >> 5) / G;
+    const int t_ = row_ >> 3, h_ = kvh * kQPerKv + (row_ & 7);
+    gate_raw = *reinterpret_cast<const unsigned int*>(
+        p.gate + (static_cast<int64_t>(req) * kTokens + t_) * p.gate_token_stride + h_ * kHeadDim + 2 * lane_);
+  }
+  // kEarlyTrigger: the dependents (the output projection) may launch now and start their weight stream during the
+  // merge; they read this kernel's output only after their own dependency wait (full completion of this grid).
+  // Without it this kernel lets them launch only as its blocks exit.
+  if constexpr (kUsePDL && kEarlyTrigger) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+  asm volatile("mov.b32 %0, %0;\n" : "+r"(seq_len_raw));
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int row = blockIdx.x * (8 / G) + warp / G, grp = warp % G;
-  const int seq_len = p.seq_lens[req];
+  const int seq_len = seq_len_raw;
   int nsplit = 0;
   {
     int p0, p1, lo;
@@ -965,8 +1451,10 @@ __global__ void __launch_bounds__(256) full_verify_attn_merge_kernel(const Param
     for (int mask = 16; mask >= 2; mask >>= 1) ss = ss + __shfl_xor_sync(0xffffffffu, ss, mask);
     ss = __shfl_sync(0xffffffffu, ss, lane | 1);
     const float r = rsqrtf(ss / static_cast<float>(kHeadDim) + p.norm_eps);
-    const float2 g = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
-        p.gate + (static_cast<int64_t>(req) * kTokens + t) * p.gate_token_stride + h * kHeadDim + 2 * lane));
+    const float2 g = kPre ? __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gate_raw))
+                          : __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
+                                p.gate + (static_cast<int64_t>(req) * kTokens + t) * p.gate_token_stride + h * kHeadDim +
+                                2 * lane));
     const auto sig = [](float z) { return __fdividef(1.0f, 1.0f + __expf(-z)); };
     float y0 = x.x * r, y1 = x.y * r;
     y0 *= sig(g.x);
@@ -1014,7 +1502,8 @@ inline CUtensorMap pool_map(const void* base, int64_t slots, int64_t row_bytes) 
 
 }  // namespace fva_host
 
-template <bool kUsePDL, bool kClusterMerge, bool kNormGate, int kQk, bool kUnfused>
+template <bool kUsePDL, bool kClusterMerge, bool kNormGate, int kQk, bool kUnfused, int kStage = 0,
+          bool kEarlyTrigger = false, bool kMergePre = false, bool kSrMain = false, bool kGatePre = false>
 struct FullVerifyAttnKernel {
   static void run(const tvm::ffi::TensorView q,           // [R*8, Hq, 64] e4m3, heads/dims contiguous (kQk: unused)
                   const tvm::ffi::TensorView k_pool,      // [slots, Hkv*64] e4m3, rows contiguous
@@ -1111,9 +1600,13 @@ struct FullVerifyAttnKernel {
     const CUtensorMap k_map = fva_host::pool_map(k_pool.data_ptr(), k_pool.size(0), k_pool.size(1));
     const CUtensorMap v_map = fva_host::pool_map(v_pool.data_ptr(), v_pool.size(0), v_pool.size(1));
 
-    constexpr auto kernel = fva::full_verify_attn_kernel<kUsePDL, kClusterMerge, kNormGate, kQk, kUnfused>;
+    static_assert(!kSrMain || (!kClusterMerge && !kMergePre), "SR main kernel: merge kernel path without MERGE_PRE");
+    constexpr auto kernel = kSrMain ? fva::full_verify_attn_sr_kernel<kUsePDL, kNormGate, kQk, kUnfused, kStage>
+                                    : fva::full_verify_attn_kernel<kUsePDL, kClusterMerge, kNormGate, kQk, kUnfused,
+                                                                   kStage, kMergePre>;
     constexpr int kSmem = kQk > 0 ? fva::kSmBytesQk : fva::kSmBytes;
-    constexpr auto merge = fva::full_verify_attn_merge_kernel<kUsePDL, kNormGate>;
+    // kGatePre: the merge kernel's gate preload (kPre) without MERGE_PRE's early trigger in the main kernel
+    constexpr auto merge = fva::full_verify_attn_merge_kernel<kUsePDL, kNormGate, kEarlyTrigger, kMergePre || kGatePre>;
     static bool configured = false;
     if (!configured) {
       RuntimeDeviceCheck(::cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
@@ -1129,7 +1622,7 @@ struct FullVerifyAttnKernel {
                                                                                                     k_map, v_map);
       return;
     }
-    LaunchKernel(grid, fva::kThreads, out.device(), kSmem)
+    LaunchKernel(grid, kSrMain ? fva::kSrThreads : fva::kThreads, out.device(), kSmem)
         .config({.use_pdl = kUsePDL})(kernel, params, k_map, v_map);
     // warps per row in the merge: enough warps in total for the row count (tunable, bench/bench_full_verify_attn.py)
     const int64_t rows = reqs * hkv * fva::kRows;

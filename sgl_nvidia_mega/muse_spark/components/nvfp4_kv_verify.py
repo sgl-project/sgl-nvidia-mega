@@ -266,6 +266,8 @@ def _forward_extend_around(
         out=out,
         use_pdl=getattr(self, "_muse_vr_nvfp4_verify_pdl", False),
     )
+    if _shadow_enabled() and not torch.cuda.is_current_stream_capturing():
+        _shadow_compare(original, self, q, k, v, layer, forward_batch, kwargs, o)
     return o.view(-1, hq * layer.head_dim)
 
 
@@ -274,6 +276,51 @@ def _layer_is_fp8(backend, layer) -> bool:
     from . import nvfp4_kv_mixed
 
     return nvfp4_kv_mixed.requested() and nvfp4_kv_mixed.layer_is_fp8(backend, layer)
+
+
+def _shadow_enabled() -> bool:
+    return os.environ.get("MUSE_VR_NVFP4_KV_VERIFY_SHADOW", "0").strip() == "1"
+
+
+def _shadow_compare(original, backend, q, k, v, layer, forward_batch, kwargs, o):
+    """Validation instrument (eager only): run the stock path on the same inputs and log the difference."""
+    import torch
+
+    saved = forward_batch._attn_output
+    forward_batch._attn_output = None
+    try:
+        ref = (
+            original(backend, q, None, None, layer, forward_batch, False, **kwargs)
+            .view(o.shape)
+            .float()
+        )
+    finally:
+        forward_batch._attn_output = saved
+    got = o.float()
+    d = (got - ref).norm() / ref.norm().clamp_min(1e-30)
+    n = _state.setdefault("shadow_n", 0)
+    _state["shadow_n"] = n + 1
+    stats = _state.setdefault(
+        "shadow", {"max_rel": 0.0, "sum_rel": 0.0, "calls": 0, "nonfinite": 0}
+    )
+    rel = float(d)
+    stats["calls"] += 1
+    stats["sum_rel"] += rel
+    stats["max_rel"] = max(stats["max_rel"], rel)
+    stats["nonfinite"] += int(not bool(torch.isfinite(got).all()))
+    if n < 3 or n % 500 == 0:
+        logger.warning(
+            "muse_vr_plugin: nvfp4_kv_verify shadow #%d layer %d window %d rows %d: rel l2 vs stock %.4f "
+            "(max %.4f mean %.4f nonfinite %d)",
+            n,
+            layer.layer_id,
+            layer.sliding_window_size,
+            q.shape[0],
+            rel,
+            stats["max_rel"],
+            stats["sum_rel"] / stats["calls"],
+            stats["nonfinite"],
+        )
 
 
 def install() -> bool:

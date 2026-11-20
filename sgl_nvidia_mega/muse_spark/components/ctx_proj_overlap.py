@@ -26,7 +26,8 @@ stay unsharded unless the cap is raised. Because that equality depends on the GE
 shard-eligible call runs a self-check on the served weight: for every row count 8, 16, ... up to the cap, this rank's
 slice computed on the side stream must equal the same columns of the full GEMM bit for bit; the ranks agree on the
 verdict (minimum over the tensor-parallel group) and shard mode stays off for good if any rank saw a difference. Every
-rank takes the same path for a block, so the gather (a collective) is issued on all of them or none.
+rank takes the same path for a block, so the gather (a collective) is issued on all of them or none. ``MUSE_VR_CTX_PROJ_OVERLAP_SHADOW=1`` (debug) recomputes the projection on the worker's stream for every
+handed-over result and tallies bitwise matches with ``bed.shadow_result``.
 
 ``MUSE_VR_CTX_PROJ_OVERLAP_SIDE_GATHER=1`` (default off; shard mode only) also moves the gather and ``hidden_norm`` to the
 side stream, right after the slice GEMM, so the worker's call only waits for finished work. The gather cannot share the
@@ -509,6 +510,11 @@ def _gather_columns_on(vg, group, local: torch.Tensor, site: str) -> torch.Tenso
     w = group.world_size
     assert w * rows <= vg.pull_out.shape[0], "gather rows beyond the symmetric stack"
     stack = vg.pull_out[: w * rows]
+    if bed.flag("ctx_proj_rows") and pull_bounded.all_gather_pull_rows(
+        vg.comm, local, stack, out_mc_ptr=vg.pull_mc_ptr, site=site
+    ):
+        # MUSE_VR_CTX_PROJ_ROWS=1 (with the bounded pull engaged): the gather writes the [rows, world * n] matrix itself
+        return stack.view(rows, w * n)
     # SGLang's pull kernel, or its copy with bounded barrier waits (MUSE_VR_PULL_BOUNDED=1): same bytes
     pull_bounded.all_gather_pull(
         vg.comm, local, stack, out_mc_ptr=vg.pull_mc_ptr, site=site
@@ -771,6 +777,13 @@ def _around_proj(original, draft_model, target_hidden):
         return original(draft_model, target_hidden)
     proj = take(draft_model, target_hidden)
     if proj is not None:
+        if bed.flag(
+            NAME + "_shadow"
+        ):  # debug: recompute on this stream and compare bits (host sync)
+            ref = original(draft_model, target_hidden)
+            bed.shadow_result(
+                NAME, bool(torch.equal(ref.view(torch.int16), proj.view(torch.int16)))
+            )
         return proj
     return original(draft_model, target_hidden)
 
