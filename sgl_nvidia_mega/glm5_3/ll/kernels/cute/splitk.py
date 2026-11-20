@@ -42,8 +42,23 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-#: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
+#: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103 (the planning default
+#: without a GPU; :func:`smem_capacity_bytes` reads the device's own).
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
+
+
+@functools.lru_cache(maxsize=None)
+def smem_capacity_bytes(device_index: int) -> int:
+    """The opt-in per-CTA shared memory of GPU ``device_index``
+    (``cudaDevAttrMaxSharedMemoryPerBlockOptin``), which a launch reserves whole to
+    keep one CTA per SM: 232448 B on GB300 and on Rubin (SM107) alike, CuTeDSL's
+    "sm_100" value. Without the attribute, CuTeDSL's value."""
+    try:
+        props = _torch.cuda.get_device_properties(device_index)
+        return int(props.shared_memory_per_block_optin)
+    except Exception:  # noqa: BLE001 - an older torch without the field
+        return _SMEM_CAPACITY_BYTES
+
 
 #: K extent of one CTA tile.
 _CTA_K = 128
@@ -395,8 +410,11 @@ class SplitKDenseGemmKernel:
         tactic: SplitKTactic,
         use_pdl: bool,
         has_bias: bool,
+        smem_capacity: int = _SMEM_CAPACITY_BYTES,
     ) -> None:
         self.acc_dtype = cutlass.Float32
+        # dynamic shared memory each CTA reserves: the device's whole opt-in
+        self.smem_capacity = int(smem_capacity)
         self.cta_m = tactic.mma_m
         self.cta_n = tactic.mma_n
         self.cta_k = _CTA_K
@@ -442,7 +460,7 @@ class SplitKDenseGemmKernel:
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(self.smem_capacity),
             stream=stream,
             use_pdl=self.use_pdl,
         )
@@ -1035,7 +1053,12 @@ def _get_compiled_splitk_kernel(
         )
         return cute_ext.compile(
             _bmm_bias if has_bias else _bmm_no_bias,
-            SplitKDenseGemmKernel(tactic=tactic, use_pdl=use_pdl, has_bias=has_bias),
+            SplitKDenseGemmKernel(
+                tactic=tactic,
+                use_pdl=use_pdl,
+                has_bias=has_bias,
+                smem_capacity=smem_capacity_bytes(device_index),
+            ),
             *(compile_tensors if has_bias else compile_tensors[:3]),
             _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
         )
@@ -1097,7 +1120,11 @@ def run_splitk_dense(
     ``out`` has A's dtype, or ``float32`` to store the FP32 accumulator without
     rounding. Any ``M >= 1`` that ``tactic`` serves is accepted.
     """
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, bias, out))
+    validate_tactic(
+        tactic,
+        *_validate_runtime_tensors(a, b, bias, out),
+        smem_capacity=smem_capacity_bytes(a.get_device()),
+    )
     has_bias = bias is not None
     with _torch.cuda.device(a.device):
         tensors = _to_cute_swap(a, b, out, bias)

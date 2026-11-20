@@ -93,6 +93,8 @@ PRIORITY_UNIT = "ll.moe.alt_stream_priority"
 # the small-batch routing kernel (stock FlashInfer 0.7.2) it loses at 5 rows (+1.2%) and
 # 6 rows (+2.4%): the shared expert already wins its race there. Hence opt-in.
 PRIORITY_MAX_ROWS = 6
+# On Rubin (SM107, ``ll.device``) the same pieces run (FlashInfer's trtllm-gen MoE has
+# SM107 cubins) under GB300's gate: derived, not measured.
 
 
 def _next_power_of_2(n: int) -> int:
@@ -458,8 +460,11 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
         return f"{mode} steps are the draft's"
     if profile.tp != 4:
         return f"TP{profile.tp}: ll.moe serves TP4 (the small-M MoE engine serves TP8)"
-    if tuple(profile.sm) != (10, 3):
-        return f"sm_{profile.sm[0]}{profile.sm[1]}: measured on GB300 (sm_103) only"
+    from sgl_nvidia_mega.glm5_3.ll import device
+
+    why = device.reason(profile.sm)
+    if why is not None:
+        return why
     if rows > MAX_ROWS:
         return f"{rows} rows (the finalize hop serves <= {MAX_ROWS})"
     return None
@@ -472,7 +477,10 @@ def _family(model: Any, derived: Any, profile: Any):
         family = LlMoeFamily.of_model(model)
     except ValueError as e:
         return DeclinedFamily(str(e))
+    from sgl_nvidia_mega.glm5_3.ll import device
+
     family.sm, family.sms = tuple(profile.sm), profile.sms
+    device.note_derived("ll.moe", profile.sm, "GB300's shared-expert stream gate")
     return family
 
 

@@ -17,8 +17,9 @@ Stated limits of this spec:
   takes the branches the stock step copies; a reason on any rank stops every rank
   (``runtime/executor.py``).
 * TP4 at 3-6 tokens per request, up to 48 rows (``profile.UNITS``), runs the kernel
-  units composed per width (``runtime/composed.py``, ``registry``, ``units``); a width
-  no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
+  units composed per width (``runtime/composed.py``, ``registry``, ``units``), on GB300
+  (SM103, measured plans) and Rubin (SM107, plans derived from GB300's: ``ll/device.py``);
+  a width no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
   rows (``plan.py``).
 * PD disaggregation is served at the TP4 profiles' decode role (``pd_reasons``); the
   prefill role runs without the flag.
@@ -230,8 +231,7 @@ def decode_graph_backends() -> frozenset:
 
 REQUIREMENTS = Requirements(
     # B300 / GB300 (SM103) and Rubin / VR NVL72 (SM107): the same kernels (the TP4
-    # kernel units are measured and served on SM103 only: on SM107 a TP4 build serves
-    # no width and stops, naming them)
+    # kernel units' plans are measured on SM103 and derived for SM107: ll/device.py)
     isas=frozenset({"sm_103", "sm_107"}),
     tp_sizes=frozenset(tp for tp, _ in ACCEPTED),
     resident_blocks=RESIDENT_BLOCKS,
