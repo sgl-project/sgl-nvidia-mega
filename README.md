@@ -35,12 +35,16 @@ and what this README says of GLM-5.3 holds for GLM-5.2. On `nvidia/GLM-5.2-NVFP4
 own target verify and draft steps shows no difference, and GSM8K-200 (strict match)
 scores 0.975 with the megakernel and 0.960 without it.
 
-GLM-5.2 at TP16 on Rubin (VR200, SM107), one request, EAGLE 7 steps / 8 draft
-tokens, has a separate path in `sgl_nvidia_mega/glm5_3/sm107`: prebuilt cubins for
-the target decode chain, the draft and the verify tail, turned on with `GLM5MK=1`
-and `GLM5MK_ARTIFACTS=<cubin dir>`, not with `--enable-nvidia-megakernel`. The two
-switches do not combine: the GLM-5.3 spec admits TP8 and TP4 only, and the sm107 path
-refuses any TP other than 16.
+At TP16 on Rubin (VR200, SM107, four trays), one request, EAGLE 7 steps / topk 1 /
+8 draft tokens, the same flag runs `sgl_nvidia_mega/glm5_3/sm107` for GLM-5.2: the
+75-layer decoder chain, dense layers 0-2, the fused NextN draft and the fused verify
+tail, launched from prebuilt cubins. The GLM-5.3 specs select it by the TP size, and
+refuse TP16 on any other GPU. It needs `SGLANG_NVIDIA_MEGAKERNEL_GLM_SM107_CUBINS` set
+to the cubin directory (`{chain,d012,draft,tail}/{entry.cubin,CALL.json}`),
+`SGLANG_DSA_FUSE_TOPK=0`, `--kv-cache-dtype fp8_e4m3 --dsa-decode-backend trtllm
+--moe-runner-backend flashinfer_trtllm --speculative-algorithm EAGLE
+--speculative-num-steps 7 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8`.
+Steps with more than one request run SGLang's forward.
 
 ### Speculative step graph (any EAGLE v2 model)
 

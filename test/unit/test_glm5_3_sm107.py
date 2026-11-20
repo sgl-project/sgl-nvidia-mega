@@ -24,53 +24,109 @@ def test_the_package_imports_without_sglang_torch_or_cute_dsl():
         "assert not bad, bad\n"
     )
     env = dict(os.environ, PYTHONPATH=str(PKG.parents[2]))
-    env.pop("GLM5MK", None)
     subprocess.run([sys.executable, "-c", code], check=True, env=env)
 
 
 @pytest.fixture
-def mk(monkeypatch):
+def mk():
     import sgl_nvidia_mega.glm5_3.sm107 as mk
 
-    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
-    monkeypatch.delattr(mk.install, "_done", raising=False)
-    for name in (mk.TARGET, mk.DRAFT_TARGET):
-        monkeypatch.delitem(sys.modules, name, raising=False)
     return mk
 
 
-def test_the_hooks_install_only_with_glm5mk(mk, monkeypatch):
-    monkeypatch.delenv("GLM5MK", raising=False)
-    assert mk.install() is False
-    monkeypatch.setenv("GLM5MK", "1")
-    assert mk.install() is True and mk.install() is True
-    (finder,) = [f for f in sys.meta_path if isinstance(f, mk._Finder)]
-    assert set(finder.targets) == {mk.TARGET, mk.DRAFT_TARGET}
+def test_the_flag_is_the_only_switch():
+    """--enable-nvidia-megakernel at TP16 is the only way in: glm5_3's specs dispatch
+    to sm107; the plugin has no switch of its own and installs no import hooks."""
+    sources = [PKG.parents[1] / "plugin.py", *PKG.glob("*.py")]
+    for path in sources:
+        text = path.read_text()
+        assert "GLM5MK" not in text and "meta_path" not in text, path
+    spec_src = (PKG.parent / "spec.py").read_text()
+    draft_src = (PKG.parent / "draft.py").read_text()
+    assert "sm107.config_reasons(cfg, hf_config)" in spec_src
+    assert "sm107.build_target(model, hf_config, ctx)" in spec_src
+    assert "sm107.build_draft(model, hf_config, ctx)" in draft_src
+    assert not (PKG / "root").exists()
 
 
-def test_the_model_runner_wrapper_marks_the_class_once(mk):
-    runner = type("ModelRunner", (), {"load_model": lambda s: 0, "init_cuda_graphs": lambda s: 0})
-    module = types.ModuleType("fake_model_runner")
+def test_the_cubin_directory_is_refused_when_unset_or_incomplete(mk, monkeypatch, tmp_path):
+    monkeypatch.delenv(mk.ARTIFACTS_ENV, raising=False)
+    (reason,) = mk.artifact_reasons()
+    assert mk.ARTIFACTS_ENV in reason and "not set" in reason
+    monkeypatch.setenv(mk.ARTIFACTS_ENV, str(tmp_path))
+    for part in mk.ARTIFACT_PARTS:
+        (tmp_path / part).mkdir()
+        for name in mk.ARTIFACT_FILES:
+            (tmp_path / part / name).write_bytes(b"x")
+    assert mk.artifact_reasons() == []
+    (tmp_path / "tail" / "CALL.json").unlink()
+    (reason,) = mk.artifact_reasons()
+    assert "tail/CALL.json" in reason
+
+
+class _Mode:
+    def __init__(self, name):
+        self.name = name
+
+    def is_target_verify(self):
+        return self.name == "target_verify"
+
+    def is_idle(self):
+        return self.name == "idle"
+
+
+class _Rows:
+    def __init__(self, n):
+        self.shape = (n,)
+
+
+def _batch(bs, mode):
+    return types.SimpleNamespace(batch_size=bs, forward_mode=_Mode(mode))
+
+
+def test_the_built_plans_one_request_only(mk, monkeypatch):
+    monkeypatch.setattr(mk, "_step_class", lambda: (lambda **k: k))
+    target, draft = mk.Built("t", is_draft=False), mk.Built("d", is_draft=True)
+    assert target.widths == draft.widths == (mk.TOKENS_PER_REQUEST,)
+    assert target.plan(_Rows(8), _batch(1, "target_verify")) == {"mode": "target_verify", "rows": 8}
+    assert target.plan(_Rows(16), _batch(2, "target_verify")) is None
+    assert target.plan(_Rows(1), _batch(1, "decode")) is None
+    assert draft.plan(_Rows(8), _batch(1, "draft_extend")) == {"mode": "decode", "rows": 8}
+    assert draft.plan(_Rows(1), _batch(1, "decode")) == {"mode": "decode", "rows": 1}
+    assert draft.plan(_Rows(2), _batch(2, "decode")) is None
+    assert draft.plan(_Rows(0), _batch(1, "idle")) is None
+    assert target.forward(None, lambda *a, **k: (a, k), 1, x=2) == ((1,), {"x": 2})
+
+
+def test_the_runner_binds_before_its_graphs_once(mk, monkeypatch):
+    calls = []
+    runner = type("ModelRunner", (), {"init_cuda_graphs": lambda self: calls.append("graphs")})
+    module = types.ModuleType("sglang.srt.model_executor.model_runner")
     module.ModelRunner = runner
-    mk._wrap(module)
-    wrapped = runner.load_model
-    mk._wrap(module)
-    assert runner._glm5mk is True and runner.load_model is wrapped
+    for name in ("sglang", "sglang.srt", "sglang.srt.model_executor"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    fake_target = types.SimpleNamespace(bind_runner=lambda r: calls.append("target"))
+    fake_draft = types.SimpleNamespace(bind_runner=lambda r: calls.append("draft"))
+    monkeypatch.setitem(sys.modules, "sgl_nvidia_mega.glm5_3.sm107.target", fake_target)
+    monkeypatch.setitem(sys.modules, "sgl_nvidia_mega.glm5_3.sm107.draft", fake_draft)
+    monkeypatch.setattr(mk, "target", fake_target, raising=False)
+    monkeypatch.setattr(mk, "draft", fake_draft, raising=False)
+    mk._bind_before_graphs()
+    wrapped = runner.init_cuda_graphs
+    mk._bind_before_graphs()
+    assert runner.init_cuda_graphs is wrapped and runner._glm5_3_sm107 is True
+    runner().init_cuda_graphs()
+    draft_runner = runner()
+    draft_runner.is_draft_worker = True
+    draft_runner.init_cuda_graphs()
+    assert calls == ["target", "graphs", "draft", "graphs"]
 
 
-def test_the_plugin_entry_point_installs_the_hooks(monkeypatch):
-    import sgl_nvidia_mega.glm5_3.sm107 as mk
-    from sgl_nvidia_mega import plugin
-
-    called = []
-    monkeypatch.setattr(mk, "install", lambda: called.append(1))
-    monkeypatch.setitem(sys.modules, "sglang", None)
-    monkeypatch.setenv(plugin.GLM5_3_SM107_ENV, "1")
-    try:
-        plugin.register()
-    except (ImportError, ModuleNotFoundError):
-        pass
-    assert called == [1]
+def test_the_context_must_be_one_request_of_eight_tokens(mk):
+    mk._check_context(types.SimpleNamespace(tokens_per_request=8, widths=(8, 16)))
+    with pytest.raises(ValueError):
+        mk._check_context(types.SimpleNamespace(tokens_per_request=4, widths=(4, 8)))
 
 
 def test_no_binaries_and_no_cpp():

@@ -8,10 +8,9 @@ from . import target as launch
 SGLANG_READS = {
     "srt/distributed/parallel_state.py": ("get_tp_group",),
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_gather",),
-    "srt/model_executor/forward_batch_info.py": ("ForwardMode", "DRAFT_EXTEND_V2"),
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": ("ForwardMode", "DRAFT_EXTEND_V2"),
     "srt/speculative/eagle_utils.py": ("TreeMaskMode",),
     "srt/speculative/eagle_worker_common.py": ("build_tree_kernel_efficient",),
-    "srt/model_executor/model_runner.py": ("server_args",),
     "srt/speculative/eagle_worker_v2.py": (
         "EagleDraftWorker",
         "_draft_extend_for_decode",
@@ -31,8 +30,6 @@ VOCAB, SHARD, HIDDEN, INTER = 154880, 9680, 6144, 128
 LG_W_WORDS = 16 * 38 * 512
 W_ROUTER_ELEMS = 256 * HIDDEN + 2 * LG_W_WORDS
 W_LM_ELEMS = SHARD * HIDDEN + (SHARD * 3456 + 4 * SHARD) // 2
-CUBIN = launch.ARTIFACTS + "/draft/entry.cubin"
-CALL = launch.ARTIFACTS + "/draft/CALL.json"
 PLAN = [(launch.KIND_S0, 0, False)] + [(launch.KIND_SK, k, k == 6) for k in range(1, 7)]
 
 _DRAFT = {}
@@ -50,9 +47,10 @@ def _target_chain():
 
 
 class DraftRunner:
-    def __init__(self, draft_mr):
-        self.mr = draft_mr
-        self.nextn = draft_mr.model.model
+    def __init__(self, draft_model, model_path):
+        # the draft's ModelRunner (its KV pools) arrives before its CUDA graphs (bind_runner)
+        self.mr, self.model, self.model_path = None, draft_model, model_path
+        self.nextn = draft_model.model
         self.chain = _target_chain()
         self.rank = self.chain.rank
         self.bound = False
@@ -148,7 +146,7 @@ class DraftRunner:
         w["gamma_hnorm"] = n.hnorm.weight.contiguous()
         w["gamma_enorm"] = n.enorm.weight.contiguous()
 
-        lm = self.chain.mr.model.lm_head.weight
+        lm = self.chain.lm_head.weight
         assert lm.dtype == torch.bfloat16 and tuple(lm.shape) == (SHARD, HIDDEN), (lm.dtype, lm.shape)
         self.lm_bf16 = lm
         w["lm_w"] = pack_lm_w_fp4(lm.contiguous())
@@ -167,7 +165,7 @@ class DraftRunner:
         import json
         from safetensors import safe_open
         r = self.rank
-        idx = json.load(open(self.mr.server_args.model_path + "/model.safetensors.index.json"))["weight_map"]
+        idx = json.load(open(self.model_path + "/model.safetensors.index.json"))["weight_map"]
         pre = "model.layers.78.mlp."
         files = {}
         for k, f in idx.items():
@@ -180,7 +178,7 @@ class DraftRunner:
         lo, hi = INTER * r, INTER * r + INTER
         seen = 0
         for f, keys in files.items():
-            with safe_open(self.mr.server_args.model_path + "/" + f, framework="pt", device="cpu") as h:
+            with safe_open(self.model_path + "/" + f, framework="pt", device="cpu") as h:
                 for k in keys:
                     name = k[len(pre):]
                     parts = name.split(".")
@@ -252,7 +250,7 @@ class DraftRunner:
                       num_accepted=torch.ones((1,), **i32), length=torch.full((7,), 8, **i32))
         self.dt64 = torch.zeros((1, 7), dtype=torch.int64, device=dev)
         self.sel_hidden = torch.zeros((1, HIDDEN), **bf)
-        self.kernel = launch.Kernel(CUBIN, CALL, launch.DRAFT_PARAMS)
+        self.kernel = launch.Kernel(launch.artifact("draft", "entry.cubin"), launch.artifact("draft", "CALL.json"), launch.DRAFT_PARAMS)
         w, p, ws = self.W, self.p, self.ws
         base = dict(
             x=p["x"].data_ptr(), residual=p["residual"].data_ptr(), residual_out=p["residual_out"].data_ptr(),
@@ -352,8 +350,11 @@ class _LeanFB:
 
 def _lean_prepare_for_draft_extend(draft_extend_input, batch, predict, num_draft_tokens, draft_model_runner,
                                    cuda_graph_runner, *, return_hidden_states_before_norm, widened_out_cache_loc=None,
-                                   widened_positions=None):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+                                   widened_positions=None, iteration_ids=None):
+    try:
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#47731
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
     assert getattr(draft_extend_input, "num_front_tokens", 0) == 0 and widened_out_cache_loc is None
     bs = len(batch.seq_lens)
     batch.spec_info = draft_extend_input
@@ -448,13 +449,16 @@ def _wrap_worker(module):
             d.pending = False
         return orig_prefill(self, *a, **k)
 
-    def extend_w(self, batch, batch_result):
+    def extend_w(self, batch, batch_result, **kw):
+        # kw: iteration_ids (SGLang after a4ff5634b): the plan of this iteration's
+        # write window; the fused draft writes the same slots through req_to_token
+        # (config_reasons refuses a pool whose ids need translating)
         d = _DRAFT.get("runner")
         if d is None or not _eligible_extend(self, batch, batch_result):
             if d is not None:
                 d.dirty = d.dirty or d.pending
                 d.pending = False
-            return orig_extend(self, batch, batch_result)
+            return orig_extend(self, batch, batch_result, **kw)
         if not d.bound:
             d.bind()
         hidden = batch_result.logits_output.hidden_states
@@ -500,7 +504,7 @@ def _wrap_worker(module):
                 module.prepare_for_draft_extend = _lean_prepare_for_draft_extend
                 if seed is not None:
                     self.seed_dsa_topk_from_draft_extend = False
-            out = orig_extend(self, batch, batch_result)
+            out = orig_extend(self, batch, batch_result, **kw)
         finally:
             self.cuda_graph_runner_for_draft_extend = fr
             self.draft_runner.forward = fe
@@ -514,11 +518,12 @@ def _wrap_worker(module):
             nd.dsa_topk_indices = None
         return out
 
-    def draft_w(self, batch):
+    def draft_w(self, batch, **kw):
         d = _DRAFT.get("runner")
         di = batch.spec_info
         ours = (d is not None and d.bound and d.pending and not batch.forward_mode.is_idle()
-                and len(batch.seq_lens) == 1 and di is not None and getattr(di, "hidden_states", None) is not None)
+                and len(batch.seq_lens) == 1 and di is not None and getattr(di, "hidden_states", None) is not None
+                and not kw.get("with_topology", False))
         if not ours:
             if d is not None and d.pending and di is not None and getattr(di, "hidden_states", None) is not None \
                     and not batch.forward_mode.is_idle():
@@ -526,10 +531,21 @@ def _wrap_worker(module):
             elif d is not None:
                 d.dirty = d.dirty or d.pending
                 d.pending = False
-            return orig_draft(self, batch)
+            return orig_draft(self, batch, **kw)
         m = module
-        forward_batch, _ = m.prepare_for_draft(di, self.req_to_token_pool, batch, self.cuda_graph_runner,
-                                               self.draft_runner, self.topk, self.speculative_num_steps)
+        args = (di, self.req_to_token_pool, batch, self.cuda_graph_runner, self.draft_runner, self.topk,
+                self.speculative_num_steps)
+        iteration_ids = None
+        if _PREPARE_PLANS_WINDOW.setdefault(id(m), _plans_window(m.prepare_for_draft)):
+            # SGLang after a4ff5634b: plan the iteration's write window as its draft does
+            _, _, iteration_ids = m.prepare_for_draft(
+                *args, target_translator=self.target_worker.model_runner.runner_ids,
+                num_draft_tokens=self.speculative_num_draft_tokens)
+            runtime = getattr(self, "draft_runtime", None)
+            if runtime is not None:
+                runtime.begin_draft_round(runner=self.cuda_graph_runner, batch=batch, draft_input=di, active=False)
+        else:
+            m.prepare_for_draft(*args)
         draft_tokens = d.run_sk(batch.req_pool_indices, batch.seq_lens)
         di.topk_index = draft_tokens[:, :1]
         vi = m.build_eagle_verify_input(
@@ -537,9 +553,23 @@ def _wrap_worker(module):
             target_worker=self.target_worker, topk=self.topk, num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens, tree_mask_mode=self.tree_mask_mode, device=self.device)
         vi._glm5mk_ours = True
+        if iteration_ids is not None:
+            # verify and draft extend write the window the draft planned (as SGLang's draft)
+            vi.iteration_ids = iteration_ids
+            vi.prepared_out_cache_loc = iteration_ids.write_virtual
         return vi
 
     cls._draft_extend_for_decode, cls.draft, cls._draft_extend_for_prefill, cls._glm5mk = extend_w, draft_w, prefill_w, True
+
+
+_PREPARE_PLANS_WINDOW = {}
+
+
+def _plans_window(prepare_for_draft):
+    """Whether this SGLang's prepare_for_draft plans the write window (IterationIds)."""
+    import inspect
+
+    return "target_translator" in inspect.signature(prepare_for_draft).parameters
 
 
 def _fallback_topk(worker, d, di):
@@ -553,15 +583,26 @@ def _fallback_topk(worker, d, di):
     d.pending = False
 
 
-def on_draft_loaded(model_runner):
-    if type(model_runner.model).__name__ == "GlmMoeDsaForCausalLMNextN":
-            _DRAFT["runner"] = DraftRunner(model_runner)
+def engage(draft_model, model_path):
+    """At the draft's build: pack the NextN weights (the target is engaged already)
+    and wrap SGLang's EAGLE v2 draft worker, which runs the fused draft at one request."""
+    import sglang.srt.speculative.eagle_worker_v2 as worker
+
+    assert type(draft_model).__name__ == "GlmMoeDsaForCausalLMNextN", type(draft_model).__name__
+    _DRAFT["runner"] = DraftRunner(draft_model, model_path)
+    _wrap_worker(worker)
+    return _DRAFT["runner"]
 
 
-def before_draft_graphs(model_runner):
+def bind_runner(model_runner):
+    """Before the draft's CUDA graphs: bind the draft to the runner's KV pools. False
+    when the runner's model is not the engaged draft."""
     d = _DRAFT.get("runner")
-    if d is not None and d.mr is model_runner:
-        d.bind()
+    if d is None or d.model is not getattr(model_runner, "model", None):
+        return False
+    d.mr = model_runner
+    d.bind()
+    return True
 
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)

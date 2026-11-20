@@ -44,7 +44,7 @@ class VerifyTail:
         self.x_ts[9] = 1.0
         self.x_ts[10] = 1.0
         self.argmax = torch.zeros((8,), dtype=torch.int32, device=dev)
-        self.kernel = launch.Kernel(launch.ARTIFACTS + "/tail/entry.cubin", launch.ARTIFACTS + "/tail/CALL.json",
+        self.kernel = launch.Kernel(launch.artifact("tail", "entry.cubin"), launch.artifact("tail", "CALL.json"),
                                     launch.DRAFT_PARAMS)
         common = dict(d.vals[0], step=0, last=0, copy=0, normalized=self.shard.data_ptr(), x=self.x_ts.data_ptr(),
                       next_new_tokens=self.argmax.data_ptr())
@@ -82,11 +82,14 @@ class VerifyTail:
             reasons.append("top_k/min_p")
         return reasons
 
-    def sample(self, orig, verify_input, batch, logits_output, grammar_mask=None, **kw):
+    def sample(self, orig, verify_input, batch, logits_output, grammar_mask=None, *args, **kw):
         if batch.forward_mode.is_idle():
-            return orig(verify_input, batch, logits_output, grammar_mask, **kw)
+            return orig(verify_input, batch, logits_output, grammar_mask, *args, **kw)
         self._pv = None
         reasons = self.uncovered(verify_input, batch)
+        # SGLang after a4ff5634b: options the fused tail does not implement
+        if kw.get("watermark") is not None:
+            reasons.append("watermark")
         if not self.active and self.in_graph == 0:
             reasons.append("not-our-verify")
         if reasons or not self.bound:
@@ -107,9 +110,10 @@ class VerifyTail:
             self.x_ts[10:11].copy_(si.top_ps.view(-1)[:1] if getattr(si, "need_top_p_sampling", False)
                                    else torch.ones_like(self.x_ts[10:11]))
             self.call_ts.launch(s)
-        return self._post_verify(verify_input, batch, d.p["accepted"], d.p["num_accepted"])
+        return self._post_verify(verify_input, batch, d.p["accepted"], d.p["num_accepted"],
+                                 simulated=kw.get("simulated_acc_len"), rng=kw.get("simulated_acc_len_rng"))
 
-    def _post_verify(self, verify_input, batch, acc, na):
+    def _post_verify(self, verify_input, batch, acc, na, simulated=None, rng=None):
         import sglang.srt.speculative.spec_utils as su
         dev = acc.device
         L = 0
@@ -117,7 +121,17 @@ class VerifyTail:
             if su.SIMULATE_ACC_TOKEN_MODE != "real-draft-token" or verify_input.max_tree_depth != 8:
                 raise RuntimeError(f"glm5_3.sm107: simulation mode {su.SIMULATE_ACC_TOKEN_MODE} depth "
                                    f"{verify_input.max_tree_depth} not covered")
-            L = su.sample_simulated_acc_len(su.SIMULATE_ACC_LEN, su.SIMULATE_ACC_METHOD, verify_input.max_tree_depth)
+            if simulated is not None:
+                # newer SGLang injects the draw (a tensor a captured graph replays)
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("glm5_3.sm107: an injected simulated acceptance inside a graph is not covered")
+                L = int(simulated.reshape(-1)[0])
+            elif rng is not None:
+                L = su.sample_simulated_acc_len(su.SIMULATE_ACC_LEN, su.SIMULATE_ACC_METHOD,
+                                                verify_input.max_tree_depth, generator=rng)
+            else:
+                L = su.sample_simulated_acc_len(su.SIMULATE_ACC_LEN, su.SIMULATE_ACC_METHOD,
+                                                verify_input.max_tree_depth)
         cand = verify_input.draft_token.reshape(-1)
         if not cand.is_contiguous():
             cand = cand.contiguous()
@@ -160,6 +174,11 @@ def _patch_run_eagle_verify(ewc):
     import inspect
     import re
     src = inspect.getsource(ewc.run_eagle_verify)
+    if "prepare_verify_commit_outputs" in src:
+        # SGLang after a4ff5634b computes the new sequence lengths and bonus tokens
+        # itself from (predict, accept_index, accept_lens) in one fused kernel: the
+        # tail's stash would only duplicate it.
+        return
     a = "    new_seq_lens = batch.seq_lens + accept_lens\n"
     assert src.count(a) == 1, "run_eagle_verify: new_seq_lens line not found"
     src = src.replace(a, "    new_seq_lens = _glm5mk_pv_nsl(batch, accept_lens)\n")
@@ -203,16 +222,21 @@ def install(target_model_runner):
     lp._logits_gatherer = _Gatherer()
     orig_c = lp._copy_logits_to_buffer
 
-    def copy_w(logits, logits_metadata, use_buffer=True, _o=orig_c):
+    def copy_w(logits, logits_metadata, use_buffer=True, *args, _o=orig_c, **kw):
         # The kernel holds the rank's shard, so the placeholder is never copied into the logits buffer.
         if vt.full_placeholder is not None and logits is vt.full_placeholder:
+            # newer SGLang passes softcap here; GLM-5.2 has none to apply
+            assert kw.get("softcap") is None and not args, "glm5_3.sm107: logit softcap not covered"
             buf = logits_metadata.next_token_logits_buffer if use_buffer else None
             return buf if buf is not None and tuple(buf.shape) == tuple(logits.shape) else logits
-        return _o(logits, logits_metadata, use_buffer)
+        return _o(logits, logits_metadata, use_buffer, *args, **kw)
 
     lp._copy_logits_to_buffer = copy_w
     import sglang.srt.speculative.eagle_worker_common as ewc
     _patch_run_eagle_verify(ewc)
     orig_s = ewc.eagle_sample
-    ewc.eagle_sample = lambda vi, b, lo, gm=None, _o=orig_s, **k: vt.sample(_o, vi, b, lo, gm, **k)
+    def eagle_sample(vi, b, lo, gm=None, *a, _o=orig_s, **k):
+        return vt.sample(_o, vi, b, lo, gm, *a, **k)
+
+    ewc.eagle_sample = eagle_sample
     return vt

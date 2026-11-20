@@ -22,6 +22,12 @@ Stated limits of this spec:
   rows (``plan.py``).
 * PD disaggregation is served at the TP4 profiles' decode role (``pd_reasons``); the
   prefill role runs without the flag.
+* TP16 on Rubin (SM107) at one request, EAGLE 7 steps / 8 draft tokens, runs
+  ``glm5_3/sm107``: its own kernels, server arguments and environment
+  (``sm107.config_reasons``), selected here by the TP size. The TP8 / TP4 server
+  arguments and environment (``SERVER_ARGS``, ``ENV``) are checked per TP size in
+  ``config_disable_reasons`` rather than in ``Requirements``, which one spec shares
+  across every TP size.
 """
 
 from __future__ import annotations
@@ -84,7 +90,9 @@ SGLANG_READS = {
         "MegakernelBinding",
     ),
     "srt/model_executor/cuda_graph_config.py": ("decode", "backend", '"disabled"'),
+    "srt/runtime_context.py": ("get_parallel", "tp_size"),
     "srt/environ.py": (
+        "envs",
         "SGLANG_DSA_FUSE_TOPK",
         "SGLANG_DSA_TOPK_BROADCAST",
         "SGLANG_EXPERIMENTAL_LORA_OPTI",
@@ -228,19 +236,49 @@ def decode_graph_backends() -> frozenset:
     return frozenset({"full", "disabled"} if parity.eager_steps_allowed() else {"full"})
 
 
+# glm5_3/sm107's TP size (sm107.TP_SIZE; the package is imported only at TP16)
+SM107_TP_SIZE = 16
+
 REQUIREMENTS = Requirements(
     # B300 / GB300 (SM103) and Rubin / VR NVL72 (SM107): the same kernels (the TP4
     # kernel units are measured and served on SM103 only: on SM107 a TP4 build serves
-    # no width and stops, naming them)
+    # no width and stops, naming them); TP16 runs glm5_3/sm107, on SM107 only
     isas=frozenset({"sm_103", "sm_107"}),
-    tp_sizes=frozenset(tp for tp, _ in ACCEPTED),
+    tp_sizes=frozenset(tp for tp, _ in ACCEPTED) | {SM107_TP_SIZE},
     resident_blocks=RESIDENT_BLOCKS,
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
-    server_args=SERVER_ARGS,
+    # per TP size: SERVER_ARGS and ENV at TP8 / TP4, sm107's at TP16
+    # (_config_disable_reasons)
+    server_args={},
     hf_config={**HF_CONFIG, "model_type": MODEL_TYPE},
-    env=ENV,
+    env={},
 )
+
+
+def pinned_reasons(cfg, server_args, env) -> list[str]:
+    """The server arguments and environment a TP size pins, checked and worded as
+    SGLang checks a spec's Requirements.server_args and Requirements.env."""
+    from sglang.srt.environ import envs
+
+    reasons = [
+        f"{arg} {getattr(cfg, arg, None)!r} is not one of {sorted(map(str, allowed))}"
+        for arg, allowed in server_args.items()
+        if getattr(cfg, arg, None) not in allowed
+    ]
+    for name, want in env.items():
+        value = getattr(envs, name).get()
+        if value != want:
+            reasons.append(f"{name} {value!r} is not {want!r}")
+    return reasons
+
+
+def _tp_size() -> int:
+    """The TP size of this model process (at load and build), as SGLang's megakernel
+    layer reads it."""
+    from sglang.srt.runtime_context import get_parallel
+
+    return int(get_parallel().tp_size)
 
 # Per kernel output against SGLang's op (or an fp64 reference, where SGLang's own op
 # carries the same error) on the same GPU; each key names the test (test/kernels) that
@@ -451,9 +489,13 @@ def pd_reasons(cfg) -> list[str]:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    if cfg.tp_size == SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.config_reasons(cfg, hf_config)
     from sgl_nvidia_mega.glm5_3 import runtime
 
-    reasons = toolchain_reasons() + binding_reasons() + runtime.slot_reasons()
+    reasons = pinned_reasons(cfg, SERVER_ARGS, ENV) + toolchain_reasons() + binding_reasons() + runtime.slot_reasons()
     reasons += draft_capture_reasons() + deadline_reasons(cfg) + profile_reasons(cfg)
     reasons += pd_reasons(cfg)
     if (
@@ -468,12 +510,20 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
 
 def _model_disable_reasons(model, hf_config) -> list[str]:
+    if _tp_size() == SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.model_reasons(model)
     from sgl_nvidia_mega.glm5_3 import runtime
 
     return runtime.model_disable_reasons(model)
 
 
 def _build(model, hf_config, ctx):
+    if _tp_size() == SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.build_target(model, hf_config, ctx)
     from sgl_nvidia_mega.glm5_3 import runtime
 
     return runtime.build(model, ctx)
@@ -486,7 +536,8 @@ SPEC = MegakernelSpec(
         {
             # MTP verify steps
             Feature.SPECULATIVE_DECODING,
-            # TP8 spans the two 4-GPU trays of one NVL72 rack (GB300, Rubin)
+            # TP8 spans the two 4-GPU trays of one NVL72 rack (GB300, Rubin); TP16
+            # (glm5_3/sm107) four Rubin trays
             Feature.MULTI_NODE_TP,
             # HiCache: the covered steps read only the running requests' device KV pages
             Feature.KV_OFFLOAD,
@@ -496,7 +547,7 @@ SPEC = MegakernelSpec(
     ),
     numerics=NUMERICS,
     # the widest verify step of any accepted profile: whole requests up to 16 verify
-    # rows at TP8 (plan.supported_rows), up to 48 at TP4 (profile.UNITS)
+    # rows at TP8 (plan.supported_rows), up to 48 at TP4 (profile.UNITS); 8 at TP16
     max_rows=SPEC_MAX_ROWS,
     build=_build,
     api_version=API_VERSION,

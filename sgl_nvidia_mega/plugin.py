@@ -23,7 +23,7 @@ SPECS = (
     # The MTP draft offers EAGLE draft-loop and draft-extend entries.
     ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
-    # GLM-5.3 and GLM-5.2: the MTP target verify step
+    # GLM-5.3 and GLM-5.2: the MTP target verify step (TP16 on Rubin: glm5_3/sm107)
     ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm5_3.spec:SPEC"),
     # the NextN draft (ModelConfig names a GLM draft's architecture this way)
     ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
@@ -45,9 +45,6 @@ TEST_HOOKS = (
     ),
 )
 
-# GLM-5.2 TP16 on Rubin (sgl_nvidia_mega.glm5_3.sm107) is enabled by this switch, not by --enable-nvidia-megakernel
-GLM5_3_SM107_ENV = "GLM5MK"
-
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     # the entry point name pyproject.toml declares (test/unit/test_plugin.py)
@@ -63,10 +60,6 @@ SGLANG_READS = {
 
 def register() -> None:
     """SGLang's plugin loader calls this in every process, before any model is built."""
-    if os.environ.get(GLM5_3_SM107_ENV) == "1":
-        from sgl_nvidia_mega.glm5_3 import sm107 as glm5_3_sm107
-
-        glm5_3_sm107.install()
     try:
         import sglang.kernels.plugin_kernels.nvidia.spec as megakernels
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389

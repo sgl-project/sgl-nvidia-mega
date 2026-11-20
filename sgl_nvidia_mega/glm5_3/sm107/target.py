@@ -16,14 +16,18 @@ SGLANG_READS = {
     "srt/layers/moe/token_dispatcher/flashinfer_utils.py": ("TorchDistributedCommBackend",),
     "srt/layers/attention/dsa_backend.py": (
         "DeepseekSparseAttnBackend",
-        "fused_dsa_target_verify_metadata",
+        # fused_dsa_target_verify_metadata is read with getattr: newer SGLang has none
         "_apply_cuda_graph_metadata",
         "_refresh_paged_mqa_schedule_metadata",
         "_refresh_topk_v2_plan",
     ),
 }
 
-ARTIFACTS = os.environ.get("GLM5MK_ARTIFACTS", "/glm5mk")
+from . import ARTIFACTS_ENV
+
+
+def artifact(part, name):
+    return os.path.join(os.environ[ARTIFACTS_ENV], part, name)
 
 PARAMS = (
     ("x", 8, "p"), ("residual", 8, "p"), ("residual_out", 8, "p"), ("normalized", 8, "p"),
@@ -447,7 +451,7 @@ class ChainRunner:
         self.norm_out = torch.empty((8, 6144), dtype=torch.bfloat16, device=dev)
         self.x_ph = torch.zeros((8, 6144), dtype=torch.bfloat16, device=dev)
         self.r_ph = torch.zeros((8, 6144), dtype=torch.bfloat16, device=dev)
-        self.kernel = Kernel(ARTIFACTS + "/chain/entry.cubin", ARTIFACTS + "/chain/CALL.json")
+        self.kernel = Kernel(artifact("chain", "entry.cubin"), artifact("chain", "CALL.json"))
         self.layer_calls = []
         ws = self.ws
         for i in LAYERS:
@@ -542,25 +546,26 @@ def patched_forward(self, input_ids, positions, forward_batch, input_embeds=None
     return runner.launch_chain(x, r).clone()
 
 
-def on_model_loaded(model_runner):
-    if getattr(model_runner, "is_draft_worker", False):
-        return
-    inner = getattr(getattr(model_runner, "model", None), "model", None)
-    if inner is None or type(inner).__name__ != "DeepseekV2Model":
-        return
-    from sglang.srt.distributed import get_tp_group
-    assert get_tp_group().world_size == 16
+def engage(model):
+    """At build (after load, before KV cache sizing): pack the weights and route the
+    decoder's forward through the chain. The KV pools bind later (bind_runner)."""
+    inner = model.model
+    assert type(inner).__name__ == "DeepseekV2Model", type(inner).__name__
     if not hasattr(type(inner), "_glm5mk_orig_forward"):
         type(inner)._glm5mk_orig_forward = type(inner).forward
     inner.forward = types.MethodType(patched_forward, inner)
-    _RUNNER[id(inner)] = ChainRunner(inner, model_runner)
-    _skip_verify_meta(_RUNNER[id(inner)])
-    _skip_verify_meta2(_RUNNER[id(inner)])
+    runner = _RUNNER[id(inner)] = ChainRunner(inner, None)
+    runner.lm_head = model.lm_head
+    _skip_verify_meta(runner)
+    _skip_verify_meta2(runner)
+    return runner
 
 
 def _skip_verify_meta(runner):
     import sglang.srt.layers.attention.dsa_backend as db
-    orig = db.fused_dsa_target_verify_metadata
+    orig = getattr(db, "fused_dsa_target_verify_metadata", None)
+    if orig is None:  # SGLang after the fused DSA verify metadata was removed
+        return
     if getattr(orig, "_glm5mk", False):
         return
 
@@ -604,15 +609,18 @@ def _skip_verify_meta2(runner):
     cls._apply_cuda_graph_metadata, cls._refresh_paged_mqa_schedule_metadata, cls._refresh_topk_v2_plan = apply_w, pm_w, tp_w
 
 
-def before_graphs(model_runner):
-    if getattr(model_runner, "is_draft_worker", False):
-        return
+def bind_runner(model_runner):
+    """Before the target's CUDA graphs: bind the chain to the runner's KV pools and
+    install the fused verify tail. False when the runner's model is not engaged."""
     inner = getattr(getattr(model_runner, "model", None), "model", None)
     r = _RUNNER.get(id(inner))
-    if r is not None:
-        r.bind()
-        from . import verify_tail
-        verify_tail.install(model_runner)
+    if r is None:
+        return False
+    r.mr = model_runner
+    r.bind()
+    from . import verify_tail
+    verify_tail.install(model_runner)
+    return True
 
 
 D_LAYERS = (0, 1, 2)
@@ -621,8 +629,13 @@ MCAST_BYTES = 10152960
 
 
 class D012Runner:
+    @property
+    def mr(self):
+        # the target's ModelRunner, bound before its CUDA graphs (bind_runner)
+        return self.chain.mr
+
     def __init__(self, chain):
-        self.chain, self.model, self.mr = chain, chain.model, chain.mr
+        self.chain, self.model = chain, chain.model
         cfg = self.model.config
         assert all(cfg.indexer_types[i] == "full" for i in D_LAYERS), cfg.indexer_types[:3]
         assert cfg.first_k_dense_replace == 3 and cfg.intermediate_size == 12288
@@ -729,7 +742,7 @@ class D012Runner:
         self.topk = {0: torch.full((8, 2048), -1, dtype=torch.int32, device=dev),
                      1: torch.full((8, 2048), -1, dtype=torch.int32, device=dev),
                      2: ch.topk_in}
-        self.kernel = Kernel(ARTIFACTS + "/d012/entry.cubin", ARTIFACTS + "/d012/CALL.json",
+        self.kernel = Kernel(artifact("d012", "entry.cubin"), artifact("d012", "CALL.json"),
                                     D012_PARAMS)
         self.calls_l = []
         gamma_in = self.model.layers[0].input_layernorm.weight.contiguous()
