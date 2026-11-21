@@ -3,6 +3,7 @@
 | GPU | Tensor parallel | Coverage |
 | --- | --- | --- |
 | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
+| Rubin (SM107), GLM-5.2 | 16 (four trays of one NVLink domain) | One request, EAGLE 7 steps / topk 1 / 8 draft tokens: the 75-layer decoder chain, dense layers 0-2, the fused NextN draft and the fused verify tail. See [TP16 on Rubin](#tp16-on-rubin) |
 
 Larger verify steps, prefill and extend run SGLang's standard path, and the NextN draft step runs on its draft spec.
 
@@ -63,6 +64,24 @@ At TP4 (one GB300 tray, 16 attention heads per rank) the verify step's groups ar
 The TP4 split-K GEMMs (`ll.gemm`) run FlashInfer's split-K kernel (`mm_bf16(..., tactic=)`) when the installed FlashInfer has it with the synchronization fixes (`SplitKTactic.SYNC_FIXED`); otherwise they run the plugin's vendored copy (`ll/kernels/cute/splitk.py`). The startup log names the source. `SGLANG_NVIDIA_MEGAKERNEL_GLM_GEMM_SPLITK` switches it: `auto` (the default), `flashinfer` (FlashInfer's kernel even without the fixes; the server stops if FlashInfer has no such API) or `vendored`.
 
 With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting only; a list without a slot another needs (`dnorm` needs `qkv_a_small_m_shared` and `hops`, `qkv_a_small_m_shared` needs `attention`, `draft_rowselect` needs `draft`) stops the server at startup, naming it. Slot `draft` needs embedding replication, which the flag turns on (SGLang sets `SGLANG_ENABLE_EMBED_REPLICATION` when it is unset), greedy draft acceptance and an SGLang whose EAGLE draft graph runners run a draft spec's capture check; the server stops at startup, naming each one that is missing (an explicit `SGLANG_ENABLE_EMBED_REPLICATION=0` too).
+
+## TP16 on Rubin
+
+At TP16 on Rubin (VR200, SM107, four trays), one request, EAGLE 7 steps / topk 1 /
+8 draft tokens, the same flag runs `sgl_nvidia_mega/glm5_3/sm107` for GLM-5.2: the
+75-layer decoder chain, dense layers 0-2, the fused NextN draft and the fused verify
+tail, launched from prebuilt cubins. The GLM-5.3 specs select it by the TP size, and
+refuse TP16 on any other GPU. `--enable-nvidia-megakernel` is the only switch. It needs
+`SGLANG_NVIDIA_MEGAKERNEL_GLM_SM107_CUBINS` set to the cubin directory
+(`{chain,d012,draft,tail}/{entry.cubin,CALL.json}`), `SGLANG_DSA_FUSE_TOPK=0`,
+`--kv-cache-dtype fp8_e4m3 --dsa-decode-backend trtllm
+--moe-runner-backend flashinfer_trtllm --speculative-algorithm EAGLE
+--speculative-num-steps 7 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8`;
+a setup that lacks any of them stops the server at startup, naming each reason.
+It serves one request at a time. A target verify step it does not cover (more than one
+request, grammar, logprobs, penalties, logit bias, a sampling seed, top-k / min-p
+sampling) raises instead of falling back (`sm107/verify_tail.py`), so serve it at
+concurrency 1 with greedy or temperature / top-p sampling.
 
 ## Tests
 

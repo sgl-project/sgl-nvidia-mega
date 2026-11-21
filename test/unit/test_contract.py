@@ -43,18 +43,20 @@ ROOT = Path(sglang.__file__).resolve().parent  # the installed sglang package
 PACKAGE = Path(sgl_nvidia_mega.__file__).resolve().parent
 
 
-@lru_cache(maxsize=None)
-def _tree(path: Path) -> ast.Module:
-    return ast.parse(path.read_text())
-
-
 def _files(pattern: str) -> list:
-    """The files a ``SGLANG_READS`` key names: its first alternative that exists."""
+    """The files a ``SGLANG_READS`` key names: its first alternative that exists.
+    A key like ``"new.py|old.py"`` tries the first path; if no file matches, tries
+    the next, so files that moved between SGLang versions are named newest first."""
     for alternative in pattern.split("|"):
         files = sorted(ROOT.glob(alternative))
         if files:
             return files
     return []
+
+
+@lru_cache(maxsize=None)
+def _tree(path: Path) -> ast.Module:
+    return ast.parse(path.read_text())
 
 
 @lru_cache(maxsize=None)
@@ -136,7 +138,7 @@ def test_sglang_provides_what_the_plugin_reads(path):
         files = _files(pattern)
         if not files and pattern in optional:
             continue
-        assert files, f"{_id(path)}: no file matches {pattern}"
+        assert files, f"{_id(path)}: no file matches any alternative in {pattern!r}"
         provided = frozenset().union(*map(_provided, files))
         skipped = []
         if files == _files(BINDING) and not _has_dsa_view():
