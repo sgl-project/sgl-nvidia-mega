@@ -1,9 +1,7 @@
 # The end-to-end tests SGLang's pr-test-megakernel.yml runs on a PR here, by model.
 # gpu and gpus: the GPU and how many of them on one host the model's tests need.
-# A runner with another GPU or fewer GPUs skips the model and logs why. A new
-# model adds its entry here; SGLang's workflow needs no change.
-# Only models supported by the available four-GPU GB300 runner belong here.
-# Qwen3.5 requires eight GPUs and is not included in this CI configuration.
+# SGLang selects a reviewed runner for each GPU/count requirement. Models without
+# a suitable runner are not covered; explicitly requesting one must fail.
 #
 # Each model's key is its CI label: run-ci-sglang:<key> on a PR runs only that
 # model, and run-ci-sglang runs them all. Keys use lowercase letters, digits and
@@ -15,3 +13,10 @@ deepseek_v41:
   tests:
     - test_deepseek_v41_server.py
     - test_deepseek_v41_switch.py
+
+# Requires SGLang's per-model runner selection; stock draft execution, q6, DCP off.
+kimi_k3:
+  gpu: B300
+  gpus: 8
+  tests:
+    - test_kimi_k3_b300.py
