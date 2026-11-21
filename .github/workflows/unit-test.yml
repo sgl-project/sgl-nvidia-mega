@@ -13,13 +13,6 @@ concurrency:
   group: unit-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  # Includes the hybrid preparation/views API from sgl-project/sglang#45406 and the
-  # speculative runtime hooks from sgl-project/sglang#47201.
-  # Pin source until a published nightly contains this interface; updating the
-  # pin is a normal PR and must pass the static mirror/contract tests.
-  SGLANG_COMMIT: cf6133a16cd7b705077fa4e05366d3a2ce5e8e72
-
 jobs:
   unit:
     runs-on: ubuntu-latest
@@ -32,23 +25,34 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check out the pinned SGLang source
+      # The tests run against SGLang main, the SGLang this package is served with
+      # and the one SGLang's GPU CI runs the E2E tests on, so a binding SGLang
+      # changes fails here first.
+      - name: Check out SGLang main
         uses: actions/checkout@v4
         with:
           repository: sgl-project/sglang
-          ref: ${{ env.SGLANG_COMMIT }}
+          ref: main
           path: .ci/sglang
           persist-credentials: false
 
+      - name: Record the SGLang commit
+        run: |
+          sha=$(git -C .ci/sglang rev-parse HEAD)
+          echo "SGLang main at $sha"
+          echo "Unit tests ran against SGLang main at \`$sha\`." >> "$GITHUB_STEP_SUMMARY"
+
       # CPU unit tests do not use SGLang's optional Rust extensions. Install
-      # torch before building so build isolation does not download it twice.
-      # CUDA Python dependencies still come from SGLang's own package metadata.
+      # SGLang's own torch pin before building so build isolation does not
+      # download it twice. CUDA Python dependencies still come from SGLang's own
+      # package metadata.
       - name: Install SGLang and the package
         env:
           SGLANG_BUILD_RUST_EXTS: none
         run: |
           python -m pip install uv
-          uv pip install --system torch==2.14.1 setuptools setuptools-rust setuptools-scm wheel pytest
+          torch=$(grep -oE '"torch==[^"]+"' .ci/sglang/python/pyproject.toml | head -1 | tr -d '"')
+          uv pip install --system "$torch" setuptools setuptools-rust setuptools-scm wheel pytest
           uv pip install --system --no-build-isolation --prerelease allow ./.ci/sglang/python
           uv pip install --system --no-deps -e .
 
