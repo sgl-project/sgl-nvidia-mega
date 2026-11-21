@@ -5,10 +5,7 @@ rank slots, group 0 sums in rank order into the AttnRes) and TP16 fused producer
 consumer. With ``twoshot`` the mailbox is the one-slot gather row of
 ``common.twoshot``: the threads owning this rank's columns first reduce their
 receive slots into it (args 11-13: receive view, gather multicast address, rank).
-With ``fp8`` the slots hold ``OprojProducer.publish_fp8``'s MXFP8 rows: each lane polls its
-two E4M3 words and its CTA slice's scale word, sums the dequantized FP32 values in the
-same rank order and re-arms all three (the shared scale word once per 8 lanes, after the
-warp has read it). With ``norm_fold`` (``K31MK_OPROJ_NORM_FOLD``, AttnRes layers) the
+With ``norm_fold`` (``K31MK_OPROJ_NORM_FOLD``, AttnRes layers) the
 final RMS norm comes from exchange 1 instead of its own cluster exchange: exchange 1
 also carries |mix|^2 and <mix, prefix>, and |final|^2 = a^2 |mix|^2 + 2 a e <mix, prefix>
 + e^2 |prefix|^2 for final = a mix + e prefix (exact in real arithmetic, not bitwise)."""
@@ -18,7 +15,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 
 from ..attn_res.kernel import arm_exchanges, rstd
-from ..common.mailbox import REARM_FENCE, SENTINEL, rearm, rearm_fence
+from ..common.mailbox import rearm, rearm_fence
 from ..common.primitives import (
     add_rn,
     alloc,
@@ -49,7 +46,7 @@ from ..common.primitives import (
     zeros,
 )
 from ..common.twoshot import reduce
-from .producer import FP8_SCALE_COL, OprojProducer, pack8, tree_reduce
+from .producer import OprojProducer, pack8, tree_reduce
 
 
 @asm((Float32,) * 2, pure=True)
@@ -116,35 +113,6 @@ def fetch(raw, rank, pointer):
         raw[rank, j] = words[j]
 
 
-@asm()
-def load_pair(pointer):
-    code = "ld.volatile.global.v2.b32 {$0,$1},[$2];"
-    return code, "=r,=r,l,~{memory}", (pointer,), (Uint32,) * 2
-
-
-@asm(Uint32)
-def load_word(pointer):
-    return "ld.volatile.global.b32 $0,[$1];", "=r,l,~{memory}", (pointer,)
-
-
-@asm((Float32,) * 4, pure=True)
-def unpack_fp8(word):
-    """The four E4M3 bytes of ``word`` (byte i = value i) as FP32, exactly."""
-    code = "{ .reg .b16 lo,hi,a,b,c,d; .reg .b32 p,q; mov.b32 {lo,hi},$4; "
-    code += "cvt.rn.f16x2.e4m3x2 p,lo; cvt.rn.f16x2.e4m3x2 q,hi; "
-    code += "mov.b32 {a,b},p; mov.b32 {c,d},q; "
-    code += "cvt.f32.f16 $0,a; cvt.f32.f16 $1,b; cvt.f32.f16 $2,c; cvt.f32.f16 $3,d; }"
-    return code, "=f,=f,=f,=f,r", (Uint32(word),)
-
-
-@cute.jit
-def fetch_fp8(raw, rank, mailbox, slot, token, h):
-    """Lane ``h``'s two E4M3 words and its 64-column slice's scale word."""
-    words = load_pair(at(mailbox, slot, token, h // 2))
-    raw[rank, 0], raw[rank, 1] = words[0], words[1]
-    raw[rank, 2] = load_word(at(mailbox, slot, token, FP8_SCALE_COL + h // 64 * 2))
-
-
 class OprojConsumer:
     def __init__(
         self,
@@ -154,15 +122,12 @@ class OprojConsumer:
         groups=4,
         twoshot=False,
         deadline_ns=0,
-        fp8=False,
         norm_fold=False,
     ):
         if not 0 <= nb <= 8:
             raise ValueError("Output-projection AttnRes supports zero to eight blocks")
         self.nb, self.has_delta = nb, has_delta
-        if fp8 and twoshot:
-            raise ValueError("FP8 o-proj partials are one-shot only")
-        self.groups, self.twoshot, self.fp8 = groups, twoshot, fp8
+        self.groups, self.twoshot = groups, twoshot
         self.deadline_ns = deadline_ns
         self.kpre = 1 << max(0, (2 * nb - 1).bit_length())
         self.norm_fold = norm_fold and nb > 0  # nb == 0 has no second exchange
@@ -282,73 +247,12 @@ class OprojConsumer:
 
     @cute.jit
     def poll(self, mailbox, token, h, first, count):
-        if cutlass.const_expr(self.fp8):
-            values = self.poll_sum_fp8(mailbox, token, h, first, count)
-        else:
-            values = self.poll_sum(mailbox, token, h, first, count)
-        return values
+        return self.poll_sum(mailbox, token, h, first, count)
 
     @cute.jit
     def rearm_slot(self, mailbox, slot, token, h):
-        """Re-arm what this lane polled in ``slot``. FP8: its two E4M3 words, and the
-        shared scale word from lane 8t once the warp is past its polls."""
-        if cutlass.const_expr(self.fp8):
-            cute.arch.sync_warp()
-            store_relaxed(at(mailbox, slot, token, h // 2), (Uint32(SENTINEL),) * 2)
-            if h % 64 == 0:
-                column = FP8_SCALE_COL + h // 64 * 2
-                store_relaxed(at(mailbox, slot, token, column), (Uint32(SENTINEL),))
-        else:
-            rearm(at(mailbox, slot, token, h))
-
-    @cute.jit
-    def poll_sum_fp8(self, mailbox, token, h, first, count):
-        """``poll_sum`` over MXFP8 slots: Lamport-poll the three words of every rank,
-        then add the dequantized FP32 pairs in rank order (the same order as BF16)."""
-        n: cutlass.Constexpr = self.slots(mailbox.shape[0])
-        raw = zeros((n, 3), Uint32)
-        pending = Int32(0)
-        for rank in cutlass.range_constexpr(n):
-            if rank < count:
-                fetch_fp8(raw, rank, mailbox, first + rank, token, h)
-        for rank in cutlass.range_constexpr(n):
-            if rank < count:  # noqa: SIM102
-                if not published(raw[rank, j] for j in range(3)):
-                    pending |= 1 << rank
-        started, polls = Int64(0), Int32(0)
-        if pending != 0:
-            started = wait_deadline_start(self.deadline_ns)
-        while pending != 0:
-            polls = wait_deadline_check(started, polls, self.deadline_ns)
-            for rank in cutlass.range_constexpr(n):
-                if (pending & (1 << rank)) != 0:
-                    fetch_fp8(raw, rank, mailbox, first + rank, token, h)
-            for rank in cutlass.range_constexpr(n):
-                if (pending & (1 << rank)) != 0:  # noqa: SIM102
-                    if published(raw[rank, j] for j in range(3)):
-                        pending &= ~(1 << rank)
-        shift = Uint32(h // 32 % 2 * 8)
-        decoded = cute.make_rmem_tensor((n, 8), Float32)
-        for rank in cutlass.range_constexpr(n):
-            if rank < count:
-                exponent = (raw[rank, 2] >> shift) & Uint32(0xFF)
-                factor = bits_float(
-                    exponent << 23
-                )  # 2^(e - 127); e >= 85 (1e-10 floor)
-                for w in cutlass.range_constexpr(2):
-                    quad = unpack_fp8(raw[rank, w])
-                    for i in cutlass.range_constexpr(4):
-                        decoded[rank, 4 * w + i] = mul_rn(quad[i], factor)
-        values = cute.make_rmem_tensor(8, Float32)
-        for j in cutlass.range_constexpr(4):
-            pair = (decoded[0, 2 * j], decoded[0, 2 * j + 1])
-            for rank in cutlass.range_constexpr(1, n):
-                if rank < count:
-                    pair = pair_op(
-                        pair, (decoded[rank, 2 * j], decoded[rank, 2 * j + 1])
-                    )
-            values[2 * j], values[2 * j + 1] = pair[0], pair[1]
-        return values
+        """Re-arm what this lane polled in ``slot``."""
+        rearm(at(mailbox, slot, token, h))
 
     @cute.jit
     def poll_sum(self, mailbox, token, h, first, count):
@@ -471,8 +375,7 @@ class OprojConsumer:
             store_words(at(prefix, token, h), words)
             for r in cutlass.range_constexpr(min(S, mailbox.shape[0])):
                 self.rearm_slot(mailbox, r, token, h)
-            if cutlass.const_expr(xmoe is not None or REARM_FENCE):
-                cute.arch.fence_acq_rel_gpu()
+            cute.arch.fence_acq_rel_gpu()  # orders the re-arms (common/mailbox.py)
             self.wait_exchange(bars.iterator + 1)
             if tid < self.npost:
                 sums = [Float32(0)] * 4
@@ -557,12 +460,10 @@ class OprojConsumer:
 
 
 class OprojFused:
-    def __init__(self, nb, *, has_delta=True, fp8=False, norm_fold=False):
-        self.producer = OprojProducer(768, staged_blocks=0, fp8=fp8)
+    def __init__(self, nb, *, has_delta=True, norm_fold=False):
+        self.producer = OprojProducer(768, staged_blocks=0)
         # TP16 requires prefix/blocks to be ready at launch.
-        self.consumer = OprojConsumer(
-            nb, has_delta=has_delta, fp8=fp8, norm_fold=norm_fold
-        )
+        self.consumer = OprojConsumer(nb, has_delta=has_delta, norm_fold=norm_fold)
 
     @cute.jit
     def __call__(self, *args):

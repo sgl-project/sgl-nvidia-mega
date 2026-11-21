@@ -11,13 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 
-from ..common.mailbox import (
-    poll,
-    rearm,
-    rearm_fence_eager,
-    rearm_fence_end,
-    rearm_fence_late,
-)
+from ..common.mailbox import poll, rearm, rearm_fence_end
 from ..common.primitives import (
     alloc,
     at,
@@ -248,7 +242,6 @@ class ClusterAttnRes:
                 unpack(tuple(got[slot, k] for k in range(4)), part, 0)
                 for i in cutlass.range_constexpr(8):
                     cur[0, i] = cur[0, i] + part[0, i]
-            rearm_fence_eager()
             if cutlass.const_expr(self.slots > 1):
                 for j in cutlass.range_constexpr(4):  # all-reduce output boundary
                     round_pair(cur, 0, j)
@@ -263,8 +256,6 @@ class ClusterAttnRes:
         values[0] = dot8(v, NEW, v, NEW)
         if cutlass.const_expr(self.nb > 0):
             values[1] = dot8(v, NEW, v, W)
-        if cutlass.const_expr(self.slots > 0):
-            rearm_fence_late()  # before the exchange's barrier, so before any thread's push
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
         row = (words[0], words[1], words[2], words[3])
         store_words(at(prefix, token, col), row)

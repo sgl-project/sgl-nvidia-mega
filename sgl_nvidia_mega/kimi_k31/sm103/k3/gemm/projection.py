@@ -64,30 +64,11 @@ def _gb300_tactic(kind, batch):
     return GB300_FALLBACK[kind]
 
 
-# VR200 (SM107) overrides where a projection sweep (cold L2, same gate) beat the GB300
-# tactic by >= 5%: MLA B1-8, B16 and B64; KDA B32 and B64.
-# ``K31MK_PROJ_SM107_RETUNE=0`` keeps GB300's tactics on SM107.
-SM107_TACTICS = {
-    "mla": {
-        **{b: (128, 8, 4, 6) for b in range(1, 9)},
-        16: (128, 16, 4, 5),
-        64: (64, 64, 2, 6),
-    },
-    "kda": {32: (64, 32, 2, 9), 64: (64, 64, 2, 6)},
-}
-
-
-# TP16 KDA [3208, 7168] (vLLM nightly e4a5b55's GB300 TP16 KDA [3216, 7168] policy): the TP8
-# tactic keeps each CTA's 128 x 3584 K-slab, so half the rows only halve the CTAs (52 at B8).
-# Opt-in ``K31MK_PROJ_TP16_KDA=1`` until an arm measures it.
-TP16_KDA_TACTICS = {16: (64, 16, 2, 10), 32: (64, 32, 2, 8), 64: (64, 64, 2, 6)}
-TP16_KDA = "K31MK_PROJ_TP16_KDA"
-_TP16_KDA_LOGGED = []
 # GB300 (SM103) TP16 overrides keyed by (kind, per-rank rows, batch), from a projection sweep
 # on GB300 (cold L2), both bitwise vs the default tactic (same split K: only the M tile and
 # stages change) and faster: MLA B8 (64, 8, 4, 8) 188 CTAs -> (128, 8, 4, 6) 96 CTAs; KDA B8
 # (128, 8, 2, 6) 52 CTAs -> (64, 8, 2, 12) 102 CTAs.
-# ``K31MK_PROJ_SM103_TP16=0`` keeps the shape-agnostic tactics. MLA rows: 3008 where the in-proj carries
+# MLA rows: 3008 where the in-proj carries
 # the index-K rows (kimi_k31 spec / dsa_spec pass ``pitch``); 2880 on the K3.1 verify path (verify_spec leaves
 # build_resources' default ``packed_mla_pitch``: [qkv-a | gate], index-K is separate).
 # 2880 shares 3008's split K (bitwise by construction); its time is projected from 3008, not measured.
@@ -96,10 +77,9 @@ SM103_TP16_TACTICS = {
     ("mla", 2880, 8): (128, 8, 4, 6),
     ("kda", 3208, 8): (64, 8, 2, 12),
 }
-SM103_TP16 = "K31MK_PROJ_SM103_TP16"
 # GB300 (SM103) TP8 overrides keyed by (kind, per-rank rows, batch rows) for the Q8 Breq 3/5/6/7 widths, from a TP8
 # projection sweep (cold L2, the projection kernel gate): the N8 fallback rereads the weights per 8 rows
-# and was 2.2-4.2x slower. Not bitwise vs the fallback (split K differs). ``K31MK_PROJ_SM103_TP8=0`` keeps it.
+# and was 2.2-4.2x slower. Not bitwise vs the fallback (split K differs).
 SM103_TP8_TACTICS = {
     ("mla", 3648, 24): (64, 24, 2, 9),
     ("mla", 3648, 40): (64, 40, 2, 8),
@@ -110,7 +90,6 @@ SM103_TP8_TACTICS = {
     ("kda", 6288, 48): (64, 48, 1, 8),
     ("kda", 6288, 56): (64, 64, 1, 7),
 }
-SM103_TP8 = "K31MK_PROJ_SM103_TP8"
 _SM103_TP16_LOGGED: set = set()
 logger = logging.getLogger(__name__)
 
@@ -118,7 +97,6 @@ logger = logging.getLogger(__name__)
 def projection_tactic(kind, batch, device, tp=8, rows=None):
     """The split-K tactic of the packed ``kind`` ("mla" / "kda") projection at ``batch``
     (``rows``: the per-rank pitch, for the shape-keyed SM103 TP16 entries)."""
-    retune = os.environ.get("K31MK_PROJ_SM107_RETUNE", "1") != "0"
     capability = torch.cuda.get_device_capability(device)
     # Q5/R3 uses actual 15 rows in a single N16 tile. Reuse the existing B16
     # policies, without a tactic sweep or padding the target step back to Q8.
@@ -138,21 +116,15 @@ def projection_tactic(kind, batch, device, tp=8, rows=None):
         and tp == 8
         and batch in (10, 20, 25, 30, 35)
         and (kind, rows) in (("mla", 3648), ("kda", 6288))
-        and os.environ.get(SM103_TP8, "1") != "0"
     ):
         tile_rows = {10: 16, 20: 24, 25: 32, 30: 32, 35: 40}[batch]
         if tile_rows in (16, 32):
             return GB300_TACTICS[kind][tile_rows]
         return SM103_TP8_TACTICS[(kind, rows, tile_rows)]
-    if retune and capability == (10, 7):
-        tactic = SM107_TACTICS[kind].get(batch)
-        if tactic is not None:
-            return tactic
-    if capability == (10, 3) and os.environ.get(SM103_TP8, "1") != "0":
+    if capability == (10, 3):
         tactic = SM103_TP8_TACTICS.get((kind, rows, batch))
         if tactic is not None:
             return tactic
-    if capability == (10, 3) and os.environ.get(SM103_TP16, "1") != "0":
         tactic = SM103_TP16_TACTICS.get((kind, rows, batch))
         if tactic is not None:
             if (
@@ -169,11 +141,6 @@ def projection_tactic(kind, batch, device, tp=8, rows=None):
                     tactic,
                 )
             return tactic
-    if kind == "kda" and tp == 16 and os.environ.get(TP16_KDA, "0") not in ("", "0"):
-        if not _TP16_KDA_LOGGED:  # once per process, not per layer
-            _TP16_KDA_LOGGED.append(True)
-            logger.info("NVIDIA megakernel: TP16 KDA projection tactics (opt-in)")
-        return TP16_KDA_TACTICS.get(batch, (64, 8, 4, 8))
     return _gb300_tactic(kind, batch)
 
 

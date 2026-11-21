@@ -17,14 +17,13 @@ The order (value desc, smaller global id first) equals torch.topk(sorted) over t
 rank-major all-gather of per-rank top-k with ties to the smaller id (shards are
 contiguous vocabulary ranges).
 
-K31MK_RANKTOPK_BITONIC (read at import; off by default, 1 = on) builds RankTopK's three merges (warp,
-CTA, cluster) as lane-distributed bitonic networks instead of K serial warp_merge rounds:
-each thread's 8 values form 8 32-lane sequences, each sorted across the warp and merged
-pairwise (half-cleaner + bitonic sort) into the warp's sorted top-32; the CTA and cluster
-lists merge the same way. Same exact (value desc, id asc) top-K, so the same published
-words."""
+RankTopK's three merges (warp, CTA, cluster) are lane-distributed bitonic networks: each
+thread's 8 values form 8 32-lane sequences, each sorted across the warp and merged pairwise
+(half-cleaner + bitonic sort) into the warp's sorted top-32; the CTA and cluster lists merge
+the same way. They give the exact (value desc, id asc) top-K of the K serial warp-merge
+rounds they replaced, so the same published words (byte-equal at K16; one-GPU unit about
+-5.5 us per round at K16, -25 us at K32)."""
 
-import os
 from functools import cache
 
 import cutlass
@@ -56,7 +55,6 @@ SELECTOR_RANK = 256
 PARTS = 8  # CTAs (one cluster) per row
 EMPTY = -0x80000000  # signed ordered key below every value (incl. -inf)
 NO_ID = 0x7FFFFFFF
-BITONIC = os.environ.get("K31MK_RANKTOPK_BITONIC", "0") == "1"
 
 
 @cute.jit
@@ -72,17 +70,6 @@ def ordered(bits):
 @cute.jit
 def better(v1, i1, v2, i2):
     return (v1 > v2) | ((v1 == v2) & (i1 < i2))
-
-
-@cute.jit
-def insert(keys, ids, value, index, topk: cutlass.Constexpr[int]):
-    """Insert (value, index) into the descending ``topk``-entry register list."""
-    carry_v, carry_i = Int32(value), Int32(index)
-    for k in cutlass.range_constexpr(topk):
-        if better(carry_v, carry_i, keys[k], ids[k]):
-            old_v, old_i = keys[k], ids[k]
-            keys[k], ids[k] = carry_v, carry_i
-            carry_v, carry_i = old_v, old_i
 
 
 @cute.jit
@@ -154,24 +141,6 @@ def lane_pair(key, gid, lane):
     )
 
 
-@cute.jit
-def warp_merge(keys, ids, out_keys, out_ids, topk: cutlass.Constexpr[int]):
-    """Top-``topk`` of the warp's 32 descending lists (registers); every lane gets the
-    winners in ``out_*`` (register tensors of ``topk``)."""
-    for r in cutlass.range_constexpr(topk):
-        best_v, best_i = keys[0], ids[0]
-        for shift in cutlass.range_constexpr(4, -1, -1):
-            other_v = cute.arch.shuffle_sync_bfly(best_v, 1 << shift)
-            other_i = cute.arch.shuffle_sync_bfly(best_i, 1 << shift)
-            if better(other_v, other_i, best_v, best_i):
-                best_v, best_i = other_v, other_i
-        out_keys[r], out_ids[r] = best_v, best_i
-        if (keys[0] == best_v) & (ids[0] == best_i):
-            for k in cutlass.range_constexpr(topk - 1):
-                keys[k], ids[k] = keys[k + 1], ids[k + 1]
-            keys[topk - 1], ids[topk - 1] = Int32(EMPTY), Int32(NO_ID)
-
-
 class RankTopK:
     """Arguments: head_out [R, >= num_org] BF16, box [TP, R, 2 topk] int32 (this GPU's view),
     mc (the box's multicast address; ``local``: unused, stores go to ``box``), rank,
@@ -192,7 +161,6 @@ class RankTopK:
         self.num_org, self.local, self.topk = num_org, local, topk
         self.threads = num_org // PARTS // 8  # 160 at num_org 10240
         self.warps = self.threads // 32
-        self.bitonic = BITONIC
         if topk > TOPK and self.threads > 320:
             # K 32 keeps 4 x 32-entry register lists per thread: validated up to 320 threads
             # (TP 8); a wider shard would compile into an unverified register budget.
@@ -242,108 +210,7 @@ class RankTopK:
             lane,
             warp,
         )
-        if cutlass.const_expr(self.bitonic):
-            self.bitonic_merges(*common)
-        else:
-            self.serial_merges(*common)
-
-    @cute.jit
-    def serial_merges(
-        self,
-        head_out,
-        box,
-        mc,
-        rank,
-        vocab_start,
-        warp_keys,
-        warp_ids,
-        lists,
-        bar,
-        part,
-        row,
-        tid,
-        lane,
-        warp,
-    ):
-        """The K-round warp_merge path (per-thread register top-K lists, then the warp, CTA
-        and cluster merges); the default."""
-        topk = self.topk
-        keys = cute.make_rmem_tensor(topk, Int32)
-        ids = cute.make_rmem_tensor(topk, Int32)
-        keys.fill(EMPTY)
-        ids.fill(NO_ID)
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
-        col = (part * self.threads + tid) * 8
-        words = load_vector(at(head_out, row, col))
-        for j in cutlass.range_constexpr(4):
-            for half in cutlass.range_constexpr(2):
-                bits = Int32(Uint32(words[j]) << 16)
-                if cutlass.const_expr(half == 1):
-                    bits = Int32(Uint32(words[j]) & Uint32(0xFFFF0000))
-                if bits == Int32(EMPTY):  # -0.0 -> +0.0
-                    bits = Int32(0)
-                insert(keys, ids, ordered(bits), Int32(col + 2 * j + half), topk)
-        top_keys = cute.make_rmem_tensor(topk, Int32)
-        top_ids = cute.make_rmem_tensor(topk, Int32)
-        warp_merge(keys, ids, top_keys, top_ids, topk)
-        if lane == 0:
-            for r in cutlass.range_constexpr(topk):
-                warp_keys[warp, r] = top_keys[r]
-                warp_ids[warp, r] = top_ids[r]
-        cute.arch.sync_threads()
-        cute.arch.cluster_wait()
-        if warp == 0:
-            keys.fill(EMPTY)
-            ids.fill(NO_ID)
-            if lane < self.warps:
-                for r in cutlass.range_constexpr(topk):
-                    keys[r], ids[r] = warp_keys[lane, r], warp_ids[lane, r]
-            warp_merge(
-                keys, ids, top_keys, top_ids, topk
-            )  # this CTA's top-topk, in every lane
-            if lane < topk // 2:  # topk / 2 vectors of (key, id, key, id)
-                for v in cutlass.range_constexpr(topk // 2):
-                    if lane == v:
-                        a, b = 2 * v, 2 * v + 1
-                        pair = (top_keys[a], top_ids[a], top_keys[b], top_ids[b])
-                        if part == 0:
-                            for k in cutlass.range_constexpr(4):
-                                lists[0, 4 * v + k] = pair[k]
-                        else:
-                            floats = tuple(bits_float(Uint32(w)) for w in pair)
-                            push_float(
-                                lists.iterator + part * 2 * topk + 4 * v,
-                                floats,
-                                bar.iterator,
-                                0,
-                            )
-        if part == 0:
-            wait_phase_zero_cluster(bar.iterator)
-            cute.arch.sync_threads()
-            if warp == 0:
-                keys.fill(EMPTY)
-                ids.fill(NO_ID)
-                if lane < PARTS:
-                    for r in cutlass.range_constexpr(topk):
-                        keys[r], ids[r] = lists[lane, 2 * r], lists[lane, 2 * r + 1]
-                warp_merge(keys, ids, top_keys, top_ids, topk)
-                if lane < topk // 2:
-                    for v in cutlass.range_constexpr(topk // 2):
-                        if lane == v:
-                            a, b = 2 * v, 2 * v + 1
-                            out = (
-                                Uint32(ordered(top_keys[a])),
-                                Uint32(top_ids[a] + vocab_start),
-                                Uint32(ordered(top_keys[b])),
-                                Uint32(top_ids[b] + vocab_start),
-                            )
-                            if cutlass.const_expr(self.local):
-                                store_words(at(box, rank, row, 4 * v), out)
-                            else:
-                                offset = cute.crd2idx((rank, row, 4 * v), box.layout)
-                                # v4 multimem.st takes .f32 (stored as raw bits), not .b32.
-                                multicast_words(mc + Int64(offset) * 4, out)
+        self.bitonic_merges(*common)
 
     @cute.jit
     def bitonic_merges(
@@ -363,10 +230,8 @@ class RankTopK:
         lane,
         warp,
     ):
-        """K31MK_RANKTOPK_BITONIC: the kernel's three merges as lane-distributed bitonic
-        networks (warp: 8 sorted 32-lane sequences merged; CTA: the warps' lists; cluster:
-        the 8 CTAs' lists); the same pushes, barrier and published words as the K-round
-        warp_merge path."""
+        """The kernel's three merges as lane-distributed bitonic networks (warp: 8 sorted
+        32-lane sequences merged; CTA: the warps' lists; cluster: the 8 CTAs' lists)."""
         topk = self.topk
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()

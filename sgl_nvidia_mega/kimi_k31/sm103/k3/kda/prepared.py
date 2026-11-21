@@ -3,7 +3,6 @@
 """Prepared KDA core. One packed projection supplies Q/K/V, the output gate, F_A and
 beta; per-batch policies select the gate schedule and the projection row pitch."""
 
-import os
 from functools import cache
 
 import cutlass
@@ -21,31 +20,10 @@ from .kernel import KdaSplit
 # state row, minimum CTAs per SM, CTAs per head (0: defaults) and L2 evict-first state
 # traffic (staged only).
 SCHEDULE = {12: "16-32:3.16.3.2.1,64:3.16.4.2.1", 6: "16:1.0.0,32-64:3.16.3.2"}
-# VR200 (SM107) B2-8 decode: GB300's B16+ gate modes and staged schedules are 36-43%
-# faster there than GB300's mode 2 (cold L2, same gates as the shipped modes). Rows ->
-# (gate mode, schedule).
-# ``K31MK_KDA_SM107_RETUNE=0`` keeps GB300's B2-8 policy on SM107.
-SM107_DECODE = {
-    2: (0, "1.0.0.4.0"),
-    3: (0, "1.0.0.4.0"),
-    **{b: (0, "3.16.3.2.1") for b in (4, 5, 6, 7)},
-    8: (1, "3.16.3.2.1"),
-    # B16/B32: GB300's B64 occupancy 4 (faster at both).
-    16: (0, "3.16.4.2.1"),
-    32: (0, "3.16.4.2.1"),
-}
-
-
-def _sm107_retune(device):
-    if os.environ.get("K31MK_KDA_SM107_RETUNE", "1") == "0":
-        return False
-    return torch.cuda.get_device_capability(device) == (10, 7)
 
 
 def decode_mode(batch, device):
     """Gate mode of TP8 decode rows (GB300: B1 1, B2-8 2, B16/32/64 0)."""
-    if batch in SM107_DECODE and _sm107_retune(device):
-        return SM107_DECODE[batch][0]
     return 0 if batch in (16, 32, 64) else 1 if batch == 1 else 2
 
 
@@ -63,10 +41,6 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
     batch = specs[0][0][0]
     table = SCHEDULE if tokens == 1 else SPEC_SCHEDULE
     schedule = batch_table(table.get(heads, ""))
-    if tokens == 1 and heads == 12 and batch in SM107_DECODE and _sm107_retune(device):
-        tuned_mode, tuned = SM107_DECODE[batch]
-        if gate_mode == tuned_mode:
-            schedule[batch] = tuple(map(int, tuned.split(".")))
     schedule = schedule.get(batch // tokens, (0, 0, 0)) if gate_mode != 2 else (0,) * 3
     if schedule[0] >= 2 and specs[9][1][-2:] != (128, 1):  # staging needs whole rows
         schedule = (1, *schedule[1:4])  # no evict hint without staging

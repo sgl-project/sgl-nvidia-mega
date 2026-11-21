@@ -44,8 +44,8 @@ from ..k3.common.host import (
 from ..k3.gemm.projection import PreparedProjection
 from .attention import DraftAttention
 from .convgemm import PreparedConvProjection
-from .head import BITONIC, DraftHead
-from .kernels import DELTA, HIDDEN, TAPS, ConvPrepare, DraftFused, EmbedNorm, RowNorm
+from .head import DraftHead
+from .kernels import DELTA, HIDDEN, TAPS, ConvPrepare, DraftFused, RowNorm
 from .selector import DraftSelector
 from .tactics import draft_tactic
 
@@ -130,17 +130,6 @@ class DraftHeadWeights:
 
 
 @dataclass
-class DraftEmbedWeights:
-    """Stage 2c: the target's vocab-parallel embedding shard [num_org, 7168] (vocab_start =
-    its first global id) and the mask token's full embedding row [7168] (replicated; e.g.
-    ``embed_tokens(mask_id)`` at build)."""
-
-    shard: torch.Tensor
-    vocab_start: int
-    mask_row: torch.Tensor
-
-
-@dataclass
 class DraftKV:
     pool: torch.Tensor  # [layers, slots, 576] FP8 E4M3 (512 latent | 64 rotated k_pe)
     ctx_len: int
@@ -217,24 +206,6 @@ class DraftComm:
         if not self.aux_mc:
             raise RuntimeError("the draft aux gather needs multicast memory")
         self.aux.view(torch.int32).fill_(-0x80000000)
-        # The block embedding's anchor-row hop (stage 2c): [parity, tokens, 7168] BF16, one
-        # writer (the anchor token's owner rank) per row; parity as for ``aux``.
-        self.embed = symm_mem.empty(
-            (2, shapes.tokens, HIDDEN), dtype=torch.bfloat16, device=device
-        )
-        self.embed_mc = int(symm_mem.rendezvous(self.embed, group).multicast_ptr or 0)
-        if not self.embed_mc:
-            raise RuntimeError("the draft block embedding needs multicast memory")
-        self.embed.view(torch.int32).fill_(-0x80000000)
-        # The target argmax gather of ArgmaxAccept (stage 3a): [parity, TP, tokens, (value,
-        # id)] int32; parity as for ``aux`` (serving 0, an eager warm-up 1).
-        self.argmax = symm_mem.empty(
-            (2, self.tp, shapes.tokens, 2), dtype=torch.int32, device=device
-        )
-        self.argmax_mc = int(symm_mem.rendezvous(self.argmax, group).multicast_ptr or 0)
-        if not self.argmax_mc:
-            raise RuntimeError("the target argmax gather needs multicast memory")
-        self.argmax.fill_(-0x80000000)
         torch.accelerator.synchronize(device)
         dist.barrier(group=group)
 
@@ -252,7 +223,7 @@ class DraftComm:
         """Fail unless no CUDA storage reachable from ``targets`` (the target megakernel's
         executor / mailbox owners) overlaps the draft mailboxes: the draft hop family must
         never alias a target family's Lamport slots."""
-        own = device_ranges(self.buffer, self.head, self.aux, self.embed, self.argmax)
+        own = device_ranges(self.buffer, self.head, self.aux)
         others = device_ranges(
             *targets, skip=(DraftComm,)
         )  # a runner may hold the draft
@@ -303,20 +274,6 @@ def compile_conv(arch):
     return cute.compile(
         ConvPrepare(), *args, make_fake_stream(), options=f"--gpu-arch={arch}"
     )
-
-
-@cache
-def compile_embed(rows, num_org, local, deadline_ns):
-    args = (fake((rows,), (1,), torch.int64, 8), fake((num_org, HIDDEN), (HIDDEN, 1)))
-    args += (
-        fake((HIDDEN,), (1,)),
-        fake((HIDDEN,), (1,)),
-        fake((rows, HIDDEN), (HIDDEN, 1)),
-    )
-    args += (cutlass.Int64(0), cutlass.Int64(0), dynamic_fake(2), dynamic_fake(2))
-    args += (cutlass.Float32(1e-6),)
-    kernel = EmbedNorm(num_org, local, deadline_ns)
-    return cute.compile(kernel, *args, make_fake_stream())
 
 
 @cache
@@ -384,7 +341,6 @@ class DraftChain:
         device=None,
         targets=(),
         head: Optional[DraftHeadWeights] = None,
-        embed: Optional[DraftEmbedWeights] = None,
     ):
         """``targets``: the target megakernel's buffer owners; when given, the build
         fails if a draft mailbox aliases any of their CUDA storages. ``head``: also run
@@ -420,13 +376,10 @@ class DraftChain:
         self.value = new(shapes.heads * 128)  # M1b attention output
         self.sums, self.scratch = new(HIDDEN), new(HIDDEN)  # debug taps
         self.rank = cutlass.Int32(shapes.rank)
-        self.embed = None
-        if embed is not None:
-            self.attach_embed(embed)
         logger.info(
             "draft MK chain: layers=%d tokens=%d tp=%d rank=%d fold=%s (K31DRAFT_CONV_FOLD) "
             "race_delay_ns=%d fold_early_trigger=%s tactics conv=%s gate_up=%s fused_a=%s "
-            "embed=%s head=%s target_buffers_disjoint=%d",
+            "head=%s target_buffers_disjoint=%d",
             len(self.layers),
             tokens,
             tp,
@@ -437,12 +390,10 @@ class DraftChain:
             draft_tactic("conv", self.device),
             draft_tactic("gate_up", self.device),
             draft_tactic("fused_a", self.device),
-            embed is not None,
             head is not None,
             self.target_buffers,
         )
         self.head = self.selector = None
-        self.accept = None
         if head is not None:
             self.attach_head(head)
 
@@ -469,61 +420,12 @@ class DraftChain:
         )  # fmt: skip
         logger.info(
             "draft MK head: num_org=%d vocab_start=%d head tactic=%s rank top-k=8-CTA cluster "
-            "top_k=%d merges=%s",
+            "top_k=%d merges=bitonic",
             self.head.num_org,
             head.vocab_start,
             draft_tactic("head", self.device),
             shapes.topk,
-            "bitonic" if BITONIC else "serial",
         )
-
-    def attach_embed(self, embed: DraftEmbedWeights):
-        """Add the on-device block embedding (stage 2c, ``EmbedNorm``) after construction, e.g.
-        once SGLang hands the target's embedding to the draft. Compiles here: attach on every
-        rank before any run with ``ids`` and before graph capture, never during a capture."""
-        if self.embed is not None:
-            raise RuntimeError("the draft chain already has a block embedding")
-        shard, mask_row = embed.shard, embed.mask_row
-        if (
-            shard.dim() != 2
-            or shard.shape[1] != HIDDEN
-            or tuple(mask_row.shape) != (HIDDEN,)
-        ):
-            raise ValueError(
-                f"embedding shard {tuple(shard.shape)} / mask row {tuple(mask_row.shape)}"
-            )
-        if int(embed.vocab_start) < 0:
-            raise ValueError(f"vocab_start {embed.vocab_start}")
-        self.embed = (_bf16(shard), int(embed.vocab_start), _bf16(mask_row))
-        self.embed_code = compile_embed(
-            self.shapes.tokens, shard.shape[0], False, DEADLINE_NS
-        )
-        logger.info(
-            "draft MK embed: block embedding on device (num_org=%d vocab_start=%d)",
-            shard.shape[0],
-            int(embed.vocab_start),
-        )
-
-    def attach_accept(self, sim_real_token=True):
-        """Add the target argmax gather + DFlash accept (stage 3a, ``ArgmaxAccept``) on this
-        chain's comm. Compiles here (before any capture); returns the ``DraftAccept``."""
-        from .accept import DraftAccept
-
-        if self.accept is not None:
-            raise RuntimeError("the draft chain already has an accept stage")
-        self.accept = DraftAccept(
-            self.comm,
-            self.shapes,
-            sim_real_token=sim_real_token,
-            deadline_ns=DEADLINE_NS,
-        )
-        logger.info(
-            "draft MK accept: ArgmaxAccept over TP%d, B%d, sim token %s",
-            self.shapes.tp,
-            self.shapes.requests,
-            "real" if sim_real_token else "fixed",
-        )
-        return self.accept
 
     def _conv(self, x, delta, base, out):
         views = (dynamic_view(x), dynamic_view(delta), base, dynamic_view(out))
@@ -598,8 +500,6 @@ class DraftChain:
         stamp: Optional[Callable] = None,
         fine_stamps: bool = False,
         anchor: Optional[torch.Tensor] = None,
-        ids: Optional[torch.Tensor] = None,
-        embed_parity: int = 0,
     ):
         """x0 [tokens, 7168] BF16 block embeddings -> out [tokens, 7168] BF16 (final
         RMSNorm of the last layer's hidden + residual). M1a: ``attn(layer, x)`` maps the
@@ -622,21 +522,9 @@ class DraftChain:
         fmark = lambda i, tag: fine_stamps and mark(f"L{i}:{tag}")  # noqa: E731
         s = stream(self.device)
         mark("start")
-        if ids is not None:  # stage 2c: embed the block on device (x0 unused)
-            if self.embed is None:
-                raise RuntimeError("run(ids=...) needs attach_embed() first")
-            shard, vocab_start, mask_row = self.embed
-            box = self.comm.embed[embed_parity]
-            mc = self.comm.embed_mc + embed_parity * box.numel() * 2
-            args = (to_cute(ids, 8), to_cute(shard), to_cute(mask_row))
-            args += (self.layers[0].norm_views["input_norm"], to_cute(box))
-            args += (cutlass.Int64(mc), cutlass.Int64(vocab_start))
-            args += (dynamic_view(self.residual), dynamic_view(self.x_norm), self.eps)
-            self.embed_code(*args, s)
-        else:
-            views = (dynamic_view(x0), self.layers[0].norm_views["input_norm"])
-            views += (dynamic_view(self.residual), dynamic_view(self.x_norm), self.eps)
-            self.norm(*views, s)
+        views = (dynamic_view(x0), self.layers[0].norm_views["input_norm"])
+        views += (dynamic_view(self.residual), dynamic_view(self.x_norm), self.eps)
+        self.norm(*views, s)
         for i, layer in enumerate(self.layers):
             mark(f"L{i}:in")
             if tap:

@@ -2,24 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 """K3.1 DFlash2 draft layers on the megakernel chain in serving (stage 1; ``SGLANG_K31_DRAFT_MK``).
 
-Stage 1, M1b, 2a (head) and 2b (aux) are on by default in the GB300 BEST scope
-(kimi_k31/k3/default_scope.py), off elsewhere; a stage's env set to 0 / 1 turns it off / on. By default a stage the setup does not support declines with one INFO line; one set to 1 raises.
+Stage 1 with M1b is on by default in the GB300 BEST scope (kimi_k31/k3/default_scope.py), off elsewhere;
+``SGLANG_K31_DRAFT_MK`` set to 0 / 1 turns it off / on. With it, the chain also builds the head (2a) and the aux
+(2b) for the K3.1 DFlash runtime, unless ``K31MK_DFLASH_RUNTIME=0`` (no runtime runs them). A stage the setup
+does not support declines with one INFO line.
 
 The draft graph's forward of one B1 x 8-row TARGET_VERIFY block runs ``DraftChain`` (chain.py) in place of
 SGLang's decoder layers; the chain's attention hook (M1a) is SGLang's own MLA sublayer up to W_UV, so the
 block's KV write, RoPE and sliding window stay SGLang's. Every other draft forward (other widths, prefill)
 runs SGLang's. ``SGLANG_K31_DRAFT_MK=0``: ``max_rows`` 0, so SGLang never wraps the draft's forward.
 
-M1b (``SGLANG_K31_DRAFT_MK_M1B``): the attention sublayer runs on MK blocks as well (``DraftAttention``:
+M1b: the attention sublayer runs on MK blocks as well (``DraftAttention``:
 fused_a, DraftMlaQuery's FP8 query + the block's KV insert at its out_cache_loc slots, DraftMlaValue); only the
-core stays SGLang's, its sliding-window MLA call on the pre-built FP8 query (``save_kv_cache=False``).
+core stays SGLang's, its sliding-window MLA call on the pre-built FP8 query (``save_kv_cache=False``); a draft
+KV pool that is not plain FP8 MLA keeps M1a.
 
-Stage 3a (``SGLANG_K31_DRAFT_MK_ACCEPT``): the greedy verify accept, the gather of every rank's row argmax,
-the DFlash accept and the simulated acceptance, runs ``DraftAccept`` through SGLang's ``SupportsDraftAccept``.
-
-Stage 2b (``SGLANG_K31_DRAFT_MK_AUX``): the DFlash worker's decode aux append, the committed rows'
-target context into the draft KV, runs ``DraftAux`` (aux.py) on the chain's comm through SGLang's
-``SupportsDraftAux`` for the same B1 x 8 rows; SGLang replays it on the main stream.
+Stage 2b: the DFlash worker's decode aux append, the committed rows'
+target context into the draft KV, runs ``DraftAux`` (aux.py) on the chain's comm through the K3.1 DFlash
+runtime for the same B1 x 8 rows, which replays it on the main stream.
 
 Mailboxes: one captured graph per batch size replays ``parity=0`` every round; each of the 2L hops has its
 own slot, so a slot's reuse distance is a whole round, as for the target's graph-baked parity. All
@@ -30,7 +30,6 @@ stream raises.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 import torch
@@ -55,6 +54,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 from sgl_nvidia_mega.kimi_k31 import spec as target
+from sgl_nvidia_mega.kimi_k31.dflash.protocol import DRAFT_CHAINS, RUNTIME
 from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 
 # The SGLang names this module reads, by file under the sglang package; test/unit/test_contract.py pins them.
@@ -141,23 +141,10 @@ logger = logging.getLogger(__name__)
 
 ENV = "SGLANG_K31_DRAFT_MK"
 ENABLED = best_default(ENV, "1", "0") not in ("", "0")
-# Stage 2b: the worker's decode aux append (context features into the draft KV) on MK blocks too.
-AUX_ENV = "SGLANG_K31_DRAFT_MK_AUX"
-AUX = ENABLED and best_default(AUX_ENV, "1", "0") not in ("", "0")
-M1B_ENV = "SGLANG_K31_DRAFT_MK_M1B"
-M1B = ENABLED and best_default(M1B_ENV, "1", "0") not in ("", "0")
-# Stage 2a: the draft graph's proposal (candidate top-k over the target lm_head + the selector walk, greedy or
-# sampled per request) on MK blocks too, through SGLang's SupportsDraftSelectorHead.
-HEAD_ENV = "SGLANG_K31_DRAFT_MK_HEAD"
-HEAD = ENABLED and best_default(HEAD_ENV, "1", "0") not in ("", "0")
-# Stage 3a: the greedy verify accept (row-argmax gather + DFlash accept + sim) on the chain's comm, through
-# SGLang's SupportsDraftAccept.
-ACCEPT_ENV = "SGLANG_K31_DRAFT_MK_ACCEPT"
-ACCEPT = ENABLED and os.environ.get(ACCEPT_ENV, "0") not in ("", "0")  # off by default
-# Stage 2c: the block embedding on device (the anchor row from its owner rank's vocab shard, the mask rows
-# replicated, fused with the entry RMSNorm), in place of SGLang's embedding lookup + all-reduce.
-EMBED_ENV = "SGLANG_K31_DRAFT_MK_EMBED"
-EMBED = ENABLED and os.environ.get(EMBED_ENV, "0") not in ("", "0")
+# Stage 2b: the worker's decode aux append (context features into the draft KV) on MK blocks too, and
+# stage 2a: the draft graph's proposal (candidate top-k over the target lm_head + the selector walk, greedy
+# or sampled per request); both run through the K3.1 DFlash runtime, so both build with it.
+AUX = HEAD = ENABLED and RUNTIME
 ROWS = 8  # one DFlash block per request; stage 1 serves B1
 MLA_ROW = 576  # bytes per draft KV slot: 512 FP8 latent | 64 FP8 rotated k_pe
 
@@ -188,14 +175,12 @@ class DraftLayersOnChain:
     draft_loop = draft_extend = begin_draft_round = graph_variants = (
         None  # SGLang's own paths
     )
-    draft_aux_rows: tuple[int, ...] = ()  # SGLang's SupportsDraftAux
-    draft_head_requests: tuple[int, ...] = ()  # SGLang's SupportsDraftSelectorHead
+    # what the chain offers the K3.1 DFlash runtime (kimi_k31/dflash/runtime.py)
+    draft_aux_rows: tuple[int, ...] = ()
+    draft_head_requests: tuple[int, ...] = ()
     draft_head_sampling = (
         True  # the chain's DraftSelector walks greedy and sampled requests
     )
-    draft_accept_requests: tuple[int, ...] = ()  # SGLang's SupportsDraftAccept
-    draft_embed_requests: tuple[int, ...] = ()  # SGLang's SupportsDraftEmbed
-    _embed_on = False  # attach_draft_embed ran: forward embeds input_ids on device
 
     def __init__(self, model, hf_config, ctx):
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -260,40 +245,33 @@ class DraftLayersOnChain:
         self.draft_head_requests = (
             (1,) if HEAD and self._head_serves(model) else ()
         )  # the chain's head serves B1
-        self.draft_accept_requests = (
-            (1,) if ACCEPT else ()
-        )  # DraftAccept compiles for B1
-        self.draft_embed_requests = (1,) if EMBED else ()
-        self._accept = None
-        self.m1b = M1B
-        if M1B:
+        self.m1b = ENABLED
+        # The target's DFlash runtime (dflash/runtime.py) serves only a draft chain built here.
+        DRAFT_CHAINS.append(self)
+        if self.m1b:
             logger.info(
-                "NVIDIA megakernel: draft MK M1b: attention on MK blocks, core = SGLang's sliding-window MLA (%s)",
-                M1B_ENV,
+                "NVIDIA megakernel: draft MK M1b: attention on MK blocks, core = SGLang's sliding-window MLA"
             )
 
     @staticmethod
     def _head_serves(model):
-        """Whether the chain's head serves the draft's selector K (16 / 32); by default it declines otherwise."""
+        """Whether the chain's head serves the draft's selector K (16 / 32); it declines otherwise."""
         from sgl_nvidia_mega.kimi_k31.sm103.draft.head import TOPKS
 
         top_k = getattr(getattr(model, "candidate_selector", None), "top_k", None)
-        if (
-            top_k in TOPKS or HEAD_ENV in os.environ
-        ):  # set: attach_draft_head raises on a mismatch
+        if top_k in TOPKS:
             return True
         logger.info(
-            "NVIDIA megakernel: draft MK head off: selector top-k %s, the head serves %s (%s)",
+            "NVIDIA megakernel: draft MK head off: selector top-k %s, the head serves %s",
             top_k,
             TOPKS,
-            HEAD_ENV,
         )
         return False
 
     @staticmethod
     def _build_aux(model, shapes, comm, cos_sin):
-        """``DraftAux`` (aux.py) over this rank's SGLANG_OPT_DFLASH_TP_AUX_FC slice, on the chain's comm; None (by
-        default) for a draft it does not serve, which an explicit SGLANG_K31_DRAFT_MK_AUX=1 refuses."""
+        """``DraftAux`` (aux.py) over this rank's SGLANG_OPT_DFLASH_TP_AUX_FC slice, on the chain's comm; None for
+        a draft it does not serve."""
         from sgl_nvidia_mega.kimi_k31.sm103.draft.aux import DraftAux
         from sgl_nvidia_mega.kimi_k31.sm103.draft.chain import DEADLINE_NS
         from sgl_nvidia_mega.kimi_k31.sm103.draft.tactics import draft_tactic
@@ -306,21 +284,17 @@ class DraftLayersOnChain:
         ]
         # GatherFused publishes rank r's slice as columns [r * width, (r + 1) * width).
         if model.fc_tp_columns != (shapes.rank * width, (shapes.rank + 1) * width):
-            reason = f"{AUX_ENV} needs SGLANG_OPT_DFLASH_TP_AUX_FC's rank-ordered fc slice, got {model.fc_tp_columns}"
+            reason = f"it needs SGLANG_OPT_DFLASH_TP_AUX_FC's rank-ordered fc slice, got {model.fc_tp_columns}"
         elif any(float(norm.variance_epsilon) != shapes.eps for norm in norms):
-            reason = (
-                f"{AUX_ENV}: hidden_norm and kv_a norms must share eps {shapes.eps}"
-            )
+            reason = f"hidden_norm and kv_a norms must share eps {shapes.eps}"
         elif any(
             tuple(w.shape) != (MLA_ROW, model.fc.weight.shape[0] * shapes.tp)
             for w in kv_a
         ):
-            reason = f"{AUX_ENV}: kv_a rows {[tuple(w.shape) for w in kv_a]}"
+            reason = f"kv_a rows {[tuple(w.shape) for w in kv_a]}"
         else:
             reason = None
         if reason is not None:
-            if AUX_ENV in os.environ:
-                raise RuntimeError(reason)
             logger.info("NVIDIA megakernel: draft MK aux off: %s", reason)
             return None
         aux = DraftAux(
@@ -336,10 +310,9 @@ class DraftLayersOnChain:
         )
         device = model.fc.weight.device
         logger.info(
-            "NVIDIA megakernel: draft MK aux: fc tactic %s, kv tactic %s, comm.aux parity 0 (%s, rows %d)",
+            "NVIDIA megakernel: draft MK aux: fc tactic %s, kv tactic %s, comm.aux parity 0 (rows %d)",
             draft_tactic("fc_slice", device),
             draft_tactic("kv_stack", device),
-            AUX_ENV,
             shapes.tokens,
         )
         return aux
@@ -472,10 +445,6 @@ class DraftLayersOnChain:
             )
         )
         if not plain:
-            if M1B_ENV in os.environ:
-                raise RuntimeError(
-                    f"{M1B_ENV} needs a plain FP8 MLA draft KV pool, got {type(pool).__name__}"
-                )
             logger.info(
                 "NVIDIA megakernel: draft MK M1b off: the draft KV pool is not plain FP8 MLA (%s); M1a",
                 type(pool).__name__,
@@ -510,17 +479,11 @@ class DraftLayersOnChain:
                 raise RuntimeError(
                     f"{ENV}: a draft hop from a second stream (all-reduce program order)"
                 )
-        if self._embed_on:
-            # Stage 2c embeds the block ids on device; SGLang passes no embeddings (its graph buffer is stale).
-            if input_ids.shape != (ROWS,):
-                raise RuntimeError(f"{EMBED_ENV}: input_ids {tuple(input_ids.shape)}")
-            x0, embed = None, {"ids": input_ids}
-        elif input_embeds is None or input_embeds.shape != self.out.shape:
+        if input_embeds is None or input_embeds.shape != self.out.shape:
             raise RuntimeError(
                 f"{ENV}: input_embeds {None if input_embeds is None else tuple(input_embeds.shape)}"
             )
-        else:
-            x0, embed = input_embeds, {}
+        x0 = input_embeds
         # The head proposes from the block's rows 1..7; row 0 is the anchor (a no-copy view at B1).
         head = (
             {"anchor": input_ids.view(-1, ROWS)[:, 0]}
@@ -537,7 +500,6 @@ class DraftLayersOnChain:
                 0,
                 core=self._core(forward_batch),
                 **head,
-                **embed,
             )
         else:
             self.chain.run(
@@ -548,13 +510,12 @@ class DraftLayersOnChain:
                 0,
                 attn=self._attention(positions, forward_batch),
                 **head,
-                **embed,
             )
         hidden = self.out if capturing else self.out.clone()
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
 
     def attach_draft_head(self, *, lm_head, selector, draft_config):
-        """SGLang's SupportsDraftSelectorHead: the chain's candidate head over this rank's target lm_head shard
+        """The runtime's draft sampler: the chain's candidate head over this rank's target lm_head shard
         and the draft's selector; returns the selector's static (tokens, candidates, q)."""
         from sgl_nvidia_mega.kimi_k31.sm103.draft.chain import DraftHeadWeights
 
@@ -574,49 +535,24 @@ class DraftLayersOnChain:
         walk = self.chain.selector
         if walk.candidates.shape[-1] != selector.top_k:
             raise RuntimeError(
-                f"{HEAD_ENV}: head top-k {walk.candidates.shape[-1]} vs the selector's {selector.top_k}"
+                f"draft MK head: head top-k {walk.candidates.shape[-1]} vs the selector's {selector.top_k}"
             )
         return walk.tokens, walk.candidates, walk.q
 
     def stage_draft_head_sampling(self, *, temperatures, greedy_mask):
-        """SGLang's SupportsDraftSelectorHead: the selector's host refresh before a draft forward."""
+        """The runtime's draft sampler: the selector's host refresh before a draft forward."""
         self.chain.selector.stage_sampling(
             temperatures=temperatures, greedy_mask=greedy_mask
         )
 
-    def attach_draft_embed(self, *, embedding, mask_token_id):
-        """SGLang's SupportsDraftEmbed: the chain embeds the block from this rank's target vocab shard (the anchor
-        row's owner rank multicasts it) and the mask token's row. Collective: the mask row goes through SGLang's
-        vocab-parallel lookup once, so every rank holds it replicated."""
-        from sgl_nvidia_mega.kimi_k31.sm103.draft.chain import DraftEmbedWeights
-
-        shard = embedding.shard_indices
-        mask = torch.tensor([int(mask_token_id)], dtype=torch.int64, device=self.device)
-        mask_row = embedding(mask)[0].contiguous()
-        self.chain.attach_embed(
-            DraftEmbedWeights(
-                shard=embedding.weight[: int(shard.num_org_elements)],
-                vocab_start=int(shard.org_vocab_start_index),
-                mask_row=mask_row,
-            )
-        )
-        self._embed_on = True
-
-    def attach_draft_accept(self, *, sim_real_token):
-        """SGLang's SupportsDraftAccept: DraftAccept on the chain's argmax box (compiles here)."""
-        self._accept = self.chain.attach_accept(sim_real_token=sim_real_token)
-
-    def draft_accept(self, *, local, candidates, prefix_lens, sim_commit, out, parity):
-        # parity is the argmax box slot. SGLang alternates it over every call, eager or replayed, so its reuse
-        # does not depend on other hops in between (a round may run the accept without the MK draft).
-        self._accept.run(local, candidates, prefix_lens, sim_commit, out, parity=parity)
-
     def draft_aux(
         self, *, target_hidden, positions, slots_2d, commit_lens, kv_caches, parity
     ):
-        """SGLang's SupportsDraftAux: the decode aux append on MK blocks (DraftAux)."""
+        """The runtime's aux append: the decode aux append on MK blocks (DraftAux)."""
         if target_hidden.shape[0] != self.aux.rows:
-            raise RuntimeError(f"{AUX_ENV}: target_hidden {tuple(target_hidden.shape)}")
+            raise RuntimeError(
+                f"draft MK aux: target_hidden {tuple(target_hidden.shape)}"
+            )
         # parity is the gather's one-hop mailbox slot; SGLang alternates it over every call, eager or replayed.
         pools = self._pool_table(kv_caches, torch.cuda.is_current_stream_capturing())
         self.aux.run(
@@ -630,11 +566,11 @@ class DraftLayersOnChain:
             return self._pools
         if capturing:
             raise RuntimeError(
-                f"{AUX_ENV}: the draft KV caches changed after the eager warm-up"
+                "draft MK aux: the draft KV caches changed after the eager warm-up"
             )
         if len(caches) != self.aux.layers:
             raise RuntimeError(
-                f"{AUX_ENV}: {len(caches)} draft KV caches for {self.aux.layers} layers"
+                f"draft MK aux: {len(caches)} draft KV caches for {self.aux.layers} layers"
             )
         for cache in caches:
             if (
@@ -644,7 +580,7 @@ class DraftLayersOnChain:
                 or cache.device != self.device
             ):
                 raise RuntimeError(
-                    f"{AUX_ENV}: draft KV cache {cache.dtype} {tuple(cache.shape)}"
+                    f"draft MK aux: draft KV cache {cache.dtype} {tuple(cache.shape)}"
                 )
         if self._pools is None:
             self._pools = torch.empty(len(ptrs), dtype=torch.int64, device=self.device)

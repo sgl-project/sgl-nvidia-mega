@@ -189,19 +189,6 @@ class SparseVerifyStep(VerifyStepView):
             raise ValueError("the context-split indexer runs only in sparse verify")
 
 
-# Verify top-k: stock topk_transform_paged_v2 (the stock target-verify method, deterministic=False, over the stock
-# per-row plan) by default; ``K31MK_VERIFY_TOPK=rank`` keeps the k31 rank_topk kernel (exact FP32 selection).
-# Caveat: topk_v2 is inexact on tie-heavy rows; it is the stock method, so the
-# MK matches stock there.
-VERIFY_TOPK = os.environ.get("K31MK_VERIFY_TOPK", "v2")
-# ``K31MK_FUSED_INDEX_Q_VERIFY`` (on by default in the GB300 BEST scope, kimi_k31/k3/default_scope.py; 0 = the stock chain): sparse verify of <= 8 rows runs the index query
-# as decode's one-kernel FusedIndexQuery (same rounding points, head gate from the layer input).
-FUSED_INDEX_Q_VERIFY = best_default("K31MK_FUSED_INDEX_Q_VERIFY", "1", "0") != "0"
-# ``K31MK_DSA_WRITER_STREAM=1``: the 8-row packed index-K writer (GEMM, LayerNorm, cache store) runs on the gate
-# stream, which that path leaves idle, and the index stream waits for it only before the logits read the cache;
-# default keeps it ahead of the index query on the index stream, which then waits for it every layer.
-DSA_WRITER_STREAM = os.environ.get("K31MK_DSA_WRITER_STREAM", "0") != "0"
-_WRITER_STREAM_LOGGED = []
 # ``K31MK_DSA_EARLY_QAG=1`` (default off), DCP sparse verify whose top-k merge is the custom one-shot kernel
 # (dsa_dcp_sharded._TOPK_MERGE usable for the rows): the query all-gather and its copies run on the main stream right
 # after the MLA query, overlapping the indexer chain on the index stream, instead of on the index stream after the
@@ -251,11 +238,10 @@ def dcp_store_args():
 
 
 class VerifySelection:
+    """Verify top-k: stock topk_transform_paged_v2 (the stock target-verify method, deterministic=False,
+    over the stock per-row plan), so the MK matches stock, also on tie-heavy rows where topk_v2 is inexact."""
+
     def __init__(self, device, rows, split=None, *, scratch=None):
-        if VERIFY_TOPK not in ("v2", "rank"):
-            raise ValueError(
-                f"K31MK_VERIFY_TOPK must be v2 or rank, got {VERIFY_TOPK!r}"
-            )
         self.rows = rows
         self.selected = row_buffer(
             scratch, "selection.selected", rows, (2048,), torch.int32, device
@@ -316,18 +302,6 @@ class VerifySelection:
             return self.select_dcp(scores, table, step)
         # Native scoring computes through the last row's context (same as stock).
         # Top-k masks each row to P+j+1; no future key can become a selected slot.
-        if VERIFY_TOPK == "rank":
-            from ..sm103.dsa.rank_topk import select_rank_topk
-
-            # Top-k accepts an arbitrary row stride, including a shared row (0).
-            return select_rank_topk(
-                scores,
-                step.causal_lengths,
-                table,
-                self.selected,
-                step.topk_plan,
-                queries_per_request=step.query_width,
-            )
         from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
 
         topk_transform_paged_v2(
@@ -366,7 +340,9 @@ class VerifySelection:
 class PreparedSparseVerifyMla:
     def __init__(self, base, weights, rows, max_context, split=None, *, scratch=None):
         self.base = base
-        self.fused_index = FUSED_INDEX_Q_VERIFY and rows <= 8
+        # Up to 8 rows the index query is decode's one-kernel FusedIndexQuery (same rounding points, head gate from
+        # the layer input); it is built for 1-8 rows (sm103/dsa/index_q.py), wider steps run the stock chain.
+        self.fused_index = rows <= 8
         if self.fused_index:
             from ..sm103.dsa.index_q import FusedIndexQuery
 
@@ -385,10 +361,6 @@ class PreparedSparseVerifyMla:
         self.index_stream = _index_stream(base.device)
         self.gate_stream = _gate_stream(base.device)
         self.packed_index_gate = False
-        self.writer_on_gate_stream = False
-        # K31MK_DSA_WRITER_STREAM: the packed writer's GEMM (gate stream) writes the gate the index query reads;
-        # recorded right after it, waited before that query (P8).
-        self._gate_ready = torch.cuda.Event()
         self._q_gathered = (
             torch.cuda.Event()
         )  # K31MK_DSA_EARLY_QAG: the query all-gather (and its copies) done
@@ -595,12 +567,8 @@ class PreparedSparseVerifyMla:
         # The index-K/gate writer is already running on this stream. Wait only
         # for the input projection here; main MLA query is independent of it.
         self.index_stream.wait_stream(main)
-        if self.packed_index_gate:
-            # The packed writer's GEMM writes the gate the (non-fused) index query reads. Off the index stream it
-            # must be waited for before that query, not after it (P8: K31MK_DSA_WRITER_STREAM read it unordered).
-            if self.writer_on_gate_stream and not self.fused_index:
-                self.index_stream.wait_event(self._gate_ready)
-        else:
+        # The packed writer runs ahead of the index query on the index stream; otherwise the gate stream writes the gate.
+        if not self.packed_index_gate:
             self.index_stream.wait_stream(self.gate_stream)
         # DCP and the context-split indexer keep today's order (their collectives and gathers are untouched).
         after = (
@@ -620,10 +588,6 @@ class PreparedSparseVerifyMla:
                 iq, gates = self.index_projection.run(self.hidden, projected)
             else:
                 iq, gates = self.index_projection.project_query(projected)
-            if (
-                self.writer_on_gate_stream
-            ):  # the logits read the index-K the writer stored
-                self.index_stream.wait_stream(self.gate_stream)
             selected = self.selection.run(
                 iq,
                 gates,
@@ -683,14 +647,6 @@ class SparseVerifyIndexKey:
             ):  # the fused query computes its gate from the layer input
                 core.index_projection.gate = self.projected[:, 128:160]
             core.packed_index_gate = True
-            core.writer_on_gate_stream = DSA_WRITER_STREAM
-            if (
-                DSA_WRITER_STREAM and not _WRITER_STREAM_LOGGED
-            ):  # once per process, not per layer
-                _WRITER_STREAM_LOGGED.append(True)
-                logger.info(
-                    "NVIDIA megakernel: sparse verify index-K writer on the gate stream (opt-in)"
-                )
 
     def bind(self, cache, page_size, rows=(8,)):
         self.core.index_cache = cache
@@ -712,18 +668,8 @@ class SparseVerifyIndexKey:
                 fused_store_index_k_cache,
             )
 
-            writer = side
-            if (
-                self.core.writer_on_gate_stream
-            ):  # the index query need not wait for this writer
-                gate.wait_stream(main)
-                writer = gate
-            with torch.cuda.stream(writer):
+            with torch.cuda.stream(side):
                 torch.mm(hidden, self.packed_weight.T, out=self.projected)
-                if (
-                    self.core.writer_on_gate_stream
-                ):  # the packed gate (projected[:, 128:160]) the query reads
-                    self.core._gate_ready.record()
                 w = self.base.weights
                 # LayerNorm supports this padded row stride; its output is
                 # contiguous, so the stock cache writer needs no input copy.
@@ -833,7 +779,7 @@ class BuiltSparseVerify(BuiltK31Verify):
         """The context-split indexer (a collective: every TP rank builds the merge's symmetric buffer), or {}
         (an empty split keeps every step on the replicated indexer): K31MK_INDEX_SPLIT_MIN=0, a context length
         below it, and by default DCP or no usable 16-rank merge, which an explicit K31MK_INDEX_SPLIT_MIN refuses."""
-        from .split import COARSE_BITS, SPLIT_MIN, LocalIndexer, SplitMerge
+        from .split import SPLIT_MIN, LocalIndexer, SplitMerge
 
         if not SPLIT_MIN:
             return {}
@@ -877,12 +823,6 @@ class BuiltSparseVerify(BuiltK31Verify):
             group.world_size,
             self.widths,
         )
-        if COARSE_BITS != 10:
-            logger.info(
-                "NVIDIA megakernel: sparse verify context split candidates coarse bins %d bits "
-                "(K31MK_INDEX_SPLIT_COARSE_BITS)",
-                COARSE_BITS,
-            )
         return {
             rows: (
                 LocalIndexer(

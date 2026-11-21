@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 from sgl_nvidia_mega.kimi_k31.k3.providers import _cuda_memory, build_resources
 from sgl_nvidia_mega.kimi_k31.k3.spec import _deadline_ns
 
+from .dflash.protocol import DRAFT_CHAINS, RUNTIME
 from .verify_binding import KdaVerifyWeights
 from .verify_contract import supported_query_width, verify_keys
 from .verify_executor import K31VerifyExecutor
@@ -100,6 +99,19 @@ class BuiltK31Verify:
     # no speculative runtime hooks factory: SGLang keeps its own strategies
     speculative_runtime_hooks = None
 
+    @property
+    def dflash_runtime(self) -> str:
+        """The DFlash runtime (SGLang's SupportsDFlashRuntime), by "module:attribute":
+        SGLang's DFlash worker imports it at its start and builds it with this target. It
+        runs its rounds on the DFlash2 draft's megakernel chain, so it is named only once
+        a draft is built on the chain (draft/serving.py registers it); without one, or
+        with K31MK_DFLASH_RUNTIME=0, SGLang's DFlash round runs beside this target. It
+        calls prepare_sampled_accept, sampled_accept_fits, sampled_accept and kda_commit
+        below."""
+        if not DRAFT_CHAINS or not RUNTIME:
+            return ""
+        return "sgl_nvidia_mega.kimi_k31.dflash.runtime:K31DFlashRuntime"
+
     def __init__(self, weights, deadline_s):
         from .verify_weights import WeightModel
 
@@ -155,28 +167,11 @@ class BuiltK31Verify:
         )
         self.pool_view = None
         self._active_logged = set()
-        self._kda_commit = best_default("K31MK_KDA_COMMIT", "1", "0") == "1"
         self._kda_commit_logged = False
-        # The DFLASH sampled accept's rank-0 broadcast on its own multicast box (K31MK_RANK0_BCAST, default_scope), built here so
-        # its rendezvous and compile run with the rest of the build, on every rank.
-        self._bcast, self._bcast_logged = None, False
-        # Use-time round counts of the two DFLASH sampled-accept hops, logged at 1, 10, 100, ... rounds per process.
-        self._rounds = {"rank-0 broadcast": [0, 1], "sampled accept": [0, 1]}
-        if best_default("K31MK_RANK0_BCAST", "1", "0") == "1":
-            from sglang.srt.runtime_context import get_parallel
-
-            from .sm103.draft.accept import Rank0Bcast
-
-            parallel = get_parallel()
-            if int(parallel.tp_size) > 1:
-                self._bcast = Rank0Bcast(
-                    parallel.tp_group.device_group,
-                    torch.device("cuda", torch.cuda.current_device()),
-                    int(parallel.tp_rank),
-                    deadline_ns=_deadline_ns(deadline_s),
-                )
-        # The DFLASH T > 0 sampled accept on the vocab shards (K31MK_SAMPLED_ACCEPT, default_scope): built by
-        # prepare_sampled_accept, which the worker calls on every rank once it knows the target's head.
+        # Use-time round counts of the DFLASH sampled accept, logged at 1, 10, 100, ... rounds per process.
+        self._rounds = {"sampled accept": [0, 1]}
+        # The DFLASH T > 0 sampled accept on the vocab shards: built by prepare_sampled_accept, which the
+        # DFlash runtime calls on every rank once it knows the target's head.
         self._sampled, self._sampled_logged = None, False
         self._sampled_deadline_ns = _deadline_ns(deadline_s)
 
@@ -264,22 +259,6 @@ class BuiltK31Verify:
             self._active_logged.add(key)
         return result
 
-    def rank0_broadcast(self, accept_len, bonus):
-        """Rank 0's sampled accept (accept_len int32 [B], bonus int64 [B]) on every rank, in place, in one
-        multicast hop (draft.accept.Rank0Bcast). False (launching nothing; the caller keeps SGLang's
-        broadcasts) at TP 1 or with K31MK_RANK0_BCAST off (default_scope). Collective: every rank, in the same order."""
-        if self._bcast is None:
-            return False
-        self._bcast.run(accept_len, bonus)
-        if not self._bcast_logged:
-            logger.info(
-                "NVIDIA megakernel: rank-0 sampled-accept broadcast active (one multicast hop; "
-                "the dflash-selector NCCL broadcasts skipped)"
-            )
-            self._bcast_logged = True
-        self._count_round("rank-0 broadcast")
-        return True
-
     def _count_round(self, path):
         count = self._rounds[path]
         count[0] += 1
@@ -292,10 +271,8 @@ class BuiltK31Verify:
     ):
         """Build draft.sampled.SampledAccept (its multicast boxes and kernels) for a target head of
         ``vocab_size`` over TP shards of ``shard_width`` columns and the selector's ``topk`` (16 / 32),
-        at block 5 for Q5, otherwise legacy block 8 (Q8 / Q16). True when built; False (building nothing) at TP 1, with K31MK_SAMPLED_ACCEPT off (default_scope), or
-        (by default) for a selector K or shard width it does not serve. Collective: every rank, in the same order."""
-        if best_default("K31MK_SAMPLED_ACCEPT", "1", "0") != "1":
-            return False
+        at block 5 for Q5, otherwise legacy block 8 (Q8 / Q16). True when built; False (building nothing) at TP 1
+        or for a selector K or shard width its kernels do not serve. Collective: every rank, in the same order."""
         from sglang.srt.runtime_context import get_parallel
 
         from .sm103.draft.sampled import SLICE, TOPKS, SampledAccept
@@ -304,9 +281,7 @@ class BuiltK31Verify:
         if int(parallel.tp_size) < 2:
             return False
         # Rank-uniform: the selector and the head shard are the same on every rank.
-        if (
-            int(topk) not in TOPKS or int(shard_width) % SLICE
-        ) and "K31MK_SAMPLED_ACCEPT" not in os.environ:
+        if int(topk) not in TOPKS or int(shard_width) % SLICE:
             logger.info(
                 "NVIDIA megakernel: sampled accept off (selector K %d, shard width %d; it serves K %s and "
                 "widths divisible by %d)",
@@ -356,9 +331,7 @@ class BuiltK31Verify:
 
     def kda_commit(self, **kwargs):
         """Stage 3b: the post-verify KDA commit in one launch (draft.commit.kda_commit, keyword
-        arguments as there). False (the caller keeps today's path) with K31MK_KDA_COMMIT off (default_scope)."""
-        if not self._kda_commit:
-            return False
+        arguments as there); True (it launched), as the DFlash runtime's KdaCommit expects."""
         from .sm103.draft.commit import kda_commit
 
         kda_commit(**kwargs)

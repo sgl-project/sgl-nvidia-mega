@@ -19,14 +19,9 @@ from ..common.host import fake, layout, stream, to_cute
 from .kernel import KdaSplit
 from .prepared import decode_conv_weight
 
-# VR200 (SM107) verify schedules (early, lanes per state row, minimum CTAs per SM, CTAs
-# per head) by (requests, queries), from an SM107 sweep (cold L2, same gates): Breq4 Q8 is
-# faster on 4-CTA clusters (192 CTAs, one wave on 212 SMs); GB300's 8-CTA clusters stay best
-# at Breq 1 and 2.
-SM107_VERIFY: dict = {(4, 8): (0, 8, 2, 4)}
-# GB300 (SM103) TP8 (12 heads per rank) verify schedules by (requests, queries), from a TP8 sweep (cold L2, the
-# KDA kernel gates): from Breq 2, 4 CTAs per head beat the default 8 (Breq 4: 9.4 vs 14.7 us).
-# Not bitwise vs the default schedule. ``K31MK_KDA_SM103_TP8=0`` keeps the default.
+# GB300 (SM103) TP8 (12 heads per rank) verify schedules (early, lanes per state row, minimum CTAs per SM, CTAs per
+# head) by (requests, queries), from a TP8 sweep (cold L2, the KDA kernel gates): from Breq 2, 4 CTAs per head beat
+# the default 8 (Breq 4: 9.4 vs 14.7 us). Not bitwise vs the default schedule.
 SM103_TP8_HEADS = 12
 SM103_TP8_VERIFY: dict = {
     (2, 8): (0, 8, 2, 4),
@@ -40,18 +35,9 @@ SM103_TP8_VERIFY: dict = {
 
 
 def verify_schedule(requests, queries, device, heads=None):
-    """GB300: (0, 8, 1 if Q > 8 else 2, 8). ``K31MK_KDA_VERIFY_SCHEDULE="l.o.c"`` forces
-    lanes/occupancy/cluster (tuning sweeps); ``K31MK_KDA_SM107_RETUNE=0`` keeps GB300's."""
-    forced = os.environ.get("K31MK_KDA_VERIFY_SCHEDULE")
-    if forced:
-        return (0, *map(int, forced.split(".")))
-    retune = os.environ.get("K31MK_KDA_SM107_RETUNE", "1") != "0"
+    """GB300: (0, 8, 1 if Q > 8 else 2, 8), and the TP8 table above."""
     capability = torch.cuda.get_device_capability(device)
-    if retune and capability == (10, 7):
-        if (requests, queries) in SM107_VERIFY:
-            return SM107_VERIFY[requests, queries]
-    sm103_tp8 = os.environ.get("K31MK_KDA_SM103_TP8", "1") != "0"
-    if sm103_tp8 and capability == (10, 3) and heads == SM103_TP8_HEADS:
+    if capability == (10, 3) and heads == SM103_TP8_HEADS:
         # Experimental Q5/R3 point: preserve ReplaySSM dependency and arithmetic
         # contracts while reusing the established four-CTA layout. Default off.
         if (requests, queries) == (3, 5) and os.environ.get(

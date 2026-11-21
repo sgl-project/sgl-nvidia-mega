@@ -5,8 +5,6 @@ SiTU hidden exchange and output epilogue. Capacity <= 8 keeps the batch's activa
 SMEM; capacity > 8 (grouped) runs (expert, <= 8 tokens) units whose FC1 stages gather
 8-row slices of the grid-quantized batch."""
 
-import os
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint32, Uint64
@@ -174,15 +172,15 @@ def mx_values(values):
 # (bytes 0-3 used), the layout of the experts' per-slot SMEM images.
 PLAN_XSF = 64 * 3584
 PLAN_BYTES = PLAN_XSF + 64 * 448
-# On by default in the GB300 BEST scope, kimi_k31/k3/default_scope.py (0 = off): the TP8 B8 streamed experts copy the plan the routing kernel's copy role
-# writes (as at B>8) into their SMEM activation image, instead of every CTA loading
-# the FP32 rows and quantizing them; the image holds the same bytes.
-PLAN_B8 = "SGLANG_NVIDIA_MEGAKERNEL_EXPERTS_PLAN_B8"
 
 
 def plan_b8(tp, batch):
-    """Whether TP8 ``batch`` 8 runs on the plan (``PLAN_B8``)."""
-    return tp == 8 and batch == 8 and best_default(PLAN_B8, "1", "0") not in ("", "0")
+    """Whether the TP8 B8 streamed experts copy the plan the routing kernel's copy role writes (as at B>8)
+    into their SMEM activation image, instead of every CTA loading the FP32 rows and quantizing them; the
+    image holds the same bytes (bitwise; Rubin TP8 serving TPOT -3.42 %). The copy needs the non-grouped
+    capacity-8 engine (``copy_plan_x``, the ExpertsKernel assert). TP16 B8, the GB300 BEST path, keeps the
+    per-CTA quantization it was measured with; the plan copy there has no measurement yet."""
+    return tp == 8 and batch == 8
 
 
 # vLLM's copy of this engine (nightly e4a5b55) launches without the cooperative attribute
@@ -195,19 +193,6 @@ COOPERATIVE = "K31MK_EXPERTS_COOPERATIVE"
 
 def cooperative():
     return best_default(COOPERATIVE, "0", "1") != "0"
-
-
-# The routing preamble's input-independent half before griddepcontrol.wait: the per-CTA call
-# counter (written at the end of the previous experts call, which every kernel in between has
-# waited on; the route kernel just before never touches it) and the first-occurrence table fill
-# (shared memory of weight stage 0, unused until the producer starts). Same bookkeeping, so
-# bitwise (on VR200 each CTA loads its ids and finishes its consumer earlier). On by default;
-# ``K31MK_EXPERTS_PREWAIT=0`` restores the in-route order.
-PREWAIT = "K31MK_EXPERTS_PREWAIT"
-
-
-def prewait():
-    return os.environ.get(PREWAIT, "1") not in ("", "0")
 
 
 @cute.jit
@@ -389,7 +374,6 @@ class ExpertsKernel(ExpertsGeometry):
         # Non-grouped capacity 8 only: ``x`` is the plan (``copy_plan_x``).
         self.planned_x = planned and not self.grouped and not self.dense
         assert not planned or self.planned_x, "the B8 plan copy needs capacity 8"
-        self.prewait = prewait()
         self.rounds = (112 * capacity + 319) // 320 if self.dense else 3
 
     def sync(self, barrier, phase=0, tmem=False):
@@ -1592,7 +1576,12 @@ class ExpertsKernel(ExpertsGeometry):
         tid, warp, lane, cta = thread()
         sm = alloc(cutlass.utils.SmemAllocator(), Uint8, self.smem_bytes, 1024)
         tmem_base = self.initialize(sm, maps, batch)
-        hoisted: cutlass.Constexpr = self.prewait and not self.grouped
+        # The routing preamble's input-independent half before griddepcontrol.wait: the per-CTA call
+        # counter (written at the end of the previous experts call, which every kernel in between has
+        # waited on; the route kernel just before never touches it) and the first-occurrence table fill
+        # (shared memory of weight stage 0, unused until the producer starts). Same bookkeeping, so
+        # bitwise (on VR200 each CTA loads its ids and finishes its consumer earlier).
+        hoisted: cutlass.Constexpr = not self.grouped
         if cutlass.const_expr(hoisted):
             table = view(sm.iterator, 0, Int32, self.experts)
             for i in range(tid, self.experts, 384):

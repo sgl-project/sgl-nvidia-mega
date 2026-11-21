@@ -22,10 +22,9 @@ same block before the sublayer and ``finish`` (side 1) does the same to its outp
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Uint32
+from cutlass import Float32, Int64, Uint32
 
 from ..k3.attn_res.kernel import rstd
-from ..k3.common.mailbox import poll, rearm, rearm_fence
 from ..k3.common.primitives import (
     add_rn,
     alloc,
@@ -33,7 +32,6 @@ from ..k3.common.primitives import (
     launch,
     load_vector,
     multicast_words,
-    no_neg_zero,
     sigmoid,
     sleep_ns,
     store_words,
@@ -154,76 +152,6 @@ class RowNorm:
         cute.arch.griddepcontrol_launch_dependents()
         words = load_vector(at(x, row, h))
         store_words(at(residual, row, h), words)
-        values = cute.make_rmem_tensor(8, Float32)
-        square = Float32(0)
-        for j in cutlass.range_constexpr(4):
-            values[2 * j], values[2 * j + 1] = unpack_bf16(words[j])
-        for i in cutlass.range_constexpr(8):
-            square = square + values[i] * values[i]
-        square = warp_sum(square)
-        if lane == 0:
-            partials[warp] = square
-        cute.arch.sync_threads()
-        total = Float32(0)
-        for w_ in cutlass.range_constexpr(HIDDEN // 8 // 32):
-            total = add_rn(total, partials[w_])
-        scale = rstd(total, eps)
-        for i in cutlass.range_constexpr(8):
-            values[i] = values[i] * scale * w[i]
-        store_words(at(out, row, h), pack8(values))
-
-
-class EmbedNorm:
-    """Chain entry from block token ids (stage 2c): row 8b is the request's anchor (bonus)
-    token, rows 8b+1.. the mask token. The anchor row's owner rank (vocab-parallel
-    embedding shard) multicasts it into every rank's embed box (one hop, -0.0 as +0.0);
-    every rank polls it, re-arms, and the mask rows come from the replicated ``mask_row``.
-    Then residual = x and out = RMSNorm(x) * weight, as RowNorm. Arguments: ids [rows]
-    int64, embed shard [num_org, 7168], mask_row [7168], weight [7168], box [rows, 7168]
-    (this parity), mc, vocab_start, residual, out, eps. ``local``: the owner stores to its
-    own box (one-GPU checks)."""
-
-    def __init__(self, num_org: int, local: bool = False, deadline_ns: int = 0):
-        self.num_org, self.local, self.deadline_ns = num_org, local, deadline_ns
-
-    @cute.jit
-    def __call__(self, *args):
-        launch(self.kernel, args, (args[0].shape[0], 1, 1), HIDDEN // 8)
-
-    @cute.kernel
-    def kernel(self, args):
-        ids, embed, mask_row, weight, box, mc, vocab_start, residual, out, eps = args[
-            0:10
-        ]
-        row, _, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()
-        lane, warp = tid % 32, tid // 32
-        smem = cutlass.utils.SmemAllocator()
-        partials = alloc(smem, Float32, 32)
-        h = tid * 8
-        w = load8(weight.iterator + h)
-        mask_words = load_vector(mask_row.iterator + h)
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
-        words = cute.make_rmem_tensor(4, Uint32)  # branch-written: a register tensor
-        for j in cutlass.range_constexpr(4):
-            words[j] = mask_words[j]
-        if row % BLOCK == 0:
-            local_id = Int64(ids[row]) - Int64(vocab_start)
-            if (local_id >= Int64(0)) & (local_id < Int64(self.num_org)):
-                raw = load_vector(at(embed, Int32(local_id), h))
-                clean = tuple(no_neg_zero(word) for word in raw)
-                if cutlass.const_expr(self.local):
-                    store_words(at(box, row, h), clean)
-                else:
-                    offset = cute.crd2idx((row, h), box.layout)
-                    multicast_words(mc + Int64(offset) * 2, clean)
-            got = poll(at(box, row, h), 0, 1, self.deadline_ns)
-            for j in cutlass.range_constexpr(4):
-                words[j] = got[0, j]
-            rearm(at(box, row, h))
-            rearm_fence()
-        store_words(at(residual, row, h), tuple(words[j] for j in range(4)))
         values = cute.make_rmem_tensor(8, Float32)
         square = Float32(0)
         for j in cutlass.range_constexpr(4):

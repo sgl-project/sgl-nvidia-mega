@@ -7,7 +7,6 @@ keep the caller's top16 order."""
 
 import functools
 import logging
-import os
 
 import cuda.bindings.driver as cuda
 import cutlass as c
@@ -27,7 +26,6 @@ from .experts import (
     cooperative,
     fc2_pairs,
     plan_b8,
-    prewait,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,27 +149,11 @@ GB300_GRIDS = {8: (136, "3-4:148,5-6:128,7:132,9-64:152"), 16: (152, "8:144")}
 def device_grids(tp, sms):
     """(default grid, per-batch table) for a device with ``sms`` SMs: GB300's tables
     with the same number of SMs left free beside the experts (so a 212-SM VR200 adds
-    60 CTAs to every grid). ``K31MK_EXPERTS_GRID_SMS`` overrides the SM count the
-    grids are derived for (e.g. 152 reproduces GB300's grids on any device)."""
-    sms = int(os.environ.get("K31MK_EXPERTS_GRID_SMS", sms))
+    60 CTAs to every grid)."""
     default, spec = GB300_GRIDS[tp]
     extra = sms - GB300_SMS
     table = {b: min(g + extra, MAX_CTAS) for b, g in batch_table(spec).items()}
     return min(default + extra, MAX_CTAS), table
-
-
-W2_UNPADDED = "K31MK_EXPERTS_W2_UNPADDED"
-
-
-def fc2_rows(w2, tp):
-    """The w2 rows the FC2 map reads. TP16 FC2 reads K 0-191 of each row as two
-    overlapping 128-K boxes (chunk stride 64 elements), so ``K31MK_EXPERTS_W2_UNPADDED``
-    swaps the padded rows (pitch 128 bytes, K 192 padded to 256) for an unpadded copy
-    (pitch 96) the boxes read identically; the stock prefill MoE keeps the padded w2, so
-    the copy is a second w2. Other TPs (and the default) read ``w2`` itself."""
-    if tp == 16 and os.environ.get(W2_UNPADDED, "0") not in ("", "0"):
-        return w2.view(torch.uint8)[..., :96].contiguous()
-    return w2
 
 
 class PersistentExperts:
@@ -203,12 +185,10 @@ class PersistentExperts:
         # The experts kernel uses maps 0-1 (L2 promotion on w13); the TP8 B1 cluster
         # experts use maps 2-4 (w13, w2 two-chunk and one-chunk boxes, promoted); TP8
         # FC2 pairs (B4-64) use map 5 (w2 chunk 2 of 256 rows).
-        # The FC2 map's rows; an opt-in unpadded copy at TP16 stays alive on the object.
-        self.w2_rows = fc2_rows(w2, self.tp)
-        w2_tile = (192, 3, 64) if self.tp == 8 else (self.w2_rows.shape[-1], 2, 32)
+        w2_tile = (192, 3, 64) if self.tp == 8 else (w2.shape[-1], 2, 32)
         specs = [
             (w13, rows, 1792, 28, 64, 2, True),
-            (self.w2_rows, 3584, *w2_tile, 2, False),
+            (w2, 3584, *w2_tile, 2, False),
         ]
         if self.tp == 8:
             specs += [specs[0]] + [(w2, 3584, 192, 3, 64, box, True) for box in (2, 1)]
@@ -246,7 +226,7 @@ class PersistentExperts:
         if not cooperative() and not _NONCOOP_LOGGED:  # engagement tag for A/B runs
             _NONCOOP_LOGGED.append(True)
             logger.info("NVIDIA megakernel: routed experts launch non-cooperatively")
-        if prewait() and not grouped and not _PREWAIT_LOGGED:
+        if not grouped and not _PREWAIT_LOGGED:
             _PREWAIT_LOGGED.append(True)
             logger.info(
                 "NVIDIA megakernel: routed experts route before the PDL wait (prewait)"
