@@ -68,7 +68,11 @@
  * Ordering: q (or the QKV output), the newest K/V rows, seq_lens and the page table may be written by the preceding
  * kernel, so the kernel reads them only after griddepcontrol.wait. With kPrefetch, the threads issue L2 prefetch hints for the
  * K/V rows of their key range before that wait; the seq_lens / page table values read for those hints only form
- * prefetch addresses (bounds-checked) and never reach the results.
+ * prefetch addresses (bounds-checked) and never reach the results. With kStage (staging) the kernel instead reads seq_lens,
+ * its page-table entries and the K/V rows of keys older than this step's 8 tokens BEFORE the wait and uses them (with kQk
+ * and kRope also the positions and their cos_sin rows): this relies on seq_lens, the page table and the positions being
+ * graph inputs (filled before the graph runs), cos_sin being a constant table and older rows being written by earlier
+ * steps - the late-writer contract; q (or the QKV output) and this step's rows are read after the wait.
  *
  * Operand layouts (no shared-memory staging of K and V: every lane loads its fragments from global memory):
  *  - QK^T: the 64 head dimensions are permuted identically for Q and K so that each lane's fragments for all four
@@ -238,7 +242,7 @@ __device__ __forceinline__ void mbar_init_expect(uint32_t bar, uint32_t bytes) {
 // Upper bound on the number of try_wait calls of one receive-barrier wait. The arrivals come from the other blocks
 // of the cluster, which run concurrently with this one; the bound turns a wait that can only hang through a defect
 // into a trap (a CUDA error) instead of a spinning kernel.
-inline constexpr uint32_t kMaxPolls = 1u << 24;
+inline constexpr uint32_t kMaxPolls = 1u << 30;
 
 // Out of line: reached only when the bound is hit.
 __device__ __noinline__ void wait_bound_exceeded() { __trap(); }
@@ -470,11 +474,35 @@ __device__ __forceinline__ void merge_records(const float* rec, int c4, float4& 
   }
 }
 
+// kKvSide: number of warps of a block that read rows of the new tokens (keys tnew .. from the block's chunk k0 ..
+// k0 + nvalid - 1; warp sub-range w / kRG covers keys kb .. kb + kKeysPerWarp - 1 of the chunk): block-uniform.
+template <int kSplit, int kKeysPerWarp, int kRG>
+__device__ __forceinline__ int new_key_warps(int k0, int nvalid, int tnew) {
+  int n = 0;
+#pragma unroll
+  for (int w = 0; w < kSplit; ++w) {
+    const int kb = w * kKeysPerWarp;
+    if (max(kb, tnew - k0) < min(kb + kKeysPerWarp, nvalid)) n += kRG;
+  }
+  return n;
+}
+
+// kGatePre (with kNormGate): the threads that finalize rows load their gate values right after the dependency wait (the
+// gate comes from the projection with q), so their round trip overlaps the attention instead of following the receive
+// wait. Same values: bitwise equal either way.
+// kKvSide (with kQk): the block gets kWarps more warps ("side warps"). Side warp kWarps + w computes the K/V rows of
+// the 8 new tokens that warp w computes without them (same rows, same arithmetic, same shared-memory and pool stores)
+// and then waits at the cluster barrier and leaves; the attention warps only compute the q rows, so the q release no
+// longer waits for the K/V rows.
+// Only the warps whose keys include new tokens wait for those rows (named barrier 2, block-uniform thread count); the
+// block-wide barriers of the attention warps become named barrier 1 over those warps. Bitwise equal either way.
 template <int kChunk, int kSplit, int kRG, int kC, bool kUsePDL, bool kPrefetch, bool kNormGate, int kQk,
-          bool kRope, bool kUnfused>
-__global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
+          bool kRope, bool kUnfused, bool kStage, bool kEarlyTrigger = false, bool kGatePre = false,
+          bool kKvSide = false>
+__global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads * (kKvSide ? 2 : 1))
     swa_verify_attn_kernel(const Params p) {
   using C = Cfg<kChunk, kSplit, kRG, kC, kQk>;
+  static_assert(!kKvSide || kQk > 0, "side K/V warps belong to the query/key prologue");
   extern __shared__ __align__(128) uint8_t smem[];
   float* const part = reinterpret_cast<float*>(smem + C::kPart);
   float* const recv = reinterpret_cast<float*>(smem + C::kRecv);
@@ -501,36 +529,6 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
   const int64_t head_off = static_cast<int64_t>(kvh) * kHeadDim;
   const int32_t* pt = p.page_table + static_cast<int64_t>(req) * p.page_table_stride;
   const int page_mask = (1 << p.page_shift) - 1;
-
-  if constexpr (kPrefetch) {
-    // Hints only: values read here form prefetch addresses and are not used afterwards.
-    const int len = ld_cg_s32(p.seq_lens + req);
-    const int first = max(0, len - kTokens - p.window_left);
-    const int k0 = first + rank * kChunk;
-    const int n = max(0, min(kChunk, len - k0));
-    for (int r = tid; r < n; r += C::kThreads) {
-      const int key = k0 + r;
-      const int64_t slot = (static_cast<int64_t>(ld_cg_s32(pt + (key >> p.page_shift))) << p.page_shift) +
-                           (key & page_mask);
-      if (slot >= 0 && slot < p.pool_slots) {
-        const int64_t off = slot * p.pool_row_stride + head_off;
-        prefetch_l2(p.k_pool + off);
-        prefetch_l2(p.v_pool + off);
-      }
-    }
-  }
-
-  if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
-
-  // Q rows (16 * wrl + g) and (+8): tokens t0 = 2*wr and t1 = 2*wr+1, head kvh*8 + g; 16 bytes each.
-  const int t0 = 2 * wr, t1 = t0 + 1;
-  uint4 qa, qb;
-  if constexpr (kQk == 0) {
-    const uint8_t* qrow = p.q + (static_cast<int64_t>(req) * kTokens + t0) * p.q_token_stride +
-                          (kvh * kQPerKv + g) * kHeadDim + 16 * q4;
-    qa = ld_v4(qrow);
-    qb = ld_v4(qrow + p.q_token_stride);
-  }
 
   // Prologue rows (kQk = E), 64 / E threads per row: the q rows of the block (row 16 * wrl + 8 * tt + h: token
   // 2 * (rb * kRG + wrl) + tt, head kvh * 8 + h) and the K/V rows of the 8 new tokens (row j: token j / 2, K for even
@@ -560,19 +558,172 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
                                 ((kvh * kQPerKv + (wq & 7) + qrw) * kHeadDim + E * qli);
 #pragma unroll
     for (int ps = 0; ps < kPassQ; ++ps) qrows.load(ps, qsrc + ps * kQkRowsWarp * kHeadDim);
+    if constexpr (!kKvSide) {
 #pragma unroll
-    for (int ps = 0; ps < kPassKV; ++ps) {
-      const int j = warp * kItemsKW + ps * kQkRowsWarp + qrw;
-      kvrows.load(ps, p.qkv + kv_token(ps) * p.qkv_token_stride +
-                          ((p.num_q_heads + (j & 1) * p.num_kv_heads + kvh) * kHeadDim + E * qli));
+      for (int ps = 0; ps < kPassKV; ++ps) {
+        const int j = warp * kItemsKW + ps * kQkRowsWarp + qrw;
+        kvrows.load(ps, p.qkv + kv_token(ps) * p.qkv_token_stride +
+                            ((p.num_q_heads + (j & 1) * p.num_kv_heads + kvh) * kHeadDim + E * qli));
+      }
     }
   };
-  // seq_len heads the longest chain (seq_len -> page table -> K/V rows): issued first.
-  int seq_len = kQk > 0 ? ld_s32(p.seq_lens + req) : p.seq_lens[req];
-  if constexpr (kQk > 0) {
-    qrows.load_pos(0, p.positions + tok0 + qtok);
+  if constexpr (kKvSide) {
+    if (tid >= C::kThreads) {  // side warp: the K/V rows of attention warp ws, then leave
+      const int ws = warp - C::kWarps;
+      const auto tok = [&](int ps) { return tok0 + ((ws * kItemsKW + ps * kQkRowsWarp + qrw) >> 1); };
+      int sl = 0;
+      if constexpr (kStage) {  // as the attention warps read them with staging: graph inputs, before the wait
+        sl = p.seq_lens[req];
 #pragma unroll
-    for (int ps = 0; ps < kPassKV; ++ps) kvrows.load_pos(ps, p.positions + kv_token(ps));
+        for (int ps = 0; ps < kPassKV; ++ps) kvrows.load_pos(ps, p.positions + tok(ps));
+        const int k0_s = max(0, sl - kTokens - p.window_left) + rank * kChunk;
+        if (store || min(k0_s + kChunk, sl) > max(k0_s, sl - kTokens)) kvrows.load_rope(p, qli);  // = use_kv below
+      }
+      if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+      if constexpr (kUsePDL && kEarlyTrigger) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+      const int seq_len = kStage ? sl : ld_s32(p.seq_lens + req);
+      const int k0 = max(0, seq_len - kTokens - p.window_left) + rank * kChunk;
+      const int nvalid = max(0, min(kChunk, seq_len - k0));
+      const int tnew = seq_len - kTokens;
+      const bool has_new = min(k0 + kChunk, seq_len) > max(k0, tnew);  // uniform over the block
+      if (store || has_new) {
+        if constexpr (!kStage) {
+#pragma unroll
+          for (int ps = 0; ps < kPassKV; ++ps) kvrows.load_pos(ps, p.positions + tok(ps));
+        }
+#pragma unroll
+        for (int ps = 0; ps < kPassKV; ++ps) {
+          const int j = ws * kItemsKW + ps * kQkRowsWarp + qrw;
+          kvrows.load(ps, p.qkv + tok(ps) * p.qkv_token_stride +
+                              ((p.num_q_heads + (j & 1) * p.num_kv_heads + kvh) * kHeadDim + E * qli));
+        }
+#pragma unroll
+        for (int ps = 0; ps < kPassKV; ++ps) loc[ps] = store ? ld_s64(p.cache_loc + tok(ps)) : 0;
+        if constexpr (!kStage) kvrows.load_rope(p, qli);
+        uint8_t* const nks = smem + C::kNk;
+        uint8_t* const nvs = smem + C::kNv;
+#pragma unroll
+        for (int ps = 0; ps < kPassKV; ++ps) {
+          const int j = ws * kItemsKW + ps * kQkRowsWarp + qrw;
+          const int t = j >> 1;
+          uint16_t bkv[E / 2];
+          kvrows.finish(ps, ps, p.qk_eps, (j & 1) == 0, (j & 1) == 1, bkv);
+          st_bytes<E>(((j & 1) ? nvs : nks) + t * kHeadDim + E * qli, bkv);
+          if (loc[ps] != 0)
+            st_bytes<E>(((j & 1) ? p.v_store : p.k_store) + loc[ps] * p.pool_row_stride + kvh * kHeadDim + E * qli,
+                        bkv);
+        }
+        // rows in shared memory -> the waiting attention warps (bar.arrive orders this thread's prior shared stores)
+        if (has_new) {
+          const int n = 32 * (C::kWarps + new_key_warps<kSplit, C::kKeysPerWarp, kRG>(k0, nvalid, tnew));
+          asm volatile("bar.arrive 2, %0;\n" ::"r"(n) : "memory");
+        }
+      }
+      // Leave only after the cluster wait: the attention warps' wait at the merge is compiled together with a barrier
+      // over the whole block, which these warps then reach as well (no warp of the block has exited by then).
+      asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
+      return;
+    }
+  }
+
+  // kStage (staging): seq_len, the warp's two page-table entries and its K/V fragments of keys older than this step's 8
+  // tokens are read BEFORE griddepcontrol.wait (graph inputs and rows of earlier steps); after it, q (or the QKV output) and
+  // this step's rows (kQk == 0: from the pools, through the staged page entries - one round trip; kQk > 0: from the
+  // prologue, as without staging). Same values, same arithmetic.
+  uint4 kr[C::kNTiles], vr[C::kNTiles];
+  int sl_stage = 0;
+  int64_t pg0_st = 0, pg1_st = 0;
+  if constexpr (kStage) {
+    sl_stage = p.seq_lens[req];
+    const int first_s = max(0, sl_stage - kTokens - p.window_left);
+    const int k0_s = first_s + rank * kChunk;
+    const int nvalid_s = max(0, min(kChunk, sl_stage - k0_s));
+    const int tnew_s = sl_stage - kTokens;
+    const int kbase_s = wk * C::kKeysPerWarp;
+    const int kfirst_s = k0_s + kbase_s;
+    const int pfirst_s = kfirst_s >> p.page_shift;
+    const int plast_s = max(sl_stage - 1, 0) >> p.page_shift;
+    pg0_st = static_cast<int64_t>(pt[min(pfirst_s, plast_s)]) << p.page_shift;
+    pg1_st = static_cast<int64_t>(pt[min(pfirst_s + 1, plast_s)]) << p.page_shift;
+#pragma unroll
+    for (int j = 0; j < C::kNTiles; ++j) {
+      const int rel = kbase_s + 8 * j + g;
+      const int key = rel < nvalid_s ? k0_s + rel : kfirst_s;
+      const int64_t off = (((key >> p.page_shift) == pfirst_s ? pg0_st : pg1_st) + (key & page_mask)) * p.pool_row_stride +
+                          head_off + 16 * q4;
+      if (rel < nvalid_s && key < tnew_s) {
+        kr[j] = ld_v4(p.k_pool + off);
+        vr[j] = ld_v4(p.v_pool + off);
+      } else {
+        kr[j] = vr[j] = make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
+    if constexpr (kQk > 0) {  // positions (graph input) and their RoPE rows (model constant) as well
+      qrows.load_pos(0, p.positions + tok0 + qtok);
+      if constexpr (!kKvSide) {
+#pragma unroll
+        for (int ps = 0; ps < kPassKV; ++ps) kvrows.load_pos(ps, p.positions + kv_token(ps));
+      }
+      qrows.load_rope(p, qli);
+      if constexpr (!kKvSide)
+        if (store || min(k0_s + kChunk, sl_stage) > max(k0_s, tnew_s)) kvrows.load_rope(p, qli);  // = use_kv below
+    }
+  }
+  if constexpr (kPrefetch && !kStage) {
+    // Hints only: values read here form prefetch addresses and are not used afterwards.
+    const int len = ld_cg_s32(p.seq_lens + req);
+    const int first = max(0, len - kTokens - p.window_left);
+    const int k0 = first + rank * kChunk;
+    const int n = max(0, min(kChunk, len - k0));
+    for (int r = tid; r < n; r += C::kThreads) {
+      const int key = k0 + r;
+      const int64_t slot = (static_cast<int64_t>(ld_cg_s32(pt + (key >> p.page_shift))) << p.page_shift) +
+                           (key & page_mask);
+      if (slot >= 0 && slot < p.pool_slots) {
+        const int64_t off = slot * p.pool_row_stride + head_off;
+        prefetch_l2(p.k_pool + off);
+        prefetch_l2(p.v_pool + off);
+      }
+    }
+  }
+
+  if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  constexpr bool kGp = kGatePre && kNormGate && (C::kRows + kC - 1) / kC * 16 <= C::kThreads;
+  uint2 gate_pre = make_uint2(0u, 0u);
+  if constexpr (kGp) {
+    if (static_cast<int>(threadIdx.x) < nown * 16) {
+      const int sl = static_cast<int>(threadIdx.x) >> 4, c4 = static_cast<int>(threadIdx.x) & 15;
+      const int row = sl * kC + rank;
+      const int t = 2 * (rb * kRG + row / 16) + ((row >> 3) & 1);
+      const int h = kvh * kQPerKv + (row & 7);
+      gate_pre = *reinterpret_cast<const uint2*>(
+          p.gate + (static_cast<int64_t>(req) * kTokens + t) * p.gate_token_stride + h * kHeadDim + 4 * c4);
+    }
+  }
+  // kEarlyTrigger: dependents may launch once every block has passed its dependency (the successor, e.g. the output
+  // projection, starts its weight stream during this kernel); otherwise after the records are sent (below).
+  if constexpr (kUsePDL && kEarlyTrigger) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+
+  // Q rows (16 * wrl + g) and (+8): tokens t0 = 2*wr and t1 = 2*wr+1, head kvh*8 + g; 16 bytes each.
+  const int t0 = 2 * wr, t1 = t0 + 1;
+  uint4 qa, qb;
+  if constexpr (kQk == 0) {
+    const uint8_t* qrow = p.q + (static_cast<int64_t>(req) * kTokens + t0) * p.q_token_stride +
+                          (kvh * kQPerKv + g) * kHeadDim + 16 * q4;
+    qa = ld_v4(qrow);
+    qb = ld_v4(qrow + p.q_token_stride);
+  }
+
+  // seq_len heads the longest chain (seq_len -> page table -> K/V rows): issued first.
+  int seq_len = kStage ? sl_stage : (kQk > 0 ? ld_s32(p.seq_lens + req) : p.seq_lens[req]);
+  if constexpr (kQk > 0) {
+    if constexpr (!kStage) {
+      qrows.load_pos(0, p.positions + tok0 + qtok);
+      if constexpr (!kKvSide) {
+#pragma unroll
+        for (int ps = 0; ps < kPassKV; ++ps) kvrows.load_pos(ps, p.positions + kv_token(ps));
+      }
+    }
     load_qkv();
   }
 
@@ -581,8 +732,7 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
   // issued unconditionally (keys past the end read the warp's first key, a valid slot) and masked afterwards. With
   // kQk, the loads of keys >= tnew are skipped (those rows are written by this kernel).
   const int kbase = wk * C::kKeysPerWarp;
-  uint4 kr[C::kNTiles], vr[C::kNTiles];
-  if constexpr (kQk > 0) {
+  if constexpr (kQk > 0 && !kKvSide) {
 #pragma unroll
     for (int ps = 0; ps < kPassKV; ++ps) loc[ps] = store ? ld_s64(p.cache_loc + kv_token(ps)) : 0;
   }
@@ -591,16 +741,17 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
   const int nvalid = max(0, min(kChunk, seq_len - k0));
   const int tnew = seq_len - kTokens;  // key index of token 0 (kQk: keys from tnew on come from the prologue)
   // Blocks whose key range holds new tokens use the computed K/V rows (and the storing block).
-  const bool use_kv = kQk > 0 && (store || min(k0 + kChunk, seq_len) > max(k0, tnew));  // uniform over the block
+  // (kKvSide: the side warps compute them)
+  const bool use_kv = kQk > 0 && !kKvSide && (store || min(k0 + kChunk, seq_len) > max(k0, tnew));  // block-uniform
   {
     const int kfirst = k0 + kbase;
     const int pfirst = kfirst >> p.page_shift;
     const int plast = max(seq_len - 1, 0) >> p.page_shift;
     const int32_t* const pte0 = pt + min(pfirst, plast);
     const int32_t* const pte1 = pt + min(pfirst + 1, plast);
-    const int64_t pg0 = static_cast<int64_t>(kQk > 0 ? ld_s32(pte0) : *pte0) << p.page_shift;
-    const int64_t pg1 = static_cast<int64_t>(kQk > 0 ? ld_s32(pte1) : *pte1) << p.page_shift;
-    if constexpr (kQk > 0) {
+    const int64_t pg0 = kStage ? pg0_st : static_cast<int64_t>(kQk > 0 ? ld_s32(pte0) : *pte0) << p.page_shift;
+    const int64_t pg1 = kStage ? pg1_st : static_cast<int64_t>(kQk > 0 ? ld_s32(pte1) : *pte1) << p.page_shift;
+    if constexpr (kQk > 0 && !kStage) {
       qrows.load_rope(p, qli);
       if (use_kv) kvrows.load_rope(p, qli);
     }
@@ -610,7 +761,12 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
       const int key = rel < nvalid ? k0 + rel : kfirst;
       const int64_t off = (((key >> p.page_shift) == pfirst ? pg0 : pg1) + (key & page_mask)) * p.pool_row_stride +
                           head_off + 16 * q4;
-      if (kQk == 0 || (rel < nvalid && key < tnew)) {
+      if constexpr (kStage) {
+        if (kQk == 0 && rel < nvalid && key >= tnew) {  // this step's rows (kQk > 0: from the prologue below)
+          kr[j] = ld_v4(p.k_pool + off);
+          vr[j] = ld_v4(p.v_pool + off);
+        }
+      } else if (kQk == 0 || (rel < nvalid && key < tnew)) {
         kr[j] = ld_v4(p.k_pool + off);
         vr[j] = ld_v4(p.v_pool + off);
       } else {
@@ -645,9 +801,19 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
           st_bytes<E>(((j & 1) ? p.v_store : p.k_store) + loc[ps] * p.pool_row_stride + kvh * kHeadDim + E * qli, bkv);
       }
     }
-    __syncthreads();
+    if constexpr (kKvSide) {
+      asm volatile("bar.sync 1, %0;\n" ::"r"(C::kThreads) : "memory");
+    } else {
+      __syncthreads();
+    }
     qa = *reinterpret_cast<const uint4*>(qs + (wrl * 16 + g) * kHeadDim + 16 * q4);
     qb = *reinterpret_cast<const uint4*>(qs + (wrl * 16 + 8 + g) * kHeadDim + 16 * q4);
+    if constexpr (kKvSide) {  // this warp's keys include new tokens: wait for the side warps' rows
+      if (max(kbase, tnew - k0) < min(kbase + C::kKeysPerWarp, nvalid)) {
+        const int n = 32 * (C::kWarps + new_key_warps<kSplit, C::kKeysPerWarp, kRG>(k0, nvalid, tnew));
+        asm volatile("bar.sync 2, %0;\n" ::"r"(n) : "memory");
+      }
+    }
 #pragma unroll
     for (int j = 0; j < C::kNTiles; ++j) {
       const int rel = kbase + 8 * j + g;
@@ -770,7 +936,11 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
       *reinterpret_cast<float2*>(rec1 + kHeadDim) = make_float2(m1, l1);
     }
   }
-  __syncthreads();
+  if constexpr (kKvSide) {
+    asm volatile("bar.sync 1, %0;\n" ::"r"(C::kThreads) : "memory");
+  } else {
+    __syncthreads();
+  }
 
   // Merge the kSplit partials of each row; store the block's row record into the finalizing block.
   asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
@@ -785,7 +955,7 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
     st_async_v4(dst + 16 * c4, acc, rbar);
     if (c4 == 0) st_async_v2(dst + 4 * kHeadDim, mx, lsum, rbar);
   }
-  if constexpr (kUsePDL) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+  if constexpr (kUsePDL && !kEarlyTrigger) asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
   mbar_wait_phase0(bar);
 
   // Finalize the rows this block owns (rank, rank + kC, ...), four output columns per item.
@@ -810,8 +980,10 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
 #pragma unroll
       for (int mask = 8; mask >= 1; mask >>= 1) ss = ss + __shfl_xor_sync(group, ss, mask, 16);
       const float r = rsqrtf(ss / static_cast<float>(kHeadDim) + p.norm_eps);
-      const uint2 graw = *reinterpret_cast<const uint2*>(
-          p.gate + (static_cast<int64_t>(req) * kTokens + t) * p.gate_token_stride + h * kHeadDim + 4 * c4);
+      const uint2 graw = kGp ? gate_pre
+                             : *reinterpret_cast<const uint2*>(p.gate + (static_cast<int64_t>(req) * kTokens + t) *
+                                                                            p.gate_token_stride +
+                                                                        h * kHeadDim + 4 * c4);
       const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.x));
       const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&graw.y));
       const auto sig = [](float g) { return __fdividef(1.0f, 1.0f + __expf(-g)); };
@@ -834,7 +1006,7 @@ __global__ void __launch_bounds__(Cfg<kChunk, kSplit, kRG, kC, kQk>::kThreads)
 }  // namespace swa
 
 template <int kChunk, int kSplit, int kRG, int kC, bool kUsePDL, bool kPrefetch, bool kNormGate, int kQk, bool kRope,
-          bool kUnfused>
+          bool kUnfused, bool kStage = false, bool kEarlyTrigger = false, bool kGatePre = false, bool kKvSide = false>
 struct SwaVerifyAttnKernel {
   static void run(const tvm::ffi::TensorView q,           // kQk == 0: [R*8, Hq, 64] e4m3, heads/dims contiguous
                   const tvm::ffi::TensorView k_pool,      // [slots, Hkv*64] e4m3 bytes, rows contiguous
@@ -944,7 +1116,8 @@ struct SwaVerifyAttnKernel {
     }
 
     constexpr auto kernel =
-        swa::swa_verify_attn_kernel<kChunk, kSplit, kRG, kC, kUsePDL, kPrefetch, kNormGate, kQk, kRope, kUnfused>;
+        swa::swa_verify_attn_kernel<kChunk, kSplit, kRG, kC, kUsePDL, kPrefetch, kNormGate, kQk, kRope, kUnfused,
+                                    kStage, kEarlyTrigger, kGatePre, kKvSide>;
     static bool configured = false;
     if (!configured) {
       RuntimeDeviceCheck(::cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kBytes));
@@ -953,7 +1126,7 @@ struct SwaVerifyAttnKernel {
     }
     if (reqs == 0) return;
     const dim3 grid(kC, static_cast<unsigned>(Cfg::kRowBlocks * hkv), static_cast<unsigned>(reqs));
-    LaunchKernel(grid, Cfg::kThreads, out.device(), Cfg::kBytes)
+    LaunchKernel(grid, Cfg::kThreads * (kKvSide ? 2 : 1), out.device(), Cfg::kBytes)
         .config({.use_pdl = kUsePDL, .cluster_dim = dim3(kC, 1, 1)})(kernel, params);
   }
 };

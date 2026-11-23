@@ -43,7 +43,10 @@ synthetic-mode gain is the real-mode gain minus the full gather that only the sc
 
 Every output (accept lengths, bonus tokens, ``predicts`` / ``accept_index`` buffers) is meant to be bit-identical to
 the stock path for the same RNG state: ``tests/test_verify_topk_sample.py`` (one GPU, shards simulated) compares them
-with the stock functions, ``tests/dist_verify_topk_sample.py`` across ranks.
+with the stock functions, ``tests/dist_verify_topk_sample.py`` across ranks. ``MUSE_VR_SPARSE_FINAL=1`` (default off)
+runs the walk and the final-token pass as one CUDA kernel (``csrc/sparse_final.cuh``: tile sums evaluated on the
+residual's nonzero entries with the stock reduction tree, only candidate tiles scanned, no dense residual row); same
+writes, same bits (``tests/test_verify_topk_sample.py``).
 
 Engaged only when every request samples with the same ``top_k`` in [2, 64], ``top_p`` 1, no penalties, logit bias,
 custom logit processor, grammar, logprobs or sampling-mask capture, the selector path without block verification,
@@ -65,11 +68,13 @@ as at every other shape (exactly tied logits by ascending id). Before the first 
 two calls must agree and select the lowest ids; otherwise the component keeps the stock path
 (``stock:topk self-check``).
 
-Preload: the CUDA module, that self-check and the Triton kernels' compiles are not left to the first top-k step (a
-served request). Every verify step ends in ``finish_deferred_gather`` (a sampled batch) or ``deferred_argmax`` (a
-greedy batch: the worker sets the selector sample only for sampled batches), both on the step's shard rows, so on
-the first verify step (the server's own warm-up request, greedy, before it reports ready) and outside graph
-capture, ``_preload`` builds and loads the module, runs the self-check, and compiles the kernels at a top-k step's
+Preload: the CUDA modules, that self-check, the record planes and the Triton kernels' compiles are not left to the
+first top-k step (a served request). Every verify step ends in ``finish_deferred_gather`` (a sampled batch) or
+``deferred_argmax`` (a greedy batch: the worker sets the selector sample only for sampled batches), both on the
+step's shard rows, so on the first verify step (the server's own warm-up request, greedy, before it reports ready)
+and outside graph capture, ``_preload`` sets up the record planes the settings select (collective, on every rank at the
+same step, before any rank-local work), builds and loads the modules (``module`` or ``module_fast``, and
+``sf_module`` with MUSE_VR_SPARSE_FINAL), runs the self-check, and compiles the kernels at a top-k step's
 specializations: the shard prep on that step's shard rows, the chain walk and final-token passes at the checkpoint's
 default ``top_k`` and the selector's ``top_k``. It draws nothing from any RNG and runs on a side stream with buffers
 of its own, so no buffer the serving path reads is written. Counters: ``preload:missed`` (a top-k step found no
@@ -107,6 +112,11 @@ SGLANG_READS = {
     "srt/speculative/dflash_utils.py": ("_get_or_create_chain_verify_buffers",),
     "srt/layers/logits_processor.py": ("LogitsProcessor",),
     "srt/plugins/hook_registry.py": ("HookRegistry", "HookType"),
+    "srt/distributed/device_communicators/vocab_gather.py": (
+        "NVLinkVocabGather",
+        "_alloc_symm",
+        "make_vocab_gather",
+    ),
 }
 
 
@@ -123,6 +133,8 @@ T_SAMPLE = (
 )
 T_ARGMAX = "sglang.srt.layers.logits_processor.LogitsProcessor.deferred_argmax"
 _CUH = Path(__file__).resolve().parent / "csrc" / "verify_topk.cuh"
+_CUH_FAST = Path(__file__).resolve().parent / "csrc" / "verify_topk_fast.cuh"
+_SF_CUH = Path(__file__).resolve().parent / "csrc" / "sparse_final.cuh"
 
 BLOCK_V = 4096  # stock tile width of the final-token pass
 NUM_WARPS = 4  # stock launch of the non-block-verification kernel
@@ -221,6 +233,69 @@ def enabled() -> bool:
     return bed.enabled(NAME)
 
 
+RECORDS_SYMM_ROWS = 512  # row capacity of the records' symmetric pull buffer (verify rows = requests x block)
+
+
+def records_pull() -> bool:
+    """``MUSE_VR_RECORDS_PULL=1``: the records are exchanged with the bounded NVLink pull all-gather (exact bytes) into a
+    symmetric rank-major stack instead of an NCCL all-gather; same words."""
+    return bed.flag("records_pull")
+
+
+def _records_plane(group, width: int):
+    key = ("records_plane", id(group), width)
+    if key not in _state:
+        from sglang.srt.distributed.device_communicators.vocab_gather import (
+            NVLinkVocabGather,
+            make_vocab_gather,
+        )
+
+        from . import pull_bounded
+
+        pull_bounded.prepare(torch.float32)  # before the plane's collective set-up
+        vg = make_vocab_gather(
+            group, local_width=width, dtype=torch.float32, symm_rows=RECORDS_SYMM_ROWS
+        )
+        _state[key] = (
+            vg
+            if isinstance(vg, NVLinkVocabGather) and vg.pull_out is not None
+            else None
+        )
+        bed.report(NAME + ":records_plane", _state[key] is not None, width=width)
+    return _state[key]
+
+
+def exchange_records(group, rec: torch.Tensor) -> torch.Tensor:
+    """[world, rows, width] int32 stack of every rank's records (rank-major). With ``records_pull()`` and the bounded pull
+    engaged, the stack is the plane's symmetric buffer: read it before the next exchange (merge does, on this stream; a
+    peer's next exchange waits for this rank at the pull's entry barrier)."""
+    world, (rows, width) = group.world_size, rec.shape
+    if records_pull() and width % 4 == 0 and rec.is_contiguous():
+        from . import pull_bounded
+
+        vg = _records_plane(group, width)
+        if vg is not None and world * rows <= vg.pull_out.shape[0]:
+            stack = vg.pull_out[: world * rows]
+            if pull_bounded.all_gather_pull(
+                vg.comm,
+                rec.view(torch.float32),
+                stack,
+                out_mc_ptr=vg.pull_mc_ptr,
+                site="records",
+            ):
+                bed.count(NAME, "records:pull")
+                return stack.view(torch.int32).view(world, rows, width)
+        bed.count(NAME, "records:nccl (no bounded pull)")
+    gathered = _pooled("gathered", (world, rows, width), torch.int32, rec.device)
+    group.all_gather_into_tensor(gathered.view(-1, width), rec)
+    return gathered
+
+
+def select_hoist() -> bool:
+    """``MUSE_VR_VERIFY_SELECT_HOIST=1``: the select kernels issue every candidate load before comparing (same records)."""
+    return bed.enabled("verify_select_hoist")
+
+
 def pins_match() -> tuple[bool, str]:
     for rel, want in PINS.items():
         if not bed.pinned(rel, want):
@@ -311,6 +386,167 @@ def module():
             ("merge", "muse_vr::verify_topk::VerifyTopK::merge"),
         ],
     )
+
+
+def topk_fast() -> bool:
+    """``MUSE_VR_VERIFY_TOPK_FAST=1`` (default off): select with four times the threads (and the hoisted loads) and a
+    merge that ranks each entry by binary search in the other ranks' sorted records (``csrc/verify_topk_fast.cuh``).
+    Same records, same merged values / ids / argmax, bit for bit (tests/test_verify_topk_fast.py)."""
+    return bed.flag("verify_topk_fast")
+
+
+@functools.lru_cache(maxsize=None)
+def module_fast():
+    from sglang.kernels.jit.utils import load_jit
+
+    return load_jit(
+        "muse_vr_verify_topk_fast",
+        cuda_files=[str(_CUH_FAST)],
+        cuda_wrappers=[
+            ("select", "muse_vr::verify_topk_fast::VerifyTopKFast::select"),
+            ("merge", "muse_vr::verify_topk_fast::VerifyTopKFast::merge"),
+            (
+                "merge_softmax",
+                "muse_vr::verify_topk_fast::VerifyTopKFast::merge_softmax",
+            ),
+            ("select_push", "muse_vr::verify_topk_fast::VerifyTopKFast::select_push"),
+            ("merge_poll", "muse_vr::verify_topk_fast::VerifyTopKFast::merge_poll"),
+        ],
+    )
+
+
+PUSH_ROWS_MAX = 64
+_push_planes: dict = {}
+
+
+def records_push() -> bool:
+    """``MUSE_VR_VERIFY_RECORDS_PUSH=1`` (default off; with MUSE_VR_VERIFY_TOPK_FAST): the records cross the ranks by a
+    tagged multicast push from the select kernel into a symmetric buffer of their own, polled by the merge kernel
+    (``csrc/verify_topk_fast.cuh``, kPush / kPoll), instead of the barrier-bracketed all-gather between them. Same
+    record words: bit-identical merged values, ids, argmax and probabilities (tests/dist_verify_records_push.py)."""
+    return bed.flag("verify_records_push")
+
+
+def _push_plane(group, k: int, device: torch.device):
+    """(local buffer [2 * world * rows_max, 2k + 2] int64, its multicast address, per-row epoch counters) or None.
+    Collective at the first call for (group, k): every rank allocates and zeroes its copy, then all ranks agree on
+    availability (minimum) and wait for each other before any push can reach a peer's copy."""
+    key = (id(group), k)
+    if key in _push_planes:
+        return _push_planes[key]
+    from sglang.srt.distributed.device_communicators.vocab_gather import _alloc_symm
+
+    world = group.world_size
+    width = 2 * k + 2
+    ok = 1
+    try:
+        buf, mc = _alloc_symm(group, (2 * world * PUSH_ROWS_MAX, width), torch.int64)
+        buf.zero_()
+        ctr = torch.zeros(PUSH_ROWS_MAX, dtype=torch.int32, device=device)
+        ok = 1 if mc != 0 and world <= MAX_WORLD else 0
+    except Exception as e:  # noqa: BLE001 - no symmetric memory / multicast: stay on the gather
+        logger.warning("verify_topk_sample: records push plane unavailable: %s", e)
+        buf = mc = ctr = None
+        ok = 0
+    torch.cuda.synchronize(device)
+    flag = torch.tensor([ok], dtype=torch.int32)
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    plane = (buf, int(mc), ctr) if bool(flag.item()) else None
+    _push_planes[key] = plane
+    bed.report(
+        NAME + ":records_push",
+        plane is not None,
+        world=world,
+        k=k,
+        rows_max=PUSH_ROWS_MAX,
+    )
+    return plane
+
+
+def records_push_merge(
+    logits: torch.Tensor,
+    cap: float,
+    temps: torch.Tensor,
+    rows_per_req: int,
+    k: int,
+    col_offset: int,
+    cols: int,
+    group,
+    plane,
+    with_argmax: bool = False,
+    light=None,
+):
+    """``local_records`` + exchange + ``merge_records_softmax`` with the tagged-push exchange: (values, ids, argmax,
+    probabilities) of every row. ``plane``: ``_push_plane(group, k, device)``."""
+    buf, mc, ctr = plane
+    s, bkey, amax = prep_shard(
+        logits, cap, temps, rows_per_req, cols, with_argmax, pool=True
+    )
+    rows, dev = logits.shape[0], logits.device
+    if amax is None:
+        amax = _pooled("amax_unused", (rows, 1), torch.int64, dev)
+        has_amax = 0
+    else:
+        has_amax = 1
+    if (
+        light is None
+    ):  # MUSE_VR_VERIFY_RECORDS_PUSH_LIGHT=1: release stores / acquire re-reads instead of fences
+        light = bed.env_int("MUSE_VR_VERIFY_RECORDS_PUSH_LIGHT", 0)
+    mod = module_fast()
+    mod.select_push(
+        s,
+        bkey,
+        amax,
+        mc,
+        ctr,
+        int(group.rank_in_group),
+        int(group.world_size),
+        PUSH_ROWS_MAX,
+        int(col_offset),
+        int(k),
+        has_amax,
+        int(bool(light)),
+    )
+    vals = _pooled("vals", (rows, k), torch.float32, dev)
+    ids = _pooled("ids", (rows, k), torch.int64, dev)
+    am = _pooled("amax", (rows,), torch.int64, dev)
+    probs = torch.empty((rows, k), dtype=torch.float32, device=dev)
+    mod.merge_poll(
+        buf,
+        ctr,
+        vals,
+        ids,
+        am,
+        probs,
+        int(group.world_size),
+        PUSH_ROWS_MAX,
+        int(k),
+        bed.env_int("MUSE_VR_VERIFY_RECORDS_PUSH_MAX_POLLS", 1 << 30),
+        int(bool(light)),
+    )
+    return vals, ids, am, probs
+
+
+def merge_records_softmax(gathered: torch.Tensor, k: int, pool: bool = False):
+    """``merge_records`` + ``torch.softmax`` of the values in one kernel (MUSE_VR_VERIFY_TOPK_FAST): (values, ids,
+    argmax, probabilities), the probabilities bit-identical to ``torch.softmax(values, dim=-1)``."""
+    world, rows, _ = gathered.shape
+    dev = gathered.device
+    alloc = (
+        (lambda n, sh, dt: _pooled(n, sh, dt, dev))
+        if pool
+        else (lambda n, sh, dt: torch.empty(sh, dtype=dt, device=dev))
+    )
+    vals = alloc("vals", (rows, k), torch.float32)
+    ids = alloc("ids", (rows, k), torch.int64)
+    amax = alloc("amax", (rows,), torch.int64)
+    probs = torch.empty(
+        (rows, k), dtype=torch.float32, device=dev
+    )  # handed on to the sampler: a fresh tensor
+    module_fast().merge_softmax(gathered, vals, ids, amax, probs, int(k))
+    return vals, ids, amax, probs
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -673,14 +909,18 @@ def local_records(
     cols: int,
     with_argmax: bool = False,
     pool: bool = False,
+    pad: bool = False,
 ) -> torch.Tensor:
     """This rank's record per row: k scaled values, k global ids (top-k order), argmax key and id (int32 words; the
-    argmax only with ``with_argmax``, else zeros). ``pool``: reused buffers (valid until the next pooled call)."""
+    argmax only with ``with_argmax``, else zeros). ``pool``: reused buffers (valid until the next pooled call).
+    ``pad``: rows padded to a multiple of 4 words (16-byte vectors for the push-plane exchange; the pad words are not
+    read)."""
     s, bkey, amax = prep_shard(
         logits, cap, temps, rows_per_req, cols, with_argmax, pool
     )
     rows, dev = logits.shape[0], logits.device
-    shape = (rows, 2 * k + 2)
+    width = 2 * k + 2
+    shape = (rows, (width + 3) // 4 * 4 if pad else width)
     rec = (
         _pooled("rec", shape, torch.int32, dev)
         if pool
@@ -697,7 +937,12 @@ def local_records(
         has_amax = 0
     else:
         has_amax = 1
-    module().select(s, bkey, amax, rec, int(col_offset), int(k), has_amax)
+    if topk_fast():
+        module_fast().select(s, bkey, amax, rec, int(col_offset), int(k), has_amax)
+    else:
+        module().select(
+            s, bkey, amax, rec, int(col_offset), int(k), has_amax, int(select_hoist())
+        )
     return rec
 
 
@@ -714,7 +959,9 @@ def merge_records(gathered: torch.Tensor, k: int, pool: bool = False):
     vals = alloc("vals", (rows, k), torch.float32)
     ids = alloc("ids", (rows, k), torch.int64)
     amax = alloc("amax", (rows,), torch.int64)
-    module().merge(gathered, vals, ids, amax, int(k))
+    (module_fast() if topk_fast() else module()).merge(
+        gathered, vals, ids, amax, int(k)
+    )
     return vals, ids, amax
 
 
@@ -757,14 +1004,56 @@ def sparse_chain_sample(
     q_rows,
     vocab: int,
     bonus=None,
+    fused=None,
 ):
     """Same writes to predicts / accept_index / accept_token_num as ``chain_speculative_sampling_triton`` (non-block
     verification) on the dense matrices that hold top_probs at top_ids (target) and q_rows at cand_ids (draft); with
-    ``bonus`` (int64 [bs]) also the bonus tokens (``predicts[accept_index[i, accept_token_num[i]]]``)."""
+    ``bonus`` (int64 [bs]) also the bonus tokens (``predicts[accept_index[i, accept_token_num[i]]]``). ``fused``: run the
+    walk and the final-token pass as one CUDA kernel (csrc/sparse_final.cuh; same writes, same bits); None = from
+    ``MUSE_VR_SPARSE_FINAL`` (default off)."""
     bs, num_slots = candidates.shape
     k = top_ids.shape[1]
     kq = cand_ids.shape[-1]
     dev = candidates.device
+    if bonus is None:
+        bonus = torch.empty((bs,), dtype=torch.int64, device=dev)
+    if fused is None:
+        fused = bed.flag("sparse_final")
+    if fused and _sf_ok(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        uniform_samples,
+        uniform_samples_final,
+        top_probs,
+        top_ids,
+        cand_ids,
+        q_rows,
+        vocab,
+        bonus,
+    ):
+        sf_module().run(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            uniform_samples,
+            top_probs,
+            top_ids,
+            cand_ids,
+            q_rows,
+            uniform_samples_final,
+            bonus,
+            int(vocab),
+        )
+        if not torch.cuda.is_current_stream_capturing() and not _state.get(
+            "in_preload"
+        ):
+            bed.count("sparse_final", "fused")
+        return bonus
     sc = _scratch(dev, bs, vocab)
     zero, arrived, tile_sums, result, meta = (
         sc["zero"],
@@ -773,8 +1062,6 @@ def sparse_chain_sample(
         sc["result"],
         sc["meta"],
     )
-    if bonus is None:
-        bonus = torch.empty((bs,), dtype=torch.int64, device=dev)
     num_tiles = triton.cdiv(vocab, BLOCK_V)
     kp, kqp = triton.next_power_of_2(k), triton.next_power_of_2(kq)
     _launch(
@@ -848,6 +1135,92 @@ def sparse_chain_sample(
     return bonus
 
 
+@functools.lru_cache(maxsize=None)
+def sf_module():
+    from sglang.kernels.jit.utils import load_jit
+
+    return load_jit(
+        "muse_vr_sparse_final",
+        cuda_files=[str(_SF_CUH)],
+        cuda_wrappers=[("run", "muse_vr::sparse_final::SparseFinal::run")],
+    )
+
+
+def _sf_ok(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    uniform_samples,
+    uniform_samples_final,
+    top_probs,
+    top_ids,
+    cand_ids,
+    q_rows,
+    vocab,
+    bonus,
+) -> bool:
+    """Layouts csrc/sparse_final.cuh takes (else the Triton passes run)."""
+    if not all(
+        isinstance(t, torch.Tensor) and t.is_cuda
+        for t in (
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            uniform_samples,
+            uniform_samples_final,
+            top_probs,
+            top_ids,
+            cand_ids,
+            q_rows,
+            bonus,
+        )
+    ):
+        return False
+    bs, ns = candidates.shape
+    k = top_ids.shape[-1]
+    return (
+        2 <= ns <= 16
+        and 1 <= k <= 64
+        and cand_ids.dim() == 3
+        and 1 <= cand_ids.shape[-1] <= 64
+        and triton.cdiv(vocab, BLOCK_V) <= 64
+        and candidates.dtype == torch.int64
+        and retrive_index.dtype == torch.int64
+        and tuple(retrive_index.shape) == (bs, ns)
+        and tuple(accept_index.shape) == (bs, ns)
+        and accept_index.dtype == torch.int32
+        and accept_index.stride() == retrive_index.stride()
+        and accept_token_num.dtype == torch.int32
+        and accept_token_num.is_contiguous()
+        and tuple(accept_token_num.shape) == (bs,)
+        and predicts.dtype == torch.int32
+        and uniform_samples.dtype == torch.float32
+        and tuple(uniform_samples.shape) == (bs, ns - 1)
+        and uniform_samples_final.dtype == torch.float32
+        and uniform_samples_final.is_contiguous()
+        and tuple(uniform_samples_final.shape) == (bs,)
+        and top_probs.dtype == torch.float32
+        and top_ids.dtype == torch.int64
+        and top_probs.is_contiguous()
+        and top_ids.is_contiguous()
+        and tuple(top_probs.shape) == (bs * ns, k)
+        and tuple(top_ids.shape) == (bs * ns, k)
+        and cand_ids.dtype == torch.int64
+        and tuple(cand_ids.shape[:2]) == (bs, ns - 1)
+        and cand_ids.stride(-1) == 1
+        and q_rows.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and tuple(q_rows.shape) == tuple(cand_ids.shape)
+        and q_rows.stride(-1) == 1
+        and bonus.dtype == torch.int64
+        and bonus.is_contiguous()
+        and tuple(bonus.shape) == (bs,)
+    )
+
+
 def draw_coins(bs: int, gamma: int, device):
     """The two draws of the stock selector accept path (``_accept_sampling_core``), same shapes, same order."""
     uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
@@ -918,10 +1291,11 @@ def _selector_top_k(worker) -> int | None:
     return kq if 1 <= kq <= MAX_K else None
 
 
-def _warm_sampler(device, block: int, k: int, kq: int, vocab: int) -> None:
-    """The chain walk and final-token passes once, at a top-k step's specializations (the strides of the worker's
-    chain buffers and of the selector's rows, which do not depend on the batch size), at batch size 1 on fixed
-    inputs. Run on the caller's side stream; its scratch entry is dropped afterwards."""
+def _warm_sampler(device, block: int, k: int, kq: int, vocab: int, fused: bool) -> None:
+    """The chain walk and final-token passes once (``fused``: the sparse-final kernel), at a top-k step's
+    specializations (the strides of the worker's chain buffers and of the selector's rows, which do not depend on the
+    batch size), at batch size 1 on fixed inputs. Run on the caller's side stream; its scratch entry is dropped
+    afterwards."""
     gamma = block - 1
     ar = torch.arange(block, dtype=torch.int64, device=device)
     sparse_chain_sample(
@@ -937,14 +1311,15 @@ def _warm_sampler(device, block: int, k: int, kq: int, vocab: int) -> None:
         cand_ids=torch.arange(kq, dtype=torch.int64, device=device).repeat(1, gamma, 1),
         q_rows=torch.full((1, gamma, kq), 1.0 / kq, dtype=torch.float32, device=device),
         vocab=vocab,
+        fused=fused,
     )
     idx = device.index if device.index is not None else torch.cuda.current_device()
     _state["scratch"].pop((idx, torch._C._cuda_getCurrentRawStream(idx), vocab), None)
 
 
 def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
-    """Once, on the first verify step (see the module docstring): module, self-check and kernel compiles. Any failure
-    leaves the lazy path as it was (the first top-k step builds what is missing)."""
+    """Once, on the first verify step (see the module docstring): record planes, modules, self-check and kernel
+    compiles. Any failure leaves the lazy path as it was (the first top-k step builds what is missing)."""
     _state["preload_done"] = True
     dev = logits.device
     info: dict = {}
@@ -987,9 +1362,25 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
             bed.report(NAME + ":preload", False, reason=reason)
             return
         k, kq = _default_top_k(worker), _selector_top_k(worker)
-        info = dict(k=k, kq=kq, block=block, cols=cols)
+        fast, pull, fused = (
+            topk_fast(),
+            world > 1 and records_pull(),
+            bed.flag("sparse_final"),
+        )
+        info = dict(
+            k=k, kq=kq, block=block, cols=cols, fast=fast, pull=pull, fused=fused
+        )
         _state["in_preload"] = True
-        module()
+        # collective set-up first: every rank reaches this point on the same step with the same k and settings
+        if k is not None and pull:
+            info["records_plane"] = (
+                _records_plane(group, (2 * k + 2 + 3) // 4 * 4) is not None
+            )
+        if k is not None and world > 1 and fast and records_push():
+            info["push_plane"] = _push_plane(group, k, dev) is not None
+        module_fast() if fast else module()
+        if fused:
+            sf_module()
         info["check"] = _checked(dev, vocab) is None
         side = torch.cuda.Stream(dev)
         side.wait_stream(torch.cuda.current_stream(dev))
@@ -1006,10 +1397,16 @@ def _preload(worker, lp, logits: torch.Tensor, bs: int) -> None:
                     k,
                     col_offset,
                     cols,
+                    pad=pull,
                 )
-                merge_records(rec.unsqueeze(0), k)
+                if fast:
+                    merge_records_softmax(rec.unsqueeze(0), k)
+                else:
+                    merge_records(rec.unsqueeze(0), k)
                 if kq is not None:
-                    _warm_sampler(dev, block, k, kq, vocab)
+                    _warm_sampler(dev, block, k, kq, vocab, fused=False)
+                    if fused:
+                        _warm_sampler(dev, block, k, kq, vocab, fused=True)
         side.synchronize()
         bed.report(NAME + ":preload", True, **info)
     except Exception as e:  # noqa: BLE001 - the lazy path stays as it was
@@ -1144,25 +1541,43 @@ def _h_gather(original, lp, logits):
     if not _state.get("preload_done"):
         bed.count(NAME, "preload:missed")
     temps = sinfo.temperatures.reshape(-1)
-    rec = local_records(
-        logits,
-        float(lp.final_logit_softcapping),
-        temps,
-        block,
-        k,
-        col_offset,
-        cols,
-        pool=True,
-    )
-    if world > 1:
-        gathered = _pooled(
-            "gathered", (world, rows, rec.shape[1]), torch.int32, rec.device
+    plane = None
+    if world > 1 and topk_fast() and records_push() and rows <= PUSH_ROWS_MAX:
+        plane = _push_plane(group, k, logits.device)
+    if plane is not None:
+        vals, ids, amax, probs = records_push_merge(
+            logits,
+            float(lp.final_logit_softcapping),
+            temps,
+            block,
+            k,
+            col_offset,
+            cols,
+            group,
+            plane,
         )
-        group.all_gather_into_tensor(gathered.view(-1, rec.shape[1]), rec)
+        bed.count(NAME, "records:push")
     else:
-        gathered = rec.unsqueeze(0)
-    vals, ids, amax = merge_records(gathered, k, pool=True)
-    probs = torch.softmax(vals, dim=-1)
+        rec = local_records(
+            logits,
+            float(lp.final_logit_softcapping),
+            temps,
+            block,
+            k,
+            col_offset,
+            cols,
+            pool=True,
+            pad=world > 1 and records_pull(),
+        )
+        if world > 1:
+            gathered = exchange_records(group, rec)
+        else:
+            gathered = rec.unsqueeze(0)
+        if topk_fast():
+            vals, ids, amax, probs = merge_records_softmax(gathered, k, pool=True)
+        else:
+            vals, ids, amax = merge_records(gathered, k, pool=True)
+            probs = torch.softmax(vals, dim=-1)
     a = {
         "shard": logits,
         "probs": probs,

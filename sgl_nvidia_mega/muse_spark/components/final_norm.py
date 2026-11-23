@@ -15,12 +15,17 @@ post-feedforward norm and residual gate, and the model's final norm, are replace
 their inputs (the layer's FFN output and the fp32 stream) and pass a bf16 tensor along, so the model's cast is a no-op;
 the final norm's stand-in runs the fused kernel on the recorded inputs. The originals are restored when the call
 returns. Every other call runs stock.
+
+``MUSE_VR_FINAL_NORM_SPLIT=C`` (C in 2, 4, 8; default unset = one block per row) runs the same operations with each row
+split over a cluster of C thread blocks (``csrc/final_norm_split.cuh``): same arithmetic and summation order, so the
+outputs are bit-identical to the one-block kernel (tests/test_final_norm.py; timing: ``--bench``).
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -49,6 +54,9 @@ logger = logging.getLogger(__name__)
 NAME = "final_norm"  # env MUSE_VR_FINAL_NORM
 TARGET = "sglang.srt.models.muse_spark.MuseSpark1xModel._forward"
 _CUH = Path(__file__).resolve().parent / "csrc" / "final_norm.cuh"
+_CUH_SPLIT = Path(__file__).resolve().parent / "csrc" / "final_norm_split.cuh"
+ENV_SPLIT = "MUSE_VR_FINAL_NORM_SPLIT"
+SPLITS = (2, 4, 8)
 
 PINS = {
     "sglang/srt/models/muse_spark.py": (
@@ -112,6 +120,41 @@ def module(hidden: int, pdl: bool, vec: int = 4):
     )
 
 
+def split_from_env() -> int:
+    """CTAs per row from ``MUSE_VR_FINAL_NORM_SPLIT`` (0 = the one-block kernel)."""
+    raw = os.environ.get(ENV_SPLIT, "").strip()
+    if raw in ("", "0"):
+        return 0
+    c = int(raw)
+    if c not in SPLITS:
+        raise ValueError(f"{ENV_SPLIT}={raw}: expected one of {SPLITS} or 0")
+    return c
+
+
+@functools.lru_cache(maxsize=None)
+def module_split(hidden: int, split: int, pdl: bool, vec: int = 4):
+    from sglang.kernels.jit.utils import load_jit, make_cpp_args
+
+    args = (
+        make_cpp_args(hidden, split, pdl)
+        if vec == 4
+        else make_cpp_args(hidden, split, pdl, vec)
+    )
+    return load_jit(
+        "muse_vr_final_norm_split",
+        *args,
+        cuda_files=[str(_CUH_SPLIT)],
+        cuda_wrappers=[
+            ("run", f"muse_vr::final_norm_split::FinalNormSplit<{args}>::run")
+        ],
+    )
+
+
+def _kernel(hidden: int, pdl: bool, split: int, vec: int | None = None):
+    vec = vec_width() if vec is None else vec
+    return module_split(hidden, split, pdl, vec) if split else module(hidden, pdl, vec)
+
+
 def gate_coefficients(gate):
     """(alpha, beta) fp32 [H] exactly as MuseSpark1xNormPreservingResidualConnection.forward uses them."""
     if gate._alpha is None:
@@ -128,16 +171,20 @@ def gate_coefficients(gate):
     return alpha.reshape(-1).contiguous(), beta.reshape(-1).contiguous()
 
 
-def fused(ffn, stream, post_norm, gate, final_norm, out=None, pdl=None, vec=None):
-    """The output boundary for ``ffn`` (bf16) and ``stream`` (fp32): returns the final-norm output (bf16)."""
+def fused(
+    ffn, stream, post_norm, gate, final_norm, out=None, pdl=None, split=None, vec=None
+):
+    """The output boundary for ``ffn`` (bf16) and ``stream`` (fp32): returns the final-norm output (bf16).
+    ``split``: CTAs per row (None = from the environment, 0 = the one-block kernel)."""
     alpha, beta = gate_coefficients(gate)
     ffn, stream = ffn.contiguous(), stream.contiguous()
     if out is None:
         out = torch.empty(ffn.shape, dtype=torch.bfloat16, device=ffn.device)
-    module(
+    _kernel(
         ffn.shape[-1],
         _use_pdl() if pdl is None else pdl,
-        vec_width() if vec is None else vec,
+        split_from_env() if split is None else split,
+        vec,
     ).run(
         ffn,
         stream,
@@ -230,12 +277,13 @@ def _eligible(model, forward_batch) -> str | None:
         or not gt.use_stream_gate
     ):
         return "weights"
+    key = (wp.numel(), _use_pdl(), split_from_env())
     if torch.cuda.is_current_stream_capturing():
-        if (wp.numel(), _use_pdl()) not in _loaded:
+        if key not in _loaded:
             return "kernel not loaded before graph capture"
     else:
-        module(wp.numel(), _use_pdl(), vec_width())
-        _loaded.add((wp.numel(), _use_pdl()))
+        _kernel(*key)
+        _loaded.add(key)
     return None
 
 
@@ -281,6 +329,11 @@ def register() -> bool:
     if not ok:
         bed.report(NAME, False, reason=why)
         return False
+    try:
+        split = split_from_env()
+    except ValueError as e:
+        bed.report(NAME, False, reason=str(e))
+        return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
     def hook(original, *args, **kwargs):
@@ -300,5 +353,5 @@ def register() -> bool:
         )
 
     HookRegistry.register(TARGET, hook, HookType.AROUND)
-    bed.report(NAME, True, vec=vec_width())
+    bed.report(NAME, True, split=split, vec=vec_width())
     return True

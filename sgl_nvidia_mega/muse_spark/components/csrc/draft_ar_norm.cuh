@@ -30,6 +30,24 @@
 // [c * H / kCluster, (c + 1) * H / kCluster) of the block's kBlock rows, so a token's predecessor row is in the same
 // CTA. The CTA that pushes a vector is the CTA that consumes it on every rank. Row sums of squares are exchanged
 // through distributed shared memory after a cluster barrier (arrive.release / wait.acquire).
+//
+// kPollAll: the peers' slots are read all at once and only the slots still empty are read again (default: one slot after
+// the other). Same values, same arithmetic; the outputs are bit-identical (tests/dist_draft_boundary.py).
+//
+// kConsumerOnly: this rank's vectors were already pushed to the peers by the GEMV that produced the partial
+// (draft_gemv_push.cuh); the kernel polls, sums, clears and flips the counters as usual but does not push. Same slots, same
+// values: bit-identical outputs.
+//
+// kEarlyTrigger: the dependent launch is signalled right after this grid's own dependency wait instead of at its end, so a
+// following kernel launched with programmatic stream serialization can run its independent prologue (for example its
+// weight prefetch) while this kernel runs. That kernel's griddepcontrol.wait still waits until this grid has completed
+// and its memory operations are visible (PTX ISA: griddepcontrol). Same values; the outputs are bit-identical.
+//
+// kMcPush: each vector is stored once through the push plane's multicast address (multimem.st.relaxed.sys) instead of
+// once per peer; that store writes slot (dst = every rank, src = this rank) of the same phase, the own slot included.
+// The own slot is polled like a peer's (until that store has landed) and scrubbed, because other kernels share the plane
+// and read it (SGLang's gather boundary reads its rows from the phase's first slot onwards); the sum still takes this
+// rank's vector from registers. Same values and arithmetic: the outputs are bit-identical.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -49,7 +67,7 @@ namespace muse_vr_draft_arn {
 
 constexpr uint32_t kBlock = 8;     // tokens per request block (one warp per token row)
 constexpr uint32_t kThreads = 256;  // kBlock warps
-constexpr uint32_t kMaxPolls = 1u << 28;
+constexpr uint32_t kMaxPolls = 1u << 30;
 
 __device__ __noinline__ void poll_bound_exceeded() {
   __trap();
@@ -113,6 +131,47 @@ SGL_DEVICE void cluster_wait_acquire() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
 
+// kMbarX: the row sums of squares travel by st.async into each peer CTA's `part` and complete a transaction count on that
+// CTA's mbarrier, which the CTA waits on (acquire, cluster scope) instead of a full cluster barrier (PTX ISA: st.async,
+// mbarrier complete_tx).
+SGL_DEVICE void xbar_init(uint64_t* bar) {
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(a) : "memory");
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+SGL_DEVICE void xbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(a), "r"(bytes) : "memory");
+}
+
+SGL_DEVICE void xbar_wait(uint64_t* bar, uint32_t parity) {
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t ready = 0;
+  uint32_t polls = 0;
+  while (!ready) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], %2;\n\t"
+        "selp.b32 %0, 1, 0, p;\n\t}"
+        : "=r"(ready)
+        : "r"(a), "r"(parity)
+        : "memory");
+    if (!ready && ++polls == kMaxPolls) [[unlikely]] poll_bound_exceeded();
+  }
+}
+
+SGL_DEVICE void st_async_cluster_f32(const float* local_addr, uint32_t cta, float v, uint64_t* bar) {
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(local_addr));
+  const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint32_t ra, rb;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(a), "r"(cta));
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(rb) : "r"(b), "r"(cta));
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(ra), "r"(__float_as_uint(v)),
+               "r"(rb)
+               : "memory");
+}
+
 SGL_DEVICE void st_cluster_f32(const float* local_addr, uint32_t cta, float v) {
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(local_addr));
   uint32_t remote;
@@ -120,7 +179,18 @@ SGL_DEVICE void st_cluster_f32(const float* local_addr, uint32_t cta, float v) {
   asm volatile("st.shared::cluster.f32 [%0], %1;" ::"r"(remote), "f"(v) : "memory");
 }
 
-template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, bool kUsePDL, bool kLoopback>
+// One 16-byte store through a multicast address, relaxed at system scope like the per-peer stores it replaces.
+SGL_DEVICE void st_multimem_relaxed_16B(const uint4& v, uint8_t* mc_base, uint32_t vid) {
+  uint8_t* addr = mc_base + static_cast<int64_t>(vid) * 16;
+  asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%4], {%0, %1, %2, %3};"
+               :
+               : "f"(__uint_as_float(v.x)), "f"(__uint_as_float(v.y)), "f"(__uint_as_float(v.z)),
+                 "f"(__uint_as_float(v.w)), "l"(addr)
+               : "memory");
+}
+
+template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, bool kUsePDL, bool kLoopback, bool kPollAll = false,
+          bool kEarlyTrigger = false, bool kConsumerOnly = false, bool kMcPush = false, bool kMbarX = false>
 __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_constant__ Params<kWorld> params) {
   constexpr uint32_t kSlice = kHidden / kCluster;  // columns per CTA
   constexpr uint32_t kVecsPerThread = kSlice / (32 * 8);
@@ -130,6 +200,8 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
 
   __shared__ uint16_t xs[kBlock][kSlice];
   __shared__ float part[kCluster][kBlock];
+  __shared__ alignas(8) uint64_t xbar;  // kMbarX only
+  uint32_t xparity = 0;
 
   const uint32_t c = cluster_ctarank();
   const uint32_t t = threadIdx.x / 32;
@@ -137,6 +209,11 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
   const uint32_t col0 = c * kSlice + lane * 8;
   const size_t rows_total = static_cast<size_t>(params.num_requests) * kBlock;
 
+  // kMbarX: the exchange mbarrier is initialized (and made visible cluster-wide) before the entry arrive, so every peer's
+  // st.async after its wait on that arrive finds it ready
+  if constexpr (kMbarX) {
+    if (threadIdx.x == 0) xbar_init(&xbar);
+  }
   cluster_arrive_relaxed();
   // static parameters (never written by any kernel) before the grid dependency wait
   uint4 w4[kVecsPerThread], b0[kVecsPerThread], b1[kVecsPerThread];
@@ -148,6 +225,7 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
     b1[v] = *reinterpret_cast<const uint4*>(params.base + kHidden + col);
   }
   device::PDLWaitPrimary<kUsePDL>();
+  if constexpr (kEarlyTrigger) device::PDLTriggerSecondary<kUsePDL>();
 
   uint32_t phase = 0;
   if constexpr (!kLoopback) {
@@ -193,20 +271,68 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
 #pragma unroll
     for (uint32_t v = 0; v < kVecsPerThread; ++v) {
       clear_pos_zero(own[v]);
-      const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+      if constexpr (!kConsumerOnly) {  // kConsumerOnly: the producing GEMV pushed these vectors (draft_gemv_push.cuh)
+        const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+        if constexpr (kMcPush) {
+          st_multimem_relaxed_16B(own[v], params.ws.mc_workspace + (params.rank + phase * kWorld) * params.ws.slot_bytes,
+                                  vid);
+        } else {
 #pragma unroll
-      for (uint32_t i = 0; i < kWorld; ++i) {
-        if (i == params.rank) continue;
-        uint8_t* slot = params.ws.workspaces[i] + (params.rank + phase * kWorld) * params.ws.slot_bytes;
-        device::ptx::st_relaxed_16B(own[v], slot, vid);
+          for (uint32_t i = 0; i < kWorld; ++i) {
+            if (i == params.rank) continue;
+            uint8_t* slot = params.ws.workspaces[i] + (params.rank + phase * kWorld) * params.ws.slot_bytes;
+            device::ptx::st_relaxed_16B(own[v], slot, vid);
+          }
+        }
       }
     }
+    if constexpr (kPollAll) {
+      // every peer slot read at once; then only the empty ones again until all hold data; then the clears
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+        const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+#pragma unroll
+        for (uint32_t i = 0; i < kWorld; ++i) {
+          if (!kMcPush && i == params.rank) continue;  // kMcPush: the own slot too (header)
+          device::ptx::ld_relaxed_16B(
+              vec[v][i], params.ws.workspaces[params.rank] + (i + phase * kWorld) * params.ws.slot_bytes, vid);
+        }
+      }
+      uint32_t polls = 0;
+      while (true) {
+        bool all = true;
+#pragma unroll
+        for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+          const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+#pragma unroll
+          for (uint32_t i = 0; i < kWorld; ++i) {
+            if ((!kMcPush && i == params.rank) || !has_zero(vec[v][i])) continue;
+            all = false;
+            device::ptx::ld_relaxed_16B(
+                vec[v][i], params.ws.workspaces[params.rank] + (i + phase * kWorld) * params.ws.slot_bytes, vid);
+          }
+        }
+        if (all) break;
+        if (++polls == kMaxPolls) [[unlikely]] poll_bound_exceeded();
+      }
+      const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+        const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
+#pragma unroll
+        for (uint32_t i = 0; i < kWorld; ++i) {
+          if (!kMcPush && i == params.rank) continue;
+          device::ptx::st_global_16B(zero, params.ws.workspaces[params.rank] + (i + phase * kWorld) * params.ws.slot_bytes,
+                                     vid);
+        }
+      }
+    } else {
 #pragma unroll
     for (uint32_t v = 0; v < kVecsPerThread; ++v) {
       const uint32_t vid = row * kRowVecs + (col0 + v * 256) / 8;
 #pragma unroll
       for (uint32_t i = 0; i < kWorld; ++i) {
-        if (i == params.rank) continue;
+        if (!kMcPush && i == params.rank) continue;
         uint8_t* slot = params.ws.workspaces[params.rank] + (i + phase * kWorld) * params.ws.slot_bytes;
         uint32_t polls = 0;
         do {
@@ -217,6 +343,7 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
         const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
         device::ptx::st_global_16B(zero, slot, vid);
       }
+    }
     }
   }
 
@@ -275,9 +402,17 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
   for (uint32_t m = 16; m >= 1; m /= 2) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, m));
 
   cluster_wait_acquire();  // every CTA of the cluster is running (pairs with the arrive at entry)
-  if (lane < kCluster) st_cluster_f32(&part[c][t], lane, ss);
-  cluster_arrive_release();
-  cluster_wait_acquire();
+  if constexpr (kMbarX) {
+    // every CTA's 8 row sums land in this CTA's `part` (kCluster x kBlock floats) and complete the mbarrier's count
+    if (threadIdx.x == 0) xbar_arrive_expect_tx(&xbar, kCluster * kBlock * 4);
+    if (lane < kCluster) st_async_cluster_f32(&part[c][t], lane, ss, &xbar);
+    xbar_wait(&xbar, xparity);
+    xparity ^= 1u;
+  } else {
+    if (lane < kCluster) st_cluster_f32(&part[c][t], lane, ss);
+    cluster_arrive_release();
+    cluster_wait_acquire();
+  }
   float total = part[0][t];
 #pragma unroll
   for (uint32_t src = 1; src < kCluster; ++src) total = __fadd_rn(total, part[src][t]);
@@ -309,11 +444,210 @@ __global__ __launch_bounds__(kThreads) void draft_ar_norm_kernel(const __grid_co
   }
 }
 
+// Row-split variant (kSplit > 1): a request block's kBlock rows are shared by kSplit clusters of kCluster CTAs, part p
+// owning rows [p * R, (p + 1) * R) with R = kBlock / kSplit, so kSplit times as many CTAs share the exchange. The
+// convolution of a part's first row needs the reduced row before it: every rank pushes that row's partial a second time
+// into a copy slot after the block rows (row rows_total + req * (kSplit - 1) + p - 1), which only part p reads and
+// scrubs; part p's warp 0 reduces it exactly as part p - 1 reduces the original. Warps 1..R own rows p * R .. p * R + R - 1
+// with the original kernel's thread map (one warp per row, lane = 8-column vectors at lane * 8 + v * 256 of the CTA's
+// slice), so every row's sums (rank order, per thread, warp, cluster in CTA order) are those of draft_ar_norm_kernel:
+// bit-identical outputs. Each CTA handles one (request, part) unit per grid-stride step.
+template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, uint32_t kSplit, bool kUsePDL, bool kEarlyTrigger,
+          bool kMcPush>
+__global__ __launch_bounds__((kBlock / kSplit + 1) * 32) void draft_ar_norm_split_kernel(
+    const __grid_constant__ Params<kWorld> params) {
+  constexpr uint32_t kRows = kBlock / kSplit;  // rows a part owns
+  constexpr uint32_t kWarpsHere = kRows + 1;   // + warp 0: the row before the part (copy slot)
+  constexpr uint32_t kThreadsHere = kWarpsHere * 32;
+  constexpr uint32_t kSlice = kHidden / kCluster;
+  constexpr uint32_t kVecsPerThread = kSlice / (32 * 8);
+  constexpr uint32_t kGroups = kHidden / 16;
+  static_assert(kBlock % kSplit == 0 && kSplit > 1, "parts must split the block's rows evenly");
+  static_assert(kSlice % 256 == 0 && kVecsPerThread >= 1, "slice must be whole warp-wide vector rows");
+  constexpr uint32_t kRowVecs = kHidden / 8;
+
+  __shared__ uint16_t xs[kWarpsHere][kSlice];
+  __shared__ float part[kCluster][kWarpsHere];
+
+  const uint32_t c = cluster_ctarank();
+  const uint32_t lw = threadIdx.x / 32;  // 0: previous row (copy), 1..kRows: owned rows
+  const uint32_t lane = threadIdx.x % 32;
+  const uint32_t col0 = c * kSlice + lane * 8;
+  const uint32_t rows_total = params.num_requests * kBlock;
+  const uint32_t units = params.num_requests * kSplit;
+
+  cluster_arrive_relaxed();
+  uint4 w4[kVecsPerThread], b0[kVecsPerThread], b1[kVecsPerThread];
+#pragma unroll
+  for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+    const uint32_t col = col0 + v * 256;
+    w4[v] = *reinterpret_cast<const uint4*>(params.weight + col);
+    b0[v] = *reinterpret_cast<const uint4*>(params.base + col);
+    b1[v] = *reinterpret_cast<const uint4*>(params.base + kHidden + col);
+  }
+  device::PDLWaitPrimary<kUsePDL>();
+  if constexpr (kEarlyTrigger) device::PDLTriggerSecondary<kUsePDL>();
+
+  const uint32_t phase = params.ws.counter[blockIdx.x].get() & 1;
+  if (blockIdx.x == 0) {
+    for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += kThreadsHere) {
+      params.ws.counter[i].set(phase ^ 1);
+    }
+  }
+
+  for (uint32_t unit = blockIdx.x / kCluster; unit < units; unit += gridDim.x / kCluster) {
+    const uint32_t req = unit / kSplit, p = unit % kSplit;
+    if (unit != blockIdx.x / kCluster) cluster_arrive_release();
+    // warp 0 of part 0 has no previous row; every other warp reduces one row
+    const bool active = lw >= 1 || p >= 1;
+    const uint32_t blk_row = p * kRows + lw - 1;  // row within the block (lw >= 1), or the previous row (lw == 0)
+    const uint32_t row = req * kBlock + blk_row;  // global row of data (residual, partial, out, coefficients)
+    const uint32_t slot_row = lw >= 1 ? row : rows_total + req * (kSplit - 1) + (p - 1);  // where its vectors travel
+    uint4 vec[kVecsPerThread][kWorld];
+    uint4 own[kVecsPerThread];
+    uint4 res4[kVecsPerThread];
+    float d0[kVecsPerThread], d1[kVecsPerThread];
+    if (active) {
+      const uint16_t* coef_row = params.coef + static_cast<int64_t>(row) * params.coef_stride;
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+        const uint32_t col = col0 + v * 256;
+        own[v] = params.partial[row * kRowVecs + col / 8];
+        if (lw >= 1) {
+          res4[v] = *reinterpret_cast<const uint4*>(params.residual + static_cast<size_t>(row) * kHidden + col);
+          d0[v] = bf(coef_row[col / 16]);
+          d1[v] = bf(coef_row[kGroups + col / 16]);
+        }
+      }
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+        clear_pos_zero(own[v]);
+        const uint32_t vid = slot_row * kRowVecs + (col0 + v * 256) / 8;
+        if constexpr (kMcPush) {
+          st_multimem_relaxed_16B(own[v], params.ws.mc_workspace + (params.rank + phase * kWorld) * params.ws.slot_bytes,
+                                  vid);
+        } else {
+#pragma unroll
+          for (uint32_t i = 0; i < kWorld; ++i) {
+            if (i == params.rank) continue;
+            uint8_t* slot = params.ws.workspaces[i] + (params.rank + phase * kWorld) * params.ws.slot_bytes;
+            device::ptx::st_relaxed_16B(own[v], slot, vid);
+          }
+        }
+      }
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+        const uint32_t vid = slot_row * kRowVecs + (col0 + v * 256) / 8;
+#pragma unroll
+        for (uint32_t i = 0; i < kWorld; ++i) {
+          if (!kMcPush && i == params.rank) continue;  // kMcPush: the own slot too (see draft_ar_norm_kernel)
+          uint8_t* slot = params.ws.workspaces[params.rank] + (i + phase * kWorld) * params.ws.slot_bytes;
+          uint32_t polls = 0;
+          do {
+            device::ptx::ld_relaxed_16B(vec[v][i], slot, vid);
+            if (!has_zero(vec[v][i])) break;
+            if (++polls == kMaxPolls) [[unlikely]] poll_bound_exceeded();
+          } while (true);
+          const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+          device::ptx::st_global_16B(zero, slot, vid);
+        }
+      }
+      // fp32 sum in rank order, one bf16 rounding (as draft_ar_norm_kernel)
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+#pragma unroll
+        for (uint32_t w = 0; w < 4; ++w) {
+          float lo = 0.0f, hi = 0.0f;
+#pragma unroll
+          for (uint32_t i = 0; i < kWorld; ++i) {
+            const uint32_t word = i == params.rank ? (&own[v].x)[w] : (&vec[v][i].x)[w];
+            const float a = bf(word & 0xffffu), b = bf(word >> 16);
+            lo = i == 0 ? a : __fadd_rn(lo, a);
+            hi = i == 0 ? b : __fadd_rn(hi, b);
+          }
+          const uint32_t lo16 = to_bf16_bits(lo), hi16 = to_bf16_bits(hi);
+          *reinterpret_cast<uint32_t*>(&xs[lw][lane * 8 + v * 256 + 2 * w]) = lo16 | (hi16 << 16);
+        }
+      }
+    }
+    __syncthreads();
+
+    float h[kVecsPerThread][8];
+    float ss = 0.0f;
+    if (lw >= 1) {
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+        const uint32_t col = col0 + v * 256;
+        const uint4 x4 = *reinterpret_cast<const uint4*>(&xs[lw][lane * 8 + v * 256]);
+        uint4 prev4 = make_uint4(0u, 0u, 0u, 0u);
+        if (blk_row >= 1) prev4 = *reinterpret_cast<const uint4*>(&xs[lw - 1][lane * 8 + v * 256]);
+        uint32_t res_out[4];
+#pragma unroll
+        for (uint32_t e = 0; e < 8; ++e) {
+          const uint32_t w = e / 2;
+          const uint32_t sh = (e % 2) * 16;
+          const float xv = bf(((&x4.x)[w] >> sh) & 0xffffu);
+          const float c0 = __fadd_rn(bf(((&b0[v].x)[w] >> sh) & 0xffffu), d0[v]);
+          const float c1 = __fadd_rn(bf(((&b1[v].x)[w] >> sh) & 0xffffu), d1[v]);
+          const float prev = blk_row >= 1 ? bf(((&prev4.x)[w] >> sh) & 0xffffu) : 0.0f;
+          const float yv = bf(to_bf16_bits(__fmaf_rn(c0, xv, __fmul_rn(c1, prev))));
+          const float hv = __fadd_rn(yv, bf(((&res4[v].x)[w] >> sh) & 0xffffu));
+          h[v][e] = hv;
+          ss = __fmaf_rn(hv, hv, ss);
+          const uint32_t r16 = to_bf16_bits(hv);
+          if (e % 2 == 0)
+            res_out[w] = r16;
+          else
+            res_out[w] |= r16 << 16;
+        }
+        *reinterpret_cast<uint4*>(params.residual + static_cast<size_t>(row) * kHidden + col) =
+            make_uint4(res_out[0], res_out[1], res_out[2], res_out[3]);
+      }
+#pragma unroll
+      for (uint32_t m = 16; m >= 1; m /= 2) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, m));
+    }
+
+    cluster_wait_acquire();  // every CTA of the cluster is running (pairs with the arrive at entry / loop end)
+    if (lw >= 1 && lane < kCluster) st_cluster_f32(&part[c][lw], lane, ss);
+    cluster_arrive_release();
+    cluster_wait_acquire();
+    if (lw >= 1) {
+      float total = part[0][lw];
+#pragma unroll
+      for (uint32_t src = 1; src < kCluster; ++src) total = __fadd_rn(total, part[src][lw]);
+      const float rstd = rsqrt_approx(__fadd_rn(__fdiv_rn(total, static_cast<float>(kHidden)), params.eps));
+#pragma unroll
+      for (uint32_t v = 0; v < kVecsPerThread; ++v) {
+        const uint32_t col = col0 + v * 256;
+        uint32_t o[4];
+#pragma unroll
+        for (uint32_t e = 0; e < 8; ++e) {
+          const uint32_t w = e / 2;
+          const uint32_t sh = (e % 2) * 16;
+          const float wv = __fadd_rn(bf(((&w4[v].x)[w] >> sh) & 0xffffu), 0.0f);
+          const uint32_t o16 = to_bf16_bits(__fmul_rn(__fmul_rn(h[v][e], rstd), wv));
+          if (e % 2 == 0)
+            o[w] = o16;
+          else
+            o[w] |= o16 << 16;
+        }
+        *reinterpret_cast<uint4*>(params.out + static_cast<size_t>(row) * kHidden + col) =
+            make_uint4(o[0], o[1], o[2], o[3]);
+      }
+    }
+    __syncthreads();  // `xs` is rewritten by the next unit
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  if (threadIdx.x == 0) params.ws.counter[blockIdx.x].set(phase ^ 1);
+}
+
 }  // namespace muse_vr_draft_arn
 
 using host::distributed::CommunicatorRef;
 
-template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, bool kUsePDL>
+template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, bool kUsePDL, bool kPollAll = false,
+          bool kEarlyTrigger = false, bool kConsumerOnly = false, bool kMcPush = false, bool kMbarX = false>
 struct MuseVrDraftArNorm {
   using TensorView = tvm::ffi::TensorView;
   using P = muse_vr_draft_arn::Params<kWorld>;
@@ -372,11 +706,16 @@ struct MuseVrDraftArNorm {
     RuntimeCheck(clusters >= 1, "the push plane has fewer block counters than one cluster");
     const uint32_t grid = clusters * kCluster;
     p.ws = push.get_workspace<kWorld>(nbytes);
+    if constexpr (kMcPush) {
+      RuntimeCheck(p.ws.mc_workspace != nullptr, "the multicast push needs a push plane with a multicast address");
+    }
     p.num_counters = push.num_blocks;
     p.rank = push.rank;
     p.partial = static_cast<const uint4*>(partial.data_ptr());
     p.partial_all = nullptr;
-    constexpr auto kernel = muse_vr_draft_arn::draft_ar_norm_kernel<kHidden, kWorld, kCluster, kUsePDL, false>;
+    constexpr auto kernel =
+        muse_vr_draft_arn::draft_ar_norm_kernel<kHidden, kWorld, kCluster, kUsePDL, false, kPollAll, kEarlyTrigger,
+                                                kConsumerOnly, kMcPush, kMbarX>;
     allow_cluster(kernel);
     LaunchKernel(grid, muse_vr_draft_arn::kThreads, device.unwrap())
         .config({.use_pdl = kUsePDL, .cluster_dim = dim3(kCluster, 1, 1)})(kernel, p);
@@ -405,6 +744,59 @@ struct MuseVrDraftArNorm {
         max_clusters > 0 ? std::min<uint32_t>(p.num_requests, static_cast<uint32_t>(max_clusters)) : p.num_requests;
     LaunchKernel(clusters * kCluster, muse_vr_draft_arn::kThreads, device.unwrap())
         .config({.use_pdl = false, .cluster_dim = dim3(kCluster, 1, 1)})(kernel, p);
+  }
+};
+
+// Row-split launcher (draft_ar_norm_split_kernel): same arguments and outputs as MuseVrDraftArNorm::run.
+template <uint32_t kHidden, uint32_t kWorld, uint32_t kCluster, uint32_t kSplit, bool kUsePDL, bool kEarlyTrigger = false,
+          bool kMcPush = false>
+struct MuseVrDraftArNormSplit {
+  using TensorView = tvm::ffi::TensorView;
+  using P = muse_vr_draft_arn::Params<kWorld>;
+  static constexpr uint32_t kBlock = muse_vr_draft_arn::kBlock;
+
+  static void
+  run(CommunicatorRef ref, TensorView partial, TensorView coef, int64_t coef_offset, int64_t coef_stride, TensorView base,
+      TensorView residual, TensorView weight, TensorView out, double eps) {
+    using namespace host;
+    const auto& push = ref.get()->get_push_obj();
+    auto device = SymbolicDevice{};
+    P p{};
+    uint32_t rows = 0;
+    MuseVrDraftArNorm<kHidden, kWorld, kCluster, kUsePDL>::fill(p, coef, coef_offset, coef_stride, base, residual, weight,
+                                                              out, eps, device, rows);
+    auto M = SymbolicSize{"num_rows"};
+    M.set_value(rows);
+    TensorMatcher({M, int64_t(kHidden)}).with_dtype<bf16_t>().with_device(device).verify(partial);
+    if (rows == 0) return;
+    RuntimeCheck(push.world_size == kWorld, "the kernel is compiled for TP", kWorld);
+    // block rows plus one copy of each part's previous row
+    const int64_t nbytes = (int64_t(rows) + int64_t(p.num_requests) * (kSplit - 1)) * kHidden * 2;
+    RuntimeCheck(nbytes <= int64_t(push.slot_bytes), "rows exceed the push slot size");
+    const uint32_t units = p.num_requests * kSplit;
+    const uint32_t clusters = std::min<uint32_t>(units, push.num_blocks / kCluster);
+    RuntimeCheck(clusters >= 1, "the push plane has fewer block counters than one cluster");
+    const uint32_t grid = clusters * kCluster;
+    p.ws = push.get_workspace<kWorld>(nbytes);
+    if constexpr (kMcPush) {
+      RuntimeCheck(p.ws.mc_workspace != nullptr, "the multicast push needs a push plane with a multicast address");
+    }
+    p.num_counters = push.num_blocks;
+    p.rank = push.rank;
+    p.partial = static_cast<const uint4*>(partial.data_ptr());
+    p.partial_all = nullptr;
+    constexpr auto kernel =
+        muse_vr_draft_arn::draft_ar_norm_split_kernel<kHidden, kWorld, kCluster, kSplit, kUsePDL, kEarlyTrigger, kMcPush>;
+    // this launcher's own once-per-kernel flag (the plain launcher's flag is keyed by its class, not by this kernel)
+    if constexpr (kCluster > 8) {
+      static const bool configured = [kernel] {
+        host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        return true;
+      }();
+      (void)configured;
+    }
+    LaunchKernel(grid, (kBlock / kSplit + 1) * 32, device.unwrap())
+        .config({.use_pdl = kUsePDL, .cluster_dim = dim3(kCluster, 1, 1)})(kernel, p);
   }
 };
 

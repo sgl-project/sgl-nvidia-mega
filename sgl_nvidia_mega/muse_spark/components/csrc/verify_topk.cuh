@@ -94,7 +94,51 @@ struct SelectParams {
   int k;
   int32_t* out;           // [rows, out_ld]
   int64_t out_ld;
+  int hoist;              // candidate scan with all loads issued first (same result)
 };
+
+// Phase 2's candidate scan: the elements of the nsel selected buckets with composite >= lo, appended to sm.cand / sm.cbits
+// (append order is irrelevant: the composites are unique and ranked by comparison). p.hoist: every load of a thread is
+// issued before any of them is compared (same elements, same values).
+SGL_DEVICE void collect_candidates(SelectSmem& sm, const SelectParams& p, const float* sr, int nsel, uint64_t lo) {
+  const int tid = threadIdx.x;
+  if (p.hoist) {
+    constexpr int kPer = kMaxCand / kThreads;
+    int cc[kPer];
+    uint32_t sb[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      const int i = tid + j * kThreads;
+      const int c = i < nsel * kBucket ? sm.blist[i / kBucket] * kBucket + (i % kBucket) : p.cols;
+      cc[j] = c < p.cols ? c : -1;
+    }
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) sb[j] = cc[j] >= 0 ? __float_as_uint(__ldg(sr + cc[j])) : 0u;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      if (cc[j] < 0) continue;
+      const uint64_t ck = composite(order_key(sb[j]), static_cast<uint32_t>(cc[j]));
+      if (ck >= lo) {
+        const int pos = atomicAdd(&sm.ncand, 1);
+        sm.cand[pos] = ck;
+        sm.cbits[pos] = sb[j];
+      }
+    }
+    return;
+  }
+  for (int i = tid; i < nsel * kBucket; i += kThreads) {
+    const int c = sm.blist[i / kBucket] * kBucket + (i % kBucket);
+    if (c < p.cols) {
+      const uint32_t sb = __float_as_uint(sr[c]);
+      const uint64_t ck = composite(order_key(sb), static_cast<uint32_t>(c));
+      if (ck >= lo) {
+        const int pos = atomicAdd(&sm.ncand, 1);
+        sm.cand[pos] = ck;
+        sm.cbits[pos] = sb;
+      }
+    }
+  }
+}
 
 __global__ __launch_bounds__(kThreads) void select_kernel(const __grid_constant__ SelectParams p) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -172,18 +216,7 @@ __global__ __launch_bounds__(kThreads) void select_kernel(const __grid_constant_
   // 2. elements with key >= key(L) of the selected buckets
   const float* sr = p.s + static_cast<int64_t>(row) * p.ld;
   const int nsel = sm.nb_sel;  // == k
-  for (int i = tid; i < nsel * kBucket; i += kThreads) {
-    const int c = sm.blist[i / kBucket] * kBucket + (i % kBucket);
-    if (c < p.cols) {
-      const uint32_t sb = __float_as_uint(sr[c]);
-      const uint64_t ck = composite(order_key(sb), static_cast<uint32_t>(c));
-      if (ck >= lo) {
-        const int pos = atomicAdd(&sm.ncand, 1);
-        sm.cand[pos] = ck;
-        sm.cbits[pos] = sb;
-      }
-    }
-  }
+  collect_candidates(sm, p, sr, nsel, lo);
   __syncthreads();
   const int n = sm.ncand;
   int32_t* o = p.out + static_cast<int64_t>(row) * p.out_ld;
@@ -261,7 +294,8 @@ __global__ __launch_bounds__(kMergeThreads) void merge_kernel(const __grid_const
 
 struct VerifyTopK {
   static void select(const tvm::ffi::TensorView s, const tvm::ffi::TensorView bkey, const tvm::ffi::TensorView amax,
-                     const tvm::ffi::TensorView out, int64_t col_offset, int64_t k, int64_t has_amax) {
+                     const tvm::ffi::TensorView out, int64_t col_offset, int64_t k, int64_t has_amax,
+                     int64_t hoist) {
     using namespace host;
     auto R = SymbolicSize{"rows"};
     auto C = SymbolicSize{"cols"};
@@ -297,6 +331,7 @@ struct VerifyTopK {
     p.k = static_cast<int>(k);
     p.out = static_cast<int32_t*>(out.data_ptr());
     p.out_ld = O.unwrap();
+    p.hoist = hoist ? 1 : 0;
     constexpr std::size_t smem = sizeof(SelectSmem);
     static bool attr_set = false;
     if (!attr_set) {

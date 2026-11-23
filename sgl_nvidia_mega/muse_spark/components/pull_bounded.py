@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 NAME = "pull_bounded"  # env MUSE_VR_PULL_BOUNDED
 ENV_MAX_POLLS = "MUSE_VR_PULL_BOUNDED_MAX_POLLS"
-DEFAULT_MAX_POLLS = 1 << 27
+DEFAULT_MAX_POLLS = 1 << 30
 MIN_MAX_POLLS, MAX_MAX_POLLS = 1 << 10, (1 << 32) - 1
 NUM_UNROLL = 4  # SGLang's all_gather_pull default, which both call sites use
 
@@ -71,7 +71,12 @@ PINS = {
 }
 
 # sha256 of csrc/pull_gather_bounded.cuh as validated (bitwise, fault and sanitizer tests); any other file is not used.
-SOURCE_SHA256 = "b6aa914f1a704fd1bcdb02f89253b354364dda57350f33013d99d02c923749c0"
+# The validation ran on this file without its two copyright lines; the digest below is of this copy.
+SOURCE_SHA256 = "10423c5c0fbda9a28eb1223d24aa1f109bb778ced09bb920dc165ccc70104772"
+# the row-layout copy (csrc/pull_gather_rows.cuh): same kernel with a row-layout store entry, used only through all_gather_pull_rows
+_ROWS_CUH = Path(__file__).resolve().parent / "csrc" / "pull_gather_rows.cuh"
+# The validation ran on this file without its copyright lines; the digest below is of this copy.
+ROWS_SOURCE_SHA256 = "351763dadedefc85754714d0da76811709b9c0d2472c0ec19ac19ed04c1c7a1c"
 
 _state: dict = {"engaged": None, "max_polls": None}
 
@@ -176,4 +181,72 @@ def all_gather_pull(
         _state["max_polls"],
     )
     bed.count(NAME, site or "calls")
+    return True
+
+
+def _rows_module(dtype: torch.dtype):
+    key = ("rows_module", dtype)
+    mod = _state.get(key)
+    if mod is None:
+        from sglang.kernels.jit.utils import (
+            is_arch_support_pdl,
+            load_jit,
+            make_cpp_args,
+        )
+
+        args = make_cpp_args(dtype, is_arch_support_pdl())
+        mod = _state[key] = load_jit(
+            "muse_vr_pull_rows",
+            *args,
+            f"unroll{NUM_UNROLL}",
+            cuda_files=[str(_ROWS_CUH)],
+            cuda_wrappers=[
+                (
+                    "all_gather_rows",
+                    f"sglang::muse_vr_pull_rows::MuseVrPullRows<{args}>::all_gather_pull_rows<{NUM_UNROLL}>",
+                )
+            ],
+        )
+    return mod
+
+
+def rows_ready() -> bool:
+    """The row-layout copy may be used: the bounded pull is engaged and the copy matches its pin (checked once)."""
+    if "rows_ok" not in _state:
+        ok = (
+            engage()
+            and hashlib.sha256(_ROWS_CUH.read_bytes()).hexdigest() == ROWS_SOURCE_SHA256
+        )
+        _state["rows_ok"] = ok
+        if engage() and not ok:
+            bed.report(
+                NAME + ":rows", False, reason=f"{_ROWS_CUH.name} differs from its pin"
+            )
+    return _state["rows_ok"]
+
+
+def all_gather_pull_rows(
+    comm,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    out_mc_ptr: int = 0,
+    site: str = "",
+) -> bool:
+    """Row-layout all-gather with bounded barrier waits: ``output`` (the ``[world * rows, n]`` stack) read as ``[rows,
+    world * n]`` holds rank r's ``[rows, n]`` block in columns ``[r * n, (r + 1) * n)``. Only when ``rows_ready()``
+    (returns False and does nothing otherwise: the caller gathers contiguously)."""
+    import sglang.kernels.ops.communication.nvlink_comm as nvlink_comm
+
+    if not rows_ready():
+        return False
+    _rows_module(input.dtype).all_gather_rows(
+        comm,
+        input,
+        output,
+        out_mc_ptr or nvlink_comm.get_multicast_ptr(output),
+        0,
+        _state["max_polls"],
+    )
+    bed.count(NAME, (site or "calls") + ":rows")
     return True

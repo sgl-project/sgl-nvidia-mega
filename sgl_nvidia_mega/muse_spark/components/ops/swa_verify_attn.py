@@ -126,13 +126,23 @@ def _module(
     norm_gate: bool,
     qk: int = 0,
     rope: bool = False,
+    stage: bool = False,
+    early: bool = False,
+    gate_pre: bool = False,
     unfused: bool = False,
+    kv_side: bool = False,
 ):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
-    args = make_cpp_args(
-        kchunk, ksplit, krg, kc, use_pdl, prefetch, norm_gate, qk, rope, unfused
-    )
+    a = (kchunk, ksplit, krg, kc, use_pdl, prefetch, norm_gate, qk, rope, unfused)
+    if kv_side:
+        args = make_cpp_args(*a, stage, early, gate_pre, True)
+    elif gate_pre:
+        args = make_cpp_args(*a, stage, early, True)
+    elif early:
+        args = make_cpp_args(*a, stage, early)
+    else:
+        args = make_cpp_args(*a, stage) if stage else make_cpp_args(*a)
     return load_jit(
         "muse_vr_swa_verify_attn",
         *args,
@@ -151,6 +161,35 @@ def pdl_for(num_requests: int, qk: int = 0) -> bool:
     return _use_pdl() and num_requests not in no_pdl
 
 
+def stage_for(num_requests: int) -> bool:
+    """Staging (seq_lens, page entries and older K/V read before the dependency; see the kernel header): the request
+    counts in MUSE_VR_SWA_VERIFY_ATTN_STAGE (list separated by "," or "/"; default: none). Bitwise equal either way."""
+    return num_requests in _env_set("MUSE_VR_SWA_VERIFY_ATTN_STAGE", frozenset())
+
+
+def early_trigger_for(num_requests: int) -> bool:
+    """Early dependent launch (after the dependency wait instead of after the record sends; the successor - the output
+    projection - then starts its weight stream during this kernel): the request counts in
+    MUSE_VR_SWA_VERIFY_ATTN_EARLY_TRIGGER (list separated by "," or "/"; default: none). Bitwise equal either way."""
+    return num_requests in _env_set(
+        "MUSE_VR_SWA_VERIFY_ATTN_EARLY_TRIGGER", frozenset()
+    )
+
+
+def kv_side_for(num_requests: int) -> bool:
+    """Side K/V warps (with the query/key prologue: extra warps compute this step's K/V rows while the attention warps
+    compute the q rows; see the kernel source): the request counts in MUSE_VR_SWA_VERIFY_ATTN_KV_SIDE (list separated by
+    "," or "/"; default: none). Bitwise equal either way."""
+    return num_requests in _env_set("MUSE_VR_SWA_VERIFY_ATTN_KV_SIDE", frozenset())
+
+
+def gate_pre_for(num_requests: int) -> bool:
+    """Gate preload (with the norm + gate: the finalizing threads load their gate values right after the dependency wait):
+    the request counts in MUSE_VR_SWA_VERIFY_ATTN_GATE_PRE (list separated by "," or "/"; default: none). Bitwise equal
+    either way."""
+    return num_requests in _env_set("MUSE_VR_SWA_VERIFY_ATTN_GATE_PRE", frozenset())
+
+
 def module_key(
     num_requests: int,
     window_left: int,
@@ -159,9 +198,13 @@ def module_key(
     prefetch: bool = False,
     qk: int = 0,
     rope: bool = False,
+    stage: bool | None = None,
+    early: bool | None = None,
 ) -> tuple:
     c, k, r = cfg(num_requests)
     pdl = pdl_for(num_requests, qk) if use_pdl is None else use_pdl
+    st = stage_for(num_requests) if stage is None else stage
+    et = early_trigger_for(num_requests) if early is None else early
     return (
         c,
         k,
@@ -172,7 +215,11 @@ def module_key(
         bool(norm_gate),
         int(qk),
         bool(rope) if qk else False,
+        bool(st),
+        bool(et) and bool(pdl),
+        bool(norm_gate) and gate_pre_for(num_requests),
         qk_unfused(qk),
+        bool(qk) and kv_side_for(num_requests),
     )
 
 
@@ -306,6 +353,9 @@ def swa_verify_attn(
     cache_loc: torch.Tensor | None = None,
     qk_eps: float = 0.0,
     num_q_heads: int | None = None,
+    stage: bool | None = None,
+    early_trigger: bool | None = None,
+    kv_side: bool | None = None,
 ) -> torch.Tensor:
     """Attention of 8 consecutive query tokens per request over a sliding window of a paged FP8 KV pool.
 
@@ -325,6 +375,14 @@ def swa_verify_attn(
         computes the e4m3 queries and the e4m3 K/V rows of the 8 new tokens per request (RMS norm with ``qk_eps``,
         RoPE when ``positions`` / ``cos_sin`` are given, as SGLang's fused QK-norm kernel does), uses them, and stores
         the K/V rows into ``k_pool`` / ``v_pool`` at ``cache_loc`` (int64; rows with location 0 are not stored).
+    :param stage: read seq_lens, the page-table entries and the K/V rows of keys older than this step's 8 tokens before
+        the dependency (requires seq_lens and the page table to be graph inputs - see the kernel header); None: the
+        MUSE_VR_SWA_VERIFY_ATTN_STAGE request-count list (default: off). Output bitwise equal either way.
+    :param early_trigger: with programmatic dependent launch, let the dependents launch right after the dependency wait
+        instead of after the record sends; None: ``early_trigger_for`` (MUSE_VR_SWA_VERIFY_ATTN_EARLY_TRIGGER, default
+        off). Output bitwise equal either way.
+    :param kv_side: with ``qkv``, side warps compute this step's K/V rows while the attention warps compute the q rows;
+        None: ``kv_side_for`` (MUSE_VR_SWA_VERIFY_ATTN_KV_SIDE, default off). Output and pools bitwise equal either way.
     """
     if qkv is not None:
         m = qkv.shape[0]
@@ -342,7 +400,25 @@ def swa_verify_attn(
     c, k, r = config or cfg(reqs)
     kc = cluster_size(int(window_left), c)
     pdl = pdl_for(reqs, qk) if use_pdl is None else use_pdl
-    key = (c, k, r, kc, pdl, bool(prefetch), gate is not None, qk, rope, qk_unfused(qk))
+    st = stage_for(reqs) if stage is None else stage
+    et = early_trigger_for(reqs) if early_trigger is None else early_trigger
+    kvs = bool(qk) and (kv_side_for(reqs) if kv_side is None else bool(kv_side))
+    key = (
+        c,
+        k,
+        r,
+        kc,
+        pdl,
+        bool(prefetch),
+        gate is not None,
+        qk,
+        rope,
+        bool(st),
+        bool(et) and bool(pdl),
+        gate is not None and gate_pre_for(reqs),
+        qk_unfused(qk),
+        kvs,
+    )
     mod = _module(*key)
     _loaded.add(key)
     dummy = out.view(out.shape[0], -1)
