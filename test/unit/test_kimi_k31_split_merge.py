@@ -291,6 +291,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             "aux_done": "aux event",
             "selector_sampling_accept": lambda **kw: (
                 log("sglang_sampled_accept")
+                or self.accept_inputs.append(kw["draft_input"])
                 or (torch.tensor([2], dtype=torch.int32), torch.tensor([9]), None)
             ),
             "update_target_mamba_state_after_verify": lambda **kw: log("sglang_commit"),
@@ -314,9 +315,15 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         kda_state = patch.object(rt.KdaCommit, "_kda_state", lambda kda: self.kda_state)
         kda_state.start()
         self.addCleanup(kda_state.stop)
-        verify_input = types.SimpleNamespace(
-            prepare_for_verify=lambda *a, **kw: log("prepare_verify") or ("fb", True)
-        )
+        self.accept_inputs = []
+
+        # SGLang's prepare_for_verify makes the verify input the batch's spec_info.
+        def prepare_for_verify(batch, *a, **kw):
+            log("prepare_verify")
+            batch.spec_info = verify_input
+            return "fb", True
+
+        verify_input = types.SimpleNamespace(prepare_for_verify=prepare_for_verify)
         for name, value in {
             "megakernel_agree": lambda value, what: log(("agree", what)),
             "built_megakernel": lambda model: self.chain,
@@ -770,7 +777,11 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         self._tp8_q5()
         runtime = self._runtime()
         del self.calls[:]
-        out, published = self._round(runtime, self._batch(need_top_p_sampling=True))
+        batch = self._batch(need_top_p_sampling=True)
+        draft_input = batch.spec_info
+        out, published = self._round(runtime, batch)
+        # SGLang's accept reads the round's draft input, not the verify's
+        self.assertEqual(self.accept_inputs, [draft_input])
         self.assertEqual(
             self.calls,
             [

@@ -229,6 +229,7 @@ class _DraftBlock(NamedTuple):
     draft_tokens: torch.Tensor  # [bs, block], filled by _draft
     iteration_ids: Any  # the target runner's plan of this round's slots
     forward_batch: ForwardBatch  # the draft forward's
+    draft_input: Any  # batch.spec_info at the round's start; the verify replaces it
 
 
 class K31DFlashRuntime:
@@ -742,6 +743,7 @@ class K31DFlashRuntime:
             draft_tokens=draft_tokens,
             iteration_ids=iteration_ids,
             forward_batch=forward_batch,
+            draft_input=draft_input,
         )
 
     def _draft(self, block: _DraftBlock, sampling_info, *, bs, sampled):
@@ -854,7 +856,7 @@ class K31DFlashRuntime:
                 candidates=draft_tokens,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_input=batch.spec_info,
+                draft_input=block.draft_input,
                 prefix_lens=prefix_lens,
                 bs=bs,
                 target_predict=target_predict,
@@ -903,7 +905,7 @@ class K31DFlashRuntime:
                 candidate_ids=selector_candidate_ids,
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
-                draft_input=batch.spec_info,
+                draft_input=block.draft_input,
             )
             # Rank 0's decision on every rank (in place), one multicast hop.
             if self._broadcast is not None:
