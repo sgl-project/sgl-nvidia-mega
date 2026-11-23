@@ -13,7 +13,8 @@ SGLang into the package is listed in ``SGLANG_MOVED`` the same way: while SGLang
 defines it, both copies must be the same code; once SGLang drops it, the pin retires.
 A DFlash runtime declares the worker names it binds (``DFLASH_BINDINGS``) and the
 guard values it serves (``DFLASH_GUARDS``); SGLang's DFlash binding must bind and
-guard each by name. A file that moved between SGLang versions is named newest first,
+guard each by name, and bind all or none of the names of SGLang's own phases
+(``DFLASH_STOCK_BINDINGS``). A file that moved between SGLang versions is named newest first,
 ``"new.py|old.py"``; the first one present is checked. A read name such as
 "replication|layout" accepts either field.
 An explicitly guarded opt-in extension uses ``SGLANG_OPTIONAL_READS``: its
@@ -537,6 +538,12 @@ def test_the_dflash_binding_binds_and_guards_what_the_runtime_declares(path):
         _assigned(binding, "GUARDS")
     )
     assert not unguarded, f"{_id(path)}: SGLang has no guard key {sorted(unguarded)}"
+    # SGLang's own phases: an SGLang before them binds none, one with them binds all.
+    stock = _strings(_assigned(runtime, "DFLASH_STOCK_BINDINGS"))
+    bound = stock & _strings(_assigned(binding, "BINDINGS"))
+    assert bound in (frozenset(), stock), (
+        f"{_id(path)}: SGLang binds only {sorted(bound)} of {sorted(stock)}"
+    )
 
 
 def _built_classes() -> dict:

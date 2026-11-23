@@ -7,26 +7,32 @@ SGLang's DFlash worker binds it through
 phases:
 
 * ``__init__(binding, built)``: the end of the worker's ``__init__``, before the KV pools
-  are sized, so the sampled accept's build comes out of the KV budget. Collective.
-* ``draft_sampler(lm_head)``: before the draft cuda graph captures, the megakernel head
-  that proposes inside it, when the draft chain's head serves every captured graph.
-  Collective.
-* ``decode_round(batch, ...)``: the whole decode round, on every target TP rank:
+  are sized, so the sampled accept's and the rank-0 broadcast's builds come out of the
+  KV budget. Collective.
+* ``draft_sampler(lm_head)``: before the draft cuda graph captures. It picks each phase
+  of the round, logs them once on TP rank 0, and returns the megakernel head that
+  proposes inside the draft graph when the draft chain's head serves every captured
+  graph (else None: the worker folds its own sampler in). Collective.
+* ``decode_round(batch, ...)``: the whole decode round, on every target TP rank, each
+  phase on the megakernel where the build and the setup serve it, else SGLang's own
+  (read through the binding, called, not copied):
 
-      draft graph replay (MK chain + head) -> target verify graph -> sampled accept on
-      the kept vocab shard (or SGLang's greedy accept on the target's argmax) ->
-      simulated acceptance -> recurrent-state commit (KDA) -> publish -> aux graph
-      (main stream)
+      draft graph replay (MK chain + head, or SGLang's draft with its sampler) ->
+      target verify graph (MK) -> accept: SGLang's greedy accept on the target's argmax;
+      a sampled batch on the MK sampled accept, or SGLang's sampled accept (top-k/top-p,
+      block verification) and the MK rank-0 broadcast of its decision -> simulated
+      acceptance -> recurrent-state commit (MK KDA commit, or SGLang's) -> publish ->
+      aux append (MK aux graph on the main stream, or SGLang's aux graph)
 
-  It returns None, launching nothing, for a round the megakernel kernels do not serve
-  (``_unserved`` names the reason, logged once per reason on TP rank 0); SGLang then
-  runs its own round. Every condition is the same on every rank.
+  It returns None, launching nothing, for a round no phase serves (``_unserved`` names
+  the reason, logged once per reason on TP rank 0); SGLang then runs its own round.
+  Every condition is the same on every rank.
 
 It reads the worker only through the names it binds (``bindings``). It declares no
-setup guards: what it serves is what the megakernel build offers. The target build
-refuses setups its kernels do not support (``SPEC``), the target names this runtime
-only once a draft is built on the megakernel chain, and the chain's offers (rows, head
-requests, widths) decide which rounds run here.
+setup guards: what it serves is what the megakernel build and SGLang's bound phases
+offer. The target build refuses setups its kernels do not support (``SPEC``) and names
+this runtime whenever it is built; the draft chain's offers (rows, head requests,
+widths) decide where the megakernel draft and aux run.
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     built_megakernel,
     megakernel_agree,
 )
+from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import BINDINGS
 from sglang.srt.layers.dp_attention import require_mlp_sync
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -85,6 +92,7 @@ SGLANG_READS = {
     "kernels/ops/memory/small_copy.py": ("try_small_copy",),
     "kernels/ops/speculative/dflash.py": ("_prepare_dflash_draft_block_unchecked",),
     "srt/kernel_plugins/nvidia/binding.py": ("built_megakernel", "megakernel_agree"),
+    "srt/kernel_plugins/nvidia/kimi_k31_dflash_binding.py": ("BINDINGS",),
     "srt/layers/dp_attention.py": ("require_mlp_sync",),
     "srt/lora/layers.py": ("unwrap_lora_layer",),
     "srt/managers/utils.py": ("GenerationBatchResult",),
@@ -133,6 +141,7 @@ SGLANG_READS = {
         "defer_plain_gather",
         "is_deferred_shard",
         "deferred_argmax",
+        "finish_deferred_gather",
     ),
     "srt/layers/vocab_parallel_embedding.py": ("num_embeddings_per_partition",),
     "srt/models/dflash.py": ("candidate_selector", "draft_config", "top_k"),
@@ -190,6 +199,19 @@ DFLASH_BINDINGS = frozenset(
         "accept_block",
     }
 )
+# SGLang's own phases, which the round runs where the megakernel does not serve one
+# (an SGLang without them binds none: test/unit/test_contract.py pins all or none).
+DFLASH_STOCK_BINDINGS = frozenset(
+    {
+        "draft_sampler",
+        "append_target_hidden_decode",
+        "aux_overlap",
+        "join_aux",
+        "aux_done",
+        "selector_sampling_accept",
+        "update_target_mamba_state_after_verify",
+    }
+)
 # No setup guards: the build offers what the runtime runs on (see the module docstring).
 DFLASH_GUARDS: dict = {}
 
@@ -212,7 +234,8 @@ class _DraftBlock(NamedTuple):
 class K31DFlashRuntime:
     """One per DFlash worker, over the target's ``BuiltK31Verify``."""
 
-    bindings = DFLASH_BINDINGS
+    # SGLang raises on a name it does not bind: declare its phases only where it has them.
+    bindings = DFLASH_BINDINGS | (DFLASH_STOCK_BINDINGS & BINDINGS.keys())
     guards = DFLASH_GUARDS
 
     def __init__(self, binding: Any, built: Any) -> None:
@@ -243,6 +266,9 @@ class K31DFlashRuntime:
         self._draft_kv_ring = spec.speculative_dflash_draft_kv_ring
         self._block_verification = spec.speculative_use_block_verification
         self._is_domino = self.draft_model.draft_config.is_domino
+        # SGLang binds its own phases (DFLASH_STOCK_BINDINGS); without them every phase
+        # must run on the megakernel.
+        self._stock = DFLASH_STOCK_BINDINGS <= self.bindings
         # set by draft_sampler, before the draft graph captures
         self._sampler = None
         self._draft_runner = None
@@ -250,8 +276,17 @@ class K31DFlashRuntime:
         self._kda = None
         self._recurrent_commit = False
         self._round_bs = frozenset()
-        # Why no round runs here; draft_sampler clears it when the head attaches.
-        self._stock_reason = "no megakernel draft head (no draft cuda graph captured)"
+        self._aux_rows = frozenset()
+        self._stock_aux = None
+        self._aux_overlap = False
+        self._join_aux = lambda: None
+        self._stock_sampled_accept = None
+        self._commit_state = None
+        # Why no round runs here; draft_sampler clears it once it picks the phases.
+        self._stock_reason = (
+            "no draft cuda graph (the worker asks for the draft sampler only when it "
+            "captures one for a selector draft)"
+        )
         self._declined = set()
         # SGLang sets a batch's decode-graph flag only under MLP sync.
         self._mlp_sync = require_mlp_sync()
@@ -268,12 +303,23 @@ class K31DFlashRuntime:
             what="DFlash draft chain offers",
         )
         self._aux_chain = offered(draft, draft.draft_aux_rows)
-        # None: sampled rounds run SGLang's (_unserved); greedy rounds still run here. A
-        # chain without the aux or the head serves no round (_round_reason, draft_sampler),
-        # so nothing is built for it (rank-uniform: the offers agree above).
+        # None: sampled rounds take SGLang's accept, or without it run SGLang's round
+        # (_unserved). It accepts per token, so a block-verification setup never runs it;
+        # without SGLang's phases, a chain without the aux or the head serves no round.
+        # Nothing is built where it cannot run (rank-uniform: the offers agree above).
+        serves = self._stock or (
+            self._aux_chain is not None and bool(draft.draft_head_requests)
+        )
         self._megakernel_sampled = (
             self._prepare_megakernel_sampled_accept()
-            if self._aux_chain is not None and draft.draft_head_requests
+            if serves and not self._block_verification
+            else None
+        )
+        # Rank 0's decision of SGLang's sampled accept on every rank in one multicast
+        # hop, instead of SGLANG_SPEC_TP_SYNC's three NCCL broadcasts (none at TP 1).
+        self._broadcast = (
+            built.rank0_broadcast
+            if self._stock and built.prepare_rank0_broadcast()
             else None
         )
 
@@ -334,11 +380,13 @@ class K31DFlashRuntime:
             )
 
     def draft_sampler(self, lm_head: Any) -> Optional[MegakernelSelectorDraftSampler]:
-        """The megakernel head, which proposes inside the draft forward, or None for
-        SGLang's sampler; before the draft graph captures (after the worker's attention
-        backends). Collective; every input is the same on every rank."""
-        self._draft_runner = self._binding.pull("draft_model_runner")
-        self._recurrent_commit = self._binding.pull("need_mamba_verify_commit")
+        """Picks the round's phases and returns the megakernel head, which proposes
+        inside the draft forward, or None for SGLang's sampler; before the draft graph
+        captures (after the worker's attention backends). Collective; every input is
+        the same on every rank."""
+        pull = self._binding.pull
+        self._draft_runner = pull("draft_model_runner")
+        self._recurrent_commit = pull("need_mamba_verify_commit")
         self._embed_module = unwrap_lora_layer(
             _resolve_dflash_embedding_module(self.draft_model, self._target_model)
         )
@@ -358,30 +406,67 @@ class K31DFlashRuntime:
         block_size = int(self.block_size)
         # The head is folded into every captured draft graph, after the chain's forward:
         # it serves only if the chain runs each graph's rows (B1 x 8 today).
-        if (
-            head is None
-            or not head.draft_head_sampling
-            or not graph_bs <= set(head.draft_head_requests)
-            or not {bs * block_size for bs in graph_bs} <= set(chain.widths)
-        ):
-            self._decline_all(
-                f"no megakernel draft head for decode graphs {sorted(graph_bs)} "
-                f"x block {block_size} (the chain runs rows {list(chain.widths)}, "
-                f"its head batch sizes {list(chain.draft_head_requests)})"
+        draft_mk = (
+            head is not None
+            and head.draft_head_sampling
+            and graph_bs <= set(head.draft_head_requests)
+            and {bs * block_size for bs in graph_bs} <= set(chain.widths)
+        )
+        # The aux writes the per-slot draft table and holds no sliding-window locations.
+        sliding = (
+            self._draft_runner.runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None
+        )
+        aux_mk = self._aux_chain is not None and not self._draft_kv_ring and not sliding
+        kda_mk = self._recurrent_commit and self._kda.serves()
+        reason = self._round_reason(
+            graph_bs=graph_bs, draft_mk=draft_mk, aux_mk=aux_mk, kda_mk=kda_mk
+        )
+        if draft_mk:
+            # The draft graph runs only its captured sizes: the head serves each.
+            self._round_bs = frozenset(graph_bs)
+        else:
+            # SGLang's draft graph runner pads a batch to the next captured size.
+            self._round_bs = frozenset(range(1, max(graph_bs) + 1))
+        if aux_mk:
+            self._aux_rows = frozenset(chain.draft_aux_rows)
+        if not self._stock:
+            # Every round's aux on the megakernel.
+            rows = self._aux_rows
+            self._round_bs = frozenset(
+                bs for bs in self._round_bs if bs * block_size in rows
             )
-            return None
-        self._stock_reason = self._round_reason()
-        rows = set(chain.draft_aux_rows)
-        self._round_bs = frozenset(bs for bs in graph_bs if bs * block_size in rows)
-        if self._stock_reason is not None:
-            self._decline_all(self._stock_reason)
+        else:
+            self._stock_aux = pull("append_target_hidden_decode")
+            self._aux_overlap = pull("aux_overlap")
+            self._join_aux = pull("join_aux")
+            self._stock_sampled_accept = pull("selector_sampling_accept")
+        self._commit_state = (
+            self._commit_on_megakernel
+            if kda_mk or not self._stock
+            else pull("update_target_mamba_state_after_verify")
+        )
+        self._stock_reason = reason
+        if reason is not None:
+            self._decline_all(reason)
         elif self._target_tp_rank == 0:
+            served = sorted(self._round_bs)
+            aux_bs = [bs for bs in served if bs * block_size in self._aux_rows]
+            aux = "mk" if aux_bs == served else "sglang"
+            if aux_bs and aux_bs != served:
+                aux = f"mk at batch sizes {aux_bs}, else sglang"
+            commit = "mk" if kda_mk else "sglang" if self._recurrent_commit else "-"
             logger.info(
-                "DFLASH rounds run on the NVIDIA megakernel at batch sizes %s "
-                "(aux rows %s, on the main stream)",
-                sorted(self._round_bs),
-                sorted(rows),
+                "DFLASH round phases: draft=%s aux=%s accept=%s broadcast=%s "
+                "kda_commit=%s (batch sizes %s)",
+                "mk" if draft_mk else "sglang",
+                aux,
+                "mk" if self._megakernel_sampled is not None else "sglang",
+                "mk" if self._broadcast is not None else "-",
+                commit,
+                served,
             )
+        if not draft_mk:
+            return None
         tokens, candidates, q = head.attach_draft_head(
             lm_head=lm_head,
             selector=self.draft_model.candidate_selector,
@@ -401,18 +486,28 @@ class K31DFlashRuntime:
         )
         return self._sampler
 
-    def _round_reason(self) -> Optional[str]:
-        """Why no round can run here although the head serves the draft graphs: the
-        aux and KDA kernels' layouts."""
+    def _round_reason(self, *, graph_bs, draft_mk, aux_mk, kda_mk) -> Optional[str]:
+        """Why no round can run here: a phase neither the megakernel nor SGLang's bound
+        phases serve."""
+        # Both the draft forward and the aux write the ring's block locations, which
+        # SGLang's round computes inline (no bound member), and the chain reads none.
+        if self._draft_kv_ring:
+            return "the draft KV ring (the draft and the aux write its block locations)"
+        if self._stock:
+            return None
+        if not draft_mk:
+            chain = self._draft_chain
+            return (
+                f"no megakernel draft head for decode graphs {sorted(graph_bs)} "
+                f"x block {int(self.block_size)} (the chain runs rows "
+                f"{list(chain.widths)}, its head batch sizes "
+                f"{list(chain.draft_head_requests)})"
+            )
         if self._aux_chain is None:
             return "no megakernel aux on the draft chain (see the draft MK build log)"
-        # The aux writes the per-slot draft table the ring replaces.
-        if self._draft_kv_ring:
-            return "the draft KV ring (the megakernel aux writes per-slot draft rows)"
-        # The aux graphs hold no sliding-window locations.
-        if self._draft_runner.runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None:
+        if not aux_mk:
             return "a sliding-window draft KV sub-pool (the megakernel aux writes none)"
-        if self._recurrent_commit and self._kda._kda_state() is None:
+        if self._recurrent_commit and not kda_mk:
             return "a recurrent state the megakernel KDA commit is not laid out for"
         return None
 
@@ -453,13 +548,15 @@ class K31DFlashRuntime:
         """Why the round runs SGLang's way, or None; rank-uniform, before any launch."""
         if self._stock_reason is not None:
             return self._stock_reason
+        # Past these, SGLang's draft runs eager (its inline branches, no bound member).
         if bs not in self._round_bs:
-            return (
-                f"batch size {bs}: the megakernel chain serves {sorted(self._round_bs)}"
-            )
+            return f"batch size {bs}: the draft graphs serve {sorted(self._round_bs)}"
         # Without MLP sync the draft graph runs whenever bs is captured.
         if self._mlp_sync and not batch.can_run_decode_cuda_graph:
             return "no decode cuda graph under MLP sync"
+        # These need SGLang's round's inline verify steps (the grammar tree before the
+        # verify, the grammar mask and barrier, the sampling-mask capture, the full
+        # logits kept for the logprobs), which no bound member offers.
         if batch.has_grammar:
             return "a grammar"
         if batch.return_logprob:
@@ -472,7 +569,8 @@ class K31DFlashRuntime:
             or sampling_info.sampling_mask_batch_indices is not None
         ):
             return "adjusted logits"
-        if not sampled:
+        # SGLang's sampled accept serves what the megakernel's does not.
+        if not sampled or self._stock_sampled_accept is not None:
             return None
         if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
             return "top-k/top-p"
@@ -505,8 +603,10 @@ class K31DFlashRuntime:
         # Before the aux: the next round's host reads the lengths without waiting on it.
         if on_publish is not None:
             on_publish(new_seq_lens)
-        self._append_aux(block, logits_output, commit_lens, bs=bs)
-        return self._result(target_out, out_tokens, commit_lens, bonus, new_seq_lens)
+        aux_done = self._append_aux(block, logits_output, commit_lens, bs=bs)
+        return self._result(
+            target_out, out_tokens, commit_lens, bonus, new_seq_lens, aux_done
+        )
 
     def _block_buffers(self, bs: int) -> tuple:
         bufs = self._block_bufs
@@ -645,13 +745,19 @@ class K31DFlashRuntime:
         )
 
     def _draft(self, block: _DraftBlock, sampling_info, *, bs, sampled):
-        """The draft graph (megakernel chain + head) proposes the block into
-        ``block.draft_tokens``; returns the selector's (candidate ids, q rows) for a
-        sampled batch, else None (as SGLang's round, a Domino draft accepts greedily)."""
+        """The draft graph (megakernel chain + head, or SGLang's draft with its sampler)
+        proposes the block into ``block.draft_tokens``; returns the selector's
+        (candidate ids, q rows) for a sampled batch, else None (as SGLang's round, a
+        Domino draft accepts greedily)."""
         block_size = int(self.block_size)
         sampler = self._sampler
+        if sampler is None:
+            # SGLang's, which the worker folds in once draft_sampler returns None.
+            sampler = self._sampler = self._binding.pull("draft_sampler")
         # Consumed by the in-graph sample; must be staged before the replay.
         sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        # An aux append SGLang's round left on its side stream writes the draft KV.
+        self._join_aux()
         with (
             torch.inference_mode(),
             draft_tp_context(self._draft_parallel_layout),
@@ -662,7 +768,7 @@ class K31DFlashRuntime:
         draft_next = sampler.out[: bs * (block_size - 1)].view(bs, block_size - 1)
         selector_sample = (
             (sampler.candidate_out[:bs], sampler.q_out[:bs])
-            if sampled and not self._is_domino
+            if sampled and sampler.sampling_enabled and not self._is_domino
             else None
         )
         draft_tokens, block_ids = block.draft_tokens, block.block_ids
@@ -720,7 +826,7 @@ class K31DFlashRuntime:
     ) -> tuple:
         """(accept_len, commit_lens, bonus, out_tokens, new_seq_lens or None) from the
         verify's logits: the kept vocab shard, or the gathered logits of a greedy batch
-        when the plain deferral is refused."""
+        when the plain deferral is refused or of SGLang's sampled accept."""
         draft_tokens, prefix_lens = block.draft_tokens, block.prefix_lens
         shard = logits_output.next_token_logits
         target_lp = self._target_logits_processor
@@ -754,19 +860,55 @@ class K31DFlashRuntime:
                 target_predict=target_predict,
                 cutoff_verify_lens=None,
             )[:5]
-        # The sampled accept, served only with the deferral armed, reads the shard.
-        if not deferred or not self._megakernel_sampled.sampled_accept_fits(bs, shard):
-            raise RuntimeError(f"K3.1 DFlash runtime: a {shard.dtype} verify shard")
-        logits_output.next_token_logits = None
-        # Samples on the vocab shards; every rank gets rank 0's decision.
         selector_candidate_ids, selector_q_rows = selector_sample
-        accept_len, bonus, target_predict = self._megakernel_sampled.sampled_accept(
-            logits=shard,
-            temperatures=sampling_info.temperatures,
-            candidates=draft_tokens,
-            candidate_ids=selector_candidate_ids,
-            q_rows=selector_q_rows,
-        )
+        sampled = self._megakernel_sampled
+        if (
+            sampled is not None
+            and deferred
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+            and sampled.sampled_accept_fits(bs, shard)
+        ):
+            # The megakernel's, armed with the deferral, reads the shard and samples on
+            # the vocab shards; every rank gets rank 0's decision.
+            logits_output.next_token_logits = None
+            accept_len, bonus, target_predict = sampled.sampled_accept(
+                logits=shard,
+                temperatures=sampling_info.temperatures,
+                candidates=draft_tokens,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+            )
+            logits = None
+        else:
+            # SGLang's (top-k/top-p, block verification) on the gathered logits, as its
+            # round: the shard gathered, the adjustments (none: _unserved), the accept.
+            _require(
+                self._stock_sampled_accept is not None,
+                "a verify shard the megakernel sampled accept does not take",
+            )
+            if deferred:
+                shard = target_lp.finish_deferred_gather(shard)
+                logits_output.next_token_logits = shard
+            adjust_verify_logits(
+                shard,
+                sampling_info=sampling_info,
+                grammar_mask=None,
+                draft_tokens=draft_tokens,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
+            )
+            accept_len, bonus, _ = self._stock_sampled_accept(
+                candidates=draft_tokens,
+                next_token_logits=shard,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                draft_input=batch.spec_info,
+            )
+            # Rank 0's decision on every rank (in place), one multicast hop.
+            if self._broadcast is not None:
+                self._broadcast(accept_len, bonus)
+            target_predict, logits = None, shard
         out_tokens, commit_lens = _commit_accept(draft_tokens, accept_len, bonus)
         new_seq_lens = None
         if SIMULATE_ACC_LEN > 0:
@@ -780,7 +922,7 @@ class K31DFlashRuntime:
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-                next_token_logits=None,
+                next_token_logits=logits,
                 generator=self._simulated_acc_len_rng,
                 prefix_lens=prefix_lens,
                 new_seq_lens=new_seq_lens,
@@ -788,12 +930,24 @@ class K31DFlashRuntime:
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
     def _commit(self, batch, block, seq_lens_pre_verify, commit_lens, new_seq_lens):
-        """The KDA commit of the accepted recurrent state; returns the new lengths."""
+        """The recurrent-state commit of the accepted steps; returns the new lengths."""
         prefix_lens = block.prefix_lens
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if not self._recurrent_commit:
             return new_seq_lens
+        self._commit_state(
+            batch=batch,
+            seq_lens_pre_verify=seq_lens_pre_verify,
+            seq_lens_post_verify=new_seq_lens,
+            commit_lens=commit_lens,
+        )
+        return new_seq_lens
+
+    def _commit_on_megakernel(
+        self, *, batch, seq_lens_pre_verify, seq_lens_post_verify, commit_lens
+    ) -> None:
+        """The KDA commit, as SGLang's update_target_mamba_state_after_verify."""
         _require(
             self._kda._megakernel_kda_commit(
                 batch=batch,
@@ -802,11 +956,11 @@ class K31DFlashRuntime:
             ),
             "the KDA commit declined the target's recurrent state",
         )
-        return new_seq_lens
 
     def _append_aux(self, block: _DraftBlock, logits_output, commit_lens, *, bs):
-        """The committed rows' target hidden states into the draft KV: the aux graph,
-        replayed on the main stream (a collective)."""
+        """The committed rows' target hidden states into the draft KV: the megakernel
+        aux graph on the main stream (a collective) where the chain offers the rows,
+        else SGLang's aux graph. Returns SGLang's side-stream event when it ran there."""
         block_size = int(self.block_size)
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -816,7 +970,20 @@ class K31DFlashRuntime:
         hidden = hidden.view(bs, block_size, -1)
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        cache_loc = block.iteration_ids.write_ids(self._draft_runner.runner_ids)
+        runner_ids = self._draft_runner.runner_ids
+        cache_loc = block.iteration_ids.write_ids(runner_ids)
+        if bs * block_size not in self._aux_rows:
+            self._stock_aux(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(block.verify_out_cache_loc_2d.shape),
+                positions=block.positions,
+                commit_lens=commit_lens,
+                swa_cache_loc=block.iteration_ids.write_ids(
+                    runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
+                ),
+            )
+            return self._binding.pull("aux_done") if self._aux_overlap else None
         self._aux._append_target_hidden_megakernel(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             positions=block.positions,
@@ -824,8 +991,11 @@ class K31DFlashRuntime:
             cache_loc_2d=cache_loc.view(block.verify_out_cache_loc_2d.shape),
             commit_lens=commit_lens,
         )
+        return None
 
-    def _result(self, target_out, out_tokens, commit_lens, bonus, new_seq_lens):
+    def _result(
+        self, target_out, out_tokens, commit_lens, bonus, new_seq_lens, aux_done
+    ):
         logits_output = target_out.logits_output
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
@@ -837,7 +1007,7 @@ class K31DFlashRuntime:
             next_draft_input=make_draft_input_v2(
                 bonus_tokens=bonus, new_seq_lens=new_seq_lens
             ),
-            side_stream_done=None,
+            side_stream_done=aux_done,
             speculative_num_draft_tokens=int(self.block_size),
             new_seq_lens=new_seq_lens,
             block_accept_lens=None,

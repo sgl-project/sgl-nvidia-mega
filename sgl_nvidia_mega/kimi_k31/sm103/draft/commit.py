@@ -366,6 +366,12 @@ def compile_kda_commit(layers, heads, k_heads, dim, ring, conv_elems, track_inte
     return cute.compile(kernel, *args, make_fake_stream())
 
 
+def kda_commit_serves(rawk, window):
+    """Whether KdaCommit folds this ring: it prefetches STEPS ring steps per slot and
+    folds at most STEPS accepted steps (``range_constexpr(STEPS)``, shared memory)."""
+    return rawk.shape[3] >= STEPS and window.shape[2] <= STEPS
+
+
 def kda_commit(
     *,
     temporal,
@@ -392,9 +398,8 @@ def kda_commit(
         all(t[0].is_contiguous() for t in (temporal, rawk, rawv, gk, beta, conv))
         and window[0, 0].is_contiguous()
         and temporal.shape[4] == dim
-        and ring >= STEPS
+        and kda_commit_serves(rawk, window)
         and window.shape[3:] == conv.shape[2:]
-        and window.shape[2] <= STEPS
     )
     dtypes = (
         rawk.dtype == rawv.dtype == conv.dtype == window.dtype == torch.bfloat16

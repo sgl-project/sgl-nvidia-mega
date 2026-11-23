@@ -6,7 +6,7 @@ from its hybrid linear-attention backend, handed to ``BuiltK31Verify.kda_commit`
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
@@ -52,13 +52,8 @@ SGLANG_READS = {
     ),
     "srt/mem_cache/base_prefix_cache.py": ("page_size",),
 }
-# SGLang code moved here (test/unit/test_contract.py): while SGLang still defines it,
-# its digest must match, so both copies run the same code.
-SGLANG_MOVED = {
-    "srt/speculative/dflash_worker_v2.py:DFlashWorkerV2._megakernel_kda_commit": "ba15293d591d1602",
-    "srt/speculative/dflash_worker_v2.py:DFlashWorkerV2._kda_commit_kwargs": "ec0914b06e705615",
-    "srt/speculative/dflash_worker_v2.py:DFlashWorkerV2._kda_commit_inputs": "b571b1571f900b01",
-}
+# _megakernel_kda_commit, _kda_commit_kwargs and _kda_commit_inputs moved here from
+# SGLang (#51676), which no longer defines them; the commit reads its inputs in place.
 
 
 class KdaCommit:
@@ -70,7 +65,13 @@ class KdaCommit:
         self._target_attn_backend = target_attn_backend
         self.device = device
         self._kda_confirmed = True
-        self._kda_commit_buffers: Optional[Tuple[torch.Tensor, ...]] = None
+        self._kda_commit_buffers: Optional[torch.Tensor] = None
+
+    def serves(self) -> bool:
+        """Whether the commit kernel is laid out for the target's recurrent state;
+        once, before the draft graph captures (the state pool is sized by then)."""
+        state = self._kda_state()
+        return state is not None and self._megakernel_kda.kda_commit_serves(state[1])
 
     def _megakernel_kda_commit(
         self,
@@ -82,14 +83,14 @@ class KdaCommit:
         if self._megakernel_kda is None:
             return False
         bs = int(commit_lens.shape[0])
-        slots, track, commit = self._kda_commit_inputs(bs)
-        kwargs = self._kda_commit_kwargs(batch=batch, bs=bs, slots=slots, track=track)
+        kwargs = self._kda_commit_kwargs(batch=batch, bs=bs)
         if kwargs is None:
             return False
-        commit.copy_(commit_lens)
+        # The kernel reads the round's tensors in place (no-op casts at their dtypes):
+        # nothing is copied into static inputs, as nothing captures this launch.
         used = self._megakernel_kda.kda_commit(
             **kwargs,
-            commit_lens=commit,
+            commit_lens=commit_lens.to(torch.int32),
             prefix_lens=seq_lens_pre_verify.to(torch.int64),
         )
         if not used:
@@ -98,24 +99,19 @@ class KdaCommit:
         self._kda_confirmed = used
         return used
 
-    def _kda_commit_kwargs(
-        self,
-        *,
-        batch: ScheduleBatch,
-        bs: int,
-        slots: torch.Tensor,
-        track: torch.Tensor,
-    ) -> Optional[dict]:
+    def _kda_commit_kwargs(self, *, batch: ScheduleBatch, bs: int) -> Optional[dict]:
         state = self._kda_state()
         if state is None:
             return None
         linear, spec_state = state
         state_slots = linear.forward_state_slots(bs, batch.mamba_track_indices)
-        slots.copy_(state_slots.working)
-        if state_slots.track is None:
-            track.fill_(-1)
-        else:
-            track.copy_(state_slots.track)
+        # The slots are read before the kernel's griddepcontrol.wait: the forward's
+        # metadata wrote them before the verify, not the launch right before this one.
+        track = (
+            self._kda_commit_inputs(bs)
+            if state_slots.track is None
+            else state_slots.track.to(torch.int32)
+        )
         return dict(
             temporal=spec_state.temporal,
             rawk=spec_state.replayssm_rawk,
@@ -124,7 +120,7 @@ class KdaCommit:
             beta=spec_state.replayssm_beta,
             conv=spec_state.conv[0],
             window=spec_state.intermediate_conv_window[0],
-            slots=slots,
+            slots=state_slots.working.to(torch.int32),
             track_slots=track,
             track_interval=mamba_track_grid(batch.tree_cache.page_size),
         )
@@ -151,9 +147,10 @@ class KdaCommit:
             return None
         return linear, spec_state
 
-    def _kda_commit_inputs(self, bs: int) -> Tuple[torch.Tensor, ...]:
-        if self._kda_commit_buffers is None or self._kda_commit_buffers[0].numel() < bs:
-            self._kda_commit_buffers = tuple(
-                torch.empty(bs, dtype=torch.int32, device=self.device) for _ in range(3)
+    def _kda_commit_inputs(self, bs: int) -> torch.Tensor:
+        """The track slots of a batch without checkpoints: -1, filled once per size."""
+        if self._kda_commit_buffers is None or self._kda_commit_buffers.numel() < bs:
+            self._kda_commit_buffers = torch.full(
+                (bs,), -1, dtype=torch.int32, device=self.device
             )
-        return tuple(buf[:bs] for buf in self._kda_commit_buffers)
+        return self._kda_commit_buffers[:bs]

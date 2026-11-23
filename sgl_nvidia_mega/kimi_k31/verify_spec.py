@@ -10,7 +10,7 @@ import torch
 from sgl_nvidia_mega.kimi_k31.k3.providers import _cuda_memory, build_resources
 from sgl_nvidia_mega.kimi_k31.k3.spec import _deadline_ns
 
-from .dflash.protocol import DRAFT_CHAINS, RUNTIME
+from .dflash.protocol import RUNTIME
 from .verify_binding import KdaVerifyWeights
 from .verify_contract import supported_query_width, verify_keys
 from .verify_executor import K31VerifyExecutor
@@ -94,12 +94,13 @@ class BuiltK31Verify:
     def dflash_runtime(self) -> str:
         """The DFlash runtime (SGLang's SupportsDFlashRuntime), by "module:attribute":
         SGLang's DFlash worker imports it at its start and builds it with this target. It
-        runs its rounds on the DFlash2 draft's megakernel chain, so it is named only once
-        a draft is built on the chain (draft/serving.py registers it); without one, or
-        with K31MK_DFLASH_RUNTIME=0, SGLang's DFlash round runs beside this target. It
-        calls prepare_sampled_accept, sampled_accept_fits, sampled_accept and kda_commit
-        below."""
-        if not DRAFT_CHAINS or not RUNTIME:
+        runs every round, each phase on the megakernel where it serves (this verify
+        always; the draft chain's head and aux where a draft is built on it) and SGLang's
+        own phase elsewhere. With K31MK_DFLASH_RUNTIME=0, SGLang's DFlash round runs
+        beside this target. It calls prepare_sampled_accept, sampled_accept_fits,
+        sampled_accept, prepare_rank0_broadcast, rank0_broadcast, kda_commit_serves and
+        kda_commit below."""
+        if not RUNTIME:
             return ""
         return "sgl_nvidia_mega.kimi_k31.dflash.runtime:K31DFlashRuntime"
 
@@ -153,8 +154,11 @@ class BuiltK31Verify:
         self.pool_view = None
         self._active_logged = set()
         self._kda_commit_logged = False
-        # Use-time round counts of the DFLASH sampled accept, logged at 1, 10, 100, ... rounds per process.
-        self._rounds = {"sampled accept": [0, 1]}
+        # Use-time round counts of the DFLASH sampled accept and rank-0 broadcast, logged at 1, 10, 100, ...
+        # rounds per process.
+        self._rounds = {"sampled accept": [0, 1], "rank-0 broadcast": [0, 1]}
+        # The rank-0 broadcast of SGLang's sampled accept: built by prepare_rank0_broadcast.
+        self._bcast = None
         # The DFLASH T > 0 sampled accept on the vocab shards: built by prepare_sampled_accept, which the
         # DFlash runtime calls on every rank once it knows the target's head.
         self._sampled, self._sampled_logged = None, False
@@ -313,6 +317,46 @@ class BuiltK31Verify:
             self._sampled_logged = True
         self._count_round("sampled accept")
         return out
+
+    def prepare_rank0_broadcast(self):
+        """Build draft.sampled.Rank0Bcast (its multicast box and kernel) for the DFLASH runtime's
+        broadcast of SGLang's sampled accept. True when built; False (building nothing) at TP 1,
+        where no rank waits on another. Collective: every rank, in the same order."""
+        from sglang.srt.runtime_context import get_parallel
+
+        from .sm103.draft.sampled import Rank0Bcast
+
+        parallel = get_parallel()
+        if int(parallel.tp_size) < 2:
+            return False
+        self._bcast = Rank0Bcast(
+            parallel.tp_group.device_group,
+            torch.device("cuda", torch.cuda.current_device()),
+            int(parallel.tp_rank),
+            deadline_ns=self._sampled_deadline_ns,
+        )
+        return True
+
+    def rank0_broadcast(self, accept_len, bonus):
+        """Rank 0's accept (accept_len int32 [B], bonus int64 [B]) on every rank, in place, in one
+        multicast hop: SGLANG_SPEC_TP_SYNC's dflash-selector NCCL broadcasts without NCCL. Collective:
+        every rank, in the same order, after prepare_rank0_broadcast."""
+        self._bcast.run(accept_len, bonus)
+        if self._bcast.calls == 1:
+            logger.info(
+                "NVIDIA megakernel: rank-0 sampled-accept broadcast active (one multicast hop; "
+                "the dflash-selector NCCL broadcasts skipped)"
+            )
+        self._count_round("rank-0 broadcast")
+
+    def kda_commit_serves(self, spec_state):
+        """Whether kda_commit's kernel folds the target's speculative KDA state (its ring and
+        verify steps; draft.commit.kda_commit_serves)."""
+        from .sm103.draft.commit import kda_commit_serves
+
+        return kda_commit_serves(
+            spec_state.replayssm_rawk, spec_state.intermediate_conv_window[0]
+        )
 
     def kda_commit(self, **kwargs):
         """Stage 3b: the post-verify KDA commit in one launch (draft.commit.kda_commit, keyword

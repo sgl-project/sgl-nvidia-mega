@@ -160,6 +160,8 @@ class K31DFlashRuntimeRound(unittest.TestCase):
     hands back to SGLang's stock round."""
 
     BLOCK = 8
+    # SGLang binds its own phases (DFLASH_STOCK_BINDINGS); False: an SGLang without them.
+    STOCK = True
 
     def setUp(self):
         try:
@@ -172,6 +174,10 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         from sgl_nvidia_mega.kimi_k31.dflash import runtime as rt
 
         self.rt, self.calls = rt, []
+        bound = rt.DFLASH_BINDINGS | (rt.DFLASH_STOCK_BINDINGS if self.STOCK else set())
+        bindings = patch.object(rt.K31DFlashRuntime, "bindings", bound)
+        bindings.start()
+        self.addCleanup(bindings.stop)
         # No MLP sync unless a test says so (SGLang reads it from the parallel config).
         mlp_sync = patch.object(rt, "require_mlp_sync", return_value=False)
         mlp_sync.start()
@@ -197,6 +203,9 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 log("sampled_accept")
                 or (torch.tensor([2], dtype=torch.int32), torch.tensor([9]), None)
             ),
+            prepare_rank0_broadcast=lambda: log("prepare_bcast") or True,
+            rank0_broadcast=lambda accept_len, bonus: log("rank0_broadcast"),
+            kda_commit_serves=lambda state: True,
         )
         lp = types.SimpleNamespace(
             vocab_size=32,
@@ -204,6 +213,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             defer_plain_gather=False,
             is_deferred_shard=lambda x: log("is_deferred_shard") or True,
             deferred_argmax=lambda x: log("deferred_argmax") or torch.zeros(1, 8),
+            finish_deferred_gather=lambda x: log("gather") or torch.zeros(8, 32),
         )
         runner = types.SimpleNamespace(
             model=types.SimpleNamespace(
@@ -246,7 +256,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             "draft_block_spec_info": None,
             "target_worker": types.SimpleNamespace(
                 model_runner=runner,
-                forward_batch_generation=lambda **kw: log("verify") or self.verify_out,
+                forward_batch_generation=lambda **kw: log("verify") or self._verified(),
             ),
             "target_logits_processor": lp,
             "sim_acc_rng": None,
@@ -265,6 +275,25 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                     None,
                 )
             ),
+            # SGLang's own phases
+            "draft_sampler": types.SimpleNamespace(
+                out=torch.arange(8 * 7),
+                candidate_out=torch.zeros(8, 7, 16),
+                q_out=torch.zeros(8, 7, 16),
+                sampling_enabled=True,
+                stage_sampling_params=lambda **kw: log("stage_sglang_sampler"),
+            ),
+            "append_target_hidden_decode": lambda **kw: log(
+                ("sglang_aux", kw["swa_cache_loc"])
+            ),
+            "aux_overlap": False,
+            "join_aux": lambda: None,
+            "aux_done": "aux event",
+            "selector_sampling_accept": lambda **kw: (
+                log("sglang_sampled_accept")
+                or (torch.tensor([2], dtype=torch.int32), torch.tensor([9]), None)
+            ),
+            "update_target_mamba_state_after_verify": lambda **kw: log("sglang_commit"),
         }
         self.graphs = graphs = types.SimpleNamespace(
             graph=types.SimpleNamespace(
@@ -280,6 +309,8 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             speculative_use_block_verification=False,
         )
         self.kda_state = ("linear", "speculative state")
+        self.swa_loc = None  # no sliding-window draft sub-pool
+        self.hidden_rows = self.BLOCK  # bs 1 x block
         kda_state = patch.object(rt.KdaCommit, "_kda_state", lambda kda: self.kda_state)
         kda_state.start()
         self.addCleanup(kda_state.stop)
@@ -308,6 +339,15 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             mocked.start()
             self.addCleanup(mocked.stop)
 
+    def _verified(self):
+        """The verify's output; a round consumes its hidden states."""
+        out = self.verify_out.logits_output
+        if out.hidden_states is None:
+            out.hidden_states = torch.zeros(self.hidden_rows, 4)
+        if out.next_token_logits is None:
+            out.next_token_logits = "shard"
+        return self.verify_out
+
     def _plan(self, **kw):
         log = self.calls.append
         return types.SimpleNamespace(
@@ -315,7 +355,11 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 bind=lambda fb, translator: log("bind")
             ),
             bind=lambda fb, translator: log("bind (shared mapping)"),
-            write_ids=lambda reader: torch.zeros(8, dtype=torch.int64),
+            write_ids=lambda reader, kind=None: (
+                torch.zeros(self.hidden_rows, dtype=torch.int64)
+                if kind is None
+                else self.swa_loc
+            ),
         )
 
     def _binding(self, bindings=None):
@@ -374,7 +418,12 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         runtime = self._runtime()
         self.assertEqual(
             self.calls,
-            [("agree", "DFlash draft chain offers"), "prepare_sampled", "attach_head"],
+            [
+                ("agree", "DFlash draft chain offers"),
+                "prepare_sampled",
+                "prepare_bcast",
+                "attach_head",
+            ],
         )
         self.assertTrue(self.bindings["target_logits_processor"].defer_plain_gather)
         self.assertEqual(runtime._round_bs, {1})
@@ -431,8 +480,6 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             "bs 2": dict(seq_lens=torch.tensor([5, 6])),
         }
         sampling = {
-            "top_p": dict(need_top_p_sampling=True),
-            "top_k": dict(need_top_k_sampling=True),
             "penalties": dict(step_penalties=object()),
             "logit bias": dict(logit_bias=torch.zeros(1)),
             "custom logit processor": dict(has_custom_logit_processor=True),
@@ -465,17 +512,26 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 self.assertEqual(out is not None, served)
                 self.assertEqual(bool(self.calls), served)
 
-    def test_a_kernel_limit_sends_sampled_rounds_to_sglang_and_keeps_greedy_ones(self):
-        """Block verification, or no sampled-accept build: the megakernel sampled
-        accept cannot run, the greedy accept still can."""
-        for name, change in {
-            "block verification": lambda: setattr(
-                self.spec, "speculative_use_block_verification", True
+    def test_sampled_rounds_the_megakernel_accept_does_not_serve_take_sglangs(self):
+        """Top-k/top-p, block verification, no sampled-accept build: SGLang's sampled
+        accept on the gathered logits, then the megakernel rank-0 broadcast of its
+        decision; the greedy accept is SGLang's as before."""
+        for name, change, sampling in (
+            ("top-p", lambda: None, dict(need_top_p_sampling=True)),
+            ("top-k", lambda: None, dict(need_top_k_sampling=True)),
+            (
+                "block verification",
+                lambda: setattr(self.spec, "speculative_use_block_verification", True),
+                {},
             ),
-            "no sampled accept": lambda: setattr(
-                self.target, "prepare_sampled_accept", lambda **kw: False
+            (
+                "no sampled accept",
+                lambda: setattr(
+                    self.target, "prepare_sampled_accept", lambda **kw: False
+                ),
+                {},
             ),
-        }.items():
+        ):
             with (
                 self.subTest(name),
                 patch.object(self, "spec", copy.copy(self.spec)),
@@ -486,22 +542,39 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 self.verify_out.logits_output.hidden_states = torch.zeros(8, 4)
                 runtime = self._runtime()
                 del self.calls[:]
-                out, _ = self._round(runtime, self._batch())
-                self.assertEqual((out, self.calls), (None, []))
+                out, _ = self._round(runtime, self._batch(**sampling))
+                self.assertIsNotNone(out)
+                accept = self.calls[self.calls.index("verify") + 1 :]
+                self.assertEqual(
+                    accept[:5],
+                    [
+                        "is_deferred_shard",
+                        "gather",
+                        "adjust",
+                        "sglang_sampled_accept",
+                        "rank0_broadcast",
+                    ],
+                )
+                self.assertNotIn("sampled_accept", self.calls)
                 out, _ = self._round(runtime, self._batch(is_all_greedy=True))
                 self.assertIsNotNone(out)
                 self.assertIn("kda_commit", self.calls)
+        # A block-verification setup never builds the per-token megakernel accept.
+        self.spec.speculative_use_block_verification = True
+        del self.calls[:]
+        self._runtime()
+        self.assertNotIn("prepare_sampled", self.calls)
 
-    def test_a_layout_the_kernels_do_not_serve_sends_every_round_to_sglang(self):
-        """No head for the captured graphs or the block, no aux, the draft KV ring, a
-        sliding-window draft pool, a recurrent state the KDA commit is not laid out
-        for: nothing fails at startup, and every round runs SGLang's, logged once."""
+    def _layout_cases(self):
         bindings = self.bindings
-        cases = {
+        return {
             "decode graphs [1, 2, 4]": lambda: setattr(
                 self.graphs.graph.cuda_graph_config.decode, "bs", [1, 2, 4]
             ),
-            "block 5": lambda: bindings.__setitem__("block_size", 5),
+            "block 5": lambda: (
+                bindings.__setitem__("block_size", 5),
+                setattr(self, "hidden_rows", 5),
+            ),
             "no aux": lambda: setattr(self.chain, "draft_aux_rows", ()),
             "ring": lambda: setattr(
                 self.spec, "speculative_dflash_draft_kv_ring", True
@@ -511,39 +584,49 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             ),
             "KDA state": lambda: setattr(self, "kda_state", None),
         }
-        for name, change in cases.items():
-            with self.subTest(name):
-                saved = (
-                    dict(self.chain.__dict__),
-                    dict(self.spec.__dict__),
-                    dict(bindings),
-                    dict(bindings["draft_model_runner"].runner_ids.__dict__),
-                    self.kda_state,
-                )
-                change()
-                with self.assertLogs(self.rt.logger, "WARNING") as logs:
+
+    @contextlib.contextmanager
+    def _changed(self, change):
+        bindings = self.bindings
+        saved = (
+            dict(self.chain.__dict__),
+            dict(self.spec.__dict__),
+            dict(bindings),
+            dict(bindings["draft_model_runner"].runner_ids.__dict__),
+            self.kda_state,
+            self.hidden_rows,
+        )
+        change()
+        try:
+            yield
+        finally:
+            self.chain.__dict__.update(saved[0])
+            self.spec.__dict__.update(saved[1])
+            bindings.update(saved[2])
+            bindings["draft_model_runner"].runner_ids.__dict__.update(saved[3])
+            self.kda_state, self.hidden_rows = saved[4:]
+            self.graphs.graph.cuda_graph_config.decode.bs = [1]
+
+    def test_only_the_draft_kv_ring_sends_every_round_to_sglang(self):
+        """The ring's block locations are written by SGLang's round inline: every round
+        runs SGLang's, logged once. Every other layout the megakernel does not serve
+        takes SGLang's phase inside the round."""
+        for name, change in self._layout_cases().items():
+            with self.subTest(name), self._changed(change):
+                with self.assertLogs(self.rt.logger, "INFO") as logs:
                     runtime = self._runtime()
                     del self.calls[:]
                     out, published = self._round(runtime, self._batch())
                     self._round(runtime, self._batch())
-                self.assertEqual((out, self.calls, published), (None, [], []))
-                (warning,) = logs.output  # once, at the draft graph's capture
-                self.assertIn("every round runs SGLang's round", warning)
-                self.chain.__dict__.update(saved[0])
-                self.spec.__dict__.update(saved[1])
-                bindings.update(saved[2])
-                bindings["draft_model_runner"].runner_ids.__dict__.update(saved[3])
-                self.kda_state = saved[4]
-                self.graphs.graph.cuda_graph_config.decode.bs = [1]
-        # The head stays off the draft graph only where it cannot serve it.
-        self.graphs.graph.cuda_graph_config.decode.bs = [1, 2, 4]
-        runtime = self.rt.K31DFlashRuntime(self._binding(), self.target)
-        self.assertIsNone(runtime.draft_sampler(lm_head="lm_head"))
-        self.graphs.graph.cuda_graph_config.decode.bs = [1]
-        # Without a draft graph (cuda graphs off) the worker never asks for the head.
-        runtime = self.rt.K31DFlashRuntime(self._binding(), self.target)
-        out, _ = self._round(runtime, self._batch())
-        self.assertIsNone(out)
+                warnings = [r for r in logs.records if r.levelname == "WARNING"]
+                if name == "ring":
+                    self.assertEqual((out, self.calls, published), (None, [], []))
+                    (warning,) = warnings
+                    self.assertIn("every round runs SGLang's round", warning.message)
+                    continue
+                self.assertEqual(warnings, [])
+                self.assertIsNotNone(out)
+                self.assertEqual(len(published), 1)
 
     def test_the_shared_draft_mapping_without_a_draft_window(self):
         self.spec.speculative_draft_window_size = None
@@ -556,7 +639,7 @@ class K31DFlashRuntimeRound(unittest.TestCase):
 
     def test_gathered_logits_of_a_greedy_batch_take_the_adjusted_argmax(self):
         """SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER=0: no sampled accept is built, sampled
-        rounds run SGLang's, a greedy round accepts on the gathered logits."""
+        rounds take SGLang's accept, a greedy round accepts on the gathered logits."""
         lp = self.bindings["target_logits_processor"]
         lp.is_deferred_shard = lambda x: self.calls.append("is_deferred_shard") or False
         plain = types.SimpleNamespace(is_set=lambda: True, get=lambda: False)
@@ -568,7 +651,10 @@ class K31DFlashRuntimeRound(unittest.TestCase):
             runtime = self._runtime()
         self.assertNotIn("prepare_sampled", self.calls)
         self.assertFalse(lp.defer_plain_gather)
-        self.assertIsNone(self._round(runtime, self._batch())[0])
+        del self.calls[:]
+        self.assertIsNotNone(self._round(runtime, self._batch())[0])
+        self.assertIn("sglang_sampled_accept", self.calls)
+        self.assertNotIn("gather", self.calls)  # already gathered
         logits = torch.zeros(8, 32)
         logits[:, 5] = 1.0
         self.verify_out.logits_output.next_token_logits = logits
@@ -593,9 +679,10 @@ class K31DFlashRuntimeRound(unittest.TestCase):
         self.assertNotIn("sampled_accept", self.calls)
         self.assertIn("deferred_argmax", self.calls)
 
-    def test_a_chain_without_its_aux_or_head_builds_no_sampled_accept(self):
-        """The sampled accept (a collective build out of the KV budget) serves only
-        rounds on the chain; a chain without the aux or the head serves none."""
+    def test_the_sampled_accept_is_built_where_a_round_can_run_it(self):
+        """The sampled accept (a collective build out of the KV budget) serves rounds
+        with or without the chain once SGLang's phases are bound; without them, only
+        rounds on a chain with its aux and head."""
         for name, offer in {
             "no aux": "draft_aux_rows",
             "no head": "draft_head_requests",
@@ -605,17 +692,280 @@ class K31DFlashRuntimeRound(unittest.TestCase):
                 setattr(self.chain, offer, ())
                 del self.calls[:]
                 self._runtime()
-                self.assertNotIn("prepare_sampled", self.calls)
+                self.assertEqual("prepare_sampled" in self.calls, self.STOCK)
                 self.chain.__dict__.update(saved)
         del self.calls[:]
         self._runtime()
         self.assertIn("prepare_sampled", self.calls)
 
+    def _phases(self):
+        with self.assertLogs(self.rt.logger, "INFO") as logs:
+            runtime = self._runtime()
+        (line,) = [m for m in logs.output if "DFLASH round phases" in m]
+        return runtime, line.split("DFLASH round phases: ")[1]
+
+    def _tp8_q5(self):
+        """TP8/DCP8 Q5: no draft on the chain (its spec declines TP8), block 5, decode
+        graphs 1..8, block verification."""
+        self.bindings["block_size"] = 5
+        self.graphs.graph.cuda_graph_config.decode.bs = list(range(1, 9))
+        self.spec.speculative_use_block_verification = True
+        self.addCleanup(setattr, self.graphs.graph.cuda_graph_config.decode, "bs", [1])
+        built = patch.object(self.rt, "built_megakernel", lambda model: None)
+        built.start()
+        self.addCleanup(built.stop)
+        self.hidden_rows = 5
+        self.verify_out.logits_output.hidden_states = None
+
+    def test_each_setup_picks_its_phases_once(self):
+        """TP16 measured: every phase on the megakernel; TP16 with decode graphs
+        [1, 2, 4]: SGLang's draft (the head serves bs 1 only), the megakernel aux at bs
+        1; TP8 Q5: SGLang's draft, aux and accept beside the megakernel verify,
+        broadcast and KDA commit."""
+        _, line = self._phases()
+        self.assertEqual(
+            line,
+            "draft=mk aux=mk accept=mk broadcast=mk kda_commit=mk (batch sizes [1])",
+        )
+        self.graphs.graph.cuda_graph_config.decode.bs = [1, 2, 4]
+        runtime, line = self._phases()
+        self.assertEqual(
+            line,
+            "draft=sglang aux=mk at batch sizes [1], else sglang accept=mk "
+            "broadcast=mk kda_commit=mk (batch sizes [1, 2, 3, 4])",
+        )
+        self.assertIsNone(runtime._sampler)  # the worker folds its own sampler in
+        self._tp8_q5()
+        del self.calls[:]
+        runtime, line = self._phases()
+        self.assertEqual(
+            line,
+            "draft=sglang aux=sglang accept=sglang broadcast=mk kda_commit=mk "
+            "(batch sizes [1, 2, 3, 4, 5, 6, 7, 8])",
+        )
+        self.assertNotIn("attach_head", self.calls)
+
+    def test_the_head_and_aux_serve_only_their_sizes(self):
+        """Decode graphs [1, 2, 4]: the head runs no graph unless it serves every one,
+        even where the chain runs the rows; the aux is picked per round, on the
+        megakernel only at the rows the chain offers."""
+        self.graphs.graph.cuda_graph_config.decode.bs = [1, 2, 4]
+        self.addCleanup(setattr, self.graphs.graph.cuda_graph_config.decode, "bs", [1])
+        self.chain.widths = (8, 16, 32)
+        runtime, line = self._phases()
+        self.assertTrue(line.startswith("draft=sglang "), line)
+        for bs, aux in ((1, "draft_aux"), (2, ("sglang_aux", None))):
+            with self.subTest(bs=bs):
+                self.hidden_rows = bs * self.BLOCK
+                self.verify_out.logits_output.hidden_states = None
+                batch = self._batch(is_all_greedy=True)
+                batch.seq_lens = torch.arange(bs) + 5
+                del self.calls[:]
+                out, _ = self._round(runtime, batch)
+                self.assertIsNotNone(out)
+                self.assertEqual(self.calls[-1], aux)
+
+    def test_a_tp8_round_composes_sglangs_phases_with_the_megakernel(self):
+        runtime = self._runtime()
+        self._tp8_q5()
+        runtime = self._runtime()
+        del self.calls[:]
+        out, published = self._round(runtime, self._batch(need_top_p_sampling=True))
+        self.assertEqual(
+            self.calls,
+            [
+                "prepare_block",
+                "embed",
+                "compact_lens",
+                "compact_bound",
+                "compact_rebuild",
+                "forward_batch",
+                "bind",
+                "stage_sglang_sampler",
+                "draft_forward",
+                "prepare_verify",
+                "verify",
+                "is_deferred_shard",
+                "gather",
+                "adjust",
+                "sglang_sampled_accept",
+                "rank0_broadcast",
+                "simulate",
+                "kda_commit",
+                "publish",
+                ("sglang_aux", None),
+            ],
+        )
+        self.assertEqual([t.tolist() for t in published], [[11]])
+        self.assertIsNone(out["side_stream_done"])
+        # greedy: SGLang's accept on the shard's argmax, no broadcast
+        del self.calls[:]
+        self._round(runtime, self._batch(is_all_greedy=True))
+        self.assertIn("deferred_argmax", self.calls)
+        self.assertNotIn("rank0_broadcast", self.calls)
+
+    def test_sglangs_aux_on_its_side_stream_is_joined_and_reported(self):
+        joins = []
+        self.bindings["aux_overlap"] = True
+        self.bindings["join_aux"] = lambda: joins.append(len(self.calls))
+        self._tp8_q5()
+        runtime = self._runtime()
+        del self.calls[:]
+        out, _ = self._round(runtime, self._batch())
+        # joined right before the draft forward, which reads the draft KV
+        self.assertEqual(joins, [self.calls.index("draft_forward")])
+        self.assertEqual(out["side_stream_done"], "aux event")
+        # a sliding-window draft hands SGLang's aux its locations
+        self.swa_loc = "swa locations"
+        self._round(runtime, self._batch())
+        self.assertIn(("sglang_aux", "swa locations"), self.calls)
+
+    def test_a_kda_state_the_kernel_does_not_fold_takes_sglangs_commit(self):
+        """kda_commit_serves: the kernel folds at most 8 steps (Q16 does not fit)."""
+        self.target.kda_commit_serves = lambda state: False
+        runtime, line = self._phases()
+        self.assertIn("kda_commit=sglang", line)
+        del self.calls[:]
+        self._round(runtime, self._batch())
+        self.assertIn("sglang_commit", self.calls)
+        self.assertNotIn("kda_commit", self.calls)
+
+    def test_tp8_rounds_no_phase_serves_go_to_sglang_before_any_launch(self):
+        self._tp8_q5()
+        runtime = self._runtime()
+        cases = {
+            "bs 9": dict(seq_lens=torch.arange(9)),
+            "grammar": dict(has_grammar=True),
+            "logprob": dict(return_logprob=True),
+        }
+        for name, fields in cases.items():
+            with self.subTest(name):
+                batch = self._batch()
+                batch.__dict__.update(fields)
+                del self.calls[:]
+                out, published = self._round(runtime, batch)
+                self.assertIsNone(out)
+                self.assertEqual((self.calls, published), ([], []))
+        with patch.object(self.rt, "require_mlp_sync", return_value=True):
+            runtime = self._runtime()
+        batch = self._batch()
+        batch.can_run_decode_cuda_graph = False
+        del self.calls[:]
+        self.assertEqual(self._round(runtime, batch), (None, []))
+        self.assertEqual(self.calls, [])
+
+
+class K31DFlashRuntimeRoundOnOlderSGLang(K31DFlashRuntimeRound):
+    """Against an SGLang that binds none of its own phases the runtime is main's: every
+    phase on the megakernel, and the rest handed back to SGLang's round."""
+
+    STOCK = False
+
+    def setUp(self):
+        super().setUp()
+        self.bindings = {
+            name: value
+            for name, value in self.bindings.items()
+            if name not in self.rt.DFLASH_STOCK_BINDINGS
+        }
+
+    def test_init_builds_the_sampled_accept_and_arms_the_deferral_before_capture(self):
+        self._runtime()
+        self.assertEqual(
+            self.calls,
+            [("agree", "DFlash draft chain offers"), "prepare_sampled", "attach_head"],
+        )
+
+    def test_sampled_rounds_the_megakernel_accept_does_not_serve_take_sglangs(self):
+        """Top-k/top-p and a block-verification or no sampled-accept build hand
+        sampled rounds back; greedy rounds still run here."""
+        for name, change, sampling in (
+            ("top-p", lambda: None, dict(need_top_p_sampling=True)),
+            ("top-k", lambda: None, dict(need_top_k_sampling=True)),
+            (
+                "block verification",
+                lambda: setattr(self.spec, "speculative_use_block_verification", True),
+                {},
+            ),
+            (
+                "no sampled accept",
+                lambda: setattr(
+                    self.target, "prepare_sampled_accept", lambda **kw: False
+                ),
+                {},
+            ),
+        ):
+            with (
+                self.subTest(name),
+                patch.object(self, "spec", copy.copy(self.spec)),
+                patch.object(self, "target", copy.copy(self.target)),
+            ):
+                change()
+                runtime = self._runtime()
+                del self.calls[:]
+                out, _ = self._round(runtime, self._batch(**sampling))
+                self.assertEqual((out, self.calls), (None, []))
+                out, _ = self._round(runtime, self._batch(is_all_greedy=True))
+                self.assertIsNotNone(out)
+                self.assertIn("kda_commit", self.calls)
+
+    def test_only_the_draft_kv_ring_sends_every_round_to_sglang(self):
+        """Every layout the megakernel does not serve sends every round to SGLang."""
+        for name, change in self._layout_cases().items():
+            with self.subTest(name), self._changed(change):
+                with self.assertLogs(self.rt.logger, "WARNING") as logs:
+                    runtime = self._runtime()
+                    del self.calls[:]
+                    out, published = self._round(runtime, self._batch())
+                    self._round(runtime, self._batch())
+                self.assertEqual((out, self.calls, published), (None, [], []))
+                (warning,) = logs.output  # once, at the draft graph's capture
+                self.assertIn("every round runs SGLang's round", warning)
+        # The head stays off the draft graph only where it cannot serve it.
+        self.graphs.graph.cuda_graph_config.decode.bs = [1, 2, 4]
+        runtime = self.rt.K31DFlashRuntime(self._binding(), self.target)
+        self.assertIsNone(runtime.draft_sampler(lm_head="lm_head"))
+        self.graphs.graph.cuda_graph_config.decode.bs = [1]
+        # Without a draft graph (cuda graphs off) the worker never asks for the head.
+        runtime = self.rt.K31DFlashRuntime(self._binding(), self.target)
+        out, _ = self._round(runtime, self._batch())
+        self.assertIsNone(out)
+
+    def test_gathered_logits_of_a_greedy_batch_take_the_adjusted_argmax(self):
+        lp = self.bindings["target_logits_processor"]
+        lp.is_deferred_shard = lambda x: False
+        plain = types.SimpleNamespace(is_set=lambda: True, get=lambda: False)
+        with patch.object(
+            self.rt,
+            "envs",
+            types.SimpleNamespace(SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER=plain),
+        ):
+            runtime = self._runtime()
+        self.assertIsNone(self._round(runtime, self._batch())[0])
+
+    def test_each_setup_picks_its_phases_once(self):
+        _, line = self._phases()
+        self.assertEqual(
+            line,
+            "draft=mk aux=mk accept=mk broadcast=- kda_commit=mk (batch sizes [1])",
+        )
+
+    def test_a_tp8_round_composes_sglangs_phases_with_the_megakernel(self):
+        self._tp8_q5()
+        runtime = self._runtime()
+        self.assertEqual(self._round(runtime, self._batch()), (None, []))
+
+    test_sglangs_aux_on_its_side_stream_is_joined_and_reported = None
+    test_the_head_and_aux_serve_only_their_sizes = None
+    test_a_kda_state_the_kernel_does_not_fold_takes_sglangs_commit = None
+    test_tp8_rounds_no_phase_serves_go_to_sglang_before_any_launch = None
+
 
 class K31DFlashRuntimeNaming(unittest.TestCase):
-    def test_the_target_names_the_runtime_only_with_a_draft_on_the_chain(self):
-        """Without a draft on the megakernel chain (another TP size, another draft) the
-        runtime has nothing to run its rounds on: SGLang's DFlash round runs."""
+    def test_the_target_names_the_runtime_chain_or_no_chain(self):
+        """The runtime runs every round, each phase on the megakernel or SGLang's, so
+        the target names it with a draft on the chain or without one (another TP size,
+        another draft); K31MK_DFLASH_RUNTIME=0 names none."""
         try:
             from sgl_nvidia_mega.kimi_k31.verify_spec import BuiltK31Verify
         except ImportError as e:  # the GPU-only kernel packages
@@ -626,13 +976,127 @@ class K31DFlashRuntimeNaming(unittest.TestCase):
         name = BuiltK31Verify.dflash_runtime.fget
         saved = list(DRAFT_CHAINS)
         self.addCleanup(lambda: DRAFT_CHAINS.__setitem__(slice(None), saved))
-        with patch.object(verify_spec, "RUNTIME", True):
-            DRAFT_CHAINS.clear()
-            self.assertEqual(name(None), "")
-            DRAFT_CHAINS.append(object())
-            self.assertEqual(name(None), K31DFlashRuntimeGuard.PATH)
-        with patch.object(verify_spec, "RUNTIME", False):  # K31MK_DFLASH_RUNTIME=0
-            self.assertEqual(name(None), "")
+        for chains in ([], [object()]):
+            DRAFT_CHAINS[:] = chains
+            with patch.object(verify_spec, "RUNTIME", True):
+                self.assertEqual(name(None), K31DFlashRuntimeGuard.PATH)
+            with patch.object(verify_spec, "RUNTIME", False):  # K31MK_DFLASH_RUNTIME=0
+                self.assertEqual(name(None), "")
+
+
+class K31KdaCommitInputs(unittest.TestCase):
+    """The KDA commit reads the round's slots and lengths in place: no copy launches,
+    the same values the kernel read from its static copies before."""
+
+    def test_the_commit_takes_the_rounds_tensors_in_place(self):
+        try:
+            from sglang.srt.kernel_plugins.nvidia import (  # noqa: F401
+                kimi_k31_dflash_binding,
+            )
+        except ImportError:
+            self.skipTest("this SGLang has no DFlash runtime binding")
+        from sgl_nvidia_mega.kimi_k31.dflash import commit
+
+        seen = []
+        target = types.SimpleNamespace(kda_commit=lambda **kw: seen.append(kw) or True)
+        working = torch.tensor([7, 3], dtype=torch.int32)
+        commit_lens = torch.tensor([2, 5], dtype=torch.int32)
+        prefix = torch.tensor([64, 9], dtype=torch.int64)
+        spec_state = types.SimpleNamespace(
+            temporal="h",
+            replayssm_rawk="k",
+            replayssm_rawv="v",
+            replayssm_g="g",
+            replayssm_beta="b",
+            conv=["conv"],
+            intermediate_conv_window=["window"],
+        )
+        for track in (None, torch.tensor([4, -1], dtype=torch.int64)):
+            with self.subTest(track=track):
+                linear = types.SimpleNamespace(
+                    forward_state_slots=lambda bs, ids: types.SimpleNamespace(
+                        working=working[:bs],
+                        track=None if track is None else track[:bs],
+                    )
+                )
+                kda = commit.KdaCommit(
+                    megakernel_kda=target, target_attn_backend=None, device="cpu"
+                )
+                batch = types.SimpleNamespace(
+                    mamba_track_indices=track,
+                    tree_cache=types.SimpleNamespace(page_size=64),
+                )
+                del seen[:]
+                with (
+                    patch.object(
+                        commit.KdaCommit,
+                        "_kda_state",
+                        lambda self: (linear, spec_state),
+                    ),
+                    patch.object(commit, "mamba_track_grid", lambda page: 256),
+                ):
+                    used = kda._megakernel_kda_commit(
+                        batch=batch, seq_lens_pre_verify=prefix, commit_lens=commit_lens
+                    )
+                self.assertTrue(used)
+                (kw,) = seen
+                self.assertEqual(kw["slots"].data_ptr(), working.data_ptr())
+                self.assertIs(kw["commit_lens"], commit_lens)
+                self.assertIs(kw["prefix_lens"], prefix)
+                self.assertEqual(kw["track_slots"].dtype, torch.int32)
+                want = [-1, -1] if track is None else [4, -1]
+                self.assertEqual(kw["track_slots"].tolist(), want)
+                self.assertEqual((kw["window"], kw["conv"]), ("window", "conv"))
+
+
+def _rank0_broadcast_rank(rank, world, init, results):
+    """One rank of K31Rank0BroadcastGPU: three rounds of rank-local (accept_len, bonus)."""
+    import torch.distributed as dist
+
+    from sgl_nvidia_mega.kimi_k31.sm103.draft.sampled import Rank0Bcast
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=init, rank=rank, world_size=world)
+    device = torch.device("cuda", rank)
+    bcast = Rank0Bcast(dist.group.WORLD, device, rank, deadline_ns=10**10)
+    got = []
+    for round_ in range(3):
+        b = 3 + round_
+        accept_len = torch.full(
+            (b,), 10 * rank + round_, dtype=torch.int32, device=device
+        )
+        bonus = torch.arange(b, dtype=torch.int64, device=device) + 1000 * rank + 7
+        bcast.run(accept_len, bonus)
+        got.append((accept_len.tolist(), bonus.tolist()))
+    torch.cuda.synchronize(device)
+    results[rank] = got
+    dist.destroy_process_group()
+
+
+class K31Rank0BroadcastGPU(unittest.TestCase):
+    """GPU (2+ GPUs with multicast, e.g. GB300): every rank ends each round with rank
+    0's values, rounds of different batch sizes reusing the one box."""
+
+    def test_every_rank_takes_rank_0s_decision(self):
+        if torch.cuda.device_count() < 2:
+            self.skipTest("needs 2 GPUs with multicast")
+        import tempfile
+
+        import torch.multiprocessing as mp
+
+        world = 2
+        with tempfile.NamedTemporaryFile() as store:
+            results = mp.Manager().dict()
+            mp.spawn(
+                _rank0_broadcast_rank,
+                args=(world, f"file://{store.name}", results),
+                nprocs=world,
+            )
+        want = [
+            ([round_] * (3 + round_), [7 + i for i in range(3 + round_)])
+            for round_ in range(3)
+        ]
+        self.assertEqual([results[r] for r in range(world)], [want] * world)
 
 
 class K31DFlashRuntimeGuard(unittest.TestCase):
