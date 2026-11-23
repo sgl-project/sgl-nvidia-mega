@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Slots markov_tail and draft_final_collapse on CPU: opt-in draft slots with their
+"""Slots markov_tail and draft_final_collapse on CPU: default-on draft slots with their
 prerequisites, the draft hop built with the collapse only when asked, the startup
 summary's state of each, and the proposal step's launches with and without the tail.
 The kernels are tested bitwise in test/kernels/test_deepseek_v41_markov_slots.py and
@@ -25,11 +25,9 @@ SLOTS = ("markov_tail", "draft_final_collapse")
 @pytest.mark.parametrize("slot", SLOTS)
 def test_the_slots_are_draft_slots(slot):
     assert slot in runtime.DRAFT_SLOTS
-    # markov_tail runs by default; draft_final_collapse has no resolved served gain
-    if slot == "markov_tail":
-        assert slot in runtime.DEFAULT_ON_SLOTS and slot not in runtime.OPT_IN_SLOTS
-    else:
-        assert slot in runtime.OPT_IN_SLOTS and slot not in runtime.SHIPPED_SLOTS
+    assert slot in runtime.DEFAULT_ON_SLOTS and slot not in runtime.OPT_IN_SLOTS
+    # draft_final_collapse needs draft_hop, which acts at attention TP8 only
+    assert (slot in runtime.TP8_DEFAULT_SLOTS) is (slot == "draft_final_collapse")
 
 
 @pytest.mark.parametrize(

@@ -70,6 +70,11 @@ def register() -> None:
             return
     for architecture, path in SPECS:
         megakernels.register(architecture=architecture, path=path)
+    # DeepSeek-V4.1: the KV layout it takes for one-request serving, chosen at
+    # argument resolution when the user leaves it unset
+    from sgl_nvidia_mega.deepseek_v41 import serving
+
+    serving.register()
     # Muse Spark's kernels hook SGLang's own forward rather than replacing a
     # whole step; each is opt-in and default off, so this is a no-op unless a
     # MUSE_VR_* switch is set.

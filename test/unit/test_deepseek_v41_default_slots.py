@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The default-on slots: shipped, not opt-in, their dependencies shipped too, the
-numerics-changing ones labelled, and the unresolved, measurement-only and
-layout-dependent slots still opt-in."""
+numerics-changing ones labelled, where a default start takes the attention-TP8 and
+layout-dependent ones, and the measurement-only and not-bitwise-without-gain slots
+still opt-in."""
 
 import pytest
 
@@ -17,6 +18,7 @@ NUMERICS_DEFAULT_ON = {
     "draft_shared_ll",
     "wo_b_publish_split",
     "moe_balanced",
+    "attn_core_lean",
 }
 
 
@@ -24,8 +26,9 @@ def test_the_default_on_slots_are_shipped_and_not_opt_in():
     on = set(runtime.DEFAULT_ON_SLOTS)
     assert on <= set(runtime.SHIPPED_SLOTS)
     assert not on & set(runtime.OPT_IN_SLOTS)
-    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 30
-    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 70
+    assert len(runtime.DEFAULT_ON_SLOTS) == len(on) == 38
+    assert len(runtime.SHIPPED_SLOTS) == len(set(runtime.SHIPPED_SLOTS)) == 78
+    assert runtime.TP8_DEFAULT_SLOTS <= on
 
 
 def test_the_shipped_list_needs_no_opt_in_slot(monkeypatch):
@@ -57,23 +60,14 @@ def test_the_numerics_changing_default_slots_are_labelled():
 @pytest.mark.parametrize(
     "slot",
     [
-        # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
-        "attn_core_lean",
-        # no resolved served gain
-        "draft_final_collapse",
-        # a small gain (2 + 2 launches, or one GPU only) that a longer A/B has not confirmed
-        "attn_cluster_merge",
-        "attn_index_q_first",
-        # a gain resolved only in the full batch-1 stack, not alone
-        "attn_wo_a_fp8",
-        "attn_index_weights_bf16",
         # not bitwise at attention TP8 + EP2, no resolved gain alone
         "hop_final_collapse",
         # untuned tactics; measurement only
         "lm_head_pinned_tactic",
         "draft_lm_head_mxfp8",
-        # no resolved served gain alone
-        "draft_stage0_first",
+        # no served gain shown
+        "hop_b_cap16",
+        "hop_b_quad_trigger",
     ],
 )
 def test_the_remaining_slots_stay_opt_in(slot):
@@ -96,7 +90,48 @@ def test_a_default_slot_can_be_turned_off(monkeypatch, slot):
     needed_by = {
         "target_lm_head": {"target_lm_head_mxfp8", "target_lm_head_xload"},
         "target_lm_head_mxfp8": {"target_lm_head_xload"},
+        "swapab_h8": {"attn_core_lean"},
+        "wo_a_g1": {"attn_core_lean"},
     }
     rest = set(runtime.SHIPPED_SLOTS) - {slot} - needed_by.get(slot, set())
     monkeypatch.setattr(runtime, "SLOTS", frozenset(rest))
     assert runtime.slot_reasons() == []
+
+
+@pytest.mark.parametrize(
+    "listed, slot, heads, layout, takes",
+    [
+        (False, "attn_wo_a_fp8", 8, "v4", True),
+        (False, "attn_wo_a_fp8", 16, "v4", False),
+        (True, "attn_wo_a_fp8", 16, "v4", True),
+        (False, "draft_embed", 16, "v4", False),
+        (False, "attn_core_lean", 8, "v41_new", True),
+        (False, "attn_core_lean", 8, "v4", False),
+        (True, "attn_core_lean", 8, "v4", True),
+        (False, "gate_route", 16, "v4", True),
+    ],
+    ids=[
+        "tp8_default",
+        "tp4_default_left_off",
+        "tp4_listed",
+        "draft_tp4_default_left_off",
+        "core_lean_v41_new",
+        "core_lean_v4_left_off",
+        "core_lean_listed",
+        "other_default_at_tp4",
+    ],
+)
+def test_where_a_default_start_takes_a_slot(
+    monkeypatch, listed, slot, heads, layout, takes
+):
+    """A default start takes the TP8_DEFAULT_SLOTS at 8 local heads only and
+    attn_core_lean on the v41_new KV layout only; a listed slot runs where it builds."""
+    if listed:
+        monkeypatch.setenv(runtime.SLOTS_ENV, slot)
+        monkeypatch.setattr(runtime, "SLOTS", frozenset({slot}))
+    else:
+        monkeypatch.delenv(runtime.SLOTS_ENV, raising=False)
+        monkeypatch.setattr(runtime, "SLOTS", frozenset(runtime.SHIPPED_SLOTS))
+    monkeypatch.setattr(runtime, "kv_layout", lambda: layout)
+    assert runtime.default_takes(slot, heads) is takes
+    assert (slot in runtime.slots_here(heads)) is takes

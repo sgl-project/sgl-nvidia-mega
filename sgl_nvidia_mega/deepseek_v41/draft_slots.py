@@ -102,6 +102,8 @@ def _forward(built, stages, slots, name):
     if name == "draft_tail":
         return BUILT, "BF16 streams into hc_combine"
     if name == "draft_embed":
+        if getattr(built, "_embed_table", ...) is None:
+            return NOT_NEEDED, "the draft has its own vocabulary modules"
         return BUILT, "the target's whole table, bound at the first forward"
     if name == "draft_stage0_first":
         if not built._stage0_wanted:

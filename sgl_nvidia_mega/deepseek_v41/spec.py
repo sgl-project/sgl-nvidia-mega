@@ -293,7 +293,7 @@ NUMERICS = Numerics(
         # within 5 % of the pair's
         "attn.q_cluster.bf16_ulp": 128,
         "attn.q_cluster.rel_vs_pair_error": 1.05,
-        # slot attn_core_lean (opt-in, a numerics change): the core's output against an
+        # slot attn_core_lean (a numerics change): the core's output against an
         # fp64 attention over the v41_new bytes it reads, relative RMS
         # (test_deepseek_v41_core_lean.py: 0.0021 to 0.0023 measured)
         "attn.core_lean.rel_fp64": 4e-3,
