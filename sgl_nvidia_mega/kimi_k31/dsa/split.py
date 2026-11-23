@@ -98,7 +98,6 @@ class LocalIndexer:
         self.prepared_for = step
 
     def run(self, query, gates, cache, table, step):
-        import deep_gemm
         from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
             _restore_row_stride,
         )
@@ -106,9 +105,11 @@ class LocalIndexer:
             topk_transform_paged_candidates_v2,
         )
 
+        from ..sm103.dsa.score import fp8_paged_mqa_logits
+
         if self.prepared_for is not step:
             self.prepare(table, step)
-        scores = deep_gemm.fp8_paged_mqa_logits(
+        scores = fp8_paged_mqa_logits(
             query.view(step.batch_requests, step.query_width, 32, 128),
             cache.view(-1, PAGE, 1, 132),
             gates.squeeze(-1),
