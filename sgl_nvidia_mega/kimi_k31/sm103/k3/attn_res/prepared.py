@@ -15,6 +15,7 @@ from ..common.host import (
     dynamic_fake,
     dynamic_view,
     fake,
+    prepare_shared_carveout,
     stream,
     to_cute,
 )
@@ -98,9 +99,11 @@ class PreparedAttnRes:
 
     def _compile(self, slots, cap, aux=False, mixture=False):
         arch = architecture(self.device)
-        return compile_consumer(
+        code = compile_consumer(
             *self.key, slots, cap, arch, self.deadline_ns, aux, mixture
         )
+        # 100 % shared memory, as in the GB300 TP8/DCP8 Q5 reference run: the next in-projection loads beside it.
+        return prepare_shared_carveout(code, self.device.index, 100)
 
     @classmethod
     def for_target(cls, target, *, deadline_ns, final=False, has_delta=True):
