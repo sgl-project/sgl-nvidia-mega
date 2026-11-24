@@ -13,6 +13,7 @@ from types import SimpleNamespace
 KIMI = Path(__file__).resolve().parents[2] / "sgl_nvidia_mega/kimi_k3"
 SPEC = "sglang.kernels.plugin_kernels.nvidia.spec"
 BINDING = "sglang.srt.kernel_plugins.nvidia.binding"
+HF_COMMON = "sglang.srt.hf_transformers.common"
 ABSENT_NAMESPACES = {
     SPEC: (
         "sglang.kernels",
@@ -25,6 +26,7 @@ ABSENT_NAMESPACES = {
         "sglang.srt.kernel_plugins.nvidia",
         BINDING,
     ),
+    HF_COMMON: ("sglang.srt.hf_transformers", HF_COMMON),
 }
 
 
@@ -57,7 +59,11 @@ def _execute(guard, *, new_error=None, old_error=None, missing_symbol=False):
             if new_error is not None:
                 raise new_error
             return new
-        if name in ("sglang.srt.megakernels.spec", "sglang.srt.megakernels.binding"):
+        if name in (
+            "sglang.srt.megakernels.spec",
+            "sglang.srt.megakernels.binding",
+            "sglang.srt.utils.hf_transformers.common",
+        ):
             if old_error is not None:
                 raise old_error
             return old
@@ -70,10 +76,10 @@ def _execute(guard, *, new_error=None, old_error=None, missing_symbol=False):
 
 
 class TestKimiK3ImportCompatibility(unittest.TestCase):
-    def test_all_five_guards_prefer_new_types_when_both_paths_exist(self):
+    def test_all_guards_prefer_new_symbols_when_both_paths_exist(self):
         guards = _guards()
-        # Spec, its annotation, capture-width agreement, pool and step.
-        self.assertEqual(len(guards), 5)
+        # Spec, its annotation, context length, capture-width agreement, pool and step.
+        self.assertEqual(len(guards), 6)
         for filename, guard in guards:
             with self.subTest(file=filename, module=guard.body[0].module):
                 run, namespace, new, _, calls = _execute(guard)

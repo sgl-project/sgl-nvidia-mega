@@ -106,7 +106,9 @@ SGLANG_READS = {
         "megakernel_agree",
     ),
     "srt/runtime_context.py": ("get_model",),
-    "srt/utils/hf_transformers/common.py": ("get_context_length",),
+    "srt/hf_transformers/common.py|srt/utils/hf_transformers/common.py": (
+        "get_context_length",
+    ),
     "srt/configs/kimi_k3.py": ("text_config",),
     "srt/arg_groups/fields/*.py": (
         "context_length",
@@ -157,7 +159,15 @@ def _deadline_ns(seconds: Any) -> int:
 
 
 def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
-    from sglang.srt.utils.hf_transformers.common import get_context_length
+    try:
+        from sglang.srt.hf_transformers.common import get_context_length
+    except ModuleNotFoundError as error:
+        if error.name not in (
+            "sglang.srt.hf_transformers",
+            "sglang.srt.hf_transformers.common",
+        ):
+            raise
+        from sglang.srt.utils.hf_transformers.common import get_context_length
 
     reasons: list[str] = []
     try:

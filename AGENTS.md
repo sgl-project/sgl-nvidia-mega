@@ -350,6 +350,13 @@ python -m pytest test/unit -v -rfE
   CI now. A setup that needs eight GPUs on one host or another GPU type is
   skipped with a notice; run its tests by hand (see the last item). Once an
   eight-GPU runner is added, CI will run those setups as well.
+- Kimi K3's `test_kimi_k3_b300.py` adds a sequential stock/plugin accuracy and
+  performance comparison on eight B300 GPUs: TP8, five-proposal/q6 DSpark,
+  stock draft execution, DCP off, and the existing `sm148` opt-in. Its normal
+  CI route requires SGLang's per-model runner mapping (#51429) and hybrid
+  verification views (#51977) on `main`. Adding a model that fits a reviewed
+  mapping needs no workflow change; adding a runner mapping does. Explicitly
+  requesting an unavailable configuration must fail, not count as coverage.
 - Each supported model and hardware setup needs:
   - **an accuracy test** against native SGLang with the megakernel off, on the
     same SGLang SHA and evaluation set, ending in a comparison verdict rather
@@ -365,10 +372,10 @@ python -m pytest test/unit -v -rfE
   B300 or another GPU, and a pass at one layout does not qualify another.
   [The comparison protocol](#the-comparison-protocol) below says how to run the
   accuracy and performance tests.
-- Today's tests do not meet that yet. DeepSeek-V4.1-Flash's serving test
+- Not all existing tests meet that yet. DeepSeek-V4.1-Flash's serving test
   (`test_deepseek_v41_server.py`) launches only the megakernel and checks
-  GSM8K against an absolute bound; no model has a paired accuracy and
-  performance comparison in CI. New tests follow the protocol above, and an
+  GSM8K against an absolute bound. Kimi K3's B300 test provides the paired
+  comparison; other new tests follow the protocol above, and an
   agent extending an existing test moves it toward it.
 - Reuse the DeepSeek-V4.1-Flash structure. A helper module
   (`deepseek_v41_server.py`) holds the model path, launch arguments and
