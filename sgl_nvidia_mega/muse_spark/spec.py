@@ -79,6 +79,15 @@ def serves_this_step() -> bool:
 # still have no GB300 entry.
 ISAS = frozenset({"sm_103"})
 
+# The opt-in components (components.register_all installs them as SGLang hooks at plugin load, each behind its own
+# MUSE_VR_* switch) come in two sets, by the GPU architectures each is built for. muse_spark/components is the GB300 set;
+# Rubin runs it as well, next to the Rubin set, since its kernels come from the Rubin line. muse_spark/sm107 is the Rubin
+# set: the loader reads the device's architecture once and registers it only on the architectures listed for it here.
+COMPONENT_ISAS = {
+    "components": frozenset({"sm_103", "sm_107"}),
+    "sm107": frozenset({"sm_107"}),
+}
+
 REQUIREMENTS = Requirements(
     isas=ISAS,
     tp_sizes=frozenset({4}),

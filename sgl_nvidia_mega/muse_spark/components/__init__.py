@@ -15,6 +15,12 @@ A component that cannot engage -- a switch unset, a pinned SGLang source that
 has moved, a model that does not match -- reports why and leaves SGLang stock.
 It never half-engages: that is the difference between a run that is slower and
 a run whose numbers cannot be trusted.
+
+The components come in two sets, by the GPU architecture they are built for
+(``spec.COMPONENT_ISAS``): this package holds the GB300 set, and
+``muse_spark/sm107`` holds the Rubin set (``SM107``), whose code the loader
+imports from there. The loader reads the device's architecture once, through
+NVML, and registers the Rubin set only on an architecture that set is built for.
 """
 
 from __future__ import annotations
@@ -113,6 +119,37 @@ ENTRY: dict[str, str] = {
     "sp_fp4_dispatch": "engage",
 }
 
+# The Rubin set: components whose code lives in muse_spark/sm107, built for the architectures spec.COMPONENT_ISAS lists
+# for it. They keep their places in COMPONENTS.
+SM107 = frozenset(
+    {
+        "ctx_kv_counter",
+        "verify_logits_gather",
+        "softmax_split",
+        "draft_attn",
+        "moe_ld",
+        "bf16_ldw",
+        "moe_tail",
+        "proj_publish",
+        "unorm_boundary",
+        "fin2",
+        "fin_2shot",
+        "hb0_rr",
+        "mid_rs",
+        "moe_tactic",
+        "prefill_moe_tactic",
+        "prefill_moe_x",
+        "o_rowshard",
+        "fp8_prefill",
+        "rs_samem",
+        "car_table",
+        "prefill_attn",
+        "draft_topk",
+        "draft_head_lt",
+    }
+)
+SM107_PACKAGE = "sgl_nvidia_mega.muse_spark.sm107"
+
 _registered: dict[str, bool] | None = None
 
 
@@ -122,6 +159,35 @@ def _disabled(name: str) -> bool:
         for x in os.environ.get("MUSE_VR_PLUGIN_DISABLE", "").split(",")
         if x.strip()
     }
+
+
+def _capability() -> tuple[int, int] | None:
+    """This node's GPU compute capability, or None. Read through NVML, so loading the components never initializes
+    CUDA in the process."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            return int(major), int(minor)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # noqa: BLE001 - no NVML: the architecture is unknown
+        return None
+
+
+def _sm107_refusal() -> str | None:
+    """Why the Rubin set must not register on this node (None: it may). Read once per process, and only when some
+    component setting is present."""
+    from sgl_nvidia_mega.muse_spark.spec import COMPONENT_ISAS
+
+    cc = _capability()
+    isa = f"sm_{cc[0]}{cc[1]}" if cc else None
+    if isa in COMPONENT_ISAS["sm107"]:
+        return None
+    return f"the Rubin set is built for {sorted(COMPONENT_ISAS['sm107'])}; this device is {isa or 'unknown (no NVML)'}"
 
 
 def _engage_warp_redux_volatile() -> bool:
@@ -163,6 +229,12 @@ def _engage_warp_redux_volatile() -> bool:
     return True
 
 
+def _settings_present() -> bool:
+    """Whether some component setting (a MUSE_VR_* variable other than the loader's own) is present."""
+    _infra = {"MUSE_VR_PLUGIN_SITE", "MUSE_VR_ENGAGE_DIR", "MUSE_VR_PLUGIN_DISABLE"}
+    return any(k.startswith("MUSE_VR_") and k not in _infra for k in os.environ)
+
+
 def register_all() -> dict[str, bool]:
     """Register every component once; returns name -> engaged.
 
@@ -177,8 +249,7 @@ def register_all() -> dict[str, bool]:
 
         # Engine modules that moved between SGLang layouts stay importable under the names components use. Only when
         # some MUSE_VR_* setting is present: a process with no component settings imports nothing extra.
-        _infra = {"MUSE_VR_PLUGIN_SITE", "MUSE_VR_ENGAGE_DIR", "MUSE_VR_PLUGIN_DISABLE"}
-        if any(k.startswith("MUSE_VR_") and k not in _infra for k in os.environ):
+        if _settings_present():
             try:
                 aliases = sgl_compat.install_aliases()
                 bed.report(
@@ -215,10 +286,24 @@ def register_all() -> dict[str, bool]:
             bed.report("warp_redux_volatile", _state["engaged"])
     from sgl_nvidia_mega.muse_spark.components import bed
 
+    # The Rubin set registers only on an architecture it is built for; without any component setting nothing can
+    # engage, so its modules are not imported then either.
+    sm107_off = "no component enabled"
+    if _settings_present():
+        try:
+            sm107_off = _sm107_refusal()
+        except Exception as e:  # noqa: BLE001 - the Rubin set stays off; the GB300 set registers as before
+            sm107_off = f"architecture check failed: {type(e).__name__}: {e}"
+        if sm107_off is not None:
+            bed.report("sm107", False, reason=sm107_off)
     _registered = {}
     for name in COMPONENTS:
+        if name in SM107 and sm107_off is not None:
+            _registered[name] = False
+            continue
+        module = f"{SM107_PACKAGE}.{name}" if name in SM107 else f"{__name__}.{name}"
         try:
-            mod = importlib.import_module(f"{__name__}.{name}")
+            mod = importlib.import_module(module)
             ok = bool(getattr(mod, ENTRY.get(name, "register"))())
         except Exception as e:  # noqa: BLE001 - a failed opt-in leaves SGLang stock
             bed.report(
