@@ -5,8 +5,7 @@ request's seven-row draft block on the draft backbone, is ``draft_step``.
 
 With slot ``markov`` the built object also offers SGLang's folded proposal a
 ``draft_sampler`` (``sampler``): the draft LM head and the whole Markov chain of each
-draft block at 1-16 requests, the chain in one kernel per rank; with slot
-``draft_lm_head`` too, the LM head runs on an MXFP8 copy. Without ``markov`` SGLang's
+draft block at 1-16 requests, the chain in one kernel per rank. Without ``markov`` SGLang's
 proposal runs. The draft's slots are requested in the target's list
 (``runtime.SLOTS``); ``EngagementCheck`` stops a server that requested them and whose
 proposal never asked for the sampler.

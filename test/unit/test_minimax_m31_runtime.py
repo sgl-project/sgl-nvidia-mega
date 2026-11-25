@@ -93,8 +93,7 @@ class TestPlan(CustomTestCase):
 
 
 class TestSlotPlan(CustomTestCase):
-    """plan.slots per width: mega at one request only, with lm_head_mxfp8 on its
-    step; moe_nofill / moe_swap at their builds' widths where mega does not take the
+    """plan.slots per width: mega at one request only; moe_nofill / moe_swap at their builds' widths where mega does not take the
     step."""
 
     def test_the_plan_by_width(self):
@@ -114,14 +113,6 @@ class TestSlotPlan(CustomTestCase):
         self.assertEqual(m31_plan.describe(moe), "8-128: moe_nofill, moe_swap")
         stock = m31_plan.plan(VERIFY_WIDTHS, m31_plan.Facts())
         self.assertEqual(m31_plan.describe(stock), "8-128: stock")
-        # lm_head_mxfp8 closes the step mega serves, and only where its build serves
-        head = m31_plan.plan(
-            VERIFY_WIDTHS, m31_plan.Facts(mega=frozenset({8}), lm_head_mxfp8=every)
-        )
-        self.assertEqual(head[8], m31_plan.Slots(mega=True, lm_head_mxfp8=True))
-        self.assertFalse(any(head[w].lm_head_mxfp8 for w in VERIFY_WIDTHS[1:]))
-        no_mega = m31_plan.Facts(moe_nofill=every, lm_head_mxfp8=every)
-        self.assertFalse(m31_plan.slots(8, no_mega).lm_head_mxfp8)
 
     def test_bounds(self):
         # mega serves only 8 rows, whatever its build says
@@ -158,14 +149,13 @@ class TestSlotList(CustomTestCase):
         self.assertEqual(m31_runtime.requested_slots({env: ""}), frozenset())
         self.assertEqual(m31_runtime.requested_slots({env: " , "}), frozenset())
         listed = m31_runtime.requested_slots(
-            {env: "moe_nofill, moe_swap,markov,draft_lm_head,lm_head_mxfp8"}
+            {env: "moe_nofill, moe_swap,markov,"}
         )
         # the target's plan takes its slots, the draft spec the draft's
-        self.assertEqual(
-            m31_runtime.target_slots(listed),
-            {"moe_nofill", "moe_swap", "lm_head_mxfp8"},
-        )
-        self.assertEqual(m31_runtime.draft_slots(listed), {"markov", "draft_lm_head"})
+        self.assertEqual(m31_runtime.target_slots(listed), {"moe_nofill", "moe_swap"})
+        self.assertEqual(m31_runtime.draft_slots(listed), {"markov"})
+        # every slot ships: a new kernel runs by default
+        self.assertFalse(hasattr(m31_runtime, "OPT_IN_SLOTS"))
         for slot in m31_runtime.DRAFT_SLOTS:
             self.assertNotIn(slot, m31_plan.Slots.__struct_fields__)
         self.assertEqual(m31_runtime.slot_reasons(shipped), [])
@@ -177,12 +167,6 @@ class TestSlotList(CustomTestCase):
         shipped = m31_spec._numerics(frozenset(m31_runtime.SHIPPED_SLOTS))
         self.assertEqual(shipped.kind, NumericsKind.TOLERANCE)
         self.assertEqual(dict(shipped.tolerances), m31_spec.MEGA_TOLERANCES)
-        # slot lm_head_mxfp8 adds its bound to slot mega's
-        head = m31_spec._numerics(frozenset({"mega", "lm_head_mxfp8"}))
-        self.assertEqual(
-            dict(head.tolerances),
-            {**m31_spec.MEGA_TOLERANCES, **m31_spec.LM_HEAD_TOLERANCES},
-        )
         # the MoE slots are bitwise; a draft slot does not change the target's steps
         for slots in ({"moe_nofill", "moe_swap", "markov"}, {"moe_nofill"}, set()):
             self.assertEqual(

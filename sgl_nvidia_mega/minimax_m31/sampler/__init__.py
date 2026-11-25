@@ -6,18 +6,17 @@ draft step in one vocab-sharded kernel per rank (slot ``markov``).
 Two phases. The draft spec's build (``prebuild``, from ``draft_step.DraftStep`` when
 SGLang installs the draft model, before it sizes its KV pools) checks the Markov head and
 allocates the chain's buffers (``sm103/draft/markov.py``: the symmetric-memory peer
-buffer, the noise) and, with slot ``draft_lm_head``, the storage of an MXFP8 copy of this
-rank's LM-head shard. SGLang's folded proposal (``DsparkDraftSampler``, the draft CUDA
+buffer, the noise). SGLang's folded proposal (``DsparkDraftSampler``, the draft CUDA
 graph's tail) then asks the draft spec for its ``draft_sampler`` once, on every rank,
 with its own buffers; ``build_steps`` checks the LM head SGLang has attached by then,
-fills the copy, compiles and warms on every rank what a step launches before the chain's
+compiles and warms on every rank what a step launches before the chain's
 first cross-rank wait, and returns the step for each batch size the chain serves, which
 replaces ``compute_base_logits`` + ``draft_markov_block`` there. A step that fails to
 build on one rank raises on every rank, with each rank's error; nothing compiles inside
 a step. The step projects the draft hidden states through this
 rank's LM-head shard (SGLang's projection, ``project_through_lm_head``, so the base
-logits are SGLang's bit for bit, under ``--speculative-dspark-lm-head-dtype`` too; or the
-MXFP8 copy on SGLang's FlashInfer MXFP8 linear), then runs the chain: ranks agree on each
+logits are SGLang's bit for bit, under ``--speculative-dspark-lm-head-dtype`` too), then
+runs the chain: ranks agree on each
 step's token inside the kernel, so the proposal needs no per-step exchange launches. The
 draft noise is SGLang's (same Philox key, counters and offset), drawn on a side stream
 while the LM head runs. The steps serve 1 to ``MAX_REQUESTS`` requests, whatever the
@@ -75,17 +74,6 @@ SGLANG_READS = {
         "org_vocab_size",
         "weight",
     ),
-    # slot draft_lm_head: SGLang's MXFP8 quantize and FlashInfer MXFP8 linear
-    "srt/layers/quantization/fp8_utils.py": (
-        "flashinfer_mxfp8_quantize",
-        "flashinfer_mxfp8_quantize(is_sf_swizzled_layout)",
-        "flashinfer_mxfp8_blockscaled_linear",
-        "flashinfer_mxfp8_blockscaled_linear(input)",
-        "flashinfer_mxfp8_blockscaled_linear(weight)",
-        "flashinfer_mxfp8_blockscaled_linear(weight_scale)",
-        "flashinfer_mxfp8_blockscaled_linear(backend)",
-        "flashinfer_mxfp8_blockscaled_linear(pin_tactic)",
-    ),
     "srt/speculative/dspark_components/dspark_draft.py": (
         "key",
         "offset",
@@ -132,11 +120,6 @@ PARITY = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_MARKOV_PARITY", "0") == "1"
 
 # The chain serves at most MAX_REQUESTS requests (the megakernel's coverage); wider draft
 # steps keep SGLang's proposal.
-# Slot draft_lm_head: the MXFP8 copy's kernel, SGLang's FlashInfer MXFP8 linear on its
-# CuTe DSL backend at FlashInfer's default tactic (pinned: no per-boot tuning); the
-# kernel test prints its time beside the BF16 projection's on the TP4 shard (N 50016,
-# K 6144) at 1, 8 and 16 requests' rows
-LM_HEAD_MXFP8_BACKEND = "cute-dsl"
 
 
 def head_reason(lm, *, gamma: int, world: int) -> str:
@@ -239,85 +222,23 @@ def buffer_reason(
 
 
 class DraftLmHead:
-    """This rank's LM-head shard for the draft's rows: SGLang's projection, or with
-    ``mxfp8`` (slot draft_lm_head) an MXFP8 copy of the shard (E4M3 with a UE8M0 scale
-    per 32 of K, half the bytes, in FlashInfer's 128x4 scale layout) on SGLang's
-    FlashInfer MXFP8 linear, which quantizes the draft rows the same way. The copy's
-    storage is allocated here, at the draft spec's build; ``attach`` fills it from the
-    LM head SGLang attaches to the draft later, in row chunks (no full-size temporary)."""
+    """This rank's LM-head shard for the draft's rows: SGLang's projection
+    (``project_through_lm_head``) of the LM head SGLang attaches to the draft after the
+    draft spec's build."""
 
-    # rows per quantize launch of the fill: a multiple of the scale layout's 128-row tiles
-    FILL_ROWS = 8192
-
-    def __init__(self, *, rows: int, cols: int, device, mxfp8: bool = False):
+    def __init__(self, *, rows: int, cols: int, device):
         self.rows, self.cols = rows, cols
         self.lm_head = None
-        self.weight = self.weight_scale = None
         self.kind = "SGLang's BF16"
-        if mxfp8:
-            from flashinfer import block_scale_interleave
-
-            self.weight = torch.empty(
-                rows, cols, dtype=torch.float8_e4m3fn, device=device
-            )
-            # the 128x4 layout's padded size, from the layout of zero scales
-            self.weight_scale = block_scale_interleave(
-                torch.zeros(rows, cols // 32, dtype=torch.uint8, device=device)
-            ).contiguous()
-            self.kind = f"MXFP8 copy ({LM_HEAD_MXFP8_BACKEND})"
-
-    def device_bytes(self) -> int:
-        return sum(
-            t.numel() * t.element_size()
-            for t in (self.weight, self.weight_scale)
-            if t is not None
-        )
 
     def attach(self, lm_head) -> None:
-        """Read ``lm_head`` from here on (SGLang's projection), or fill the copy from
-        its weight."""
+        """Read ``lm_head`` from here on (SGLang's projection)."""
         self.lm_head = lm_head
-        if self.weight is None:
-            return
-        from flashinfer import block_scale_interleave
-        from sglang.srt.layers.quantization.fp8_utils import (
-            flashinfer_mxfp8_quantize,
-        )
-
-        weight = lm_head.weight.detach()
-        assert tuple(weight.shape) == (self.rows, self.cols), tuple(weight.shape)
-        scales = torch.empty(
-            self.rows, self.cols // 32, dtype=torch.uint8, device=weight.device
-        )
-        for start in range(0, self.rows, self.FILL_ROWS):
-            end = min(start + self.FILL_ROWS, self.rows)
-            quantized, scale = flashinfer_mxfp8_quantize(
-                weight[start:end].contiguous(), is_sf_swizzled_layout=False
-            )
-            self.weight[start:end].copy_(quantized.view(end - start, self.cols))
-            scales[start:end].copy_(
-                scale.view(torch.uint8).reshape(end - start, self.cols // 32)
-            )
-        self.weight_scale.copy_(
-            block_scale_interleave(scales).view_as(self.weight_scale)
-        )
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight is None:
-            from sglang.srt.models.dspark import project_through_lm_head
+        from sglang.srt.models.dspark import project_through_lm_head
 
-            return project_through_lm_head(x, self.lm_head)
-        from sglang.srt.layers.quantization.fp8_utils import (
-            flashinfer_mxfp8_blockscaled_linear,
-        )
-
-        return flashinfer_mxfp8_blockscaled_linear(
-            input=x,
-            weight=self.weight,
-            weight_scale=self.weight_scale,
-            backend=LM_HEAD_MXFP8_BACKEND,
-            pin_tactic=True,
-        )
+        return project_through_lm_head(x, self.lm_head)
 
 
 class Prebuilt:
@@ -343,10 +264,7 @@ class Prebuilt:
         self.slots = frozenset(slots)
 
     def device_bytes(self) -> dict[str, int]:
-        out = self.chain.device_bytes()
-        if self.lm_head.weight is not None:
-            out["LM-head MXFP8 copy"] = self.lm_head.device_bytes()
-        return out
+        return self.chain.device_bytes()
 
 
 def _memory(parts: dict[str, int]) -> str:
@@ -403,7 +321,6 @@ def prebuild(
             rows=int(head.vocab_size) // world,
             cols=HF_CONFIG["hidden_size"],
             device=head.markov_w1.weight.device,
-            mxfp8="draft_lm_head" in slots,
         ),
         "allocating the draft LM head",
     )
@@ -440,7 +357,7 @@ def _on_every_rank(cpu_group, step, what: str):
 def _warm(steps: dict, prebuilt: Prebuilt, *, noise, step_temperatures) -> None:
     """Compile what a step launches on this rank before the chain's first cross-rank
     wait, on SGLang's own buffers: the noise kernel (Triton) and the LM head at every
-    batch size (with the MXFP8 copy, CuTe DSL kernels). The caller gathers every rank's
+    batch size. The caller gathers every rank's
     result, so no rank enters a chain launch while another still compiles (a JIT stall
     longer than the wait deadline would fault its peers)."""
     chain, lm_head = prebuilt.chain, prebuilt.lm_head
@@ -524,7 +441,7 @@ def build_steps(
         lm_head.attach(lm.lm_head)
         _warm(steps, prebuilt, noise=noise, step_temperatures=step_temperatures)
 
-    # every rank fills its LM-head copy and compiles, or every rank raises with each
+    # every rank compiles, or every rank raises with each
     # rank's error; the gather is the barrier: none goes on to capture a chain launch
     # while another still compiles
     _on_every_rank(cpu_group, warm, "warming the draft proposal")

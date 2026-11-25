@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""CPU checks of the MiniMax-M3.1 DSpark draft's slots, markov (shipped) and
-draft_lm_head (opt-in): the numerics the draft spec declares with them; the target's
+"""CPU checks of the MiniMax-M3.1 DSpark draft's slot markov: the numerics the draft spec declares with them; the target's
 summary and the engagement check its executor runs; the draft spec's built object,
 which offers SGLang's folded proposal the draft sampler only with slot markov and
 builds its buffers at the spec's build; the sampler's refusals of LM heads, buffers
@@ -43,13 +42,7 @@ def test_the_draft_slots_state_their_tolerances_in_the_draft_spec():
     assert dict(draft._numerics(TARGET_SLOTS).tolerances) == backbone
     markov = dict(draft._numerics(TARGET_SLOTS | {"markov"}).tolerances)
     assert markov == {**backbone, **m31_runtime.DRAFT_TOLERANCES["markov"]}
-    both = draft._numerics(frozenset({"markov", "draft_lm_head"}))
-    assert both.kind is NumericsKind.TOLERANCE
-    assert dict(both.tolerances) == {
-        **backbone,
-        **m31_runtime.DRAFT_TOLERANCES["markov"],
-        **m31_runtime.DRAFT_TOLERANCES["draft_lm_head"],
-    }
+    assert draft._numerics(TARGET_SLOTS | {"markov"}).kind is NumericsKind.TOLERANCE
     assert set(m31_runtime.DRAFT_TOLERANCES) == set(m31_runtime.DRAFT_SLOTS)
 
 
@@ -76,13 +69,13 @@ def test_the_targets_summary_names_the_draft_slots_and_arms_the_check():
     """The draft's slots are no slot of the target's plan (a requested one serves none
     of its widths, which is no refusal); its summary names them and its executor checks
     that the draft engaged them."""
-    built = _build({"moe_nofill", "moe_swap", "markov", "draft_lm_head"})
+    built = _build({"moe_nofill", "moe_swap", "markov"})
     assert built.summary().endswith(
-        "slots by width 8-128: moe_nofill, moe_swap; draft slots ['draft_lm_head', "
-        "'markov'], built by the DSpark draft's spec"
+        "slots by width 8-128: moe_nofill, moe_swap; draft slots ['markov'], built "
+        "by the DSpark draft's spec"
     )
     assert isinstance(built._draft_check, draft.EngagementCheck)
-    assert built._draft_check.slots == ["draft_lm_head", "markov"]
+    assert built._draft_check.slots == ["markov"]
     # the target itself offers no sampler
     assert built.draft_sampler is None
     stock = _build({"moe_nofill", "moe_swap"})
@@ -161,11 +154,10 @@ OFF = "decode CUDA graphs are disabled"
         # disabled decode CUDA graphs (the parity switch's eager steps): SGLang folds
         # no proposal, so the slots build nothing
         (
-            TARGET_SLOTS | {"markov", "draft_lm_head"},
+            TARGET_SLOTS | {"markov"},
             OFF,
-            "SGLang's proposal (draft slots ['draft_lm_head', 'markov'] not engaged: "
-            f"{OFF})",
-            f"['draft_lm_head', 'markov'] are not engaged on rank 2: {OFF}",
+            f"SGLang's proposal (draft slots ['markov'] not engaged: {OFF})",
+            f"['markov'] are not engaged on rank 2: {OFF}",
         ),
     ],
 )
@@ -191,10 +183,6 @@ def test_without_an_engaged_markov_the_draft_keeps_sglangs_proposal(
     "slots, lm_head",
     [
         ({"markov"}, "SGLang's LM head (draft slots ['markov'])"),
-        (
-            {"markov", "draft_lm_head"},
-            "an MXFP8 copy of the LM head (draft slots ['draft_lm_head', 'markov'])",
-        ),
     ],
 )
 def test_with_markov_the_draft_offers_the_sampler(slots, lm_head):

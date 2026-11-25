@@ -190,11 +190,6 @@ def _toolchain(slots, missing=()):
         ({"mega"}, ("cuda.bindings",), ["needs the CUDA Python bindings"]),
         ({"markov"}, ("triton",), ["slot markov needs Triton"]),
         (
-            {"markov", "draft_lm_head"},
-            ("flashinfer",),
-            ["slot draft_lm_head needs FlashInfer"],
-        ),
-        (
             {"moe_nofill"},
             ("flashinfer", "cutlass"),
             [
@@ -203,7 +198,7 @@ def _toolchain(slots, missing=()):
             ],
         ),
         # what a slot does not launch through is not asked of the machine
-        ({"mega", "markov", "lm_head_mxfp8"}, ("flashinfer", "cutlass"), []),
+        ({"mega", "markov"}, ("flashinfer", "cutlass"), []),
         ({"moe_nofill", "moe_swap"}, ("cuda.bindings", "triton"), []),
     ],
 )
@@ -212,12 +207,11 @@ def test_each_slot_names_the_toolchain_it_misses(slots, missing, want):
 
 
 def test_only_slot_mega_asks_for_the_nvcc_floor():
-    """Slots markov and lm_head_mxfp8 build with any nvcc; the QMUL4 floor is slot
+    """Slot markov builds with any nvcc; the QMUL4 floor is slot
     mega's; the MoE slots build nothing."""
     for slots, floor in (
         ({"mega", "markov"}, nvcc.QMUL4_VERSION),
         ({"markov"}, None),
-        ({"lm_head_mxfp8"}, None),
     ):
         _toolchain(slots)[1].assert_called_once_with(floor)
     _toolchain({"moe_nofill", "moe_swap"})[1].assert_not_called()
@@ -249,7 +243,6 @@ def test_the_attention_scales_are_tiled_128x4():
     [
         ({"hop_mxfp8"}, "unknown slot 'hop_mxfp8'"),
         ({"moe_swap"}, "slot 'moe_swap' needs slot 'moe_nofill'"),
-        ({"draft_lm_head"}, "slot 'draft_lm_head' needs slot 'markov'"),
     ],
 )
 def test_a_slot_list_refusal_names_it(slots, want):
@@ -261,19 +254,13 @@ def test_a_slot_list_refusal_names_it(slots, want):
 def test_the_draft_slots_checks_apply_only_with_them():
     """Slot markov ships: the documented setup runs it. The draft's slots replace
     SGLang's folded DSpark proposal, so a server without it is refused while one is
-    requested; draft_lm_head (opt-in) also refuses SGLang's own quantized draft LM
-    head, which slot markov alone runs."""
-    assert "markov" in spec.SLOTS and "draft_lm_head" not in spec.SLOTS
+    requested; it runs SGLang's own quantized draft LM head too."""
+    assert "markov" in spec.SLOTS
     unfolded = {"SGLANG_DSPARK_FOLDED_PROPOSAL": False}
     assert "SGLANG_DSPARK_FOLDED_PROPOSAL is off" in _refusal(env=unfolded)
     int8_walk = {"SGLANG_DSPARK_OPT_INT8_MARKOV_WALK": True}
     assert "asks for SGLang's int8 walk" in _refusal(env=int8_walk)
     assert _refusal(speculative_dspark_lm_head_dtype="mxfp8") == ""
-    with patch.object(spec, "SLOTS", spec.SLOTS | {"draft_lm_head"}):
-        assert _refusal() == ""
-        assert "--speculative-dspark-lm-head-dtype mxfp8" in _refusal(
-            speculative_dspark_lm_head_dtype="mxfp8"
-        )
     with patch.object(spec, "SLOTS", spec.SLOTS - {"markov"}):
         assert _refusal(env={**unfolded, **int8_walk}) == ""
 

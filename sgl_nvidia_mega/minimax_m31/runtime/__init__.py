@@ -55,12 +55,9 @@ SGLANG_READS = {
 #   kernels on the same inputs: bitwise
 # - markov: a slot of the DSpark draft (DRAFT_SLOTS below)
 SHIPPED_SLOTS: tuple[str, ...] = ("mega", "moe_nofill", "moe_swap", "markov")
-# Slots that run only when SLOTS_ENV lists them:
-# - draft_lm_head: a slot of the DSpark draft (DRAFT_SLOTS below)
-OPT_IN_SLOTS: tuple[str, ...] = ("draft_lm_head",)
 # The DSpark draft's slots: the draft spec builds them (draft.SPEC, draft_step), not
 # the target's plan, and they replace SGLang's folded proposal, the tail of the draft's
-# CUDA graph, at 1-16 requests. Neither is bitwise (DRAFT_TOLERANCES, in draft.NUMERICS):
+# CUDA graph, at 1-16 requests. Not bitwise (DRAFT_TOLERANCES, in draft.NUMERICS):
 # - markov: the proposal's Markov chain (7 steps of bias, sample and cross-rank
 #   exchange) in one vocab-sharded kernel per rank (sampler, sm103/draft/markov.py),
 #   through SGLang's draft_sampler hook. Its MMA sums each step's bias in another order
@@ -71,18 +68,11 @@ OPT_IN_SLOTS: tuple[str, ...] = ("draft_lm_head",)
 #   than with SGLang's proposal. Greedy requests return the target's argmax tokens,
 #   identical while the draft tokens are; a batch's verify numerics depend on its
 #   draft tokens
-# - draft_lm_head: the draft's base logits from an MXFP8 copy of this rank's LM-head
-#   shard (about 300 MiB a rank) on SGLang's FlashInfer MXFP8 linear, half the bytes of
-#   the BF16 shard SGLang's projection reads. Not bitwise (E4M3 weights and draft
-#   rows): its draft tokens differ, and with them the acceptance length and the verify
-#   of the other rows of a batch
-DRAFT_SLOTS: tuple[str, ...] = ("markov", "draft_lm_head")
+DRAFT_SLOTS: tuple[str, ...] = ("markov",)
 # slot -> the slots it needs
 NEEDS: dict[str, tuple[str, ...]] = {
     # it swaps the streams of moe_nofill's MoE
     "moe_swap": ("moe_nofill",),
-    # the MXFP8 copy serves the chain's step
-    "draft_lm_head": ("markov",),
 }
 # The slots whose kernels agree with SGLang's bit for bit; slot mega makes the spec's
 # numerics TOLERANCE (spec.NUMERICS)
@@ -106,12 +96,6 @@ DRAFT_TOLERANCES: dict[str, dict[str, float]] = {
         # draft tokens may differ only where two candidates are that close; bitwise
         # when the bias products sum exactly (the kernel test)
         "draft_markov.tokens.exact_sum_mismatches": 0.0,
-    },
-    "draft_lm_head": {
-        # the base logits against SGLang's BF16 projection, over their largest
-        # |value|: MXFP8 rounding of the weights and the draft rows (the kernel test
-        # asserts it on Gaussian data)
-        "draft_lm_head.logits.rel": 2**-4,
     },
 }
 
@@ -152,10 +136,9 @@ def draft_tolerances(slots: frozenset[str] = SLOTS) -> dict[str, float]:
 
 def slot_reasons(slots: frozenset[str] = SLOTS) -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
-    known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS)
     reasons = [
-        f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(known)})"
-        for name in sorted(slots - set(known))
+        f"{SLOTS_ENV}: unknown slot {name!r} (known: {', '.join(SHIPPED_SLOTS)})"
+        for name in sorted(slots - set(SHIPPED_SLOTS))
     ]
     reasons += [
         f"{SLOTS_ENV}: slot {slot!r} needs slot {need!r}"

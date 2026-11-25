@@ -15,8 +15,7 @@ page table.
 The proposal that samples the block (the draft LM head, the Markov head, the sampling)
 is SGLang's, or with slot ``markov`` the plugin's (``sampler``): the built object
 offers SGLang's folded proposal a ``draft_sampler`` for draft batches of 1-16 requests,
-whose Markov chain is one kernel per rank; slot ``draft_lm_head`` runs its LM head on
-an MXFP8 copy. Its buffers are allocated at the build, before SGLang sizes its KV
+whose Markov chain is one kernel per rank. Its buffers are allocated at the build, before SGLang sizes its KV
 pools; the folded proposal asks for the sampler later, with its own buffers."""
 
 from __future__ import annotations
@@ -320,8 +319,8 @@ class DraftStep:
         draft_spec._COUNTS["built"] += 1
 
     def _build_proposal(self, ctx, rank: int) -> str:
-        """What samples the block. With slot markov: the chain's buffers (and slot
-        draft_lm_head's LM-head copy), allocated here, after the backbone's arena and
+        """What samples the block. With slot markov: the chain's buffers, allocated
+        here, after the backbone's arena and
         before SGLang sizes its KV pools (collective: every rank builds them in this
         order), and the sampler offered to SGLang's folded proposal. Every rank logs
         which proposal it serves and why."""
@@ -355,14 +354,9 @@ class DraftStep:
             greedy_draft=envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get(),
         )
         self.draft_sampler = self._draft_sampler
-        lm_head = (
-            "an MXFP8 copy of the LM head"
-            if "draft_lm_head" in self.slots
-            else "SGLang's LM head"
-        )
         return (
             f"Markov chain in one kernel at 1-{sampler.MAX_REQUESTS} requests, "
-            f"{lm_head} (draft slots {requested})"
+            f"SGLang's LM head (draft slots {requested})"
         )
 
     def _draft_sampler(self, **buffers):

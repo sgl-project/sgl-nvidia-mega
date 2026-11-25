@@ -10,7 +10,7 @@ requirements at argument resolution and the model at load
 every rank, listing every reason. The checks of slot mega's kernels (their toolchain,
 the config fields they are built for, the context their page tables hold, the
 persistent grid's residency) apply while it is requested; so do those of the DSpark
-draft's slots markov and draft_lm_head (``draft_config_reasons``), which the draft
+draft's slot markov (``draft_config_reasons``), which the draft
 spec builds (``draft``). This module stays light: SGLang imports it in the launcher.
 """
 
@@ -73,7 +73,7 @@ SGLANG_READS = {
         "quantization",
         "context_length",
         "disable_overlap_schedule",
-        # SGLang's own quantized draft LM head, which slot draft_lm_head would double
+        # the newest of the SGLang arguments the package mirrors (host_reasons)
         "speculative_dspark_lm_head_dtype",
     ),
     "srt/environ.py": (
@@ -196,8 +196,7 @@ def toolchain_reasons(slots: frozenset = SLOTS) -> list[str]:
     """The requested slots' toolchains, by import spec only: slot mega's kernels build
     with the CUDA Python bindings and nvcc 13.4 or newer; slot markov's chain with the
     bindings and any nvcc, its noise kernel with Triton; slot moe_nofill launches
-    FlashInfer's CuTe-DSL quantize (FlashInfer, CuTe DSL); slot draft_lm_head SGLang's
-    FlashInfer MXFP8 linear."""
+    FlashInfer's CuTe-DSL quantize (FlashInfer, CuTe DSL)."""
     reasons = []
     if slots & {"mega", "markov"}:
         if not _has_module("cuda.bindings"):
@@ -210,8 +209,6 @@ def toolchain_reasons(slots: frozenset = SLOTS) -> list[str]:
             reasons += [reason] if reason else []
     if "markov" in slots and not _has_module("triton"):
         reasons.append("slot markov needs Triton")
-    if "draft_lm_head" in slots and not _has_module("flashinfer"):
-        reasons.append("slot draft_lm_head needs FlashInfer")
     if "moe_nofill" in slots:
         reasons += [
             f"slot moe_nofill needs {what}"
@@ -294,13 +291,6 @@ def draft_config_reasons(cfg, slots: frozenset = SLOTS) -> list[str]:
         reasons.append(
             "slot markov replaces the draft's Markov walk, and "
             "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK asks for SGLang's int8 walk: unset one"
-        )
-    lm_head_dtype = cfg.speculative_dspark_lm_head_dtype
-    if "draft_lm_head" in requested and lm_head_dtype is not None:
-        reasons.append(
-            "slot draft_lm_head keeps its own MXFP8 copy of the draft's LM head; "
-            f"--speculative-dspark-lm-head-dtype {lm_head_dtype} already quantizes "
-            "SGLang's projection, which slot markov runs: drop one of the two"
         )
     return reasons
 

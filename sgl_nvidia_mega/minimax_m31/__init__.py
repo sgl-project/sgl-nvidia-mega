@@ -11,7 +11,7 @@ token-parallel MoE (operands from ``weights``). At 2-16 requests (16-128 rows) t
 step runs SGLang's own modules in SGLang's order (``attention``, ``boundary``,
 ``logits``) with the bitwise MoE slots ``moe_nofill`` and ``moe_swap`` (``moe``). The
 draft's slot ``markov`` offers SGLang's folded proposal the draft sampler at 1-16
-requests; its opt-in slot ``draft_lm_head`` runs the draft LM head on an MXFP8 copy."""
+requests."""
 
 # Fixed by the kernels; per TP4 rank unless noted
 TP = 4
