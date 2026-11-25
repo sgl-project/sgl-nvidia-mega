@@ -299,6 +299,8 @@ class _Layer:
             raise ValueError(f"o_proj {tuple(self.o_proj.shape)}")
         if self.down.shape != (HIDDEN, shapes.inter):
             raise ValueError(f"down {tuple(self.down.shape)}")
+        if w.gate_up.shape != (2 * shapes.inter, HIDDEN):
+            raise ValueError(f"gate_up {tuple(w.gate_up.shape)}")
         bases = (w.attn_conv_base, w.mlp_conv_base)
         self.attn_base, self.mlp_base = (
             b.detach().float().reshape(2 * TAPS, HIDDEN).contiguous() for b in bases
@@ -371,7 +373,10 @@ class DraftChain:
             new(HIDDEN) for _ in "1234"
         )
         self.residual = new(HIDDEN)
-        self.delta_attn, self.delta_mlp, self.gate_up = (new(DELTA) for _ in "123")
+        self.delta_attn, self.delta_mlp = new(DELTA), new(DELTA)
+        # gate|up GEMM output, the x mlp_hop (k = inter, silu) reads: 2 * inter columns.
+        # DELTA (the conv delta row, 1792) equals it only at TP16 (inter 896).
+        self.gate_up = new(2 * shapes.inter)
         self.blocks = self.residual.view(tokens, 1, HIDDEN)  # unused at nb = 0
         self.value = new(shapes.heads * 128)  # M1b attention output
         self.sums, self.scratch = new(HIDDEN), new(HIDDEN)  # debug taps
