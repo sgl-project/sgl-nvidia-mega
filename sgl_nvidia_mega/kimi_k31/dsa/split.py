@@ -14,8 +14,6 @@ from functools import cache
 
 import torch
 
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
-
 # Names read from SGLang. A contract test checks these before GPU use.
 SGLANG_READS = {
     "kernels/ops/attention/dsa/paged_mqa_logits.py": ("_restore_row_stride",),
@@ -25,18 +23,15 @@ SGLANG_READS = {
 
 PAGE, PAGE_BITS, TOPK = 64, 6, 2048
 # Context guard: split a forward only when its longest causal length reaches this; below it the replicated
-# path is faster (the split's local logits + top-k + merge are a fixed cost). 320000 by default in
-# the GB300 BEST scope, kimi_k31/k3/default_scope.py; 0 (the default elsewhere): never split.
-SPLIT_MIN = int(best_default("K31MK_INDEX_SPLIT_MIN", "320000", "0"))
+# path is faster (the split's local logits + top-k + merge are a fixed cost). Measured crossover: 16-rank merge
+# unit B1 on GB300: +5.8 us/layer at 134K, ~0 at 338K, -13 us/layer at 600K; prepare-early moved it to 320000.
+SPLIT_MIN = 320000
 # Rows longer than this run the clustered candidate top-k (16384 beats 8192 at 8.4K local).
 CLUSTER_FLOOR = 16384
 # The clustered top-k's coarse bin width. At 10 bits ~5 % of real AgentX local rows overflow the 2048-entry tie
-# buffer and are redone exact on one block; 11 / 12 bits narrow the bin 2x / 4x. 12 in the BEST scope, else 10.
-COARSE_BITS = int(best_default("K31MK_INDEX_SPLIT_COARSE_BITS", "12", "10"))
-if COARSE_BITS not in (10, 11, 12):
-    raise ValueError(
-        f"K31MK_INDEX_SPLIT_COARSE_BITS must be 10, 11 or 12, got {COARSE_BITS}"
-    )
+# buffer and are redone exact on one block; 12 bits narrow the bin 4x (exact either way; 62.5K local rows that
+# overflowed ran 8 us instead of 23, non-overflowing rows +0.3 us; AgentX overflow 5.0 -> 0.9 %).
+COARSE_BITS = 12
 
 
 def overflow_rows(device):

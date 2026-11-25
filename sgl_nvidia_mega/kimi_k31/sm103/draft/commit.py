@@ -23,7 +23,7 @@ contraction beyond the update FMA).
 Grid (layers * HV, V / 64, B), 256 threads: warp w owns 8 columns of the CTA's 64. Before
 ``griddepcontrol.wait`` (the ring and h were written by kernels that completed before the
 previous kernel's wait): warp t (< 8) normalizes step t's k and exponentiates its gate into
-shared memory, and every warp loads its h columns. After the wait: commit_lens (ArgmaxAccept's
+shared memory, and every warp loads its h columns. After the wait: commit_lens (the accept's
 output) -> fold the first commit steps, snapshot, store; the CTA's share of the layer's conv
 rollback / track windows (contiguous [K-1, dim] copies, KDA's dense window layout)."""
 

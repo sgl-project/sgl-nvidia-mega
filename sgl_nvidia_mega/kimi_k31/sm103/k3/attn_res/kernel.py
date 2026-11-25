@@ -11,13 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 
-from ..common.mailbox import (
-    poll,
-    rearm,
-    rearm_fence_eager,
-    rearm_fence_end,
-    rearm_fence_late,
-)
+from ..common.mailbox import poll, rearm, rearm_fence_end
 from ..common.primitives import (
     alloc,
     at,
@@ -34,7 +28,6 @@ from ..common.primitives import (
     wait,
     zeros,
 )
-from .aux import AuxMixture
 
 
 @cute.jit
@@ -87,15 +80,12 @@ class ClusterAttnRes:
         final=False,
         deadline_ns=0,
         aux_mixture=False,
-        aux_launch=True,
     ):
         self.nb, self.slots, self.has_delta = nb, slots, has_delta
         self.write, self.final = write, final
         self.deadline_ns = deadline_ns
+        # With saved blocks the caller runs AuxMixture for the aux rows (PreparedAttnRes.bind_aux, a side stream).
         self.aux_mixture = aux_mixture
-        self.aux_launch = (
-            aux_launch  # False: the caller launches AuxMixture itself (side stream)
-        )
         self.npre = 2 * nb
         self.npost = 2 if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
@@ -104,8 +94,6 @@ class ClusterAttnRes:
     @cute.jit
     def __call__(self, *args):
         launch(self.kernel, args, (7, args[1].shape[0], 1), 128, 7)
-        if cutlass.const_expr(self.aux_mixture and self.nb > 0 and self.aux_launch):
-            AuxMixture(self.nb)(*args)
 
     @cute.jit
     def exchange(
@@ -248,7 +236,6 @@ class ClusterAttnRes:
                 unpack(tuple(got[slot, k] for k in range(4)), part, 0)
                 for i in cutlass.range_constexpr(8):
                     cur[0, i] = cur[0, i] + part[0, i]
-            rearm_fence_eager()
             if cutlass.const_expr(self.slots > 1):
                 for j in cutlass.range_constexpr(4):  # all-reduce output boundary
                     round_pair(cur, 0, j)
@@ -263,8 +250,6 @@ class ClusterAttnRes:
         values[0] = dot8(v, NEW, v, NEW)
         if cutlass.const_expr(self.nb > 0):
             values[1] = dot8(v, NEW, v, W)
-        if cutlass.const_expr(self.slots > 0):
-            rearm_fence_late()  # before the exchange's barrier, so before any thread's push
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
         row = (words[0], words[1], words[2], words[3])
         store_words(at(prefix, token, col), row)

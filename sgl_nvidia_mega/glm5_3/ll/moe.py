@@ -300,11 +300,12 @@ class LlMoeFamily:
     """The per-layer arguments of ``ll.moe`` on one model."""
 
     def __init__(
-        self, layers: Dict[int, Any], dense: Dict[int, Any], sm=None, sms=None
+        self, layers: Dict[int, Any], dense: Dict[int, Any], target=None, sms=None
     ) -> None:
         self.layers = layers  # layer id -> (mlp, RoutedArgs)
         self.dense = dense  # layer id -> dense mlp
-        self.sm, self.sms = sm, sms  # the GEMM plans' device facts (None: this GPU's)
+        # the GEMM plans' target (``ll.target``; None: no plan) and SMs (None: this GPU's)
+        self.target, self.sms = target, sms
         self.widths: tuple = ()
         # the shared expert's stream (PRIORITY_UNIT), None: each layer's alt stream
         self.shared_stream: Optional[torch.cuda.Stream] = None
@@ -315,7 +316,7 @@ class LlMoeFamily:
         from sgl_nvidia_mega.glm5_3 import ll
 
         self.widths = tuple(sorted(set(int(w) for w in widths)))
-        facts = dict(sm=self.sm, sms=self.sms)
+        facts = dict(target=self.target, sms=self.sms)
         for mlp, _ in self.layers.values():
             ll.build_linear("router", mlp.gate, self.widths, **facts)
         for mlp in self.dense.values():
@@ -458,8 +459,11 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
         return f"{mode} steps are the draft's"
     if profile.tp != 4:
         return f"TP{profile.tp}: ll.moe serves TP4 (the small-M MoE engine serves TP8)"
-    if tuple(profile.sm) != (10, 3):
-        return f"sm_{profile.sm[0]}{profile.sm[1]}: measured on GB300 (sm_103) only"
+    from sgl_nvidia_mega.glm5_3.ll import target
+
+    why = target.reason(profile)
+    if why is not None:
+        return why
     if rows > MAX_ROWS:
         return f"{rows} rows (the finalize hop serves <= {MAX_ROWS})"
     return None
@@ -472,7 +476,9 @@ def _family(model: Any, derived: Any, profile: Any):
         family = LlMoeFamily.of_model(model)
     except ValueError as e:
         return DeclinedFamily(str(e))
-    family.sm, family.sms = tuple(profile.sm), profile.sms
+    family.target, family.sms = profile.target, profile.sms
+    if profile.target is not None:
+        profile.target.note("ll.moe")
     return family
 
 

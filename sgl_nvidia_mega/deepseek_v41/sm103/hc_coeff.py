@@ -60,7 +60,7 @@ def compile_nvcc(source: Path, arch: str, options: tuple[str, ...]) -> bytes:
     """A cubin of ``source`` from nvcc, cached on disk by source, headers' root,
     options and nvcc version; refuses CUDA-graph capture as ``jit.compile_source``."""
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("compiling hc_coeff inside CUDA-graph capture")
+        raise RuntimeError(f"compiling {source.stem} inside CUDA-graph capture")
     nvcc = _nvcc()
     version = subprocess.run(
         [nvcc, "--version"], capture_output=True, text=True, check=True
@@ -68,12 +68,12 @@ def compile_nvcc(source: Path, arch: str, options: tuple[str, ...]) -> bytes:
     key = hashlib.sha256(
         "\0".join([source.read_text(), arch, *options, version]).encode()
     ).hexdigest()
-    cached = cache_dir() / f"hc_coeff-{key[:24]}.cubin"
+    cached = cache_dir() / f"{source.stem}-{key[:24]}.cubin"
     if cached.is_file():
         return cached.read_bytes()
     cached.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=cached.parent) as tmp:
-        out = Path(tmp) / "hc_coeff.cubin"
+        out = Path(tmp) / f"{source.stem}.cubin"
         done = subprocess.run(
             [nvcc, "-cubin", f"-arch={arch}", *options, "-o", str(out), str(source)],
             capture_output=True,

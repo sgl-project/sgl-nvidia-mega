@@ -11,8 +11,6 @@ import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.arch import store_async_dsmem
 
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
-
 from ..common.primitives import (
     alloc,
     asm,
@@ -78,10 +76,6 @@ def sigmoids(values):
     return result
 
 
-# On by default in the GB300 BEST scope, kimi_k31/k3/default_scope.py (0 = off), read when a kernel is built: ReplaySSM verify with one token per cluster CTA
-# (Q8 on 8-CTA clusters) convolves, activates and normalizes token p's q / k only in CTA
-# p and multicasts them, instead of every CTA redoing all tokens. Same arithmetic.
-TOKEN_OWNED = "K31MK_KDA_TOKEN_OWNED"
 logger = logging.getLogger(__name__)
 _OWNED_LOGGED = []
 
@@ -171,8 +165,10 @@ class KdaSplit:
         assert not self.gate_staged or self.rows >= 64
         self.evict = bool(evict)  # staged state traffic marked L2 evict-first
         assert self.staged or not self.evict
-        owned = best_default(TOKEN_OWNED, "1", "0") not in ("", "0")
-        self.owned_tokens = owned and replayssm and tokens == self.cluster
+        # ReplaySSM verify with one token per cluster CTA (Q8 on 8-CTA clusters) convolves, activates and
+        # normalizes token p's q / k only in CTA p and multicasts them, instead of every CTA redoing all
+        # tokens; same arithmetic. The prologue is laid out for that one-to-one mapping.
+        self.owned_tokens = replayssm and tokens == self.cluster
         if self.owned_tokens and not _OWNED_LOGGED:  # engagement tag for A/B runs
             _OWNED_LOGGED.append(True)
             logger.info("NVIDIA megakernel: KDA verify runs the token-owned prologue")
@@ -231,7 +227,7 @@ class KdaSplit:
                 for size in (128, 128, 128, self.rows, 128, 8)
             )
             barrier, gate_barrier = (smem.allocate(cutlass.Uint64, 8) for _ in range(2))
-            qk_barrier = None  # TOKEN_OWNED: every token's normalized q / k arrived
+            qk_barrier = None  # owned_tokens: every token's normalized q / k arrived
             if cutlass.const_expr(self.owned_tokens):
                 qk_barrier = smem.allocate(cutlass.Uint64, 8)
             owned: cutlass.Constexpr = -(-T // self.cluster)  # tokens a CTA normalizes

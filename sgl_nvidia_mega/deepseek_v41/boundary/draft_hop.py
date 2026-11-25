@@ -36,18 +36,27 @@ class DraftHop:
     """One rank's draft mailbox (``AllReduceMHC``): the attention post publishes and
     collects in one call, the MoE post finalizes; both at 1-``capacity`` rows."""
 
-    def __init__(self, hop):
+    def __init__(self, hop, *, final_collapse: bool = False):
         self._hop = hop
         self.capacity = hop.capacity
+        # slot draft_final_collapse: the last stage's MoE post also writes the head's
+        # mHC collapse (the draft forward's output), as hop_final_collapse does for the
+        # target, so the draft skips its hc_combine launch
+        self.final_collapse = final_collapse
+
+    @property
+    def mailbox(self):
+        """The draft's ``AllReduceMHC`` (slot wo_b_publish_split publishes into it)."""
+        return self._hop
 
     def collect(self, partial, residual, post_mix, comb, pre, norm_weight, eps):
         """(updated streams, normed FFN input) of the TP-partial ``partial``."""
         return self._hop(partial, residual, post_mix, comb, pre, norm_weight, eps)
 
-    def finalize(self, *args, rows: int, mxfp8_out=None):
+    def finalize(self, *args, rows: int, mxfp8_out=None, collapse: bool = False):
         """Hop B's call (``hop_a.HopA.finalize``) on the draft's mailbox."""
         del rows  # one mailbox at every width
-        return self._hop.finalize(*args, mxfp8_out=mxfp8_out)
+        return self._hop.finalize(*args, mxfp8_out=mxfp8_out, collapse=collapse)
 
 
 def sglang_fuses() -> bool:
@@ -72,7 +81,7 @@ def layout_reason() -> str:
 
 
 def build(
-    stages, *, deadline_s: float, max_rows: int
+    stages, *, deadline_s: float, max_rows: int, final_collapse: bool = False
 ) -> tuple[Optional[DraftHop], str]:
     """(the hop, "") or (None, why not). Collective over the TP group at (8, 2): a
     failure on any rank raises on every rank."""
@@ -95,7 +104,9 @@ def build(
     group = get_parallel().tp_group
     error, hop = "", None
     try:
-        hop = _mailbox(stages[0], top_k.pop(), group, deadline_s, max_rows)
+        hop = _mailbox(
+            stages[0], top_k.pop(), group, deadline_s, max_rows, final_collapse
+        )
     except Exception as e:  # gathered, then raised on every rank
         error = f"{type(e).__name__}: {e}"
     errors = [None] * group.world_size
@@ -105,10 +116,17 @@ def build(
         raise RuntimeError(
             "NVIDIA megakernel: the draft hop build failed: " + "; ".join(failed)
         )
-    return DraftHop(hop), ""
+    return DraftHop(hop, final_collapse=final_collapse), ""
 
 
-def _mailbox(stage, top_k: int, group, deadline_s: float, max_rows: int):
+def _mailbox(
+    stage,
+    top_k: int,
+    group,
+    deadline_s: float,
+    max_rows: int,
+    final_collapse: bool = False,
+):
     from sgl_nvidia_mega.deepseek_v41.sm103 import all_reduce_mhc
 
     # before the consumer compiles: the deadline is a constant of its kernel
@@ -123,4 +141,5 @@ def _mailbox(stage, top_k: int, group, deadline_s: float, max_rows: int):
         group=group.device_group,
         quantize_layer_input=True,
         residual_only=True,
+        final_collapse=final_collapse,
     )

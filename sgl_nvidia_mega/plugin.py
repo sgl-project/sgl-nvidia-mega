@@ -23,7 +23,7 @@ SPECS = (
     # The MTP draft offers EAGLE draft-loop and draft-extend entries.
     ("Qwen3_5ForCausalLMMTP", "sgl_nvidia_mega.qwen3_5.draft:SPEC"),
     ("KimiK3ForConditionalGeneration", "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
-    # GLM-5.3 and GLM-5.2: the MTP target verify step
+    # GLM-5.3 and GLM-5.2: the MTP target verify step (TP16 on Rubin: glm5_3/sm107)
     ("GlmMoeDsaForCausalLM", "sgl_nvidia_mega.glm5_3.spec:SPEC"),
     # the NextN draft (ModelConfig names a GLM draft's architecture this way)
     ("GlmMoeDsaForCausalLMNextN", "sgl_nvidia_mega.glm5_3.draft:SPEC"),
@@ -92,3 +92,9 @@ def register() -> None:
 
         for target, kind, hook in TEST_HOOKS:
             HookRegistry.register(target, pkgutil.resolve_name(hook), HookType[kind])
+    from sgl_nvidia_mega.spec_step import switches
+
+    if switches.any_enabled():
+        from sgl_nvidia_mega.spec_step import hooks
+
+        hooks.register()

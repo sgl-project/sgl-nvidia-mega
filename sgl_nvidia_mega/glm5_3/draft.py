@@ -5,7 +5,8 @@
 With slot "draft" the draft's forward runs on the plugin's draft step inside SGLang's
 draft-decode and draft-extend CUDA graphs: at TP8 ``draft_step.FusedDraft``, at the
 TP4 profiles the draft composed from the kernel units (``draft_units``); otherwise it
-stays SGLang's. SGLang checks a draft spec at load only (its ISA, TP
+stays SGLang's. At TP16 (Rubin) the draft is ``glm5_3/sm107``'s fused draft, which
+runs inside SGLang's EAGLE v2 draft worker at one request. SGLang checks a draft spec at load only (its ISA, TP
 size, decode graphs, config and environment, and ``model_disable_reasons``); the
 target spec checks the draft's server arguments at argument resolution.
 """
@@ -129,6 +130,10 @@ class NoDraftStep:
 
 def _model_disable_reasons(model, hf_config) -> list[str]:
     """What the draft step needs beyond the requirements, read at load."""
+    if target._tp_size() == target.SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.model_reasons(model)
     if "draft" not in SLOTS:
         return []
     from sglang.srt.runtime_context import get_parallel, get_spec
@@ -158,6 +163,10 @@ def _model_disable_reasons(model, hf_config) -> list[str]:
 
 
 def _build(model, hf_config, ctx):
+    if target._tp_size() == target.SM107_TP_SIZE:
+        from sgl_nvidia_mega.glm5_3 import sm107
+
+        return sm107.build_draft(model, hf_config, ctx)
     if "draft" not in SLOTS:
         return NoDraftStep()
     from sgl_nvidia_mega.glm5_3.profile import Profile

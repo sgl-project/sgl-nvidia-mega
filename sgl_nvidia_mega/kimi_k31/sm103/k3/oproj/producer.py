@@ -10,8 +10,7 @@ during the previous group's MMAs, and is reduced and published during the next o
 With ``twoshot`` the partial chunks go to their owners' receive slots instead (the
 first shot of ``common.twoshot``; args 2-4: receive view, owners' bases, rank).
 ``OprojUmma`` is the tcgen05 engine of
-the same producer for B>8. With ``fp8`` (``K31MK_OPROJ_FP8``, one-shot B<=8 only) the
-partials go out as MXFP8 (``publish_fp8``): half the multicast payload, not bitwise."""
+the same producer for B>8."""
 
 import cutlass
 import cutlass.cute as cute
@@ -30,10 +29,7 @@ from ..common.primitives import (
     mma_bf16_block,
     mma_into,
     multicast_words,
-    mx_exponent,
-    mx_rescale,
     named_barrier,
-    pack_fp8,
     pack_pair,
     prefetch_bytes,
     release_tmem,
@@ -63,29 +59,10 @@ def tree_reduce(values, op):
     return tree[0]
 
 
-# MXFP8 mailbox row (``fp8``): the BF16 [7168] row's bytes [0, 7168) hold the E4M3 partials
-# (byte = column) and from byte 7168 one scale word per 64-column producer CTA slice: E8M0
-# bytes 0 and 1 for its two 32-column blocks, bytes 2-3 zero. The rest stays armed.
-FP8_SCALE_COL = 3584  # BF16 element offset of the first scale word
-
-
-@cute.jit
-def canon_fp8(word):
-    """``word`` with every E4M3 -0 byte (0x80) made +0. A published word is then never the
-    0x80000000 sentinel (tiny negatives that underflow in the cvt come out as -0)."""
-    flipped = word ^ Uint32(0x80808080)
-    nonzero = ((flipped & Uint32(0x7F7F7F7F)) + Uint32(0x7F7F7F7F)) | flipped
-    return word & (nonzero | Uint32(0x7F7F7F7F))
-
-
 class OprojProducer:
-    def __init__(
-        self, k, *, staged_blocks, rows=1, group_tiles=0, twoshot=False, fp8=False
-    ):
-        if fp8 and (twoshot or group_tiles):
-            raise ValueError("FP8 o-proj partials are one-shot, ungrouped (B<=8) only")
+    def __init__(self, k, *, staged_blocks, rows=1, group_tiles=0, twoshot=False):
         self.k, self.staged, self.rows = k, staged_blocks, rows
-        self.twoshot, self.fp8 = twoshot, fp8
+        self.twoshot = twoshot
         self.parts = 4 * rows
         self.kblocks = k // (32 * self.parts)
         self.register_blocks = self.kblocks - self.staged
@@ -263,57 +240,7 @@ class OprojProducer:
 
     @cute.jit
     def emit(self, args, red, cta, first: Constexpr[int]):
-        if cutlass.const_expr(self.fp8):
-            self.publish_fp8(args, red, cta, first)
-        else:
-            self.publish(args, red, cta, first)
-
-    @cute.jit
-    def publish_fp8(self, args, red, cta, first: Constexpr[int]):
-        """MXFP8 ``publish`` (one-shot, B<=8): each lane sums its 8 columns' K parts in
-        order as ``publish``, four lanes (one 32-column block) share an E8M0 scale of
-        their FP32 absmax (``plan_chunk``'s exponent, no BF16 rounding first), the
-        scaled values go out as two E4M3x4 words (-0 bytes canonicalized) and lane 8t
-        sends token t's two block scales as one word. Warps 0-1 run whole (8 lanes per
-        token), so the shuffles see full warps; only tokens < B publish."""
-        x, _, mailbox, mc, slot = args[:5]
-        count: Constexpr = min(x.shape[0] - first, 8)
-        tid, _, _ = cute.arch.thread_idx()
-        if tid < 64:
-            out_half, row_tile, token = tid % 2, (tid // 2) % 4, tid // 8
-            reduced = cute.make_rmem_tensor(8, Float32)
-            for v in cutlass.range_constexpr(8):
-                value = red[0, row_tile, 0, token, out_half * 8 + v]
-                for q in cutlass.range_constexpr(1, self.parts):
-                    value = add_rn(value, red[0, row_tile, q, token, out_half * 8 + v])
-                reduced[v] = value
-            top = abs(reduced[0])
-            for v in cutlass.range_constexpr(1, 8):
-                top = cute.arch.fmax(top, abs(reduced[v]))
-            for width in (1, 2):
-                top = cute.arch.fmax(top, cute.arch.shuffle_sync_bfly(top, width))
-            scale = mx_exponent(cute.arch.fmax(top, Float32(1e-10)))
-            reciprocal = mx_rescale(scale)
-            words = [
-                canon_fp8(
-                    pack_fp8(tuple(reduced[4 * j + i] * reciprocal for i in range(4)))
-                )
-                for j in range(2)
-            ]
-            upper = cute.arch.shuffle_sync(
-                Uint32(scale), tid % 32 + 4
-            )  # lane 8t: block 1
-            if token < count:
-                out_col = (cta * 4 + row_tile) * 16 + out_half * 8
-                offset = cute.crd2idx(
-                    (slot, first + token, out_col // 2), mailbox.layout
-                )
-                multicast_words(mc + Int64(offset) * 2, words)
-                if tid % 8 == 0:
-                    column = FP8_SCALE_COL + cta * 2
-                    offset = cute.crd2idx((slot, first + token, column), mailbox.layout)
-                    word = Uint32(scale) | (upper << 8)
-                    multicast_words(mc + Int64(offset) * 2, (word,))
+        self.publish(args, red, cta, first)
 
     @cute.jit
     def compute(self, args, smem, wr, cta, trigger_after_wait: cutlass.Constexpr[bool]):

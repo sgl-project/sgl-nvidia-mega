@@ -13,14 +13,16 @@ launches each served (row count, kernel) once, so capture never compiles; a kern
 fails to build raises (every rank builds the same set). The fused step is first
 recorded under capture, so a call at a row count the plan serves but nobody built
 raises instead of compiling there. A role the plan does not serve at a shape or row
-count (another GPU, a quantized weight, rows outside its ranges) runs stock; ``build``
-logs why, once per rank 0.
+count (no target, another SM count, a quantized weight, rows outside its ranges) runs
+stock; ``build`` logs why, once per rank 0. The plan is the target's (``ll.target``:
+``Target.gemm_plan``), handed in by the caller from its profile.
 
 Split-K source: the vendored copy of FlashInfer's kernel (``ll/kernels/cute/splitk.py``),
 which carries synchronization fixes FlashInfer's body lacks, or FlashInfer's
 ``mm_bf16(..., backend="cute-dsl", tactic=...)`` once the installed FlashInfer has that
-API (fi-1) and marks its kernel as carrying the same fixes (``SplitKTactic.<FI1_SYNC_MARKER>``).
-The fixes change no arithmetic: both return bit for bit the same result.
+API (fi-1), marks its kernel as carrying the same fixes (``SplitKTactic.<FI1_SYNC_MARKER>``)
+and serves the target with explicit tactics (``Target.flashinfer_splitk``). The fixes
+change no arithmetic: both return bit for bit the same result.
 ``SGLANG_NVIDIA_MEGAKERNEL_GLM_GEMM_SPLITK`` = ``auto`` (default: as above),
 ``flashinfer`` (FlashInfer's kernel whenever it has the API, fixed or not; raise
 without it) or ``vendored``. Each rank logs the resolved source once.
@@ -44,6 +46,7 @@ import torch
 from sgl_nvidia_mega.glm5_3 import units
 from sgl_nvidia_mega.glm5_3.ll import gemm_plan as plan
 from sgl_nvidia_mega.glm5_3.ll import stock_linear
+from sgl_nvidia_mega.glm5_3.ll.target import Target
 from sgl_nvidia_mega.glm5_3.runtime import SLOTS_ENV
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -87,6 +90,8 @@ class _Served(NamedTuple):
 _READY: Dict[Tuple[str, int, int], Dict[int, _Served]] = {}
 # (role, N, K) -> why build left it stock
 _DECLINED: Dict[Tuple[str, int, int], str] = {}
+# (role, N, K) -> the (target, SMs) build planned it for
+_PLANNED_FOR: Dict[Tuple[str, int, int], Tuple[Optional[Target], int]] = {}
 
 
 # ---------------------------------------------------------------- split-K sources
@@ -145,7 +150,9 @@ def _vendored_source() -> _SplitKSource:
 
 
 @functools.lru_cache(maxsize=None)
-def _splitk_source_for(choice: str) -> _SplitKSource:
+def _splitk_source_for(choice: str, target: Optional[str] = None) -> _SplitKSource:
+    """``target``: the name of a target on which FlashInfer's explicit tactics do not
+    run (``auto`` then takes the vendored copy), else None."""
     if choice not in SPLITK_SOURCES:
         raise ValueError(f"{SPLITK_ENV}={choice!r}; expected one of {SPLITK_SOURCES}")
     from sgl_nvidia_mega.glm5_3.sm103 import cutlass_supported
@@ -160,7 +167,7 @@ def _splitk_source_for(choice: str) -> _SplitKSource:
             "mm_bf16(..., tactic=SplitKTactic) API"
         )
     fixed = fi_gemm is not None and flashinfer_splitk_sync_fixed(fi_gemm)
-    if fi_gemm is not None and (choice == "flashinfer" or fixed):
+    if fi_gemm is not None and (choice == "flashinfer" or (fixed and target is None)):
         source, why = _flashinfer_source(fi_gemm), "mm_bf16(..., tactic=)"
         why += "" if fixed else " (without the synchronization fixes)"
     else:
@@ -171,14 +178,20 @@ def _splitk_source_for(choice: str) -> _SplitKSource:
             else "FlashInfer has no mm_bf16(..., tactic=)"
             if fi_gemm is None
             else f"FlashInfer's kernel lacks the synchronization fixes ({FI1_SYNC_MARKER})"
+            if not fixed
+            else f"FlashInfer's explicit split-K tactics do not serve {target}"
         )
     logger.info("ll.gemm split-K source: %s (%s)", source.name, why)
     return source
 
 
-def splitk_source() -> _SplitKSource:
-    """The split-K source the switch selects (resolved once per choice)."""
-    return _splitk_source_for(os.environ.get(SPLITK_ENV, "") or "auto")
+def splitk_source(target: Optional[Target] = None) -> _SplitKSource:
+    """The split-K source the switch selects on ``target`` (resolved once per choice
+    and target)."""
+    choice = os.environ.get(SPLITK_ENV, "") or "auto"
+    if target is None or target.flashinfer_splitk:
+        return _splitk_source_for(choice)
+    return _splitk_source_for(choice, target.name)
 
 
 # ---------------------------------------------------------------- plan selection
@@ -195,9 +208,8 @@ def _unit_listed(role: str) -> bool:
 
 
 @functools.lru_cache(maxsize=None)
-def _device_facts(index: int) -> Tuple[Tuple[int, int], int]:
-    props = torch.cuda.get_device_properties(index)
-    return (props.major, props.minor), props.multi_processor_count
+def _device_sms(index: int) -> int:
+    return int(torch.cuda.get_device_properties(index).multi_processor_count)
 
 
 def _min_rows(role: str, module) -> int:
@@ -208,25 +220,28 @@ def _min_rows(role: str, module) -> int:
 
 
 def _planned(
-    role: str, module, *, sm: Tuple[int, int], sms: int
+    role: str, module, *, target: Optional[Target], sms: int
 ) -> Tuple[Optional[plan.Entry], str]:
-    """The plan entry serving ``role`` for ``module``'s weight, or (None, why not)."""
+    """The entry of ``target``'s plan serving ``role`` for ``module``'s weight, or
+    (None, why not)."""
     if role not in plan.ROLE_DTYPES:
         raise ValueError(f"ll.gemm: unknown role {role!r}; known: {plan.ROLES}")
     if not units.enabled(unit(role)):
         return None, f"unit {unit(role)} is off (not in {SLOTS_ENV})"
-    if (tuple(sm), sms) != plan.MEASURED_DEVICE:
-        (major, minor), want_sms = plan.MEASURED_DEVICE
+    if target is None:
+        return None, "no plan: the profile names no target for this GPU"
+    if sms != target.sms:
+        (major, minor), how = target.sm, "measured" if target.measured else "derived"
         return None, (
-            f"the plan is measured on SM{major}{minor} with {want_sms} SMs; this GPU is "
-            f"SM{sm[0]}{sm[1]} with {sms} SMs"
+            f"the plan is {how} for SM{major}{minor} with {target.sms} SMs "
+            f"({target.name}); this GPU has {sms} SMs"
         )
     weight = module.weight
     if weight.dim() != 2 or weight.dtype != torch.bfloat16:
         return None, f"weight is {weight.dtype} {tuple(weight.shape)}, not 2-D BF16"
     if getattr(module, "bias", None) is not None:
         return None, "the module has a bias"
-    e = plan.entry(role, tuple(weight.shape))
+    e = plan.entry(role, tuple(weight.shape), target.gemm_plan)
     if e is None:
         return None, f"no measured plan for (N={weight.shape[0]}, K={weight.shape[1]})"
     if not e.preferred and not _unit_listed(role):
@@ -236,13 +251,15 @@ def _planned(
     return e, ""
 
 
-def _check_tactic(source, r: plan.Range, m: int, n: int, k: int, sms: int):
+def _check_tactic(
+    source, r: plan.Range, m: int, n: int, k: int, sms: int, gpcs: int = plan.GPCS
+):
     tactic = source.tactic_type(*r.tactic)
     tactic.validate(m, n, k)  # ValueError for a tactic that cannot serve the problem
-    if not plan.splitk_fits_one_wave(r.tactic, m, n, sms):
+    if not plan.splitk_fits_one_wave(r.tactic, m, n, sms, gpcs):
         raise ValueError(
             f"{plan.kernel_name(r)} needs {plan.splitk_ctas(r.tactic, m, n)} CTAs at "
-            f"M={m}, N={n}: more than one wave of {sms} SMs"
+            f"M={m}, N={n}: more than one wave of {sms} SMs ({gpcs} GPCs)"
         )
     return tactic
 
@@ -287,25 +304,28 @@ def build(
     module,
     rows: Iterable[int],
     *,
-    sm: Optional[Tuple[int, int]] = None,
+    target: Optional[Target] = None,
     sms: Optional[int] = None,
 ) -> str:
-    """Prepare ``role`` for ``module``'s weight at every row count in ``rows``: check the
-    planned tactics and launch each served (row count, kernel) once. ``sm`` / ``sms``
-    default to the current GPU's. Returns the role's description line."""
+    """Prepare ``role`` for ``module``'s weight at every row count in ``rows`` on
+    ``target``'s plan (the caller's ``Profile.target``; None: no plan, stock): check the
+    planned tactics and launch each served (row count, kernel) once. ``sms`` defaults
+    to the current GPU's. Returns the role's description line."""
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         raise RuntimeError(f"ll.gemm: building {role} inside CUDA-graph capture")
-    if sm is None or sms is None:
-        sm, sms = _device_facts(torch.cuda.current_device())
+    if sms is None:
+        sms = _device_sms(torch.cuda.current_device())
     weight = module.weight
     n, k = int(weight.shape[0]), int(weight.shape[1])
     key = (role, n, k)
-    e, why = _planned(role, module, sm=sm, sms=sms)
+    _PLANNED_FOR[key] = (target, int(sms))
+    e, why = _planned(role, module, target=target, sms=sms)
     if e is None:
         if key not in _DECLINED and key not in _READY:
             _DECLINED[key] = why
             _log_rank0(f"ll.gemm: {role} (N={n}, K={k}) stock: {why}")
         return _describe_key(key)
+    target.note("ll.gemm")
     min_m = _min_rows(role, module)
     ready = _READY.setdefault(key, {})
     out_dtype = _DTYPES[plan.ROLE_DTYPES[role]]
@@ -314,8 +334,8 @@ def build(
         if r is None or m < min_m or m in ready:
             continue
         if r.kernel == plan.SPLITK:
-            source = splitk_source()
-            tactic = _check_tactic(source, r, m, n, k, sms)
+            source = splitk_source(target)
+            tactic = _check_tactic(source, r, m, n, k, sms, target.gpcs)
             served = _Served(
                 plan.SPLITK, tactic, f"{plan.kernel_name(r)} [{source.name}]", source
             )
@@ -425,10 +445,14 @@ class LmHeadMixin:
 
 
 def _would_serve(role: str, module, m: int) -> bool:
-    if not torch.cuda.is_available():
+    """Whether the plan ``build`` used for this (role, N, K) serves ``m`` rows (False
+    for a weight shape ``build`` never saw)."""
+    w = module.weight
+    planned_for = _PLANNED_FOR.get((role, int(w.shape[0]), int(w.shape[1])))
+    if planned_for is None:
         return False
-    sm, sms = _device_facts(module.weight.device.index or 0)
-    e, _ = _planned(role, module, sm=sm, sms=sms)
+    target, sms = planned_for
+    e, _ = _planned(role, module, target=target, sms=sms)
     return (
         e is not None
         and m >= _min_rows(role, module)
@@ -467,6 +491,7 @@ def reset() -> None:
     """Forget every build (tests)."""
     _READY.clear()
     _DECLINED.clear()
+    _PLANNED_FOR.clear()
     _splitk_source_for.cache_clear()
 
 

@@ -1,0 +1,33 @@
+name: Sync CI Labels
+
+# Keeps a run-ci-sglang:<model> label for every model in test/e2e/ci_models.yaml,
+# so adding a model there is all it takes to run it alone on SGLang CI. Labels
+# of models removed from the file are left for a maintainer to delete.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test/e2e/ci_models.yaml
+      - .github/workflows/sync-ci-labels.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create or update the model labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for model in $(yq 'keys | .[]' test/e2e/ci_models.yaml); do
+            [[ "$model" =~ ^[a-z0-9_]+$ ]] || { echo "Bad model name: $model"; exit 1; }
+            gh label create "run-ci-sglang:$model" -R "$GITHUB_REPOSITORY" --force \
+              --color 1D76DB --description "Run the $model e2e tests on SGLang CI"
+          done

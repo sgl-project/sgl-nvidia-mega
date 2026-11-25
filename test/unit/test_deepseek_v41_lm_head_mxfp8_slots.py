@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Slots target_lm_head_mxfp8 and draft_lm_head_mxfp8 on CPU: the quantizer's rules
-(scale, rounding, swizzle) and the wiring of both heads onto one MXFP8 copy. The
-kernel itself is in test/kernels/test_deepseek_v41_lm_head_mxfp8.py."""
+"""Slots target_lm_head_mxfp8, target_lm_head_xload and draft_lm_head_mxfp8 on CPU: the
+quantizer's rules (scale, rounding, swizzle) and the wiring of both heads onto one MXFP8
+copy. The kernel itself is in test/kernels/test_deepseek_v41_lm_head_mxfp8.py."""
 
 import sys
 from contextlib import nullcontext
@@ -101,13 +101,21 @@ def test_one_copy_per_weight():
 # --------------------------------------------------------------- the slots' wiring
 
 
+class _Calls(list):
+    def __init__(self):
+        super().__init__()
+        self.xload = []
+
+
 @pytest.fixture
 def stream(monkeypatch):
-    """The MXFP8 stream on CPU (x @ dequantize(q).T); records each call's rows."""
-    calls = []
+    """The MXFP8 stream on CPU (x @ dequantize(q).T); records each call's rows (and in
+    ``.xload`` the build each call asked for)."""
+    calls = _Calls()
 
-    def matmul(x, q, *, out=None):
+    def matmul(x, q, *, out=None, xload=False):
         calls.append(x.shape[0])
+        calls.xload.append(xload)
         return (x.float() @ lh.dequantize(q).float().T).to(torch.bfloat16)
 
     monkeypatch.setattr(lh, "matmul", matmul)
@@ -131,12 +139,19 @@ def _model():
     return SimpleNamespace(lm_head=head, logits_processor=proc)
 
 
-def test_the_slots_are_opt_in_and_need_their_low_m_heads(monkeypatch):
+def test_the_slots_need_their_low_m_heads(monkeypatch):
+    # the target's MXFP8 head (and its xload build) runs by default; the draft's is
+    # measurement only
+    assert "target_lm_head_mxfp8" in runtime.DEFAULT_ON_SLOTS
+    assert "target_lm_head_xload" in runtime.DEFAULT_ON_SLOTS
+    assert "target_lm_head_xload" not in runtime.NUMERICS_CHANGE_SLOTS
+    assert "draft_lm_head_mxfp8" in runtime.OPT_IN_SLOTS
+    assert "draft_lm_head_mxfp8" not in runtime.SHIPPED_SLOTS
     for slot, needs in (
         ("target_lm_head_mxfp8", "target_lm_head"),
+        ("target_lm_head_xload", "target_lm_head_mxfp8"),
         ("draft_lm_head_mxfp8", "draft_lm_head"),
     ):
-        assert slot in runtime.OPT_IN_SLOTS and slot not in runtime.SHIPPED_SLOTS
         monkeypatch.setattr(runtime, "SLOTS", frozenset({slot}))
         assert any(f"needs slot {needs!r}" in r for r in runtime.slot_reasons())
     assert plan.MEASUREMENT_ONLY_SLOTS == {"draft_lm_head_mxfp8"}
@@ -186,6 +201,29 @@ def test_build_streams_with_the_slot_and_checks_against_sglang(stream, monkeypat
     )["target_lm_head_mxfp8"]
 
 
+def test_xload_builds_the_stream_that_loads_x_16_bytes_at_a_time(stream, monkeypatch):
+    model = _model()
+    slots = {"target_lm_head", "target_lm_head_mxfp8"}
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+    assert not logits.build(model, None, None).quant_method.xload
+    assert stream.xload == [False] * len(logits.CHECK_ROWS)
+    monkeypatch.setattr(runtime, "SLOTS", frozenset(slots | {"target_lm_head_xload"}))
+    head = logits.build(model, None, None)
+    assert head.quant_method.xload and stream.xload[-len(logits.CHECK_ROWS) :] == [
+        True
+    ] * len(logits.CHECK_ROWS)
+    bound = {
+        "moe": None,
+        "attention": {},
+        "embedding": None,
+        "engram": SimpleNamespace(prefetch=None),
+        "logits": head,
+    }
+    assert runtime.built_slots({}, bound, SimpleNamespace(routed=False))[
+        "target_lm_head_xload"
+    ]
+
+
 def test_build_refuses_a_stream_outside_the_tolerance(stream, monkeypatch, caplog):
     model = _model()
     monkeypatch.setattr(
@@ -194,7 +232,9 @@ def test_build_refuses_a_stream_outside_the_tolerance(stream, monkeypatch, caplo
     monkeypatch.setattr(
         lh,
         "matmul",
-        lambda x, q, out=None: torch.zeros(x.shape[0], VOCAB, dtype=torch.bfloat16),
+        lambda x, q, out=None, xload=False: torch.zeros(
+            x.shape[0], VOCAB, dtype=torch.bfloat16
+        ),
     )
     assert logits.build(model, None, None) is None
     assert "differ by" in caplog.text

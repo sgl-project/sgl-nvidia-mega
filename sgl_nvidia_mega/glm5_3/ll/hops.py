@@ -23,7 +23,8 @@ router GEMM, the fused QKV-A GEMM) at the row counts the decode graphs replay.
 
 Numerics (named tolerance ``ll.hops.max_ulp``): where the plan keeps FlashInfer's
 one-shot geometry (inside its 1 MiB band) a hop is bit-identical to FlashInfer's
-one-shot ``kARResidualRMSNorm``; the two-shot is bit-identical to FlashInfer's
+one-shot ``kARResidualRMSNorm`` (FlashInfer >= 0.7.3, which squares in fp32 like the
+hop; 0.7.1 and 0.7.2 squared in bf16); the two-shot is bit-identical to FlashInfer's
 two-shot + ``rmsNormLamport``; above the band the sum-of-squares order follows the
 chosen cluster (``test_glm5_3_ll_hops.py``).
 """
@@ -57,9 +58,10 @@ HOPS_PER_LAYER = 4
 EXTERNAL_SITES = 1000
 
 # Named tolerance (test_glm5_3_ll_hops.py): the norm output against an fp32
-# rank-order reference with bf16 squares, in bf16 ulps of the reference. The one-shot
-# is within 1 ulp (division and rsqrt rounding); the two-shot squares the bf16 sum in
-# fp32 and the sum-of-squares order follows the cluster.
+# rank-order reference with fp32 squares of the bf16 sum, in bf16 ulps of the
+# reference. Both forms square in fp32 (the one-shot as FlashInfer's does since
+# v0.7.3); the sum-of-squares order follows the cluster, and division and rsqrt
+# rounding stay within 1 ulp.
 TOLERANCES = {"ll.hops.max_ulp": 2.0}
 
 _VEC = 8  # bf16 per 16-byte vector, one vector per thread
@@ -346,8 +348,9 @@ class LlHopFamily:
         self.site_names: Dict[int, str] = {}
         self.max_rows = 0
         self.model: Any = None  # set by ``build``: the o_proj GEMMs are prepared too
-        cap = torch.cuda.get_device_capability(self.device)
-        self.sm: Tuple[int, int] = (int(cap[0]), int(cap[1]))
+        # the GEMM plans' target (``ll.target``), set by ``_family`` from the profile;
+        # None: o_proj keeps SGLang's GEMM
+        self.target: Any = None
 
     # ---------------------------------------------------------- build
     def reason(self, rows: int) -> Optional[str]:
@@ -390,7 +393,7 @@ class LlHopFamily:
                     "o_proj",
                     inner.layers[i].self_attn.o_proj,
                     widths,
-                    sm=self.sm,
+                    target=self.target,
                     sms=self.sm_count,
                 )
         self.buffer = transport.LamportBuffer.create(
@@ -647,8 +650,11 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
         return f"{mode} steps are the draft's"
     if profile.tp != 4:
         return f"TP{profile.tp}: the LL hops serve TP4 (the symmetric-memory hops serve TP8)"
-    if tuple(profile.sm) != (10, 3):
-        return f"sm_{profile.sm[0]}{profile.sm[1]}: the hop plans are measured on GB300 (sm_103)"
+    from sgl_nvidia_mega.glm5_3.ll import target
+
+    why = target.reason(profile)
+    if why is not None:
+        return why
     a = (profile.tp, rows, HIDDEN, profile.sms)
     if plain_plan(*a) is None or finalize_plan(*a) is None:
         return f"no hop plan at {rows} rows"
@@ -661,7 +667,9 @@ def _family(model: Any, derived: Any, profile: Any):
     if why is not None:
         return DeclinedFamily(why)
     family = build(model, deadline_s=profile.deadline_s, sm_count=profile.sms)
-    family.model, family.sm = model, tuple(profile.sm)
+    family.model, family.target = model, profile.target
+    if profile.target is not None:
+        profile.target.note("ll.hops")
     return family
 
 

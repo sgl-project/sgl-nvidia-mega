@@ -15,7 +15,7 @@ Examples: [Fix] deepseek_v41: Fix the pad-row KV write; [Perf] [GB300] deepseek_
 
 ## Accuracy Tests
 
-<!-- For each affected model/hardware configuration, give matched accuracy results against native SGLang with Mega disabled, using the same SGLang SHA and evaluation setup. Report the comparison verdict and evidence; do not use a fixed absolute score as the acceptance criterion. See CONTRIBUTING.md. -->
+<!-- For each affected model/hardware configuration, give matched accuracy results against native SGLang with Mega disabled, using the same SGLang SHA and evaluation setup. Report the comparison verdict and evidence; do not use a fixed absolute score as the acceptance criterion. See the CI test guide in AGENTS.md. -->
 
 ## Speed Tests and Profiling
 

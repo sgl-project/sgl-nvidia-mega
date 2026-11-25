@@ -15,6 +15,11 @@ group's columns are computed alone, so 1 group equals the first group of 2): e4m
 padded to 128, written zero), or ``[ceil(T / 8) * G * 4096]`` in ``q_norm_quant``'s
 row-tile layout with ``row_tile_scales``. Variants compile at build
 (:func:`precompile`), never under CUDA-graph capture.
+
+Slot attn_wo_a_fp8 (``fp8_weight``): the kernel streams the weight as E4M3 with 32x32
+UE8M0 block scales (:func:`fp8_weight`, recovered once from SGLang's BF16 wo_a and checked
+exact) and widens it in shared memory; bit for bit the BF16 launch when the recovery is
+exact, which it is for DeepSeek-V4.1's checkpoint (SGLang dequantizes that FP8 wo_a).
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import ctypes
 from collections import OrderedDict
 from functools import cache
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -90,11 +96,39 @@ def _variant_name(
     early_trigger: bool,
     row_tile_scales: bool,
     groups: int = GROUPS,
+    fp8: bool = False,
 ) -> str:
     return (
         f"wo_a_fused_m{tile}_{'i64' if int64_positions else 'i32'}"
         f"{'_et' if early_trigger else ''}{'_rt' if row_tile_scales else ''}"
-        f"{'' if groups == GROUPS else f'_g{groups}'}"
+        f"{'' if groups == GROUPS else f'_g{groups}'}{'_f8' if fp8 else ''}"
+    )
+
+
+class Fp8Weight(NamedTuple):
+    """wo_a as E4M3 codes [G * 1024, 4096] (uint8) and UE8M0 scales [G * 32, 128]."""
+
+    codes: torch.Tensor
+    scales: torch.Tensor
+
+
+def fp8_weight(weight: torch.Tensor) -> Fp8Weight:
+    """The E4M3 + 32x32 UE8M0 form of a BF16 wo_a [G, 1024, 4096] whose every 32x32 block
+    is an E4M3 block times a power of two (the checkpoint's dequant). Each block takes the
+    smallest exponent that fits its max in 448; raises ValueError unless widening the result
+    gives ``weight`` back bit for bit."""
+    groups = weight.shape[0]
+    w = weight.reshape(groups * RANK // 32, 32, GROUP_K // 32, 32).float()
+    amax = w.abs().amax(dim=(1, 3))
+    exp = torch.ceil(torch.log2(amax.clamp_min(2.0**-120) / 448.0)).clamp(-127, 127)
+    scale = torch.exp2(exp)[:, None, :, None]
+    codes = (w / scale).to(torch.float8_e4m3fn)
+    back = (codes.float() * scale).to(torch.bfloat16).reshape(weight.shape)
+    if not torch.equal(back.view(torch.int16), weight.view(torch.int16)):
+        raise ValueError("wo_a is not an exact E4M3 x 2^e dequant over 32x32 blocks")
+    return Fp8Weight(
+        codes.reshape(groups * RANK, GROUP_K).view(torch.uint8).contiguous(),
+        (exp.to(torch.int32) + 127).to(torch.uint8).contiguous(),
     )
 
 
@@ -106,6 +140,7 @@ def load_kernel(
     early_trigger: bool,
     row_tile_scales: bool = False,
     groups: int = GROUPS,
+    fp8: bool = False,
 ) -> _Kernel:
     """Compile (or read from the cache) and load one variant on ``device_index``."""
     if tile not in SHARED_BYTES:
@@ -123,11 +158,12 @@ def load_kernel(
             f"-DWO_A_ROW_TILE_SCALES={int(row_tile_scales)}",
             f"-DWO_A_SMEM_BYTES={SHARED_BYTES[tile]}",
             f"-DWO_A_GROUPS={groups}",
+            f"-DWO_A_FP8={int(fp8)}",
         )
         cubin = _compile_source(
             SOURCE.read_text(),
             _variant_name(
-                tile, int64_positions, early_trigger, row_tile_scales, groups
+                tile, int64_positions, early_trigger, row_tile_scales, groups, fp8
             ),
             f"sm_{major}{minor}a",
             options,
@@ -152,6 +188,7 @@ def precompile(
     early_trigger: bool = True,
     row_tile_scales: bool = False,
     groups: int = GROUPS,
+    fp8: bool = False,
 ) -> None:
     """Build every variant that serves 1..``rows`` rows, for int32 and int64 positions."""
     if device_index is None:
@@ -167,6 +204,7 @@ def precompile(
                 early_trigger,
                 row_tile_scales,
                 groups,
+                fp8,
             )
 
 
@@ -202,6 +240,35 @@ def _weight_map(weight: torch.Tensor):
     if tensor_map is None:
         tensor_map = _bf16_map(
             base, GROUP_K, weight.shape[0] * RANK, GROUP_K * 2, N_TILE
+        )
+        _weight_maps[key] = tensor_map
+    return tensor_map
+
+
+def _fp8_weight_map(codes: torch.Tensor):
+    """TMA map of the E4M3 weight [G * 1024, 4096] bytes: 64 x 64 boxes, no swizzle (the
+    kernel widens each box into the BF16 tile's swizzled layout itself). Cached by address."""
+    base = codes.data_ptr()
+    key = (base, codes.shape[0], "fp8")
+    tensor_map = _weight_maps.get(key)
+    if tensor_map is None:
+        cu = _driver()
+        u64, u32 = cu.cuuint64_t, cu.cuuint32_t
+        (tensor_map,) = _check(
+            cu.cuTensorMapEncodeTiled(
+                cu.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                2,
+                base,
+                [u64(GROUP_K), u64(codes.shape[0])],
+                [u64(GROUP_K)],
+                [u32(BLOCK_K), u32(N_TILE)],
+                [u32(1)] * 2,
+                cu.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+                cu.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
+                cu.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                cu.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+            ),
+            "cuTensorMapEncodeTiled(wo_a fp8)",
         )
         _weight_maps[key] = tensor_map
     return tensor_map
@@ -279,6 +346,7 @@ def fused_rope_wo_a(
     *,
     early_trigger: bool = True,
     row_tile_scales: bool = False,
+    fp8: Fp8Weight | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse RoPE of each head's last 64 lanes, then ``x @ weight^T`` per group,
     quantized to MXFP8.
@@ -286,8 +354,9 @@ def fused_rope_wo_a(
     ``x`` [T, G, 4096] bf16 (a strided view of the [T, heads, 512] attention output),
     G = 2 (TP4) or 1 (TP8), ``weight`` [G, 1024, 4096] bf16, ``freqs`` [S, 64] fp32
     (cos0, sin0, cos1, ...), ``positions`` [T] int32 or int64, 1 <= T <= 48.
-    ``early_trigger`` lets the PDL dependent launch at this kernel's start. Returns
-    (codes [T, G * 1024] e4m3, scales).
+    ``early_trigger`` lets the PDL dependent launch at this kernel's start. ``fp8`` (slot
+    attn_wo_a_fp8): :func:`fp8_weight` of ``weight``, which the kernel reads instead.
+    Returns (codes [T, G * 1024] e4m3, scales).
     """
     _check_inputs(x, weight, freqs, positions)
     rows, groups = x.size(0), x.size(1)
@@ -299,7 +368,10 @@ def fused_rope_wo_a(
         early_trigger,
         row_tile_scales,
         groups,
+        fp8 is not None,
     )
+    if fp8 is not None and tuple(fp8.codes.shape) != (groups * RANK, GROUP_K):
+        raise ValueError(f"fp8 wo_a codes {tuple(fp8.codes.shape)} for {groups} groups")
     codes = torch.empty((rows, groups * RANK), dtype=torch.float8_e4m3fn, device=device)
     tile_bytes = scale_bytes(groups)
     nbytes = (rows + 7) // 8 * tile_bytes if row_tile_scales else tile_bytes
@@ -308,7 +380,7 @@ def fused_rope_wo_a(
         kernel,
         (grid(groups), 1, 1),
         [
-            _weight_map(weight),
+            _weight_map(weight) if fp8 is None else _fp8_weight_map(fp8.codes),
             _x_map(x, rows),
             _pointer(freqs),
             _pointer(positions),
@@ -316,6 +388,7 @@ def fused_rope_wo_a(
             _pointer(scales),
             ctypes.c_void_p(0),  # the bf16 output, unused
             ctypes.c_uint32(rows),
+            ctypes.c_void_p(0 if fp8 is None else fp8.scales.data_ptr()),
         ],
         torch.cuda.current_stream(device).cuda_stream,
     )

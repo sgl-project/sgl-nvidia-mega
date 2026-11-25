@@ -832,7 +832,7 @@ def build_resources(
                 projection_weight,
                 {
                     batch: projection_module.projection_tactic(
-                        "kda", batch, device, tp, rows=kda_rows
+                        "kda", batch, device, rows=kda_rows
                     )
                     for batch in batches
                 },

@@ -9,7 +9,6 @@ latent partial, WaveMoeTail.push the shared shard and WaveMoeTail does the rest.
 partial chunk to its column owner, whose WaveMoeTail CTAs sum and multicast it."""
 
 import logging
-import os
 from functools import cache
 
 import cuda.bindings.driver as cuda
@@ -18,8 +17,6 @@ import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_fake_stream
-
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 
 from ..common.host import fake, prepare_shared_carveout, stream, tensor_maps, to_cute
 from ..common.policy import batch_table
@@ -48,22 +45,17 @@ def flat(t):
     return to_cute(t.reshape(-1), 16)
 
 
-TP16_B8_WAVE = "K31MK_TP16_B8_WAVE"
-# F1 (``tail.MoeTail`` fold): TP16 front-mode MoeTail runs the up projection beside the RMS
-# squares exchange and applies inv_rms on the owner's row sums. Not bitwise (the BF16
-# rounding moves from x * inv * gamma to x * gamma and the output); on by default in
-# the GB300 BEST scope, kimi_k31/k3/default_scope.py, 0 = off.
-TAIL_RMS_FOLD = "K31MK_TAIL_RMS_FOLD"
+# F1 (``tail.MoeTail`` fold): front-mode MoeTail runs the up projection beside the RMS squares
+# exchange and applies inv_rms on the owner's row sums. Not bitwise (the BF16 rounding moves from
+# x * inv * gamma to x * gamma and the output); GB300 TP16 c1 GSM-50 50/50, AL -0.43 %, median
+# TPOT -0.37 %. The fold is per row and per cluster, for any TP; WaveMoeTail (published
+# batches) does not fold.
 _TAIL_FOLD_LOGGED = []
-
-
-def tail_fold(tp):
-    return tp == 16 and best_default(TAIL_RMS_FOLD, "1", "0") not in ("", "0")
 
 
 def log_fold(batch):
     """Use-time engagement: called when a front-mode MoeTail batch is built with the fold (a
-    published / WaveMoeTail batch, e.g. under K31MK_TP16_B8_WAVE, never logs)."""
+    published / WaveMoeTail batch never logs)."""
     if batch not in _TAIL_FOLD_LOGGED:  # once per process and batch, not per layer
         _TAIL_FOLD_LOGGED.append(batch)
         logger.info(
@@ -74,10 +66,7 @@ def log_fold(batch):
 
 def published(tp, batch):
     """The experts publish the latent and WaveMoeTail runs the tail (else MoeTail
-    front). ``K31MK_TP16_B8_WAVE`` opts TP16 B8 into the published (one-group reduce)
-    tail."""
-    if tp == 16 and batch == 8 and os.environ.get(TP16_B8_WAVE, "0") not in ("", "0"):
-        return True
+    front)."""
     return batch > (4 if tp == 8 else 8)
 
 
@@ -153,8 +142,8 @@ def compile_tail(
     """front: rows complete at the PDL wait; front_poll: three 0xffff-armed G/W/S parity
     slots polled per row and re-armed after use; publish (``published``): WaveMoeTail
     over the published mailboxes, reading the weight shard directly, not by TMA;
-    twoshot: publish over the two-shot receive slots and gather. ``fold``: F1 (``TAIL_RMS_FOLD``),
-    front-mode MoeTail only."""
+    twoshot: publish over the two-shot receive slots and gather. ``fold``: F1, front-mode
+    MoeTail only."""
     m8, twoshot = mode in ("publish", "twoshot"), mode == "twoshot"
     vec = lambda n, dtype=BFloat16, align=16: fake((n,), None, dtype, align)
     slots = 3 * POLL_CAP if mode == "front_poll" else batch
@@ -208,7 +197,6 @@ class MoeTailWeights:
         deadline_ns=0,
     ):
         self.weight, self.gamma = weight, gamma
-        self.fold = tail_fold(tp)
         # Three parities rotate over the model's MoE layers; each launch re-arms the
         # previous MoE layer's slots of its batch (wrapping across decode steps, where
         # the first layer re-arms the largest batch the last layer may have published).
@@ -250,9 +238,9 @@ class MoeTailWeights:
                 early=b in early,
                 umma=on,
                 deadline_ns=deadline_ns,
-                fold=self.fold and mode == "front",
+                fold=mode == "front",
             )
-            if self.fold and mode == "front":
+            if mode == "front":
                 log_fold(b)
             self.codes[b] = code, views, shares(tp, b, twoshot), twoshot
         shared = any(shares(tp, b, b in twoshots) for b in batches)

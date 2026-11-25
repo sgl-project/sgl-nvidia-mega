@@ -33,7 +33,7 @@ the first rejection n the residual max(p_n - q_n, 0) is sampled by one Gumbel-ma
 {log(p_n(v) - q_n(v)) + G_v : v in S} and the out-of-S group, whose key max_{v not in S}(z_v + G_v) - LSE
 is a Gumbel at the log of that group's mass with its argmax distributed as p_n off S; with every draft
 accepted, the bonus row's Gumbel-max over all v (a sample of p_7). Rank 0's (accept_len, bonus) then
-reaches every rank in one multicast hop (as ``Rank0Broadcast``), so ranks cannot diverge. The round
+reaches every rank in one multicast hop, so ranks cannot diverge. The round
 ctr[0] advances once per call, in SampledDecide after the stats grid has completed; the stats grid copies
 the round it used to ctr[2], which SampledDecide's CTAs read (ctr[0] changes under them)."""
 
@@ -63,7 +63,18 @@ from ..k3.common.primitives import (
     wait_deadline_start,
     warp_sum,
 )
-from .accept import BLOCK, _canon
+
+BLOCK = 8
+
+
+@cute.jit
+def _canon(value):
+    """FP32 bits with -0.0 as +0.0 (the mailbox sentinel is 0x80000000)."""
+    word = Uint32(float_bits(Float32(value)))
+    if word == Uint32(0x80000000):
+        word = Uint32(0)
+    return word
+
 
 GAMMA, TOPK = (
     BLOCK - 1,
@@ -779,9 +790,8 @@ class SampledDecide:
                 accept_len[req] = n
                 bonus[req] = Int64(chosen)
             else:
-                if (
-                    rank == Int32(0)
-                ):  # rank 0's decision on every rank (as Rank0Broadcast): (n, e), (token, e)
+                # rank 0's decision on every rank: (n, e), (token, e)
+                if rank == Int32(0):
                     offset = cute.crd2idx((req, 0), bbox.layout)
                     multicast_element(bmc + Int64(offset) * 8, Uint32(n), round_word)
                     multicast_element(

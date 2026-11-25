@@ -132,8 +132,6 @@ LL_MAX_ROWS = 16
 WIDE_MAX_ROWS = 48
 # Verify rows the family serves (profile ACCEPTED at TP4).
 MAX_ROWS = 48
-# The GB300 the plan was measured on (SM103); other GPUs decline.
-SM = (10, 3)
 # The steps the unit claims (atomically: the deferred kv_a norm passes from prologue
 # to rope_cache).
 STEPS = ("qkv_a", "prologue", "index_k", "rope_cache")
@@ -603,11 +601,15 @@ class AttentionFamily:
             if f.q_b is not None:
                 _fused_a_module(Q_LORA, Q_B_SHAPE[0], pdl, f.q_b[1], False)
         # the indexer key / head-gate projection (index_k) at every width
-        sm = self.profile.sm if self.profile is not None else None
+        target = self.profile.target if self.profile is not None else None
         sms = self.profile.sms if self.profile is not None else None
         kw = {
             ll.build_linear(
-                "wk_weights_proj", a.indexer.wk_weights_proj, widths, sm=sm, sms=sms
+                "wk_weights_proj",
+                a.indexer.wk_weights_proj,
+                widths,
+                target=target,
+                sms=sms,
             )
             for a in self.attns
             if getattr(a, "indexer", None) is not None
@@ -615,6 +617,8 @@ class AttentionFamily:
         self.kw_gemm = "; ".join(sorted(d for d in kw if d))
         self.fold = self._decide_fold(widths)
         _kv_half_module(self.fold.fold, False, pdl, self.trigger_at_entry)
+        if target is not None:
+            target.note("ll.attention")
         self._log(widths)
 
     def _decide_fold(self, widths: Sequence[int]) -> norm_backend.NormFold:
@@ -716,14 +720,16 @@ class AttentionFamily:
 
 
 def _covers(profile, rows: int, mode: str) -> Optional[str]:
-    """TP4 (16 heads per rank) on SM103, 1-48 rows, every step mode (verify, draft
-    extend, and draft decode on the draft group's one-stream bodies)."""
+    """TP4 (16 heads per rank) on a GPU the profile names a target for
+    (``ll.target``), 1-48 rows, every step mode (verify, draft extend, and draft decode
+    on the draft group's one-stream bodies)."""
+    from sgl_nvidia_mega.glm5_3.ll import target
+
     if profile.heads != HEADS:
         return f"needs {HEADS} attention heads per rank (TP4), not {profile.heads}"
-    if tuple(profile.sm) != SM:
-        return (
-            f"measured and served on SM103 only, not SM{profile.sm[0]}{profile.sm[1]}"
-        )
+    why = target.reason(profile)
+    if why is not None:
+        return why
     if not 1 <= rows <= MAX_ROWS:
         return f"serves 1-{MAX_ROWS} rows"
     return None

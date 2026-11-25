@@ -107,8 +107,10 @@ def why_not_quant_fold(mlp: torch.nn.Module) -> str:
 
 
 # FlashInfer releases with the dense GEMM down_proj's cute-dsl MXFP8 linear launches
-# for the folded quant, read for where it waits on its producer grid
-EARLY_RELEASE_FLASHINFER = ("0.7.2", "0.7.3")
+# for the folded quant, read for where it waits on its producer grid (0.7.4: the same
+# kernel sources and cute-dsl runners as 0.7.3; mm_mxfp8 adds only the opt-in
+# batch_invariant branch and a per-stream workspace)
+EARLY_RELEASE_FLASHINFER = ("0.7.2", "0.7.3", "0.7.4")
 
 
 def why_not_early_release(mlp: torch.nn.Module) -> str:

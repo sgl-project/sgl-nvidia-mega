@@ -95,7 +95,9 @@ def verify_logits_processor(model, widths, profile: Profile):
     stock = model.logits_processor
     if gemm is None or not widths or type(stock) is not LogitsProcessor:
         return stock
-    ll.build_linear("lm_head", model.lm_head, widths, sm=profile.sm, sms=profile.sms)
+    ll.build_linear(
+        "lm_head", model.lm_head, widths, target=profile.target, sms=profile.sms
+    )
     if not any(gemm.built("lm_head", model.lm_head, w) for w in widths):
         return stock
 

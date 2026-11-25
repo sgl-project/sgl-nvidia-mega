@@ -7,8 +7,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Uint32
 
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
-
 from .primitives import (
     load_words,
     published,
@@ -24,18 +22,15 @@ SENTINEL = 0x80000000
 # streaming a reader's relaxed re-arm of a slot was overtaken by the next remote publish into that slot, which then
 # read as armed (deadline trap). One fence.acq_rel.gpu per thread after its re-arms, before its later stores,
 # launch_dependents and exit, orders the re-arm first. Not a strict-PTX fix (gpu scope, multicast alias);
-# a mailbox microbenchmark measures a small cost per hop. On in every mode but 0, which removes it (A/B only).
-# K31MK_REARM_FENCE=2 keeps every fence but, where a hop computes between its re-arms and its first
-# remote-visible store, re-arms right after the poll and fences just before that store (the o_proj
-# consumer's norm exchange, AttnRes's exchange): the compute hides the re-arm's latency.
-# K31MK_REARM_FENCE=3 (the default in the GB300 BEST scope, default_scope.py; 1 elsewhere) moves those two hops' fences to the end of
-# their kernels (after every output, before the closing griddepcontrol.wait); modes 2 and 3 also
-# fence RouteSitu's logits re-arm after its top16 instead of before it. The re-arm still lands before
-# the kernel completes, and the slot's next remote write follows that completion through the
-# successors' griddepcontrol.wait chain.
+# a mailbox microbenchmark measures a small cost per hop.
+# Where a hop computes between its re-arms and its first remote-visible store (AttnRes's exchange, RouteSitu's
+# logits after its top16), the fence is at the end of the kernel (``rearm_fence_end``: after every output, before
+# the closing griddepcontrol.wait), so the compute hides the re-arm's latency. The re-arm still lands before the
+# kernel completes, and the slot's next remote write follows that completion through the successors'
+# griddepcontrol.wait chain; this holds for every batch and TP. Measured against the fence right after the
+# re-arms: Rubin TP8 c1 +1.24 %, GB300 TP16 c1 mean TPOT -0.39 %.
 # Slot reuse is not always two layers apart: layers 92 and 0 share o_proj parity 0, and AttnRes's
-# tail_box.out is a single slot (A/B).
-REARM_FENCE = int(best_default("K31MK_REARM_FENCE", "3", "1"))
+# tail_box.out is a single slot.
 
 
 def rearm(pointer):
@@ -44,30 +39,14 @@ def rearm(pointer):
 
 @cute.jit
 def rearm_fence():
-    """``REARM_FENCE``: one gpu-scope acq_rel fence after this thread's re-arms."""
-    if cutlass.const_expr(REARM_FENCE != 0):
-        cute.arch.fence_acq_rel_gpu()
-
-
-@cute.jit
-def rearm_fence_eager():
-    """The fence right after the re-arms (``REARM_FENCE`` 1); mode 2 places it later."""
-    if cutlass.const_expr(REARM_FENCE == 1):
-        cute.arch.fence_acq_rel_gpu()
+    """One gpu-scope acq_rel fence after this thread's re-arms."""
+    cute.arch.fence_acq_rel_gpu()
 
 
 @cute.jit
 def rearm_fence_end():
-    """Mode 3's fence, once per thread at the end of the kernel."""
-    if cutlass.const_expr(REARM_FENCE == 3):
-        cute.arch.fence_acq_rel_gpu()
-
-
-@cute.jit
-def rearm_fence_late():
-    """Mode 2's fence, after the early re-arms and before the first remote-visible store."""
-    if cutlass.const_expr(REARM_FENCE == 2):
-        cute.arch.fence_acq_rel_gpu()
+    """The fence of a hop that re-arms early, once per thread at the end of the kernel."""
+    cute.arch.fence_acq_rel_gpu()
 
 
 @cute.jit

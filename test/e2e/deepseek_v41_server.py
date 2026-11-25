@@ -11,12 +11,9 @@ MODEL = os.environ.get(
 )
 # An already running server, so the same checks can score the switch-off arm
 URL = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_URL")
-# The measured launch's environment: the Engram prefetch needs the per-rank
-# host table (the spec refuses without it); TP sync as measured
+# The measured launch's environment: TP sync as measured
 ENV = {
     "SGLANG_SPEC_TP_SYNC": "rng,-dspark-accept-sample",
-    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
-    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
 }
 COMMON = [
     "--trust-remote-code",
@@ -31,6 +28,9 @@ COMMON = [
     "flashmla",
     "--mem-fraction-static",
     "0.8",
+    # the Engram prefetch needs the per-rank host table (the spec refuses without it)
+    "--engram-config",
+    '{"placement": "cpu"}',
 ] + os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_EXTRA_ARGS", "").split()
 # DSpark: up to 8 requests of 6 rows on the routed pair (48 rows), 9-16 requests on
 # the two-shot hops, so the same requests alternate between the two

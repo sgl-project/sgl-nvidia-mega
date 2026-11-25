@@ -26,7 +26,8 @@ THREADS = 288  # 8 consumer warps and the copy / selection warp
 # Ring stages (16 KB each) of the fused kernel; at least topk, since every routed
 # down slice holds a stage until the end.
 STAGES = 11
-# Copies of every tagged handoff word (kFusedReplicas in src/draft_moe.cu).
+# Copies of every tagged handoff word (kFusedReplicas in src/draft_moe.cu). CTA c polls
+# copy c % REPLICAS and the grid is one CTA per SM, so 152 also serves the 148-SM GB200.
 REPLICAS = 152
 TRACE_SLOTS = 32
 # Routed pairs a CTA keeps in flight (I = 128: 4, -0.35 us per call on GB300).

@@ -16,8 +16,9 @@ measured row in each of three runs):
 - ``tgv``: SGLang's CuTe DSL TGV GEMM (``cutedsl_bf16_gemm``), BF16 output.
 
 Rows a role's ranges leave out keep SGLang's GEMM for that module, bit for bit. The plan
-applies only on the GPU it was measured on (GB300: SM103 with 152 SMs); anywhere else
-every role keeps SGLang's GEMM.
+applies only on the GPU it was measured on (GB300: SM103 with 152 SMs; ``ll.target``);
+anywhere else every role keeps SGLang's GEMM. Another GPU's target may carry a plan of
+its own (``ll.target.Target.gemm_plan``) built from these entries.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ MAX_M = 96
 # idle: a split-K grid fits one wave with at most SMs - (split_k - 1) * GPCS CTAs. Every
 # split-K CTA reserves the full shared memory (one CTA per SM), so a second wave would
 # serialize a nearly empty tail and miss the window in which CTAs load weights before
-# their wait. 8 GPCs is the B200 / B300 layout (assumed, not queried).
+# their wait. 8 GPCs is the B200 / B300 layout (assumed, not queried); another GPU's
+# target states its own (``ll.target.Target.gpcs``).
 GPCS = 8
 # K extent of one split-K tile.
 SPLITK_CTA_K = 128
@@ -148,9 +150,12 @@ TOLERANCES: Dict[str, float] = {
 }
 
 
-def entry(role: str, shape: Tuple[int, int]) -> Optional[Entry]:
-    """The plan entry of ``role`` at per-rank weight ``shape``, or None."""
-    for e in PLAN:
+def entry(
+    role: str, shape: Tuple[int, int], plan: Tuple[Entry, ...] = PLAN
+) -> Optional[Entry]:
+    """The entry of ``plan`` (default GB300's) for ``role`` at per-rank weight
+    ``shape``, or None."""
+    for e in plan:
         if e.role == role and e.shape == tuple(shape):
             return e
     return None
@@ -169,8 +174,10 @@ def splitk_ctas(tactic: Tuple[int, ...], m: int, n: int) -> int:
     return -(-n // mma_m) * -(-m // mma_n) * split_k
 
 
-def splitk_fits_one_wave(tactic: Tuple[int, ...], m: int, n: int, sms: int) -> bool:
-    return splitk_ctas(tactic, m, n) <= sms - (tactic[2] - 1) * GPCS
+def splitk_fits_one_wave(
+    tactic: Tuple[int, ...], m: int, n: int, sms: int, gpcs: int = GPCS
+) -> bool:
+    return splitk_ctas(tactic, m, n) <= sms - (tactic[2] - 1) * gpcs
 
 
 def kernel_name(r: Range) -> str:

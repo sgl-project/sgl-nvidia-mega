@@ -16,7 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, List, Optional, Tuple
 
-from sgl_nvidia_mega.glm5_3 import TP_SIZE
+from sgl_nvidia_mega.glm5_3 import TP_SIZE, targets
+from sgl_nvidia_mega.glm5_3.ll.target import Target
 from sgl_nvidia_mega.glm5_3.plan import MAX_ROWS as PLAN_MAX_ROWS
 from sgl_nvidia_mega.glm5_3.plan import SERVED_TOKENS_PER_REQUEST
 
@@ -77,6 +78,9 @@ class Profile:
     multi_node: bool = False  # TP over more than one node (NVL72 trays)
     # every cross-GPU wait's deadline (BuildContext.deadline_s, below the watchdog)
     deadline_s: float = DEFAULT_DEADLINE_S
+    # the TP4 kernel units' plans on this GPU (targets.select on ``sm``, once per
+    # profile); None: every ll.* unit declines
+    target: Optional[Target] = None
 
     @property
     def units(self) -> bool:
@@ -105,6 +109,7 @@ class Profile:
             widths=clip_widths(tuple(range(tokens, MAX_ROWS + 1, tokens)), tp, tokens),
             sm=sm,
             sms=sms,
+            target=targets.select(sm),
             kv_offload=kv_offload(server_args),
             pd_decode=getattr(server_args, "disaggregation_mode", None) == "decode",
             multi_node=int(getattr(server_args, "nnodes", None) or 1) > 1,

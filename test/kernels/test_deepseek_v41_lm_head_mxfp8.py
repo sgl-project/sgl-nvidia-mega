@@ -12,6 +12,8 @@
 - The quantizer on the GPU equals the CPU one bit for bit, and its swizzle equals
   FlashInfer's ``mxfp8_quantize`` 128x4 layout (scale positions).
 - PDL launch inside a CUDA graph, a strided input and a caller's output buffer.
+- The xload build (slot target_lm_head_xload) equals the default build bit for bit, on
+  aligned rows and on rows it must take through the 8-byte loop.
 
 Run with ``python -m pytest test/kernels/test_deepseek_v41_lm_head_mxfp8.py -s``.
 """
@@ -139,3 +141,22 @@ def test_pdl_graph_replay_strided_rows_and_out_buffer():
     out.zero_()
     graph.replay()
     torch.testing.assert_close(out, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", range(1, lh.MAX_ROWS + 1))
+def test_the_xload_build_equals_the_default_build(shard, rows):
+    _, q, _ = shard
+    n = q.shape[0]
+    x = _rows(rows)
+    want = lh.matmul(x, q)
+    torch.testing.assert_close(lh.matmul(x, q, xload=True), want, rtol=0, atol=0)
+    # 8-byte aligned rows (offset 4 columns): the 8-byte loop, in a CUDA graph
+    lh.precompile(n, K, x.device, xload=True)
+    base = _rows(rows, k=K + 4)
+    xs = base[:, 4:]
+    out = torch.empty(rows, n, dtype=torch.bfloat16, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        lh.matmul(xs, q, out=out, xload=True)
+    graph.replay()
+    torch.testing.assert_close(out, lh.matmul(xs.contiguous(), q), rtol=0, atol=0)

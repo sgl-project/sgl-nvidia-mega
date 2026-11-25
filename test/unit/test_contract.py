@@ -8,19 +8,24 @@ The megakernel lives outside SGLang, so it reads SGLang by name (its specs plug 
 ``sglang`` lists what it reads in ``SGLANG_READS``. A refactor that renames one
 fails here, naming the file to repair, instead of failing at a GPU server's startup.
 A module whose stock step mirrors an SGLang function lists it in ``SGLANG_MIRRORS``
-with the digest of its code, so a changed branch fails here too. A file that moved
-between SGLang versions is named newest first, ``"new.py|old.py"``; the first one
-present is checked. A read name such as "replication|layout" accepts either field.
+with the digest of its code, so a changed branch fails here too. Code moved out of
+SGLang into the package is listed in ``SGLANG_MOVED`` the same way: while SGLang still
+defines it, both copies must be the same code; once SGLang drops it, the pin retires.
+A DFlash runtime declares the worker names it binds (``DFLASH_BINDINGS``) and the
+guard values it serves (``DFLASH_GUARDS``); SGLang's DFlash binding must bind and
+guard each by name. A file that moved between SGLang versions is named newest first,
+``"new.py|old.py"``; the first one present is checked. A read name such as
+"replication|layout" accepts either field.
 An explicitly guarded opt-in extension uses ``SGLANG_OPTIONAL_READS``: its
 file may be absent, but all declared names must match when it is installed.
 The feature's tests must cover rejection when its extension is unavailable.
 The checks are static (AST and tokens): no package module is
 imported. Run them against every supported SGLang and nightly against main. The
 GLM-5.3 package reads SGLang's megakernel DSA binding view, and its draft spec
-SGLang's draft capture check marker; against an SGLang without them, those reads and
-pins are skipped, naming each. The Kimi K3.1 and MiniMax-M3.1 packages need SGLang
-support newer than the oldest supported SGLang; against an SGLang without it their
-reads and pins are skipped, naming each file.
+SGLang's draft capture check marker, and the Kimi K3.1 DFlash runtime SGLang's DFlash
+binding; against an SGLang without them, those reads and pins are skipped, naming each.
+The MiniMax-M3.1 package needs SGLang support newer than the oldest supported SGLang;
+against an SGLang without it its reads and pins are skipped, naming each file.
 """
 
 import ast
@@ -40,18 +45,20 @@ ROOT = Path(sglang.__file__).resolve().parent  # the installed sglang package
 PACKAGE = Path(sgl_nvidia_mega.__file__).resolve().parent
 
 
-@lru_cache(maxsize=None)
-def _tree(path: Path) -> ast.Module:
-    return ast.parse(path.read_text())
-
-
 def _files(pattern: str) -> list:
-    """The files a ``SGLANG_READS`` key names: its first alternative that exists."""
+    """The files a ``SGLANG_READS`` key names: its first alternative that exists.
+    A key like ``"new.py|old.py"`` tries the first path; if no file matches, tries
+    the next, so files that moved between SGLang versions are named newest first."""
     for alternative in pattern.split("|"):
         files = sorted(ROOT.glob(alternative))
         if files:
             return files
     return []
+
+
+@lru_cache(maxsize=None)
+def _tree(path: Path) -> ast.Module:
+    return ast.parse(path.read_text())
 
 
 @lru_cache(maxsize=None)
@@ -135,7 +142,7 @@ def test_sglang_provides_what_the_plugin_reads(path):
         files = _files(pattern)
         if not files and pattern in optional:
             continue
-        assert files, f"{_id(path)}: no file matches {pattern}"
+        assert files, f"{_id(path)}: no file matches any alternative in {pattern!r}"
         provided = frozenset().union(*map(_provided, files))
         skipped = []
         if files == _files(BINDING) and not _has_dsa_view():
@@ -469,7 +476,7 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
     if _id(path).startswith(M31_PACKAGE) and not _has_m31_host():
         pytest.skip(f"{NO_M31_HOST}: {_id(path)}")
     pattern, qualname = key.split(":")
-    files = sorted(ROOT.glob(pattern))
+    files = _files(pattern)  # "new.py|old.py": the first one present
     assert len(files) == 1, f"{_id(path)}: {pattern} matches {len(files)} files"
     got = mirror_digest(files[0], qualname)
     assert got is not None, f"{_id(path)}: SGLang no longer defines {key}"
@@ -478,6 +485,78 @@ def test_the_mirrored_sglang_code_is_unchanged(path, key, digest):
         f"the mirror, then pin {got!r} in its SGLANG_MIRRORS (a tuple where the "
         "supported SGLangs differ)"
     )
+
+
+MOVED = [
+    (path, key, digest)
+    for path in sorted(PACKAGE.rglob("*.py"))
+    for key, digest in _declared(path, "SGLANG_MOVED").items()
+]
+
+
+@pytest.mark.parametrize(
+    "path, key, digest", MOVED, ids=[f"{_id(p)}::{k}" for p, k, _ in MOVED]
+)
+def test_code_moved_from_sglang_matches_while_sglang_keeps_it(path, key, digest):
+    if _id(path).startswith(K31_PACKAGE) and not _has_k31_host():
+        pytest.skip(f"{NO_K31_HOST}: {_id(path)}")
+    pattern, qualname = key.split(":")
+    files = sorted(ROOT.glob(pattern))
+    got = mirror_digest(files[0], qualname) if len(files) == 1 else None
+    if got is None:
+        pytest.skip(f"SGLang no longer defines {key}; {_id(path)} owns it")
+    assert got == digest, (
+        f"SGLang changed {key}, which {_id(path)} moved here: port the change to "
+        f"the package's copy, then pin {got!r} in its SGLANG_MOVED"
+    )
+
+
+# SGLang's DFlash binding (sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding): an SGLang without it
+# never builds BuiltK31Verify.dflash_runtime, so the runtime's pins are skipped there.
+DFLASH_BINDING = "srt/kernel_plugins/nvidia/kimi_k31_dflash_binding.py"
+NO_DFLASH_BINDING = f"this SGLang has no DFlash runtime binding ({DFLASH_BINDING})"
+
+
+def _assigned(tree: ast.Module, name: str) -> Optional[ast.expr]:
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else []
+        if isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return node.value
+    return None
+
+
+def _strings(node: Optional[ast.expr]) -> frozenset:
+    """The string keys of a dict literal, or the strings of a frozenset({...}) call."""
+    if isinstance(node, ast.Dict):
+        return frozenset(ast.literal_eval(k) for k in node.keys)
+    if isinstance(node, ast.Call) and node.args:
+        return frozenset(ast.literal_eval(node.args[0]))
+    return frozenset()
+
+
+DFLASH_RUNTIMES = [
+    path
+    for path in sorted(PACKAGE.rglob("*.py"))
+    if _assigned(_tree(path), "DFLASH_BINDINGS") is not None
+]
+
+
+@pytest.mark.parametrize("path", DFLASH_RUNTIMES, ids=_id)
+def test_the_dflash_binding_binds_and_guards_what_the_runtime_declares(path):
+    files = _files(DFLASH_BINDING)
+    if not files:
+        pytest.skip(f"{NO_DFLASH_BINDING}: {_id(path)}")
+    binding, runtime = _tree(files[0]), _tree(path)
+    missing = _strings(_assigned(runtime, "DFLASH_BINDINGS")) - _strings(
+        _assigned(binding, "BINDINGS")
+    )
+    assert not missing, f"{_id(path)}: SGLang does not bind {sorted(missing)}"
+    unguarded = _strings(_assigned(runtime, "DFLASH_GUARDS")) - _strings(
+        _assigned(binding, "GUARDS")
+    )
+    assert not unguarded, f"{_id(path)}: SGLang has no guard key {sorted(unguarded)}"
 
 
 def _built_classes() -> dict:

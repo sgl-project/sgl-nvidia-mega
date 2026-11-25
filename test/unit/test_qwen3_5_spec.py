@@ -83,6 +83,11 @@ def test_the_documented_setup_is_accepted():
     assert _refusal() == ""
 
 
+@pytest.mark.parametrize("tp_size,nnodes", [(4, 1), (8, 2)])
+def test_sm100_is_accepted(tp_size, nnodes):
+    assert _refusal(isa="sm_100", tp_size=tp_size, nnodes=nnodes) == ""
+
+
 def test_tp4_on_one_tray_is_accepted():
     assert _refusal(tp_size=4, nnodes=1) == ""
 
@@ -142,7 +147,7 @@ BREAKABLE = with_phase(
         (dict(text=dict(num_experts=256)), "config.text_config.num_experts 256"),
         (dict(text=dict(hidden_size=5120)), "config.text_config.hidden_size 5120"),
         (dict(dtype="float16"), "dtype 'float16'"),
-        (dict(isa="sm_100"), "not sm_100"),
+        (dict(isa="sm_90"), "not sm_90"),
     ],
 )
 def test_each_refusal_names_its_reason(kw, want):

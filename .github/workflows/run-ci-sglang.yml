@@ -1,11 +1,13 @@
 name: Run CI on SGLang
 
-# A maintainer adds the run-ci-sglang label to a PR here; this workflow then
-# dispatches SGLang's pr-test-megakernel.yml, which runs this PR's tests on
-# SGLang's GPU runners, waits for that run and reports its outcome as the
-# "sglang-ci/megakernel" status on the PR's head commit. For a branch in this
-# repo, pushes and reopens while the label is on dispatch again; a fork's new
-# commits run only when a maintainer applies the label again.
+# A maintainer adds the run-ci-sglang label to a PR here to run every model, or
+# run-ci-sglang:<model> labels (one per model in test/e2e/ci_models.yaml) to run
+# only those. This workflow then dispatches SGLang's pr-test-megakernel.yml,
+# which runs this PR's tests on SGLang's GPU runners, waits for that run and
+# reports its outcome as the "sglang-ci/megakernel" status on the PR's head
+# commit. For a branch in this repo, pushes and reopens while a label is on
+# dispatch again; a fork's new commits run only when a maintainer applies a
+# label again.
 
 on:
   # pull_request_target so a fork PR can read the dispatch token. This workflow
@@ -26,8 +28,8 @@ jobs:
     # A fork's author can push or reopen without review, so for a fork only a
     # maintainer applying the label dispatches.
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'run-ci-sglang') &&
-      (github.event.label.name == 'run-ci-sglang' ||
+      contains(join(github.event.pull_request.labels.*.name, ' '), 'run-ci-sglang') &&
+      (startsWith(github.event.label.name, 'run-ci-sglang') ||
        (github.event.action != 'labeled' &&
         github.event.pull_request.head.repo.full_name == github.repository))
     # On the job, not the workflow, so an event that skips the job does not
@@ -50,6 +52,19 @@ jobs:
             -f description="Queued on SGLang CI" \
             -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
+      # run-ci-sglang runs every model; otherwise each run-ci-sglang:<model>
+      # label adds its model. SGLang checks the names against ci_models.yaml.
+      - name: Pick the models
+        id: models
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          models=$(jq -r 'if index("run-ci-sglang") then empty
+            else .[] | select(startswith("run-ci-sglang:")) | ltrimstr("run-ci-sglang:") end' <<< "$LABELS" | xargs)
+          [[ "$models" =~ ^[a-z0-9_\ ]*$ ]] || { echo "Bad model label: $models"; exit 1; }
+          echo "Models: ${models:-all}"
+          echo "models=$models" >> "$GITHUB_OUTPUT"
+
       # The token only needs Actions write on SGLang; nothing else uses it.
       - name: Dispatch the megakernel tests on SGLang
         env:
@@ -57,10 +72,14 @@ jobs:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          MODELS: ${{ steps.models.outputs.models }}
         run: |
+          # Only pass models when narrowed, so "every model" needs no models input
+          extra=()
+          [ -n "$MODELS" ] && extra=(-f "models=$MODELS")
           gh workflow run "$SGLANG_WORKFLOW" -R "$SGLANG_REPO" --ref main \
             -f mega_repo="$HEAD_REPO" -f mega_sha="$HEAD_SHA" -f mega_pr="$PR_NUMBER" \
-            -f dispatch_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            -f dispatch_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "${extra[@]}"
 
       # SGLang's runs are public, so finding and watching one needs no token
       # beyond this repo's own.
@@ -88,10 +107,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ steps.find.outputs.id }}
+          MODELS: ${{ steps.models.outputs.models }}
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=pending -f context="$STATUS_CONTEXT" \
-            -f description="Running on SGLang CI" \
+            -f description="Running on SGLang CI: ${MODELS:-all models}" \
             -f target_url="${GITHUB_SERVER_URL}/${SGLANG_REPO}/actions/runs/${RUN_ID}"
 
       - name: Wait for the SGLang run

@@ -4,10 +4,8 @@
 Decode graphs of 1-8 rows run the stock index chain's method as one PDL kernel (index_q.FusedIndexQuery: rmsnorm,
 wq_b, act_quant, head gate and the weights_proj gate in one launch, which also writes the sparse core's 16-head padded
 query) and read the sparse core's 16-head output directly in MlaValue (no latent copy). Selection stays stock
-(DeepGEMM logits + topk_transform_paged_v2). ``K31MK_FUSED_INDEX_Q=0`` restores the stock chain at every width.
+(DeepGEMM logits + topk_transform_paged_v2).
 """
-
-import os
 
 import torch
 
@@ -17,7 +15,7 @@ from sgl_nvidia_mega.kimi_k31.sm103.k3.common.host import stream, to_cute
 from .indexer import IndexProjection, IndexWeights, PagedSelection
 from .mla import SparseMla
 
-FUSED_INDEX_Q = os.environ.get("K31MK_FUSED_INDEX_Q", "1") != "0"
+# FusedIndexQuery is built for 1-8 rows (sm103/dsa/index_q.py).
 FUSED_INDEX_Q_MAX_ROWS = 8
 
 
@@ -37,9 +35,7 @@ class PreparedSparseIndexMla(PreparedIndexMla):
             attention.q_a_layernorm.weight,
             float(attention.rms_norm_eps),
         )
-        self.fused_rows = {
-            r for r in self.pitches if FUSED_INDEX_Q and r <= FUSED_INDEX_Q_MAX_ROWS
-        }
+        self.fused_rows = {r for r in self.pitches if r <= FUSED_INDEX_Q_MAX_ROWS}
         if self.fused_rows:
             from ..sm103.dsa.index_q import FusedIndexQuery
         self.sparse_rows = {

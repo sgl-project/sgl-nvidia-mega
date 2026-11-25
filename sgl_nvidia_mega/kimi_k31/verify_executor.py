@@ -3,24 +3,15 @@
 
 from __future__ import annotations
 
-import logging
 from functools import partial
 
 import torch
-
-from sgl_nvidia_mega.kimi_k31.k3.default_scope import best_default
 
 from .sm103.k3.attn_res.prepared import join_aux
 from .sm103.k3.mla.verify_overlap import VerifyMlaIndexOverlap
 from .verify_binding import VerifyStepView
 from .verify_contract import verify_keys
 
-logger = logging.getLogger(__name__)
-# ``K31MK_AUX_SIDE_STREAM`` (on by default in the GB300 BEST scope, kimi_k31/k3/default_scope.py; 0 = off): at the DFlash capture layers the stock FP32 aux mixture (AuxMixture)
-# runs on a side stream instead of between the AttnRes and the next in-projection, which
-# does not read it; joined before the layer's o-proj (its fused AttnRes rewrites the prefix row the
-# mixture reads), the next AttnRes, and the end of the step. Same kernels and inputs: bitwise.
-AUX_SIDE_STREAM = best_default("K31MK_AUX_SIDE_STREAM", "1", "0") != "0"
 # The process's live executors: the buffer owners the draft chain's build checks its mailboxes against
 # (draft/serving.py, chain.DraftComm.assert_disjoint).
 INSTANCES: list = []
@@ -55,14 +46,8 @@ class K31VerifyExecutor:
             consumer = (
                 resources.final if layer_id == 92 else resources.before[layer_id + 1]
             )
-            consumer.bind_aux(
-                mixture=True, **({"side": True} if AUX_SIDE_STREAM else {})
-            )
+            consumer.bind_aux()
             self.capture_consumers[layer_id] = consumer
-        if AUX_SIDE_STREAM and self.capture_layers:
-            logger.info(
-                "NVIDIA megakernel: verify aux mixture on a side stream (K31MK_AUX_SIDE_STREAM)"
-            )
         # Q rows use generic routing/dispatch even at c1. SmallBatchChain consumes
         # a B1-specific producer mailbox and cannot represent one Q-token request.
         for _, feed in resources.feed_forward.items():
@@ -126,10 +111,7 @@ class K31VerifyExecutor:
                 core.run(
                     projected, local, pools=self.kda_pools[layer_id], step=view.kda
                 )
-            if AUX_SIDE_STREAM:
-                join_aux(
-                    torch.cuda.current_stream()
-                )  # the o-proj rewrites the prefix row
+            join_aux(torch.cuda.current_stream())  # the o-proj rewrites the prefix row
             attn.output.run(local, prefix, blocks, second)
             if attn.kind == "mla" and overlap is not None:
                 # feed.run may overwrite first, including through fused consumers.
@@ -148,8 +130,6 @@ class K31VerifyExecutor:
                 first, second = second, first
         if not ready:
             res.final.run(hidden, prefix, blocks, output, aux=self._aux(view, 92))
-        if AUX_SIDE_STREAM:
-            join_aux(
-                torch.cuda.current_stream()
-            )  # the draft reads aux_hidden after the step
+        # The draft reads aux_hidden after the step.
+        join_aux(torch.cuda.current_stream())
         return output, view.aux_hidden

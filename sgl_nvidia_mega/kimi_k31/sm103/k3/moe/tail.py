@@ -110,7 +110,7 @@ class MoeTail:
     ):
         self.tp, self.batch, self.mode, self.trigger = tp, batch, mode, trigger
         self.deadline_ns = deadline_ns
-        # F1 (``K31MK_TAIL_RMS_FOLD``, not bitwise): the up projection runs on bf16(x * gamma) as
+        # F1 (``fold``, not bitwise): the up projection runs on bf16(x * gamma) as
         # soon as the latent settles, beside the cluster squares exchange, which now goes to the
         # owner (q == 0) only; the owner scales its row sums by inv_rms before the BF16 rounding.
         # Today x is normalized, gamma-scaled and rounded before the gemv.

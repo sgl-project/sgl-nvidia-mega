@@ -187,7 +187,7 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _BuiltK31:
         from .verify_contract import supported_query_width
 
         if not supported_query_width(context.tokens_per_request):
-            raise ValueError("Kimi K3.1 verify serves Q8/Q16 or opt-in Q5")
+            raise ValueError("Kimi K3.1 verify serves Q5, Q8 or Q16")
         raise RuntimeError("K31 verify requires the SGLang tensor-weight build patch")
     widths = tuple(width for width in context.widths if width in WIDTHS)
     if not widths or context.binding is None:
@@ -224,7 +224,7 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _BuiltK31:
 
 SPEC: MegakernelSpec = msgspec.structs.replace(
     K3_SPEC,
-    name="Kimi K3.1 packed-MXFP4 decode / TARGET_VERIFY Q8/Q16 (opt-in Q5)",
+    name="Kimi K3.1 packed-MXFP4 decode / TARGET_VERIFY Q5/Q8/Q16",
     # Decode context parallel only for TARGET_VERIFY (DCP8 at TP8, DCP16 at TP16) and PD only
     # in the decode role; verify_spec refuses the rest.
     features=K3_SPEC.features

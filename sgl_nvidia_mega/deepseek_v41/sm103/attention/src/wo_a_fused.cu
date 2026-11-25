@@ -27,6 +27,19 @@
 // One variant per compile, chosen by -D: WO_A_MAX_TOKENS (16/32/48), WO_A_GROUPS (1/2), WO_A_POS_INT64,
 // WO_A_EARLY_TRIGGER, WO_A_ROW_TILE_SCALES, and WO_A_SMEM_BYTES (the launcher's
 // dynamic shared memory, checked against sizeof(Smem)). Entry: dsv41_wo_a_fused.
+//
+// WO_A_FP8 (slot attn_wo_a_fp8; default 0): the weight streams as the checkpoint's FP8
+// E4M3 with its 32x32 UE8M0 block scales (half the bytes) and the weight-loader warp
+// widens each 64x64 tile in shared memory to the BF16 tile the MMA reads: e4m3 -> f16 ->
+// f32 (exact), times the block's power of two (exact), the f32 bits' upper half (exact for
+// a value of at most four significant bits). Where SGLang's BF16 wo_a is the exact dequant
+// of that checkpoint (DeepSeek-V4.1: every element), the MMA reads the same bits and the
+// outputs are bit for bit the BF16 build's. The widening is derived from the wo_a
+// weight conversion of muLLM v0.4.1 (NVIDIA Corporation, Apache-2.0; its BF16 wo_a
+// weight path).
+#ifndef WO_A_FP8
+#define WO_A_FP8 0
+#endif
 
 #if !defined(WO_A_MAX_TOKENS) || !defined(WO_A_POS_INT64) || !defined(WO_A_EARLY_TRIGGER) || \
     !defined(WO_A_ROW_TILE_SCALES) || !defined(WO_A_SMEM_BYTES) || !defined(WO_A_GROUPS)
@@ -476,6 +489,9 @@ struct WoATrait {
     uint64_t w_ready[kStages];
     uint64_t x_ready[kStages];
     uint64_t x_landed[kHeadsPerCta];
+#if WO_A_FP8
+    uint64_t w_raw[kStages];  // the FP8 tile landed (its widening arrives on w_ready)
+#endif
     uint64_t mma_done;
     uint64_t reduce_done;
     uint64_t tmem_ld_done;
@@ -491,6 +507,9 @@ struct WoATrait {
     uint64_t w_ready[kStages];
     uint64_t x_ready[kStages];
     uint64_t x_landed[kHeadsPerCta];
+#if WO_A_FP8
+    uint64_t w_raw[kStages];  // the FP8 tile landed (its widening arrives on w_ready)
+#endif
     uint64_t mma_done;
     uint64_t reduce_done;
     uint64_t tmem_ld_done;
@@ -537,6 +556,48 @@ SGL_DEVICE void ue8m0_scale(float amax, uint32_t& sf, float& inv) {
   inv = bits == 0u ? 0.0f : __uint_as_float((254u - sf) << 23);
 }
 
+#if WO_A_FP8
+// Two E4M3 bytes (the lower byte first) as a BF16 pair times a power of two, exactly:
+// e4m3x2 -> f16x2 -> f32 is exact for every E4M3 value (muLLM's
+// BF16 wo_a weight path; the one-instruction bf16x2 cvt needs a newer ptxas than this
+// image's), a product with 2^e stays exact, and so does its BF16 rounding (<= 4 bits).
+SGL_DEVICE uint32_t e4m3x2_to_bf16x2_scaled(uint32_t two, float scale) {
+  float lo, hi;
+  asm("{\n\t.reg .b16 a, l, h;\n\t.reg .b32 p;\n\tcvt.u16.u32 a, %2;\n\t"
+      "cvt.rn.f16x2.e4m3x2 p, a;\n\tmov.b32 {l, h}, p;\n\t"
+      "cvt.f32.f16 %0, l;\n\tcvt.f32.f16 %1, h;\n\t}"
+      : "=f"(lo), "=f"(hi)
+      : "r"(two));
+  uint32_t out;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(out) : "f"(hi * scale), "f"(lo * scale));
+  return out;
+}
+
+// Widen stage tile `tile` in place: its FP8 [64 rows][64] bytes sit in the upper half
+// (TMA, row-major), the BF16 K-major 128B-swizzled [64][64] tile fills the whole buffer.
+// Thread t of the 128 widening threads takes half t % 2 (one k-block) of row t / 2; all
+// read before any writes (the named barrier). `scale_byte`: the half's UE8M0 byte.
+SGL_DEVICE void widen_fp8_tile(uint8_t* tile, uint32_t t, uint32_t scale_byte, uint32_t barrier) {
+  constexpr uint32_t kRaw = 64 * 64 * 2 / 2;
+  const uint32_t r = t / 2, half = t % 2;
+  const uint4 lo = *reinterpret_cast<const uint4*>(tile + kRaw + r * 64 + half * 32);
+  const uint4 hi = *reinterpret_cast<const uint4*>(tile + kRaw + r * 64 + half * 32 + 16);
+  asm volatile("bar.sync %0, %1;" ::"r"(barrier), "r"(128) : "memory");
+  // 2^(byte - 127) (byte 0, an all-zero block, gives 0)
+  const float scale2 = __uint_as_float((scale_byte & 0xFFu) << 23);
+  const uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    uint4 out;
+    out.x = e4m3x2_to_bf16x2_scaled(words[2 * q] & 0xFFFFu, scale2);
+    out.y = e4m3x2_to_bf16x2_scaled(words[2 * q] >> 16, scale2);
+    out.z = e4m3x2_to_bf16x2_scaled(words[2 * q + 1] & 0xFFFFu, scale2);
+    out.w = e4m3x2_to_bf16x2_scaled(words[2 * q + 1] >> 16, scale2);
+    *reinterpret_cast<uint4*>(tile + kmajor_off(r, 32 * half + 8 * q)) = out;
+  }
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Kernel
 // ---------------------------------------------------------------------------
@@ -555,7 +616,8 @@ SGL_DEVICE void wo_a_fused_kernel(
     fp8_e4m3_t* __restrict__ q,          // [T, kNOut], may be null
     uint8_t* __restrict__ scales_out,    // [kNOut * 4], may be null when q is
     bf16_t* __restrict__ y,              // [T, kNOut], may be null
-    uint32_t m) {
+    uint32_t m,
+    const uint8_t* __restrict__ w_scales) {  // WO_A_FP8: [kGroups * 32, 128] UE8M0
   using namespace device;
   // The trait's shape, unqualified, so the body below reads as plain constants.
   constexpr int kMMax = Trait::kMMax;
@@ -622,7 +684,10 @@ SGL_DEVICE void wo_a_fused_kernel(
       ptx::prefetch_tensormap(&x_map);
     } else if (warp_id == TMA_ROPE) {
       if (lane_id < kStages) {
-        ptx::mbar_init(&smem.w_ready[lane_id], 1);
+        ptx::mbar_init(&smem.w_ready[lane_id], WO_A_FP8 ? kRopeThreads : 1);
+#if WO_A_FP8
+        ptx::mbar_init(&smem.w_raw[lane_id], 1);
+#endif
         ptx::mbar_init(&smem.x_ready[lane_id], lane_id == kStages - 1 ? kRopeThreads : 1);
       }
       if (lane_id < kHeadsPerCta) ptx::mbar_init(&smem.x_landed[lane_id], 1);
@@ -644,6 +709,17 @@ SGL_DEVICE void wo_a_fused_kernel(
   if (warp_id == TMA_W) {
     // The weights are not the producer kernel's output, so this warp never waits
     // on PDL and the whole 16 MiB stream overlaps the attention tail.
+#if WO_A_FP8
+    // FP8 tiles into each stage's upper half; the rope warps widen them (w_ready)
+    if (warp::elect_one_lane()) {
+#pragma unroll
+      for (int s = 0; s < kStages; ++s) {
+        ptx::cp_async_bulk_tensor_2d(
+            ptx::to_shared(smem.w[s] + kWTile / 2), &w_map, k0 + s * kBlockK, group * 1024 + n0, &smem.w_raw[s]);
+        ptx::mbar_arrive_expect_tx(&smem.w_raw[s], kWTile / 2);
+      }
+    }
+#else
     if (warp::elect_one_lane()) {
 #pragma unroll
       for (int s = 0; s < kStages; ++s) {
@@ -652,6 +728,7 @@ SGL_DEVICE void wo_a_fused_kernel(
         ptx::mbar_arrive_expect_tx(&smem.w_ready[s], kWTile);
       }
     }
+#endif
   } else if (warp_id == TMA_X) {
     // Activation loader, plain tiles only; the rope group owns the rest. Rows
     // >= m are out of bounds in the tensor map and TMA zero-fills them, so
@@ -720,6 +797,26 @@ SGL_DEVICE void wo_a_fused_kernel(
       const uint32_t t = phase + i * kRopeWarps;
       if (t < m) rot[i] = reinterpret_cast<const float2*>(freqs + static_cast<size_t>(positions[t]) * kRopeDim)[pair];
     }
+#if WO_A_FP8
+    // Slot attn_wo_a_fp8: widen every stage's FP8 weight tile before the attention's
+    // output lands (these warps wait for it next). Row block (n0 + rope_tx / 2) / 32,
+    // k-block 2s + rope_tx % 2 of the slab.
+    {
+      const uint8_t* row_scales =
+          w_scales + (group * 32 + (n0 + rope_tx / 2) / 32) * (kGroupK / 32) + k0 / 32 + rope_tx % 2;
+      uint32_t stage_scales[kStages];
+#pragma unroll
+      for (int s = 0; s < kStages; ++s) stage_scales[s] = row_scales[2 * s];
+#pragma unroll
+      for (int s = 0; s < kStages; ++s) {
+        ptx::mbar_wait_parity(&smem.w_raw[s], 0);
+        widen_fp8_tile(smem.w[s], rope_tx, stage_scales[s], 5);
+        // The MMA reads smem through the async proxy; the widening wrote it generically.
+        ptx::fence_proxy_async_shared();
+        ptx::mbar_arrive(&smem.w_ready[s]);
+      }
+    }
+#endif
 #pragma unroll
     for (int h = 0; h < kHeadsPerCta; ++h) {
       const int s = (h + 1) * kHeadStages - 1;
@@ -882,7 +979,8 @@ extern "C" __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bound
         sglang::fp8_e4m3_t* __restrict__ q,
         uint8_t* __restrict__ scales_out,
         sglang::bf16_t* __restrict__ y,
-        uint32_t m) {
+        uint32_t m,
+        const uint8_t* __restrict__ w_scales) {
   sglang::wo_a_fused::wo_a_fused_kernel<Trait, PosT, WO_A_EARLY_TRIGGER != 0, WO_A_ROW_TILE_SCALES != 0>(
-      w_map, x_map, freqs, positions, q, scales_out, y, m);
+      w_map, x_map, freqs, positions, q, scales_out, y, m, w_scales);
 }

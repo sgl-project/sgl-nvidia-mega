@@ -91,13 +91,14 @@ def linear(role: str, module, x: torch.Tensor, *, out_dtype=None) -> torch.Tenso
     return out
 
 
-def build_linear(role: str, module, rows, *, sm=None, sms=None) -> str:
+def build_linear(role: str, module, rows, *, target=None, sms=None) -> str:
     """At family build (outside capture): prepare ``role`` on ``module`` for every row
-    count in ``rows`` it will run at. Returns a description for the build log ("" when
-    the role stays on the module's own GEMM)."""
+    count in ``rows`` it will run at, on ``target``'s plan (``Profile.target``).
+    Returns a description for the build log ("" when the role stays on the module's
+    own GEMM)."""
     gemm = _gemm()
     if gemm is not None:
-        return gemm.build(role, module, rows, sm=sm, sms=sms)
+        return gemm.build(role, module, rows, target=target, sms=sms)
     return ""
 
 

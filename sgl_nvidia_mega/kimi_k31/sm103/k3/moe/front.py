@@ -17,9 +17,7 @@ from ..common.mailbox import (
     poll,
     rearm,
     rearm_fence,
-    rearm_fence_eager,
     rearm_fence_end,
-    rearm_fence_late,
 )
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -343,8 +341,7 @@ class RouteSitu:
                     + tid * 8
                 )
                 got = poll(cell, 0, 1, self.deadline_ns)
-                rearm(cell)
-                rearm_fence_eager()  # modes 2 and 3 fence once top16 is published
+                rearm(cell)  # fenced once top16 is published (late_fence)
                 for i in c.range_constexpr(4):
                     raw[i] = bits_float(got[0, i])
                 if c.const_expr(self.lean):  # all four experts: one block, no branches
@@ -465,10 +462,9 @@ class RouteSitu:
 
     @cute.jit
     def late_fence(self):
-        """Modes 2/3: the logits re-arm's fence after the top16, off the poll -> rank chain; the
-        slot's next remote write is the next MoE layer's front GEMM."""
+        """The logits re-arm's fence after the top16, off the poll -> rank chain; the slot's next
+        remote write is the next MoE layer's front GEMM."""
         if c.const_expr(self.polled):
-            rearm_fence_late()
             rearm_fence_end()
 
 

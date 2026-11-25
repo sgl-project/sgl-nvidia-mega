@@ -187,9 +187,10 @@ def test_the_covered_forward_hands_the_logits_processor_the_built_head(bound):
     assert seen == [bound.get("logits") or "SGLang's head"]
 
 
-def test_the_slot_is_opt_in_and_in_the_built_table():
-    assert "target_lm_head" in runtime.OPT_IN_SLOTS
-    assert "target_lm_head" not in runtime.SHIPPED_SLOTS
+def test_the_slot_runs_by_default_and_is_in_the_built_table():
+    assert "target_lm_head" in runtime.DEFAULT_ON_SLOTS
+    assert "target_lm_head" in runtime.NUMERICS_CHANGE_SLOTS
+    assert "target_lm_head" not in runtime.OPT_IN_SLOTS
     facts = SimpleNamespace(routed=False)
     bound = {
         "moe": None,

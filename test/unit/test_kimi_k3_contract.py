@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -103,7 +105,6 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertEqual(MEGAKERNEL_API_VERSION, 2)
         self.assertEqual(SPEC.requires.isas, frozenset({"sm_100", "sm_103"}))
         self.assertEqual(SPEC.requires.tp_sizes, frozenset({8}))
-        self.assertEqual(SPEC.requires.resident_blocks, 152)
         self.assertEqual(SPEC.requires.dtypes, frozenset({"bfloat16"}))
         self.assertEqual(SPEC.requires.decode_graph_backends, frozenset({"full"}))
         self.assertEqual(
@@ -135,6 +136,30 @@ class TestKimiK3Contract(unittest.TestCase):
             SPEC.numerics.tolerances,
             {"forward.selected_logprobs.max_abs": 0.5},
         )
+
+    def test_resident_blocks_uses_startup_environment(self):
+        from sgl_nvidia_mega.kimi_k3.shape_policy import SLOTS_ENV
+
+        # SPEC reads the environment once at import; isolate both startup cases.
+        for slots, expected in ((None, 152), ("sm148", 148)):
+            with self.subTest(slots=slots):
+                env = dict(os.environ)
+                env.pop(SLOTS_ENV, None)
+                if slots is not None:
+                    env[SLOTS_ENV] = slots
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from sgl_nvidia_mega.kimi_k3.spec import SPEC; "
+                        f"assert SPEC.requires.resident_blocks == {expected}",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_registration_is_lazy_and_api_mismatch_fails_closed(self):
         # Preserve modules already held by other collected contract tests.

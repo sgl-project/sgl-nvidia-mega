@@ -317,7 +317,7 @@ class ComposedDraft(DraftFront):
         tokens = self.profile.tokens_per_request
         rows = sorted({r if m == DECODE else r // tokens for m, r in self.steps})
         ll.build_linear(
-            "lm_head", lm_head, rows, sm=self.profile.sm, sms=self.profile.sms
+            "lm_head", lm_head, rows, target=self.profile.target, sms=self.profile.sms
         )
 
     def _units(self, mode: str, rows: int) -> str:
@@ -611,10 +611,13 @@ def check_draft_config(model) -> None:
         if not ok:
             problems.append(what)
 
+    from sgl_nvidia_mega.glm5_3 import targets
+
     cfg, spec, par = model.config, get_spec(), get_parallel()
     need(
-        torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 3),
-        "an SM103 GPU",
+        torch.cuda.is_available()
+        and targets.select(torch.cuda.get_device_capability()) is not None,
+        "an SM103 (GB300) or SM107 (Rubin) GPU",
     )
     need(getattr(cfg, "hidden_size", None) == HIDDEN, f"hidden size {HIDDEN} (GLM-5)")
     need(

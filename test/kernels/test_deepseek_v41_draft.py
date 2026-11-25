@@ -13,12 +13,15 @@
   replay with the noise forked onto its side stream. Rows at temperature 0 leave their
   step logits untouched. A missing rank's fault is in test_deepseek_v41_fail_stop.py.
 - The same on every rank of a torchrun job (world 2, 4 or 8; world 8 is attention TP8 on
-  two GB300 trays, whose narrow kernel serves 1-4 rows and the wide kernel 8).
+  two GB300 trays).
 - The low-M LM head on the TP8 shard (N 16160) too, and the pinned tactics of both
   shards are offered.
+- Slot markov_lowlat's kernel: the same SGLang checks (its replays against the current
+  kernel are in test_deepseek_v41_markov_slots.py).
 
 Run with ``python -m pytest test/kernels/test_deepseek_v41_draft.py -s``; the ranks'
-cases with ``torchrun --nnodes 2 --nproc_per_node 4 ... -m pytest -k ranks ...``.
+cases with ``torchrun --nproc_per_node 4 -m pytest -k ranks ...`` (world 8:
+``torchrun --nnodes 2 --nproc_per_node 4 ...``).
 """
 
 import os
@@ -186,7 +189,7 @@ def _assert_cache(cache, want_cache, temperatures, rows: int, what) -> None:
     assert not cache[:rows][~keeps].any(), what
 
 
-def _make(group, rank, world, w1, w2, max_bs=MAX_BS, keeps_logits=True):
+def _make(group, rank, world, w1, w2, max_bs=MAX_BS, keeps_logits=True, lowlat=False):
     return markov.ShardedMarkov(
         embed_weight=w1,
         head_weight=w2,
@@ -199,15 +202,18 @@ def _make(group, rank, world, w1, w2, max_bs=MAX_BS, keeps_logits=True):
         max_bs=max_bs,
         deadline_s=DEADLINE_S,
         keeps_logits=keeps_logits,
+        lowlat=lowlat,
     )
 
 
-def _check_equal(device, group, rank: int, world: int, base_dtype, seed: int):
+def _check_equal(
+    device, group, rank: int, world: int, base_dtype, seed: int, lowlat=False
+):
     g = torch.Generator().manual_seed(seed)
     w1, w2 = _ternary(g, device, VOCAB, RANK), _ternary(g, device, VOCAB, RANK)
-    chain = _make(group, rank, world, w1, w2)
+    chain = _make(group, rank, world, w1, w2, lowlat=lowlat)
     # A greedy draft's chain has no logit staging; it serves greedy blocks only.
-    greedy_chain = _make(group, rank, world, w1, w2, keeps_logits=False)
+    greedy_chain = _make(group, rank, world, w1, w2, keeps_logits=False, lowlat=lowlat)
     shard = slice(rank * VOCAB // world, (rank + 1) * VOCAB // world)
     offset = torch.tensor([3], dtype=torch.int64, device=device)
     for rows in (1, 2, 4, 8):
@@ -283,7 +289,7 @@ def _check_forked_graph(device, chain, w1, w2, shard, base_dtype, g):
         forked_sample()
     torch.cuda.current_stream(device).wait_stream(side)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=side):
         forked_sample()
     for step_offset in (5, 6, 1 << 33):
         offset.fill_(step_offset)
@@ -296,9 +302,10 @@ def _check_forked_graph(device, chain, w1, w2, shard, base_dtype, g):
 
 
 @needs_gpu
+@pytest.mark.parametrize("lowlat", [False, True], ids=["current", "lowlat"])
 @pytest.mark.parametrize("base_dtype", [torch.bfloat16, torch.float32])
-def test_one_rank_matches_markov_sample_step(base_dtype):
-    _check_equal(torch.device("cuda"), None, 0, 1, base_dtype, seed=1)
+def test_one_rank_matches_markov_sample_step(base_dtype, lowlat):
+    _check_equal(torch.device("cuda"), None, 0, 1, base_dtype, seed=1, lowlat=lowlat)
 
 
 _TORCHRUN = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -321,13 +328,14 @@ def ranks():
 
 @needs_gpu
 @pytest.mark.skipif(not _TORCHRUN, reason="runs on every rank of a torchrun job")
+@pytest.mark.parametrize("lowlat", [False, True], ids=["current", "lowlat"])
 @pytest.mark.parametrize("base_dtype", [torch.bfloat16, torch.float32])
-def test_ranks_match_markov_sample_step(ranks, base_dtype):
+def test_ranks_match_markov_sample_step(ranks, base_dtype, lowlat):
     """Every rank's sharded chain draws SGLang's tokens and keeps its full-vocab step
     logits; the same seed on every rank, so all ranks agree on the reference."""
     device, group, rank, world = ranks
     assert world in markov.SUPPORTED_WORLDS
-    _check_equal(device, group, rank, world, base_dtype, seed=2)
+    _check_equal(device, group, rank, world, base_dtype, seed=2, lowlat=lowlat)
 
 
 if __name__ == "__main__":

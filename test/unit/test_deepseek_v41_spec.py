@@ -41,12 +41,11 @@ DOCUMENTED = dict(
     moe_a2a_backend="none",
     dsv4_attn_backend="flashmla",
     cuda_graph_config=default_cuda_graph_config(),
+    engram_config={"placement": "cpu"},
 )
 # the documented launch's environment (benchmark/README.md)
 DOCUMENTED_ENV = {
     "SGLANG_SPEC_TP_SYNC": "rng,-dspark-accept-sample",
-    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": True,
-    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
 }
 
 
@@ -221,15 +220,25 @@ def test_a_test_only_switch_runs_eager_steps(monkeypatch, switch, value):
 
 def test_a_launch_without_the_measured_environment_is_refused():
     """Each variable of the measured launch is named; SGLang's defaults are refused."""
-    defaults = {
-        "SGLANG_SPEC_TP_SYNC": "all",
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": False,
-        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "shared",
-    }
-    message = _refusal(env=defaults)
-    assert message.count("\n  - ") == len(defaults), message
-    for name in defaults:
+    defaults = {"SGLANG_SPEC_TP_SYNC": "all"}
+    message = _refusal(env=defaults, engram_config=None)
+    assert message.count("\n  - ") == len(defaults) + 1, message
+    for name in (*defaults, "--engram-config"):
         assert name in message
+
+
+def test_only_per_rank_host_engram_tables_are_accepted():
+    """As the option's dict and as SGLang's resolved config; SGLang's default is GPU."""
+    for config in ({"placement": "cpu"}, {"placement": "cpu", "replication": "none"}):
+        assert spec.engram_reasons(SimpleNamespace(engram_config=config)) == []
+    resolved = SimpleNamespace(placement="cpu", replication="none")
+    assert spec.engram_reasons(SimpleNamespace(engram_config=resolved)) == []
+    for config in (
+        None,
+        {"placement": "gpu"},
+        {"placement": "cpu", "replication": "per_node"},
+    ):
+        assert spec.engram_reasons(SimpleNamespace(engram_config=config))
 
 
 def test_the_draft_spec_follows_the_target_spec():
