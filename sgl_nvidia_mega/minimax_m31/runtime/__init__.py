@@ -89,12 +89,11 @@ DRAFT_TOLERANCES: dict[str, dict[str, float]] = {
         # the sum adds at most one ulp of the kept logit. A dot product that cancels far
         # below its terms can differ by more ulps of its own small value, but by its
         # FP32 summation error only, far below one ulp of the step's largest |bias|.
-        # The kernel test asserts it on Gaussian weights
-        # (test/kernels/test_minimax_m31_markov.py); the parity probe
-        # (SGLANG_NVIDIA_MEGAKERNEL_MARKOV_PARITY) measures it on each rank's shard
+        # The parity probe (SGLANG_NVIDIA_MEGAKERNEL_MARKOV_PARITY) measures it on
+        # each rank's shard in a server, against SGLang's proposal on the same inputs
         "draft_markov.step_logits.bf16_ulps": 2.0,
         # draft tokens may differ only where two candidates are that close; bitwise
-        # when the bias products sum exactly (the kernel test)
+        # when the bias products sum exactly
         "draft_markov.tokens.exact_sum_mismatches": 0.0,
     },
 }
