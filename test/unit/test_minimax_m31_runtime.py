@@ -148,9 +148,7 @@ class TestSlotList(CustomTestCase):
         self.assertEqual(m31_runtime.requested_slots({}), shipped)
         self.assertEqual(m31_runtime.requested_slots({env: ""}), frozenset())
         self.assertEqual(m31_runtime.requested_slots({env: " , "}), frozenset())
-        listed = m31_runtime.requested_slots(
-            {env: "moe_nofill, moe_swap,markov,"}
-        )
+        listed = m31_runtime.requested_slots({env: "moe_nofill, moe_swap,markov,"})
         # the target's plan takes its slots, the draft spec the draft's
         self.assertEqual(m31_runtime.target_slots(listed), {"moe_nofill", "moe_swap"})
         self.assertEqual(m31_runtime.draft_slots(listed), {"markov"})

@@ -25,6 +25,7 @@ with it; every other step runs SGLang's own code, and every rank logs
 | Kimi K3 (MXFP4) | GB300; B300, B200, GB200 | 8 | Decode and fixed-width verify | [kimi_k3](docs/models/kimi_k3.md) |
 | Kimi K3.1 (MXFP4) | GB300; B300, B200, GB200 | 8; 16 | DFlash target verify and DFlash2 draft | [kimi_k31](docs/models/kimi_k31.md) |
 | Muse Spark | GB300 | 4 | DFlash target verify | [muse_spark](sgl_nvidia_mega/muse_spark/PORT-NOTES-sm103.md) |
+| MiniMax-M3.1-Flash (NVFP4) | GB300 | 4 | DSpark target verify at 1 to 16 requests and the draft's Markov proposal | [minimax_m31](docs/models/minimax_m31.md) |
 
 B300, B200 and GB200 (148 SMs) are admitted with `sm148`; the model pages give
 the exact row widths, batch sizes and what was validated on each.
