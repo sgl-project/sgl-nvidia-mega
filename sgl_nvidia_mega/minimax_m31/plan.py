@@ -8,8 +8,7 @@ The covered steps are DSpark verify steps of 1-16 requests, 8 rows a request (8-
 rows). Slot ``mega`` is one request's step only: MegaAttention and the token-parallel
 MoE take every MoE layer, fixed at 8 rows by their kernels. ``moe_nofill`` and
 ``moe_swap`` serve every width their build serves; at a width ``mega`` serves they
-have no MoE layer left to run, so the plan leaves them off there. ``lm_head_mxfp8``
-(opt-in) closes the step ``mega`` serves: its LM-head stream takes at most 8 rows.
+have no MoE layer left to run, so the plan leaves them off there.
 """
 
 from __future__ import annotations
@@ -32,20 +31,17 @@ class Slots(msgspec.Struct, frozen=True):
     moe_nofill: bool = False
     # moe_nofill's MoE with the routed chain on the main stream (bitwise)
     moe_swap: bool = False
-    # mega's step projects through an MXFP8 copy of the LM-head shard (not bitwise)
-    lm_head_mxfp8: bool = False
 
 
 class Facts(msgspec.Struct, frozen=True):
     """What build found, which every rank agrees on (``runtime.build`` checks it); all
     empty: stock. Each field is the widths its slot's build serves: mega at its one
     width or none, moe_nofill at every width or none, moe_swap at moe_nofill's widths
-    or none, lm_head_mxfp8 at mega's width or none."""
+    or none."""
 
     mega: frozenset = frozenset()
     moe_nofill: frozenset = frozenset()
     moe_swap: frozenset = frozenset()
-    lm_head_mxfp8: frozenset = frozenset()
 
 
 def served_widths(widths: tuple[int, ...]) -> tuple[int, ...]:
@@ -68,8 +64,6 @@ def slots(rows: int, facts: Facts) -> Slots:
         moe_nofill=moe_nofill,
         # it swaps the streams of moe_nofill's MoE
         moe_swap=moe_nofill and rows in facts.moe_swap,
-        # it projects the hidden rows of mega's step
-        lm_head_mxfp8=mega and rows in facts.lm_head_mxfp8,
     )
 
 

@@ -640,8 +640,7 @@ class TestBuild(CustomTestCase):
             str(caught.exception),
             "NVIDIA megakernel: requested slots ['moe_nofill', 'moe_swap'] serve no "
             f"width of {list(VERIFY_WIDTHS)} (mega: not requested; moe_nofill: "
-            f"{nofill.reason}; moe_swap: slot moe_nofill serves no width; "
-            "lm_head_mxfp8: not requested)",
+            f"{nofill.reason}; moe_swap: slot moe_nofill serves no width)",
         )
 
 

@@ -11,8 +11,7 @@ handed to the first MoE layer. Every MoE layer is two launches: MegaAttention (t
 input norm through its TP4 all-reduce, residual add and post-attention norm), then
 the token-parallel MoE (router, shared and routed experts, TP4 all-reduce and residual
 add), which writes the next layer's input. SGLang's final norm and logits processor
-close the step; with slot lm_head_mxfp8 the processor projects through the LM head's
-MXFP8 stream (``logits.Mxfp8LmHead``) and gathers, casts and processes as before.
+close the step.
 
 The attention reads SGLang's step data in place: the positions and cache slots of the
 forward batch, the KV length and page table of the MSA-v1 decode plan (refreshed
@@ -284,10 +283,9 @@ class MegaStep:
         self.attention = host.agree(self.cpu_group, bind, "binding MegaAttention")
         self._bound = key
 
-    def run(self, step, input_ids, positions, forward_batch, lm_head=None):
+    def run(self, step, input_ids, positions, forward_batch):
         """``MiniMaxM3SparseForConditionalGeneration.forward`` for a step slot mega
-        serves (one request's eight rows); ``lm_head``: slot lm_head_mxfp8's stand-in
-        for SGLang's LM head where the plan gives the step that slot."""
+        serves (one request's eight rows)."""
         from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
@@ -332,10 +330,6 @@ class MegaStep:
             aux.capture(self.layer_input)
         hidden = lm.norm(self.layer_input)
         aux = aux if model.capture_aux_hidden_states and len(aux) else None
-        if lm_head is None:
-            lm_head = model.lm_head
-        else:
-            # test only: under the parity switch, the stream against SGLang's
-            # projection of these hidden rows
-            lm_head.log_parity(model, hidden)
-        return model.logits_processor(input_ids, hidden, lm_head, forward_batch, aux)
+        return model.logits_processor(
+            input_ids, hidden, model.lm_head, forward_batch, aux
+        )

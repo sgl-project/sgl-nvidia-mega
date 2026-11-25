@@ -3,17 +3,15 @@
 """MiniMax-M3.1-Flash megakernel: the target's spec (``spec``), its per-width slot
 plan (``plan``) and covered verify steps (``runtime``) of one to sixteen requests, the
 DSpark draft's spec (``draft``), step (``draft_step``) and proposal (``sampler``), and
-the SM103 kernels (``sm103``): MegaAttention, the token-parallel MoE, the LM-head
-stream, the draft backbone and the draft's Markov chain.
+the SM103 kernels (``sm103``): MegaAttention, the token-parallel MoE, the draft
+backbone and the draft's Markov chain.
 
 At one request (8 rows) slot ``mega`` runs every MoE layer on MegaAttention and the
 token-parallel MoE (operands from ``weights``). At 2-16 requests (16-128 rows) the
 step runs SGLang's own modules in SGLang's order (``attention``, ``boundary``,
 ``logits``) with the bitwise MoE slots ``moe_nofill`` and ``moe_swap`` (``moe``). The
 draft's slot ``markov`` offers SGLang's folded proposal the draft sampler at 1-16
-requests; its opt-in slot ``draft_lm_head`` runs the draft LM head on an MXFP8 copy.
-The target's opt-in slot ``lm_head_mxfp8`` closes slot mega's step on an MXFP8 copy of
-the LM head (``logits``)."""
+requests; its opt-in slot ``draft_lm_head`` runs the draft LM head on an MXFP8 copy."""
 
 # Fixed by the kernels; per TP4 rank unless noted
 TP = 4

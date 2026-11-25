@@ -250,7 +250,6 @@ def test_the_attention_scales_are_tiled_128x4():
         ({"hop_mxfp8"}, "unknown slot 'hop_mxfp8'"),
         ({"moe_swap"}, "slot 'moe_swap' needs slot 'moe_nofill'"),
         ({"draft_lm_head"}, "slot 'draft_lm_head' needs slot 'markov'"),
-        ({"lm_head_mxfp8"}, "slot 'lm_head_mxfp8' needs slot 'mega'"),
     ],
 )
 def test_a_slot_list_refusal_names_it(slots, want):
@@ -277,23 +276,6 @@ def test_the_draft_slots_checks_apply_only_with_them():
         )
     with patch.object(spec, "SLOTS", spec.SLOTS - {"markov"}):
         assert _refusal(env={**unfolded, **int8_walk}) == ""
-
-
-@needs_host
-def test_slot_lm_head_mxfp8s_checks_apply_only_with_it():
-    """Opt-in: the documented setup does not run it. Listed, it replaces SGLang's BF16
-    LM-head projection, so a server that asks for the FP32 one is refused."""
-    assert "lm_head_mxfp8" not in spec.SLOTS
-    assert _refusal(enable_fp32_lm_head=True) == ""
-    with patch.object(spec, "SLOTS", spec.SLOTS | {"lm_head_mxfp8"}):
-        assert _refusal() == ""
-        assert "--enable-fp32-lm-head asks for the FP32 one" in _refusal(
-            enable_fp32_lm_head=True
-        )
-        # every reason at once, before the weights load
-        refusal = _refusal(enable_fp32_lm_head=True, text=dict(hidden_size=4096))
-        assert "--enable-fp32-lm-head" in refusal
-        assert "config.hidden_size 4096" in refusal
 
 
 @needs_host
