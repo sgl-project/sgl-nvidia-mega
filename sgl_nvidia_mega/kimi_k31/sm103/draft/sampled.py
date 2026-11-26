@@ -1335,3 +1335,107 @@ class SampledAccept:
         if self.debug:
             return accept_len, bonus, target, dbg
         return accept_len, bonus, target
+
+
+class Rank0Broadcast:
+    """Grid (B,), 32 threads. Arguments (addresses): accept_len [B] int32 and bonus [B] int64 (in place: rank 0's
+    values on every rank afterwards; a bonus is a token id, below 2^31), box [rows, 2] u64 elements, its multicast
+    address, rank, the call's round (the epoch every element must carry), B. Rank 0's thread 0 multicasts request
+    b's (accept_len, round) and (bonus, round) into every rank's row b; every rank polls its row b for this round:
+    SampledDecide's decision hop, for SGLang's sampled accept (rank 0's decision of the dflash-selector site of
+    SGLANG_SPEC_TP_SYNC, without its NCCL broadcasts). Nothing is re-armed: the next round's writes carry a newer
+    epoch, and every rank has read a round before rank 0 can reach the next one (the verify's collectives lie
+    between)."""
+
+    def __init__(self, rows, *, deadline_ns=0):
+        self.rows, self.deadline_ns = rows, deadline_ns
+
+    @cute.jit
+    def __call__(self, *args):
+        launch(self.kernel, args, (args[6], 1, 1), 32)
+
+    @cute.kernel
+    def kernel(self, args):
+        accept_a, bonus_a, box_a, mc, rank, round_a, requests = args[0:7]
+        box = gtensor(Int64, box_a, (self.rows, 2), (2, 1), 16)
+        accept_len = gtensor(Int32, accept_a, requests, 1, 4)
+        bonus = gtensor(Int64, bonus_a, requests, 1, 8)
+        req, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+        round_word = Uint32(round_a)
+        if tid == 0:
+            if rank == Int32(0):
+                offset = cute.crd2idx((req, 0), box.layout)
+                multicast_element(
+                    mc + Int64(offset) * 8, Uint32(accept_len[req]), round_word
+                )
+                multicast_element(
+                    mc + (Int64(offset) + Int64(1)) * 8, Uint32(bonus[req]), round_word
+                )
+            got = poll_round(at(box, req, 0), 1, round_word, self.deadline_ns)
+            accept_len[req] = Int32(got[0, 0])
+            bonus[req] = Int64(got[0, 1])
+
+
+@cache
+def compile_rank0_broadcast(rows, deadline_ns):
+    address, value = cutlass.Int64(0), cutlass.Int32(0)
+    args = (address,) * 4 + (value,) * 3
+    return cute.compile(
+        Rank0Broadcast(rows, deadline_ns=deadline_ns), *args, make_fake_stream()
+    )
+
+
+class Rank0Bcast:
+    """Host of ``Rank0Broadcast`` with its own symm-mem box [rows, 2] u64 (datum | epoch) elements on ``group``
+    (collective construction and calls: every rank, same order). One box serves every call: each carries its
+    own 31-bit round."""
+
+    def __init__(self, group, device, rank, *, rows=256, deadline_ns=0):
+        import torch.distributed as dist
+        import torch.distributed._symmetric_memory as symm_mem
+
+        self.rows, self.rank = rows, rank
+        self.box = symm_mem.empty((rows, 2), dtype=torch.int64, device=device)
+        self.mc = int(symm_mem.rendezvous(self.box, group).multicast_ptr or 0)
+        if not self.mc:
+            raise RuntimeError("the rank-0 accept broadcast needs multicast memory")
+        self.box.fill_(-1)  # every epoch all-ones: never a (31-bit) round
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)  # every box initialized before rank 0's first publish
+        self.code = compile_rank0_broadcast(rows, deadline_ns)
+        self.fixed = (
+            cutlass.Int64(self.box.data_ptr()),
+            cutlass.Int64(self.mc),
+            cutlass.Int32(rank),
+        )
+        self.round, self.calls = 0, 0
+
+    def run(self, accept_len, bonus):
+        """``accept_len`` [B] int32, ``bonus`` [B] int64, contiguous, B <= rows: rank 0's values on every rank."""
+        b = accept_len.shape[0]
+        if (
+            accept_len.dtype != torch.int32
+            or bonus.dtype != torch.int64
+            or accept_len.dim() != 1
+            or tuple(bonus.shape) != (b,)
+            or not accept_len.is_contiguous()
+            or not bonus.is_contiguous()
+            or not 0 < b <= self.rows
+        ):
+            raise ValueError(
+                f"rank-0 broadcast of accept_len {tuple(accept_len.shape)} {accept_len.dtype}, "
+                f"bonus {tuple(bonus.shape)} {bonus.dtype} (rows {self.rows})"
+            )
+        self.round = (self.round + 1) & ROUND_MASK
+        self.code(
+            cutlass.Int64(accept_len.data_ptr()),
+            cutlass.Int64(bonus.data_ptr()),
+            *self.fixed,
+            cutlass.Int32(self.round),
+            cutlass.Int32(b),
+            stream(accept_len.device),
+        )
+        self.calls += 1
