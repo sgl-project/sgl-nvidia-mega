@@ -46,16 +46,15 @@ from . import bed
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)
 SGLANG_READS = {
-    "srt/distributed/communication_op.py": ("get_tp_group",),
     "srt/models/dflash.py": (
-        "_flashinfer_top_k",
         "get_parallel",
         "is_dense_head_weight",
         "should_apply_lm_head_quant_method",
-        "tensor_model_parallel_all_gather",
         "_project_candidate_logits",
-        "_radix_topk",
+        "radix_topk",
     ),
+    "kernels/ops/sampling/topk.py": ("_flashinfer_top_k",),
+    "srt/layers/vocab_parallel_embedding.py": ("tp_group",),
     "kernels/jit/utils/__init__.py": (
         "is_arch_support_pdl",
         "load_jit",
@@ -294,7 +293,7 @@ def _preload(world: int, device) -> None:
 
 def _eligible(model, hidden: torch.Tensor):
     """(reason, context): reason is None when the fused path applies; context carries what it needs."""
-    import sglang.srt.distributed.communication_op as co
+    import sglang.kernels.ops.sampling.topk as sampling_topk
     import sglang.srt.models.dflash as d
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
@@ -304,7 +303,7 @@ def _eligible(model, hidden: torch.Tensor):
     selector = getattr(model, "candidate_selector", None)
     if lm_head is None or selector is None or int(selector.top_k) != TOP_K:
         return "head/selector", None
-    if d._flashinfer_top_k is None:
+    if sampling_topk._flashinfer_top_k is None:
         return "no shard top-k kernel", None
     if not (hidden.is_cuda and hidden.dim() == 2):
         return "hidden layout", None
@@ -317,7 +316,7 @@ def _eligible(model, hidden: torch.Tensor):
         return "head weight", None
     # the same lookups the stock path makes: tensor-parallel size as candidate_topk reads it, group as its gather does
     tp = int(d.get_parallel().tp_size)
-    group = co.get_tp_group()
+    group = lm_head.tp_group
     if tp not in (2, 4, 8) or group.world_size != tp:
         return "tensor-parallel size", None
     comm = getattr(group, "ca_comm", None)
@@ -345,11 +344,9 @@ def _eligible(model, hidden: torch.Tensor):
 
 def _stock_tail(model, lm_head, vals, ids):
     """The rest of ``candidate_topk`` (tensor-parallel branch, pinned revision) and ``_transform_unary_logits``."""
-    import sglang.srt.models.dflash as d
-
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = d.tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = d.tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
+    gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, TOP_K, dim=-1)
     return torch.gather(gathered_ids, -1, sel).long(), model._transform_unary_logits(
         top_vals
@@ -381,7 +378,7 @@ def compute_candidates(original, model, hidden: torch.Tensor):
         if shard_topk.supported(logits):
             vals, ids = shard_topk.topk16(logits)
     if vals is None:
-        vals, ids = d._radix_topk(logits, TOP_K)
+        vals, ids = d.radix_topk(logits, TOP_K)
     if (
         vals.dtype != torch.bfloat16
         or ids.dtype != torch.int64
