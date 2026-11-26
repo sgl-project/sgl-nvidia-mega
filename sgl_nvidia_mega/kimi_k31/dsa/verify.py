@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import get_parallel
 from sgl_nvidia_mega.kimi_k31.sm103.k3.common.host import fake, layout, stream, to_cute
 from sgl_nvidia_mega.kimi_k31.sm103.k3.mla.value import MlaValue
 
+from ..sm103.dsa import score
 from ..verify_binding import VerifyStepView
 from ..verify_contract import served_request_batches, verify_keys
 from ..verify_spec import BuiltK31Verify
@@ -262,7 +263,6 @@ class VerifySelection:
     def run(self, query, gates, cache, table, step, collective_after=None):
         """``collective_after``: DCP only, an event the cross-rank selection waits for after the scoring is enqueued
         (the early query all-gather on main), so every rank issues its DCP collectives in the same order."""
-        import deep_gemm
         from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
             _restore_row_stride,
         )
@@ -278,8 +278,7 @@ class VerifySelection:
             )
 
         contexts = step.score_contexts if step.dcp_size == 1 else step.local_contexts
-        score_fn = deep_gemm.fp8_paged_mqa_logits
-        scores = score_fn(
+        scores = score.fp8_paged_mqa_logits(
             query.view(step.batch_requests, step.query_width, 32, 128),
             cache.view(-1, 64, 1, 132),
             gates.squeeze(-1),
@@ -731,6 +730,13 @@ class BuiltSparseVerify(BuiltK31Verify):
             self.sparse_cores[record.layer_id] = core
             self.indexers[record.layer_id] = MultiSparseVerifyIndexKey(
                 self.indexers[record.layer_id], core
+            )
+        if self.sparse_cores and score.serves(self.split_device, self.query_width):
+            # one Q block per request: compiled at build, never under capture
+            score.load_kernel(self.split_device.index, self.query_width)
+            logger.info(
+                "NVIDIA megakernel: sparse verify scores a request's %d draft rows in one Q block",
+                self.query_width,
             )
 
     def _build_split(self, device, context_length):

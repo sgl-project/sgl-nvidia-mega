@@ -947,3 +947,280 @@ class K31DcpQueryGather(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state.comm_buff.item(), 0)  # the padding heads start zero
         self.assertEqual(made[-1], (_CP_MAX_ROWS, 128 * 576 // 2))
+
+
+def _gpu_scorer_ready():
+    """An SM100-family GPU with DeepGEMM and the CUDA driver bindings: the one-block scorer runs."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return False
+    try:
+        import cuda.bindings.driver  # noqa: F401
+        import deep_gemm  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class K31VerifyScoreOneBlock(unittest.TestCase):
+    """The DSA scorers give a request's draft rows one Q block where DeepGEMM would split them and the block's
+    three TMEM stages fit, on SM100-family GPUs only; elsewhere DeepGEMM's own call runs. The FP32 logits equal
+    DeepGEMM's bit for bit (GPU)."""
+
+    def test_one_block_where_deepgemm_splits_and_tmem_fits(self):
+        from sgl_nvidia_mega.kimi_k31.sm103.dsa import score
+
+        for capability, served in (
+            ((10, 3), {5}),
+            ((10, 0), {5}),
+            ((9, 0), set()),
+            ((12, 0), set()),
+        ):
+            with patch.object(
+                torch.cuda, "get_device_capability", return_value=capability
+            ):
+                for next_n in range(1, 17):
+                    with self.subTest(capability=capability, next_n=next_n):
+                        self.assertEqual(
+                            score.serves("cuda:0", next_n), next_n in served
+                        )
+
+    def test_unserved_widths_call_deepgemm_and_served_ones_launch_one_block(self):
+        from sgl_nvidia_mega.kimi_k31.sm103.dsa import score
+
+        def inputs(batch, next_n, pages=9, table_pages=5):
+            return (
+                torch.zeros(batch, next_n, 32, 128, dtype=torch.float8_e4m3fn),
+                torch.zeros(pages, 64, 1, 132, dtype=torch.uint8),
+                torch.zeros(batch * next_n, 32, dtype=torch.float32),
+                torch.zeros(batch, next_n, dtype=torch.int32),
+                torch.zeros(batch, table_pages, dtype=torch.int32),
+                torch.zeros(149, 2, dtype=torch.int32),
+                table_pages * 64 - 3,
+            )
+
+        stock = []
+        deep_gemm = types.ModuleType("deep_gemm")
+        deep_gemm.fp8_paged_mqa_logits = lambda *a, **k: stock.append((a, k)) or "stock"
+        launches, maps = [], []
+        driver = types.SimpleNamespace(
+            CUtensorMapDataType=types.SimpleNamespace(
+                CU_TENSOR_MAP_DATA_TYPE_UINT8="u8",
+                CU_TENSOR_MAP_DATA_TYPE_FLOAT32="f32",
+            ),
+            CUtensorMapSwizzle=types.SimpleNamespace(
+                CU_TENSOR_MAP_SWIZZLE_128B="128B", CU_TENSOR_MAP_SWIZZLE_NONE="none"
+            ),
+        )
+
+        def record_map(dtype, base, dims, strides, box, swizzle):
+            maps.append((dtype, dims, strides, box, swizzle))
+            return len(maps) - 1
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
+            patch.object(
+                score, "load_kernel", lambda index, next_n: ("kernel", next_n)
+            ),
+            patch.object(score, "driver", lambda: driver),
+            patch.object(score, "_map", record_map),
+            patch.object(score, "launch", lambda *a: launches.append(a)),
+            patch.object(
+                torch.cuda,
+                "current_stream",
+                lambda device: types.SimpleNamespace(cuda_stream=7),
+            ),
+        ):
+            for next_n in (1, 4, 8):
+                args = inputs(2, next_n)
+                self.assertEqual(
+                    score.fp8_paged_mqa_logits(*args, clean_logits=False), "stock"
+                )
+                self.assertIs(stock[-1][0][0], args[0])
+                self.assertEqual(stock[-1][1], {"clean_logits": False})
+            self.assertEqual(launches, [])
+
+            args = inputs(3, 5)
+            logits = score.fp8_paged_mqa_logits(*args, clean_logits=False)
+            self.assertEqual(len(stock), 3)
+            ((kernel, grid, params, stream),) = launches
+            self.assertEqual((kernel, grid, stream), (("kernel", 5), (148, 1, 1), 7))
+            # rows, the row stride (317 keys up to the 256-key split), the table stride
+            self.assertEqual([p.value for p in params[:3]], [15, 512, 5])
+            self.assertEqual(logits.shape, (15, 317))
+            self.assertEqual(logits.stride(), (512, 1))
+            q, sf_kv, kv, sf_kv_again, w = params[7:]
+            # FP8: the KV-scale map fills the unused sf_q slot, as DeepGEMM's
+            self.assertEqual(sf_kv, sf_kv_again)
+            self.assertEqual(
+                maps[q], ("u8", (128, 15 * 32), (128,), (128, 5 * 32), "128B")
+            )
+            self.assertEqual(
+                maps[kv], ("u8", (128, 64, 9), (128, 8448), (128, 64, 1), "128B")
+            )
+            self.assertEqual(maps[sf_kv], ("f32", (64, 9), (8448,), (64, 1), "none"))
+            self.assertEqual(maps[w], ("f32", (32, 15), (128,), (32, 5), "none"))
+            page32 = list(inputs(3, 5))
+            page32[1] = torch.zeros(9, 32, 1, 132, dtype=torch.uint8)
+            with self.assertRaises(ValueError):  # not the page-64 FP8 index-K
+                score.fp8_paged_mqa_logits(*page32)
+
+    def test_both_dsa_scorers_score_through_the_dispatcher(self):
+        """The replicated verify selection and the context-split local indexer pass DeepGEMM's arguments to it."""
+        from sgl_nvidia_mega.kimi_k31.sm103.dsa import score
+
+        calls = []
+
+        def scorer(*args, **kwargs):
+            calls.append((args, kwargs))
+            return torch.zeros(args[0].shape[0] * args[0].shape[1], 300)
+
+        step = types.SimpleNamespace(
+            split=0,
+            dcp_size=2,
+            batch_requests=2,
+            query_width=5,
+            local_contexts="local",
+            score_contexts="stock",
+            score_schedule="schedule",
+        )
+        query, gates = torch.zeros(10, 32, 128), torch.zeros(10, 32, 1)
+        cache, table = torch.zeros(7 * 64, 132), torch.zeros(2, 6, dtype=torch.int32)
+        selection = _load(
+            "dsa/verify.py",
+            {"VerifySelection"},
+            torch=torch,
+            score=types.SimpleNamespace(fp8_paged_mqa_logits=scorer),
+        )["VerifySelection"]
+        owner = object.__new__(selection)
+        owner.split = None
+        owner.select_dcp = lambda scores, t, s: ("dcp", scores.shape)
+        self.assertEqual(
+            selection.run(owner, query, gates, cache, table, step), ("dcp", (10, 300))
+        )
+        args, kwargs = calls[-1]
+        self.assertEqual(
+            (args[0].shape, args[1].shape, args[2].shape),
+            ((2, 5, 32, 128), (7, 64, 1, 132), (10, 32)),
+        )
+        self.assertEqual(args[3:], ("local", table, "schedule", 6 * 64))
+        self.assertEqual(kwargs, {"clean_logits": False})
+
+        from sgl_nvidia_mega.kimi_k31.dsa.split import LocalIndexer
+
+        topk = types.ModuleType("sglang.kernels.ops.attention.dsv4.topk")
+        topk.topk_transform_paged_candidates_v2 = lambda *a, **k: None
+        indexer = object.__new__(LocalIndexer)
+        vars(indexer).update(
+            prepared_for=step,  # prepared this forward
+            local_pages=4,
+            local_contexts="contexts",
+            local_table="table",
+            schedule="split schedule",
+            local_lengths=None,
+            candidates="candidates",
+            world=16,
+            rank=3,
+            overflow_rows=None,
+        )
+        with (
+            patch.dict(sys.modules, {topk.__name__: topk}),
+            patch.object(score, "fp8_paged_mqa_logits", scorer),
+        ):
+            self.assertEqual(
+                indexer.run(query, gates, cache, table, step), "candidates"
+            )
+        args, kwargs = calls[-1]
+        self.assertEqual(args[3:], ("contexts", "table", "split schedule", 4 * 64))
+        self.assertEqual(kwargs, {"clean_logits": False})
+
+    @unittest.skipUnless(
+        _gpu_scorer_ready(), "needs an SM100-family GPU, DeepGEMM and cuda-python"
+    )
+    def test_logits_equal_deepgemm_bit_for_bit(self):
+        """Breq 1..8 x contexts 1K..400K, lengths ending mid-page and mid-split, eager; every logit a request's
+        last row reaches (the kernel computes each request through its last row's context, as DeepGEMM)."""
+        for batch in range(1, 9):
+            for keys in (1024, 4096 + 17, 32768 + 100, 131072 + 33, 400000):
+                with self.subTest(batch=batch, keys=keys):
+                    self._assert_equal(
+                        *self._scores(batch, keys, seed=batch * 7 + keys % 97)
+                    )
+
+    @unittest.skipUnless(
+        _gpu_scorer_ready(), "needs an SM100-family GPU, DeepGEMM and cuda-python"
+    )
+    def test_a_captured_graph_replays_deepgemm_bits(self):
+        from sgl_nvidia_mega.kimi_k31.sm103.dsa import score
+
+        args = self._case(4, 131072 + 33, seed=3)
+        # built before capture, as the sparse verify build does
+        score.load_kernel(torch.cuda.current_device(), 5)
+        graph, out = torch.cuda.CUDAGraph(), {}
+        with torch.cuda.graph(graph):
+            out["logits"] = score.fp8_paged_mqa_logits(*args, clean_logits=False)
+        args[0].copy_(torch.randn(args[0].shape, device="cuda").to(torch.float8_e4m3fn))
+        graph.replay()
+        torch.cuda.synchronize()
+        import deep_gemm
+
+        self._assert_equal(
+            deep_gemm.fp8_paged_mqa_logits(*args, clean_logits=False),
+            out["logits"],
+            args[3],
+        )
+
+    def _case(self, batch, keys, seed, next_n=5):
+        import deep_gemm
+
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        lens = torch.tensor(
+            [
+                [keys - next_n + 1 + j + 101 * b for j in range(next_n)]
+                for b in range(batch)
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        pages = -(-int(lens.max()) // 64)
+        pool = batch * pages + 8
+        codes = torch.randn(pool, 64 * 128, device="cuda", generator=g).to(
+            torch.float8_e4m3fn
+        )
+        scales = torch.rand(pool, 64, device="cuda", generator=g) * 0.1 + 0.01
+        cache = torch.cat(
+            (codes.view(torch.uint8), scales.view(torch.uint8)), dim=1
+        ).view(pool, 64, 1, 132)
+        table = (
+            torch.randperm(pool, device="cuda", generator=g)[: batch * pages]
+            .view(batch, pages)
+            .int()
+        )
+        q = torch.randn(batch, next_n, 32, 128, device="cuda", generator=g).to(
+            torch.float8_e4m3fn
+        )
+        weights = torch.randn(batch * next_n, 32, device="cuda", generator=g)
+        schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            lens, 64, deep_gemm.get_num_sms()
+        )
+        return q, cache, weights, lens, table, schedule, pages * 64
+
+    def _scores(self, batch, keys, seed):
+        import deep_gemm
+
+        from sgl_nvidia_mega.kimi_k31.sm103.dsa import score
+
+        args = self._case(batch, keys, seed)
+        ref = deep_gemm.fp8_paged_mqa_logits(*args, clean_logits=False)
+        return ref, score.fp8_paged_mqa_logits(*args, clean_logits=False), args[3]
+
+    def _assert_equal(self, ref, out, lens):
+        self.assertEqual(ref.shape, out.shape)
+        self.assertEqual(ref.stride(), out.stride())
+        reach = (
+            lens[:, -1:].expand_as(lens).reshape(-1, 1)
+        )  # each request's last row's context
+        valid = torch.arange(ref.shape[1], device=ref.device)[None, :] < reach
+        self.assertTrue(
+            torch.equal(ref.view(torch.int32)[valid], out.view(torch.int32)[valid])
+        )
