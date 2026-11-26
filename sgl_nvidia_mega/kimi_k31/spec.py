@@ -8,6 +8,7 @@ from typing import Any
 import msgspec
 from sglang.srt.runtime_context import get_model, get_parallel
 
+from sgl_nvidia_mega.kimi_k31 import targets
 from sgl_nvidia_mega.kimi_k31.k3._host import BuildContext, Feature, MegakernelSpec
 from sgl_nvidia_mega.kimi_k31.k3.spec import SPEC as K3_SPEC
 from sgl_nvidia_mega.kimi_k31.k3.spec import (
@@ -103,15 +104,25 @@ def _context_reasons(context_length: int, text: Any) -> list[str]:
     return []
 
 
+def _target_reasons(cfg: Any) -> list[str]:
+    """The TP sizes the plans of this GPU's architecture do not serve."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return []
+    return targets.tp_reasons(torch.cuda.get_device_capability(), int(cfg.tp_size))
+
+
 def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
     if not _K31_HOST:
         return [_NO_K31_HOST]
     text = _text_config(hf_config)
+    reasons = _dsa_reasons(text) + _target_reasons(cfg)
     if getattr(cfg, "speculative_algorithm", None) is not None:
         from .verify_spec import config_disable_reasons
 
-        return _dsa_reasons(text) + config_disable_reasons(cfg, hf_config)
-    reasons = _dsa_reasons(text) + _context_reasons(int(cfg.context_length or 0), text)
+        return reasons + config_disable_reasons(cfg, hf_config)
+    reasons += _context_reasons(int(cfg.context_length or 0), text)
     if (
         (getattr(cfg, "dcp_size", 1) or 1) > 1
         or (getattr(cfg, "attn_cp_size", 1) or 1) > 1

@@ -23,7 +23,7 @@ with it; every other step runs SGLang's own code, and every rank logs
 | Qwen3.5-397B-A17B (NVFP4) | GB300; GB200 | 8 | MTP target verify and EAGLE draft | [qwen3_5](docs/models/qwen3_5.md) |
 | GLM-5.3, GLM-5.2 (NVFP4) | B300, GB300, Rubin | 4; 8; 16 (GLM-5.2 on Rubin) | MTP target verify and NextN draft; at TP16 the whole one-request EAGLE step | [glm5_3](docs/models/glm5_3.md) |
 | Kimi K3 (MXFP4) | GB300; B300, B200, GB200 | 8 | Decode and fixed-width verify | [kimi_k3](docs/models/kimi_k3.md) |
-| Kimi K3.1 (MXFP4) | GB300; B300, B200, GB200 | 8; 16 | DFlash target verify and DFlash2 draft | [kimi_k31](docs/models/kimi_k31.md) |
+| Kimi K3.1 (MXFP4) | GB300; B300, B200, GB200; Rubin (TP8) | 8; 16 | DFlash target verify and DFlash2 draft | [kimi_k31](docs/models/kimi_k31.md) |
 | Muse Spark | GB300 | 4 | DFlash target verify | [muse_spark](sgl_nvidia_mega/muse_spark/PORT-NOTES-sm103.md) |
 
 B300, B200 and GB200 (148 SMs) are admitted with `sm148`; the model pages give

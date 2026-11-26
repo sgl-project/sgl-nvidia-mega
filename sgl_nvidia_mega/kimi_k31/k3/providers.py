@@ -26,6 +26,7 @@ from sglang.srt.distributed.communication_op import (
 )
 from sglang.srt.runtime_context import get_parallel
 
+from sgl_nvidia_mega.kimi_k31 import targets
 from sgl_nvidia_mega.kimi_k31.k3._host import HybridPoolView
 
 from .projection_storage import (
@@ -110,8 +111,10 @@ def _float(value: Any) -> float:
     return float(value)
 
 
-def _module(suffix: str, origins: dict[str, str]) -> Any:
-    name = f"{PAYLOAD_PACKAGE}.{suffix}"
+def _module(
+    suffix: str, origins: dict[str, str], package: str = PAYLOAD_PACKAGE
+) -> Any:
+    name = f"{package}.{suffix}"
     module = importlib.import_module(name)
     origins[name] = str(Path(inspect.getsourcefile(module) or "").resolve())
     return module
@@ -431,6 +434,8 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    # The plans of the device's architecture (targets.Target), selected once per build.
+    target: targets.Target
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
@@ -664,7 +669,6 @@ def build_resources(
     projection_module = _module("gemm.projection", origins)
     mla_module = _module("mla.prepared", origins)
     kda_module = _module("kda.prepared", origins)
-    attnres_module = _module("attn_res.prepared", origins)
     oproj_module = _module("oproj.prepared", origins)
     twoshot_module = _module("common.twoshot", origins)
     dense_module = _module("moe.dense", origins)
@@ -682,6 +686,13 @@ def build_resources(
     kda_rows = kda_pitch(heads)
     group = parallel.tp_group.device_group
     device = next(model.parameters()).device
+    capability = torch.cuda.get_device_capability(device)
+    target = targets.select(capability)
+    if target is None:
+        raise ValueError(
+            f"Kimi K3.1 megakernel has no plans for CUDA capability {capability}"
+        )
+    attnres_module = _module("attn_res.prepared", origins, target.attn_res_package)
     owner = (group, device, tp, rank)
     backbone = model.model
     layers = tuple(backbone.layers[backbone.start_layer : backbone.end_layer])
@@ -1028,6 +1039,7 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        target=target,
     )
     resources.refresh_inventory()
     return resources
