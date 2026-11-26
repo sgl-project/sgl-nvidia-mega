@@ -41,24 +41,93 @@ def _module(
     cluster: bool = False,
     norm_gate: bool = False,
     qk: int = 0,
+    stage: int = 0,
+    early: bool = False,
+    merge_pre: bool = False,
+    sr: bool = False,
+    gate_pre: bool = False,
     unfused: bool = False,
 ):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
 
-    args = make_cpp_args(use_pdl, cluster, norm_gate, qk, unfused)
+    a = (use_pdl, cluster, norm_gate, qk, unfused)
+    if gate_pre:
+        args = make_cpp_args(*a, stage, early, merge_pre, sr, True)
+    elif sr:
+        args = make_cpp_args(*a, stage, early, merge_pre, True)
+    elif merge_pre:
+        args = make_cpp_args(*a, stage, early, True)
+    else:
+        args = (
+            make_cpp_args(*a, stage, early)
+            if early
+            else make_cpp_args(*a, stage)
+            if stage
+            else make_cpp_args(*a)
+        )
+    san = int(
+        os.environ.get("MUSE_VR_FULL_VERIFY_ATTN_SAN_POLLS", "0")
+    )  # compute-sanitizer builds: poll cap
     return load_jit(
-        "muse_vr_full_verify_attn",
+        "muse_vr_full_verify_attn" + (f"_san{san}" if san > 0 else ""),
         *args,
         cuda_files=[str(_CSRC)],
         cuda_wrappers=[
             ("full_verify_attn", f"muse_vr::FullVerifyAttnKernel<{args}>::run")
         ],
+        extra_cuda_cflags=[f"-DFVA_MAX_POLLS={san}u"] if san > 0 else None,
     )
 
 
 @functools.lru_cache(maxsize=None)
 def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _env_set(name: str) -> frozenset:
+    raw = os.environ.get(name, "")
+    return frozenset(int(v) for v in raw.replace("/", ",").split(",") if v.strip())
+
+
+def stage_for(num_requests: int) -> int:
+    """K/V tiles each block reads before the dependency wait (0: none). MUSE_VR_FULL_VERIFY_ATTN_STAGE lists the
+    request counts (separated by "," or "/") that stage; MUSE_VR_FULL_VERIFY_ATTN_STAGE_TILES sets the tile count
+    (2 or 4, default 2). Default: no staging. Staging reads seq_lens, page-table rows and K/V rows of keys older than
+    this step before the wait, so it needs those to be written before the graph launch (captured decode graphs)."""
+    if num_requests not in _env_set("MUSE_VR_FULL_VERIFY_ATTN_STAGE"):
+        return 0
+    tiles = int(os.environ.get("MUSE_VR_FULL_VERIFY_ATTN_STAGE_TILES", "2"))
+    if tiles not in (2, 4):
+        raise ValueError("MUSE_VR_FULL_VERIFY_ATTN_STAGE_TILES must be 2 or 4")
+    return tiles
+
+
+def merge_pre_for(num_requests: int) -> bool:
+    """MUSE_VR_FULL_VERIFY_ATTN_MERGE_PRE (request counts separated by "," or "/"; default: none; bitwise equal either way):
+    the main kernel lets the merge kernel launch right after its dependency wait, and the merge kernel loads its gate values
+    right after its own dependency wait, together with the records. Not with the cluster merge (no merge kernel)."""
+    return num_requests in _env_set("MUSE_VR_FULL_VERIFY_ATTN_MERGE_PRE")
+
+
+def gate_pre_for(num_requests: int) -> bool:
+    """MUSE_VR_FULL_VERIFY_ATTN_GATE_PRE (request counts separated by "," or "/"; default: none; bitwise equal either way):
+    the merge kernel loads its gate values right after its dependency wait, before the records (MERGE_PRE's merge-kernel
+    part, without its early trigger in the main kernel)."""
+    return num_requests in _env_set("MUSE_VR_FULL_VERIFY_ATTN_GATE_PRE")
+
+
+def sr_for(num_requests: int) -> bool:
+    """MUSE_VR_FULL_VERIFY_ATTN_SR (request counts separated by "," or "/"; default: none; bitwise equal either way): the
+    main kernel with two tiles in flight per block (two softmax groups, one thread per row, correction warps; see
+    full_verify_attn_sr_kernel). Not with the cluster merge or MERGE_PRE."""
+    return num_requests in _env_set("MUSE_VR_FULL_VERIFY_ATTN_SR")
+
+
+def early_trigger_for(num_requests: int) -> bool:
+    """Early dependent launch of the merge kernel (right after its dependency wait, so the output projection that follows
+    starts its weight stream during the merge): the request counts in MUSE_VR_FULL_VERIFY_ATTN_EARLY_TRIGGER (list
+    separated by "," or "/"; default: none). Bitwise equal either way."""
+    return num_requests in _env_set("MUSE_VR_FULL_VERIFY_ATTN_EARLY_TRIGGER")
 
 
 def num_splits(num_requests: int, num_kv_heads: int, device) -> int:
@@ -117,6 +186,11 @@ def full_verify_attn(
     cache_loc: torch.Tensor | None = None,
     qk_eps: float = 0.0,
     num_q_heads: int | None = None,
+    stage: int | None = None,
+    early_trigger: bool | None = None,
+    merge_pre: bool | None = None,
+    sr: bool | None = None,
+    gate_pre: bool | None = None,
 ) -> torch.Tensor:
     """Attention of 8 consecutive query tokens per request over a paged FP8 KV pool (full attention when
     ``window_left < 0``, else keys [p - window_left, p] for the token at position p).
@@ -141,6 +215,13 @@ def full_verify_attn(
         norm of the q columns, and the K/V rows of the 8 new tokens of every request, stored into the pools at
         ``cache_loc`` (``[R * 8]`` int64; 0: not stored). Needs ``num_q_heads`` and a row count that
         ``swa_verify_attn.qk_class`` covers.
+    :param stage: K/V tiles per block read before the dependency wait (0, 2 or 4; bitwise-neutral; see ``stage_for``,
+        which picks it when None).
+    :param sr: the two-group main kernel (None: ``sr_for``). Bitwise-neutral.
+    :param gate_pre: the merge kernel's gate preload without MERGE_PRE's early trigger (None: ``gate_pre_for``).
+        Bitwise-neutral.
+    :param early_trigger: with use_pdl, the merge kernel lets its dependents launch right after its dependency wait
+        (None: ``early_trigger_for``). Bitwise-neutral.
     """
     hkv = k_pool.shape[1] // HEAD_DIM
     if qkv is not None:
@@ -162,10 +243,37 @@ def full_verify_attn(
     cluster = cluster and 2 <= s <= 16
     ws = workspace(dev, workspace_floats(reqs, hkv, s) if not cluster else 1)
     flat = out.view(out.shape[0], -1)
+    st = stage_for(reqs) if stage is None else int(stage)
+    et = bool(use_pdl) and (
+        early_trigger_for(reqs) if early_trigger is None else bool(early_trigger)
+    )
+    mp = (
+        (merge_pre_for(reqs) if merge_pre is None else bool(merge_pre))
+        and bool(use_pdl)
+        and not cluster
+    )
+    srm = (sr_for(reqs) if sr is None else bool(sr)) and not cluster
+    if srm:
+        mp = False
+    gp = (
+        (gate_pre_for(reqs) if gate_pre is None else bool(gate_pre))
+        and gate is not None
+        and not cluster
+        and not mp
+    )
     from .swa_verify_attn import qk_unfused
 
     _module(
-        bool(use_pdl), bool(cluster), gate is not None, qk, qk_unfused(qk)
+        bool(use_pdl),
+        bool(cluster),
+        gate is not None,
+        qk,
+        st,
+        et,
+        mp,
+        srm,
+        gp,
+        qk_unfused(qk),
     ).full_verify_attn(
         q if q is not None else out,
         k_pool,
@@ -234,20 +342,36 @@ def preload(
     gate = torch.zeros(
         TOKENS_PER_REQUEST, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device
     )
-    full_verify_attn(
-        q,
-        pool,
-        pool,
-        table,
-        lens,
-        -1,
-        PAGE,
-        1.0,
-        1.0,
-        use_pdl=use_pdl,
-        gate=gate if norm_gate else None,
-        norm_eps=1e-6,
-    )
+    variants = {(0, False, False, False, False)} | {
+        (
+            stage_for(n),
+            early_trigger_for(n),
+            merge_pre_for(n),
+            sr_for(n),
+            gate_pre_for(n),
+        )
+        for n in range(1, max_requests + 1)
+    }
+    for st, et, mp, srm, gp in variants:
+        full_verify_attn(
+            q,
+            pool,
+            pool,
+            table,
+            lens,
+            -1,
+            PAGE,
+            1.0,
+            1.0,
+            use_pdl=use_pdl,
+            gate=gate if norm_gate else None,
+            norm_eps=1e-6,
+            stage=st,
+            early_trigger=et,
+            merge_pre=mp,
+            sr=srm,
+            gate_pre=gp,
+        )
     from .swa_verify_attn import qk_class
 
     width = (2 * num_q_heads + 2 * num_kv_heads) * HEAD_DIM
@@ -261,24 +385,39 @@ def preload(
         g = torch.zeros(
             rows, num_q_heads * HEAD_DIM, dtype=torch.bfloat16, device=device
         )
-        full_verify_attn(
-            None,
-            pool,
-            pool,
-            table.expand(n, -1).contiguous(),
-            lens.expand(n).contiguous(),
-            -1,
-            PAGE,
-            1.0,
-            1.0,
-            use_pdl=use_pdl,
-            gate=g if norm_gate else None,
-            norm_eps=1e-6,
-            qkv=torch.zeros(rows, width, dtype=torch.bfloat16, device=device),
-            cache_loc=torch.zeros(rows, dtype=torch.int64, device=device),
-            qk_eps=1e-6,
-            num_q_heads=num_q_heads,
-        )
+        for st, et, mp, srm, gp in {(0, False, False, False, False)} | {
+            (
+                stage_for(k),
+                early_trigger_for(k),
+                merge_pre_for(k),
+                sr_for(k),
+                gate_pre_for(k),
+            )
+            for k in range(1, qk_max_requests + 1)
+        }:
+            full_verify_attn(
+                None,
+                pool,
+                pool,
+                table.expand(n, -1).contiguous(),
+                lens.expand(n).contiguous(),
+                -1,
+                PAGE,
+                1.0,
+                1.0,
+                use_pdl=use_pdl,
+                gate=g if norm_gate else None,
+                norm_eps=1e-6,
+                qkv=torch.zeros(rows, width, dtype=torch.bfloat16, device=device),
+                cache_loc=torch.zeros(rows, dtype=torch.int64, device=device),
+                qk_eps=1e-6,
+                num_q_heads=num_q_heads,
+                stage=st,
+                early_trigger=et,
+                merge_pre=mp,
+                sr=srm,
+                gate_pre=gp,
+            )
     torch.cuda.current_stream(device).synchronize()
     _preloaded.add(key)
 

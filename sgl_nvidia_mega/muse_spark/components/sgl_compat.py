@@ -70,6 +70,8 @@ MODULE_MOVES: dict[str, tuple[str, ...]] = {
     "sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_trtllm": (
         "sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce",
     ),
+    # the megakernel binding: verify_mk hooks its install_megakernel
+    "sglang.srt.megakernels.runtime": ("sglang.srt.kernel_plugins.nvidia.binding",),
 }
 
 # original source path -> alternatives (relative to the directory holding the ``sglang`` package)

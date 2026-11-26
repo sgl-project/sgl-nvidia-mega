@@ -509,6 +509,11 @@ def _gather_columns_on(vg, group, local: torch.Tensor, site: str) -> torch.Tenso
     w = group.world_size
     assert w * rows <= vg.pull_out.shape[0], "gather rows beyond the symmetric stack"
     stack = vg.pull_out[: w * rows]
+    if bed.flag("ctx_proj_rows") and pull_bounded.all_gather_pull_rows(
+        vg.comm, local, stack, out_mc_ptr=vg.pull_mc_ptr, site=site
+    ):
+        # MUSE_VR_CTX_PROJ_ROWS=1 (with the bounded pull engaged): the gather writes the [rows, world * n] matrix itself
+        return stack.view(rows, w * n)
     # SGLang's pull kernel, or its copy with bounded barrier waits (MUSE_VR_PULL_BOUNDED=1): same bytes
     pull_bounded.all_gather_pull(
         vg.comm, local, stack, out_mc_ptr=vg.pull_mc_ptr, site=site
