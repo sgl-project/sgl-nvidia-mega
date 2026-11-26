@@ -71,14 +71,22 @@ def serves_this_step() -> bool:
     return get_is_capture_mode() or eager_steps_allowed()
 
 
-# Every value below is the one the accepted rows ran with (P108 at c96, and
-# P106 / P102 / P100 / P52 before it at c112 / c96 / c80). A setup that differs is refused rather than served by
-# kernels that were never measured on it.
+# Every value below is the configuration the kernels were measured with (concurrency 80 to 112). A setup that
+# differs is refused rather than served by kernels that were never measured on it.
 #
-# This line serves GB300 (sm_103) only. The kernels come from the sm_107 (Rubin) line, where the rows above were
+# This line serves GB300 (sm_103) only. The kernels come from the sm_107 (Rubin) line, where they were
 # measured; PORT-NOTES-sm103.md says what was changed and checked for sm_103 and which per-device tuning tables
 # still have no GB300 entry.
 ISAS = frozenset({"sm_103"})
+
+# The opt-in components (components.register_all installs them as SGLang hooks at plugin load, each behind its own
+# MUSE_VR_* switch) come in two sets, by the GPU architectures each is built for. muse_spark/components is the GB300 set;
+# Rubin runs it as well, next to the Rubin set, since its kernels come from the Rubin line. muse_spark/sm107 is the Rubin
+# set: the loader reads the device's architecture once and registers it only on the architectures listed for it here.
+COMPONENT_ISAS = {
+    "components": frozenset({"sm_103", "sm_107"}),
+    "sm107": frozenset({"sm_107"}),
+}
 
 REQUIREMENTS = Requirements(
     isas=ISAS,

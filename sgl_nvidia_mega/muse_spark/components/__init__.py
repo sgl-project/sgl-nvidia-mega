@@ -15,6 +15,12 @@ A component that cannot engage -- a switch unset, a pinned SGLang source that
 has moved, a model that does not match -- reports why and leaves SGLang stock.
 It never half-engages: that is the difference between a run that is slower and
 a run whose numbers cannot be trusted.
+
+The components come in two sets, by the GPU architecture they are built for
+(``spec.COMPONENT_ISAS``): this package holds the GB300 set, and
+``muse_spark/sm107`` holds the Rubin set (``SM107``), whose code the loader
+imports from there. The loader reads the device's architecture once, through
+NVML, and registers the Rubin set only on an architecture that set is built for.
 """
 
 from __future__ import annotations
@@ -49,36 +55,62 @@ _state: dict = {"engaged": None, "warp_fixed_upstream": False}
 
 # Order matters; see the module docstring.
 COMPONENTS = (
-    "nvfp4_kv",  # first: kv_draftwin's sizing hook wraps its per-token bytes
+    "ctx_kv_counter",  # before nvfp4_kv: its context-function chain wraps the function this one installs (innermost)
+    "nvfp4_kv",  # first after ctx_kv_counter: kv_draftwin's sizing hook wraps its per-token bytes
     "ar_attn_boundary",
     "pull_bounded",
+    "verify_logits_gather",
     "ctx_proj_overlap",
     "ctx_proj_prefill",  # after ctx_proj_overlap: its projection hook takes only the tensor its SP exit handed out
     "spec_sample_split",
+    "softmax_split",
     "draft_candidates",
     "draft_boundary",
+    "draft_attn",
     "final_norm",
     "draft_kv_append",
     "input_norm",
     "verify_attn",
     "kv4_dec",  # after verify_attn: its hook wraps verify_attn's
-    "gemm_pick",
+    "moe_ld",  # before moe_tail: wraps the experts' forward and the routed-MoE call
+    "bf16_ldw",  # BF16-expert layers: wraps their weight preparation, TRT-LLM forward and the routed BF16 MoE call
+    "moe_tail",
+    "proj_publish",  # after moe_ld / moe_tail: rebinds the model module's pooler / unpooler call names and prepare_input
+    "unorm_boundary",  # wraps FusedPostNormResidualPreNorm.forward_jit (the boundary kernel call itself)
+    "fin2",
+    "fin_2shot",  # after fin2 (exclusive with it): wraps the finalize op, MuseSpark1xMoE._forward_tp and its workspace setter
+    "hb0_rr",  # after fin2: both wrap the finalize op; this one takes only the call right behind its expert kernel
+    "mid_rs",  # after ar_attn_boundary, final_norm, input_norm and moe_ld: wraps their layer / model hooks
+    "moe_tactic",
+    "gemm_pick",  # after pool_tgv where present: wraps the shape rule it may already have wrapped
     "gemm_lt",  # after gemm_pick: takes only calls the (wrapped) rules leave to cuBLAS
+    "prefill_moe_tactic",
+    "prefill_moe_x",  # before sp_fp4_dispatch: that hook adds the per-token scales and calls this one
     "sp_gate",
+    "o_rowshard",  # wraps the SP o_proj / QKV entry points and the model load (moves the o_proj slices at load)
+    "fp8_prefill",  # after o_rowshard (its QKV path calls o_rowshard's join) and gemm_lt (its dispatch hook is outermost)
     "sp_combine_inplace",
     "pfin",  # wraps the finalize op's CuTe-DSL call (sp_combine_inplace only picks its destination)
+    "rs_samem",  # after fp8_prefill: wraps its qkv all-gather (the fence it records) and SGLang's GEMM + reduce-scatter
     "small_extend_attn",
-    "xattn_b",  # own extend-attention op; refuses to engage next to small_extend_attn
+    "xattn_b",  # own extend-attention op; refuses to engage next to extend_attn / small_extend_attn / prefill_attn
     "sp_fp4_dispatch",
+    "car_table",
+    "prefill_attn",
     "prefill_qkn",
     "kv_draftwin",
+    "draft_topk",
+    "draft_head_lt",
     "verify_topk_sample",  # last: its hooks wrap the other components' hooks
 )
 
 # Components whose entry point is not called ``register``.
 ENTRY: dict[str, str] = {
     "pull_bounded": "engage",
+    "moe_tactic": "engage",
     "gemm_pick": "engage",
+    "prefill_moe_tactic": "engage",
+    "prefill_moe_x": "engage",
     "sp_gate": "engage",
     "sp_combine_inplace": "engage",
     "pfin": "engage",
@@ -86,6 +118,37 @@ ENTRY: dict[str, str] = {
     "xattn_b": "engage",
     "sp_fp4_dispatch": "engage",
 }
+
+# The Rubin set: components whose code lives in muse_spark/sm107, built for the architectures spec.COMPONENT_ISAS lists
+# for it. They keep their places in COMPONENTS.
+SM107 = frozenset(
+    {
+        "ctx_kv_counter",
+        "verify_logits_gather",
+        "softmax_split",
+        "draft_attn",
+        "moe_ld",
+        "bf16_ldw",
+        "moe_tail",
+        "proj_publish",
+        "unorm_boundary",
+        "fin2",
+        "fin_2shot",
+        "hb0_rr",
+        "mid_rs",
+        "moe_tactic",
+        "prefill_moe_tactic",
+        "prefill_moe_x",
+        "o_rowshard",
+        "fp8_prefill",
+        "rs_samem",
+        "car_table",
+        "prefill_attn",
+        "draft_topk",
+        "draft_head_lt",
+    }
+)
+SM107_PACKAGE = "sgl_nvidia_mega.muse_spark.sm107"
 
 _registered: dict[str, bool] | None = None
 
@@ -96,6 +159,35 @@ def _disabled(name: str) -> bool:
         for x in os.environ.get("MUSE_VR_PLUGIN_DISABLE", "").split(",")
         if x.strip()
     }
+
+
+def _capability() -> tuple[int, int] | None:
+    """This node's GPU compute capability, or None. Read through NVML, so loading the components never initializes
+    CUDA in the process."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            return int(major), int(minor)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # noqa: BLE001 - no NVML: the architecture is unknown
+        return None
+
+
+def _sm107_refusal() -> str | None:
+    """Why the Rubin set must not register on this node (None: it may). Read once per process, and only when some
+    component setting is present."""
+    from sgl_nvidia_mega.muse_spark.spec import COMPONENT_ISAS
+
+    cc = _capability()
+    isa = f"sm_{cc[0]}{cc[1]}" if cc else None
+    if isa in COMPONENT_ISAS["sm107"]:
+        return None
+    return f"the Rubin set is built for {sorted(COMPONENT_ISAS['sm107'])}; this device is {isa or 'unknown (no NVML)'}"
 
 
 def _engage_warp_redux_volatile() -> bool:
@@ -137,6 +229,12 @@ def _engage_warp_redux_volatile() -> bool:
     return True
 
 
+def _settings_present() -> bool:
+    """Whether some component setting (a MUSE_VR_* variable other than the loader's own) is present."""
+    _infra = {"MUSE_VR_PLUGIN_SITE", "MUSE_VR_ENGAGE_DIR", "MUSE_VR_PLUGIN_DISABLE"}
+    return any(k.startswith("MUSE_VR_") and k not in _infra for k in os.environ)
+
+
 def register_all() -> dict[str, bool]:
     """Register every component once; returns name -> engaged.
 
@@ -151,8 +249,7 @@ def register_all() -> dict[str, bool]:
 
         # Engine modules that moved between SGLang layouts stay importable under the names components use. Only when
         # some MUSE_VR_* setting is present: a process with no component settings imports nothing extra.
-        _infra = {"MUSE_VR_PLUGIN_SITE", "MUSE_VR_ENGAGE_DIR", "MUSE_VR_PLUGIN_DISABLE"}
-        if any(k.startswith("MUSE_VR_") and k not in _infra for k in os.environ):
+        if _settings_present():
             try:
                 aliases = sgl_compat.install_aliases()
                 bed.report(
@@ -189,10 +286,24 @@ def register_all() -> dict[str, bool]:
             bed.report("warp_redux_volatile", _state["engaged"])
     from sgl_nvidia_mega.muse_spark.components import bed
 
+    # The Rubin set registers only on an architecture it is built for; without any component setting nothing can
+    # engage, so its modules are not imported then either.
+    sm107_off = "no component enabled"
+    if _settings_present():
+        try:
+            sm107_off = _sm107_refusal()
+        except Exception as e:  # noqa: BLE001 - the Rubin set stays off; the GB300 set registers as before
+            sm107_off = f"architecture check failed: {type(e).__name__}: {e}"
+        if sm107_off is not None:
+            bed.report("sm107", False, reason=sm107_off)
     _registered = {}
     for name in COMPONENTS:
+        if name in SM107 and sm107_off is not None:
+            _registered[name] = False
+            continue
+        module = f"{SM107_PACKAGE}.{name}" if name in SM107 else f"{__name__}.{name}"
         try:
-            mod = importlib.import_module(f"{__name__}.{name}")
+            mod = importlib.import_module(module)
             ok = bool(getattr(mod, ENTRY.get(name, "register"))())
         except Exception as e:  # noqa: BLE001 - a failed opt-in leaves SGLang stock
             bed.report(
