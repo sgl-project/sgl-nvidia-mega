@@ -947,3 +947,54 @@ class K31DcpQueryGather(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state.comm_buff.item(), 0)  # the padding heads start zero
         self.assertEqual(made[-1], (_CP_MAX_ROWS, 128 * 576 // 2))
+
+
+class K31DcpSparseMlaAutotune(unittest.TestCase):
+    """FlashInfer's warmup autotune profiles trtllm_batch_decode_mla on rows up to its kernel cap, past the
+    DCP core's workspace. The DCP core keeps that op out of the tuning (its trtllm-gen backend has one
+    tactic); the DCP1 core is tuned as before."""
+
+    def test_the_dcp_core_skips_the_tuning_and_dcp1_keeps_it(self):
+        try:
+            from flashinfer.autotuner import AutoTuner, autotune
+        except ImportError as error:
+            self.skipTest(f"FlashInfer is not importable: {error}")
+        from sglang.srt.layers.attention.dsa import dsa_dcp
+
+        from sgl_nvidia_mega.kimi_k31.dsa import mla
+
+        tuner, seen = AutoTuner.get(), []
+
+        def decode(*, query, **kwargs):
+            skipped = "trtllm_batch_decode_mla" in tuner._effective_skip_ops
+            seen.append((query.shape[2], tuner.is_tuning_mode, skipped))
+            return torch.zeros(*query.shape[:3], 512), None
+
+        rows, empty = 2, torch.zeros(0)
+        cp = object.__new__(mla.CpSparseMla)
+        cp.max_context, cp.counter = 4096, empty
+        cp.workspace = torch.empty(
+            mla._CP_WORKSPACE_BYTES, dtype=torch.int8, device="meta"
+        )
+        cp.query = torch.zeros(rows, 1, 128, 576, dtype=torch.float8_e4m3fn)
+        cp.query_starts = torch.arange(rows + 1, dtype=torch.int32)
+        dcp1 = object.__new__(mla.SparseMla)
+        dcp1.max_context, dcp1.counter, dcp1.workspace = 4096, empty, empty
+        dcp1.query = torch.zeros(rows, 1, 16, 576, dtype=torch.float8_e4m3fn)
+        dcp1.output = torch.zeros(rows, 1, 16, 512)
+        cache = torch.zeros(4, 64, 656, dtype=torch.uint8)
+        selected = torch.zeros(rows, 2048, dtype=torch.int32)
+        lengths = torch.ones(rows, dtype=torch.int32)
+        with (
+            patch("flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla", decode),
+            patch.object(dsa_dcp, "fixup_zero_kv_rows", lambda *args: None),
+        ):
+            with autotune(True):  # SGLang's warmup dummy forward
+                cp.run_core(cache, selected, lengths, (1.0, 1.0))
+                dcp1.run_core(cache, selected, lengths, (1.0, 1.0))
+            cp.run_core(cache, selected, lengths, (1.0, 1.0))  # serving
+        self.assertEqual(
+            seen, [(128, True, True), (16, True, False), (128, False, True)]
+        )
+        self.assertFalse(tuner.is_tuning_mode)
+        self.assertNotIn("trtllm_batch_decode_mla", tuner._effective_skip_ops)

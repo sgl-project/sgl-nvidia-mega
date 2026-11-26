@@ -134,23 +134,27 @@ class CpSparseMla:
         self.query_starts = torch.arange(rows + 1, dtype=torch.int32, device=device)
 
     def run_core(self, cache, local_rows, counts, scales):
+        from flashinfer.autotuner import autotune
         from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 
-        return dcp_trtllm_sparse_attention(
-            query=self.query,
-            block_tables=local_rows.unsqueeze(1),
-            seq_lens=counts,
-            cu_seqlens_q=self.query_starts,
-            kv_cache=cache.view(torch.float8_e4m3fn).unsqueeze(1),
-            workspace_buffer=self.workspace,
-            qk_nope_head_dim=128,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            max_seq_len=self.max_context,
-            sparse_mla_top_k=2048,
-            bmm1_scale=scales[0],
-            bmm2_scale=scales[1],
-            enable_pdl=True,
-            backend="trtllm-gen",
-            multi_ctas_kv_counter_buffer=self.counter,
-        )
+        # FlashInfer tunes this op on rows up to its 8192-row kernel cap, past this
+        # workspace; its trtllm-gen backend has one tactic (-1), which skipping keeps.
+        with autotune(False, skip_ops={"trtllm_batch_decode_mla"}):
+            return dcp_trtllm_sparse_attention(
+                query=self.query,
+                block_tables=local_rows.unsqueeze(1),
+                seq_lens=counts,
+                cu_seqlens_q=self.query_starts,
+                kv_cache=cache.view(torch.float8_e4m3fn).unsqueeze(1),
+                workspace_buffer=self.workspace,
+                qk_nope_head_dim=128,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                max_seq_len=self.max_context,
+                sparse_mla_top_k=2048,
+                bmm1_scale=scales[0],
+                bmm2_scale=scales[1],
+                enable_pdl=True,
+                backend="trtllm-gen",
+                multi_ctas_kv_counter_buffer=self.counter,
+            )
