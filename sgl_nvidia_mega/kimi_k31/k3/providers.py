@@ -26,6 +26,7 @@ from sglang.srt.distributed.communication_op import (
 )
 from sglang.srt.runtime_context import get_parallel
 
+from sgl_nvidia_mega.kimi_k31 import targets
 from sgl_nvidia_mega.kimi_k31.k3._host import HybridPoolView
 
 from .projection_storage import (
@@ -431,6 +432,8 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    # The plans of the device's architecture (targets.Target), selected once per build.
+    target: targets.Target
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
@@ -682,6 +685,12 @@ def build_resources(
     kda_rows = kda_pitch(heads)
     group = parallel.tp_group.device_group
     device = next(model.parameters()).device
+    capability = torch.cuda.get_device_capability(device)
+    target = targets.select(capability)
+    if target is None:
+        raise ValueError(
+            f"Kimi K3.1 megakernel has no plans for CUDA capability {capability}"
+        )
     owner = (group, device, tp, rank)
     backbone = model.model
     layers = tuple(backbone.layers[backbone.start_layer : backbone.end_layer])
@@ -1028,6 +1037,7 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        target=target,
     )
     resources.refresh_inventory()
     return resources

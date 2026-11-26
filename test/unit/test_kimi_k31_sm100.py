@@ -44,7 +44,7 @@ class Sm100Admission(unittest.TestCase):
         # Catches: the spec still refusing sm_100, or hard-coding 152 again.
         req = _spec_requirements()
         isas = {elt.value for elt in req["isas"].args[0].elts}
-        self.assertEqual(isas, {"sm_100", "sm_103"})
+        self.assertEqual(isas, {"sm_100", "sm_103", "sm_107"})
         self.assertEqual(ast.unparse(req["resident_blocks"]), "resident_blocks()")
 
 

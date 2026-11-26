@@ -205,6 +205,7 @@ class BuiltK31Verify:
             return
         # The executor's projected KDA rows: kda_pitch of this rank's heads.
         pitch = self.resources.scratch["kda.projected"].shape[1]
+        target = self.resources.target
         for layer in self.resources.layers:
             layer_id = int(layer.layer_idx)
             if layer_id not in self.executor.kda_pools:
@@ -227,6 +228,7 @@ class BuiltK31Verify:
                 weights,
                 tuple((b, q, pitch, 0) for b, q, _ in self.keys),
                 old.device.index,
+                schedules=target.kda_verify_schedules(a_log.numel()),
             )
             core.prepare_caches(self.executor.kda_pools[layer_id])
             self.executor.kda_cores[layer_id] = core
