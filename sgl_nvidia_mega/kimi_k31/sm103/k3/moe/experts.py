@@ -172,13 +172,14 @@ PLAN_XSF = 64 * 3584
 PLAN_BYTES = PLAN_XSF + 64 * 448
 
 
-def plan_b8(tp, batch):
+def plan_b8(tp, batch, rows=()):
     """Whether the TP8 B8 streamed experts copy the plan the routing kernel's copy role writes (as at B>8)
     into their SMEM activation image, instead of every CTA loading the FP32 rows and quantizing them; the
     image holds the same bytes (bitwise; Rubin TP8 serving TPOT -3.42 %). The copy needs the non-grouped
     capacity-8 engine (``copy_plan_x``, the ExpertsKernel assert). TP16 B8, the GB300 BEST path, keeps the
-    per-CTA quantization it was measured with; the plan copy there has no measurement yet."""
-    return tp == 8 and batch == 8
+    per-CTA quantization it was measured with; the plan copy there has no measurement yet. ``rows``: further
+    TP8 rows that copy the plan, the plans of the caller's GPU (5 to 7: the same engine)."""
+    return tp == 8 and (batch == 8 or batch in rows)
 
 
 @cute.jit

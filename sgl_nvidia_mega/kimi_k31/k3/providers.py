@@ -950,6 +950,8 @@ def build_resources(
             counters=moe_state.shared,
             q=max(query_widths),
             deadline_ns=deadline_ns,
+            splits=target.down_splits(tp, max(query_widths) > 1),
+            plan_copy=target.plan_copy(tp),
         )
         chain = (
             None

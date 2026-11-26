@@ -3,7 +3,7 @@
 | GPU | Tensor parallel | Coverage |
 | --- | --- | --- |
 | GB300 (SM103); 148-SM B300 (SM103) and B200/GB200 (SM100) with `sm148` | 16 (one NVLink domain); 8 | DFlash target verify steps of 8 rows a request (7 drafted tokens and the anchor) at 1 to 8 requests, without DCP or with DCP equal to TP, also as the decode role of a PD-disaggregated deployment; the DFlash2 draft decoder layers at one request. Served and measured end to end at TP16, one request; on GB200 (TP16 over four trays, `sm148`) served and measured end to end at one to four requests |
-| VR200 (Rubin, SM107) | 8 | DFlash target verify steps of 5 rows a request (4 drafted tokens and the anchor) at 1 to 8 requests, with DCP equal to TP. Rubin runs GB300's kernels with its own plans for the KDA verify schedules (`kimi_k31/sm107/tp8.py`, picked by `kimi_k31/targets.py`) and for the o-proj producer's staged K blocks; no other plan is tuned for its 212 SMs yet. The DFlash2 draft chain stays TP16-only |
+| VR200 (Rubin, SM107) | 8 | DFlash target verify steps of 5 rows a request (4 drafted tokens and the anchor) at 1 to 8 requests, with DCP equal to TP. Rubin runs GB300's kernels with its own plans for the KDA verify schedules, the SMs of the shared expert's down rows on verify steps and the rows at which the routed experts copy the plan (`kimi_k31/sm107/tp8.py`, picked by `kimi_k31/targets.py`) and for the o-proj producer's staged K blocks; no other plan is tuned for its 212 SMs yet. The DFlash2 draft chain stays TP16-only |
 
 The Kimi K3.1 megakernel (`sgl_nvidia_mega/kimi_k31`) runs the DFlash target verify
 step and the DFlash2 draft's decoder layers. It needs an SGLang with the Kimi K3.1

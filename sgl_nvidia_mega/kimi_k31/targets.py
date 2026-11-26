@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import FrozenSet, Mapping, Optional, Sequence, Tuple
 
 SM100, SM103, SM107 = (10, 0), (10, 3), (10, 7)
 
@@ -44,17 +44,39 @@ class Target:
     )
     # The TP sizes served on this architecture; empty: every size the spec admits.
     tp_sizes: Tuple[int, ...] = ()
+    # By TP size: SMs of the shared expert's down rows (``SharedDown``) beside the
+    # routed experts on verify steps, per batch as a ``batch_table`` ("9-12:6"). They
+    # override the entries of ``SPLIT`` / ``SPLITS`` (``sm103/k3/moe/front.py``).
+    verify_down_splits: Mapping[int, str] = field(default_factory=dict, hash=False)
+    # By TP size: rows at which the routed experts copy the plan the routing kernel
+    # writes, besides those of ``plan_b8`` (``sm103/k3/moe/experts.py``).
+    plan_copy_rows: Mapping[int, FrozenSet[int]] = field(
+        default_factory=dict, hash=False
+    )
 
     def __post_init__(self):
-        frozen = {
+        kda = {
             int(heads): MappingProxyType(dict(table))
             for heads, table in self.kda_verify.items()
         }
-        object.__setattr__(self, "kda_verify", MappingProxyType(frozen))
+        splits = {int(tp): str(spec) for tp, spec in self.verify_down_splits.items()}
+        rows = {int(tp): frozenset(r) for tp, r in self.plan_copy_rows.items()}
+        object.__setattr__(self, "kda_verify", MappingProxyType(kda))
+        object.__setattr__(self, "verify_down_splits", MappingProxyType(splits))
+        object.__setattr__(self, "plan_copy_rows", MappingProxyType(rows))
 
     def kda_verify_schedules(self, heads: int) -> Mapping[Tuple[int, int], KdaSchedule]:
         """The KDA verify schedules of a rank with ``heads`` heads."""
         return self.kda_verify.get(int(heads), _NONE)
+
+    def down_splits(self, tp: int, verify: bool) -> str:
+        """The down-row split overrides of a TP ``tp`` build, ``verify``: of verify
+        steps (more than one row a request)."""
+        return self.verify_down_splits.get(int(tp), "") if verify else ""
+
+    def plan_copy(self, tp: int) -> FrozenSet[int]:
+        """The further rows at which a TP ``tp`` build's routed experts copy the plan."""
+        return self.plan_copy_rows.get(int(tp), frozenset())
 
 
 # SM103 (GB300, B300) and SM100 (B200, GB200): the plans as ``sm103/`` holds them.

@@ -11,6 +11,10 @@ no kernel compile.
 - The schedules of the build's target reach the KDA verify kernels through the model-level code
   (``verify_spec`` -> ``verify_kda`` -> ``sm103/k3/kda/verify.py``) and take precedence over that
   file's own choice for the keys they have; on SM103 and SM100 the choice is that file's alone.
+- Rubin's MoE plans at TP8: the shared expert's down rows take 12 SMs at 9-12 rows and 8 at
+  25-64 on verify steps, and the routed experts copy the plan at 5-7 rows as well as 8. They
+  reach the split table (``split_table``) and the experts' compile (``plan_b8``) through
+  ``build_resources``; GB300's tables are unchanged on SM103 and SM100.
 - ``sm103/`` takes those plans as values: none of its files imports ``targets`` or ``sm107``.
 """
 
@@ -26,6 +30,7 @@ from unittest.mock import patch
 import torch
 
 from sgl_nvidia_mega.kimi_k31 import targets, verify_binding, verify_contract
+from sgl_nvidia_mega.kimi_k31.sm103.k3.common.policy import batch_table
 from sgl_nvidia_mega.kimi_k31.sm107 import tp8
 
 K31 = Path(targets.__file__).parent
@@ -298,6 +303,64 @@ class KdaVerifySchedules(unittest.TestCase):
                 ),
             )
         self.assertEqual(compiled, {(3, 5): (0, 8, 1, 8), (2, 5): DEFAULT})
+
+
+class MoePlans(unittest.TestCase):
+    """Rubin's plans for the shared expert's down rows and the experts' plan copy."""
+
+    FRONT, EXPERTS = "sm103/k3/moe/front.py", "sm103/k3/moe/experts.py"
+
+    def _split(self, capability, tp, verify):
+        """Down SMs by batch at 9-64 rows, as ``SharedFront`` reads them."""
+        table = _load(
+            self.FRONT, {"SPLIT", "SPLITS", "split_table"}, batch_table=batch_table
+        )["split_table"]
+        overrides = targets.select(capability).down_splits(tp, verify)
+        split = table(tp, verify, overrides)
+        return {b: split.get(b, 0) for b in range(9, 65)}
+
+    def test_rubin_plan_values(self):
+        rubin = tp8.RUBIN
+        self.assertEqual(rubin.down_splits(8, True), "9-12:12,25-64:8")
+        self.assertEqual(rubin.down_splits(8, False), "")  # q = 1 steps: GB300's
+        self.assertEqual(rubin.plan_copy(8), frozenset({5, 6, 7}))
+        # TP16 has no Rubin plans
+        self.assertEqual(rubin.down_splits(16, True), "")
+        self.assertEqual(rubin.plan_copy(16), frozenset())
+
+    def test_rubin_verify_down_rows_take_more_sms(self):
+        want = {b: 12 for b in range(9, 13)}
+        want |= {b: 6 for b in range(13, 17)} | {b: 4 for b in range(17, 25)}
+        want |= {b: 8 for b in range(25, 65)}
+        self.assertEqual(self._split((10, 7), 8, True), want)
+
+    def test_other_split_tables_are_gb300s(self):
+        # Catches: Rubin's SMs reaching q = 1 steps, TP16, SM103 or SM100.
+        gb300 = {b: 6 for b in range(9, 17)} | {b: 4 for b in range(17, 33)}
+        gb300 |= {b: 3 for b in range(33, 65)}
+        self.assertEqual(self._split((10, 3), 8, True), gb300)
+        self.assertEqual(self._split((10, 0), 8, True), gb300)
+        for tp, verify in ((8, False), (16, False), (16, True)):
+            want = self._split((10, 3), tp, verify)
+            self.assertEqual(self._split((10, 7), tp, verify), want)
+            self.assertEqual(self._split((10, 0), tp, verify), want)
+
+    def test_the_plan_copy_rows(self):
+        plan_b8 = _load(self.EXPERTS, {"plan_b8"})["plan_b8"]
+
+        def rows(capability, tp):
+            extra = targets.select(capability).plan_copy(tp)
+            return [b for b in range(1, 65) if plan_b8(tp, b, extra)]
+
+        self.assertEqual(rows((10, 7), 8), [5, 6, 7, 8])
+        self.assertEqual(rows((10, 3), 8), [8])
+        self.assertEqual(rows((10, 0), 8), [8])
+        for capability in ((10, 7), (10, 3), (10, 0)):
+            self.assertEqual(rows(capability, 16), [])
+        # without the caller's rows: 8 only
+        self.assertEqual([b for b in range(1, 65) if plan_b8(8, b)], [8])
+        # the copy runs on the capacity-8 engine only (the ExpertsKernel assert)
+        self.assertLessEqual(set(tp8.PLAN_COPY_ROWS), {5, 6, 7})
 
 
 if __name__ == "__main__":

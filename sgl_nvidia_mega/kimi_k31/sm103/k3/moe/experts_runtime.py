@@ -24,7 +24,6 @@ from .experts import (
     ExpertsKernel,
     ExpertsPlanKernel,
     fc2_pairs,
-    plan_b8,
 )
 
 logger = logging.getLogger(__name__)
@@ -217,10 +216,10 @@ class PersistentExperts:
         ``early``: the caller runs ``group`` (pregrouped batches) before ``run``."""
         mode = "twoshot" if twoshot else bool(publish)
         grouped = pregrouped(self.tp, batch)
-        planned_b8 = planned and plan_b8(self.tp, batch)
+        planned_b8 = planned and batch <= 8  # the front's choice (``plan_b8``)
         if planned_b8 and not _PLAN_B8_LOGGED:  # once, not per layer
             _PLAN_B8_LOGGED.append(True)
-            logger.info("NVIDIA megakernel: TP8 B8 routed experts read the plan")
+            logger.info("NVIDIA megakernel: TP8 B<=8 routed experts read the plan")
         if not grouped and not _PREWAIT_LOGGED:
             _PREWAIT_LOGGED.append(True)
             logger.info(

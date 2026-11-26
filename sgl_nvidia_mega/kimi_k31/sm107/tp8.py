@@ -5,15 +5,17 @@
 
 Rubin (VR200, SM107, 212 SMs) is in the SM100 family and runs the kernels of
 ``kimi_k31/sm103``, CuTe DSL compiled for the device. Their plans were measured on
-GB300; this module holds the ones Rubin replaces. The o-proj producer's staged K
-blocks have SM107 values in ``sm103/k3/oproj/prepared.py``; every other plan is
-GB300's, not tuned for 212 SMs.
+GB300; this module holds the ones Rubin replaces (the KDA verify schedules, the
+shared expert's down-row split and the rows of the experts' plan copy). The o-proj
+producer's staged K blocks have SM107 values in ``sm103/k3/oproj/prepared.py``; every
+other plan is GB300's, not tuned for 212 SMs.
 """
 
 from __future__ import annotations
 
 from sgl_nvidia_mega.kimi_k31.targets import Target
 
+TP = 8
 # TP8: 96 KDA heads over 8 ranks
 KDA_HEADS = 12
 
@@ -32,5 +34,23 @@ KDA_VERIFY = {
     (8, 5): (0, 8, 3, 4),
 }
 
+# SMs of the shared expert's down rows (``SharedDown``) beside the routed experts on
+# verify steps, by rows, from engine sweeps at Q5 (they apply at every verify width):
+# on 212 SMs the experts finish sooner than on GB300 and the tail waits for the down
+# rows, so the down rows take more SMs than GB300's 6 at 9-12 rows and 3-4 at 25-64.
+# 13-24 rows keep GB300's 4-6.
+VERIFY_DOWN_SPLITS = "9-12:12,25-64:8"
+
+# Rows besides 8 at which the routed experts copy the plan instead of quantizing the
+# FP32 rows in every CTA (the same bytes; one Q5 request is 5 rows). The copy needs the
+# capacity-8 engine, so 5 to 7.
+PLAN_COPY_ROWS = (5, 6, 7)
+
 # Rubin serves TP8 only: TP16 has no plans here.
-RUBIN = Target(name="Rubin (VR200)", kda_verify={KDA_HEADS: KDA_VERIFY}, tp_sizes=(8,))
+RUBIN = Target(
+    name="Rubin (VR200)",
+    kda_verify={KDA_HEADS: KDA_VERIFY},
+    tp_sizes=(TP,),
+    verify_down_splits={TP: VERIFY_DOWN_SPLITS},
+    plan_copy_rows={TP: PLAN_COPY_ROWS},
+)

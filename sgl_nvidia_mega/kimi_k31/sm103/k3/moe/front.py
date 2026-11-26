@@ -486,6 +486,15 @@ FUSED, SPLIT = "9-64:1", "9-12:6,13-24:4,25-64:2"
 # q=1 B32: 3 SMs, -5.4% step). Verify steps (q > 1) share experts among a request's q
 # tokens: TP8 DL7 M16/32/64 -5.9/-12.9/-1.1%, TP16 M32 -5.9%.
 SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
+
+
+def split_table(tp, verify, overrides=""):
+    """Down SMs per batch (0: fused): ``SPLIT``, the TP's ``SPLITS`` entries for
+    ``verify`` steps or q = 1, then the caller's ``overrides``, written as ``SPLIT`` is
+    (the plans of its GPU)."""
+    return batch_table(f"{SPLIT},{SPLITS[tp][verify]},{overrides}")
+
+
 # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
 # kernel instead of two that slow each other ~2x side by side).
 MERGED = {8: "41-64:1", 16: "33-64:1"}
@@ -584,11 +593,13 @@ def compile_publish(n, split, valid, batch, device, ks, geometry=None):
 class SharedFront:
     def __init__(
         self, moe, packed, box, storage, batches, beta, linear_beta, plan=None,
-        counters=None, q=1, deadline_ns=0,
+        counters=None, q=1, deadline_ns=0, splits="", plan_copy=(),
     ):  # fmt: skip
         """``plan``: the experts' plan buffer, written by the routing kernel at B>8;
         ``counters``: the fused shared expert's model-owned barrier counters; ``q``: the
-        deployment's verify length (its SPLITS entries)."""
+        deployment's verify length (its SPLITS entries); ``splits`` (``split_table``'s
+        overrides) and ``plan_copy`` (``plan_b8``'s rows): the plans of the caller's
+        GPU."""
         experts = moe.shared_experts
         gate_up, down = experts.gate_up_proj.weight, experts.down_proj.weight
         self.shared = shared = gate_up.shape[0] // 2
@@ -609,7 +620,7 @@ class SharedFront:
         fused = batch_table(FUSED)
         fused = {b for b in batches if b > 8 and counters is not None and fused.get(b)}
         verify = q > 1
-        split = batch_table(f"{SPLIT},{SPLITS[tp][verify]}")
+        split = split_table(tp, verify, splits)
         self.split = {b: split[b] for b in fused if split.get(b)}  # down SMs
         if fused:  # TMA maps and counters of the fused kernel
             self.maps = weight_maps(gate_up, down)
@@ -627,7 +638,7 @@ class SharedFront:
             views = tuple(t[:b] for t in storage)
             logits, gate, ids, weights, h, _, latent = map(to_cute, views)
             front = compile_publish(n, n - shard, valid, b, dev, front_ks(b, n))
-            planned = plan is not None and (b > 8 or plan_b8(tp, b))
+            planned = plan is not None and (b > 8 or plan_b8(tp, b, plan_copy))
             roles = (True, True, False)
             route = compile_route(
                 b,
