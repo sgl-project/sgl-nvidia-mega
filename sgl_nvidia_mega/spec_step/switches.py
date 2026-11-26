@@ -19,7 +19,7 @@ STEP_GRAPH_FUSED_INPUT_COPY = "SGLANG_SPEC_STEP_GRAPH_FUSED_INPUT_COPY"
 # predict / accept_index / num_correct_drafts as views of one buffer: one rank-0
 # TP broadcast of the verify result instead of three.
 PACKED_VERIFY_BROADCAST = "SGLANG_SPEC_PACKED_VERIFY_BROADCAST"
-# Chain sampled verify: temperatures not expanded, no zero-filled draft_probs.
+# Chain sampled verify: no zero-filled draft_probs.
 LEAN_SAMPLED_VERIFY = "SGLANG_SPEC_LEAN_SAMPLED_VERIFY"
 # With LEAN_SAMPLED_VERIFY: the sampling passes split over vocabulary chunks.
 CHUNKED_VERIFY_SAMPLING = "SGLANG_SPEC_CHUNKED_VERIFY_SAMPLING"

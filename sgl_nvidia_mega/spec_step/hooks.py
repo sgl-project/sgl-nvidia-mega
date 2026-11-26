@@ -41,7 +41,7 @@ SGLANG_READS = {
         "EagleDraftWorker",
         "_draft_extend_for_decode",
     ),
-    "srt/speculative/eagle_utils.py": ("eagle_sample",),
+    "srt/speculative/eagle_utils.py": ("_tree_accept",),
     "srt/speculative/spec_utils.py": (
         "generate_simulated_accept_index",
         "GrammarTree",
@@ -281,13 +281,13 @@ def _rebind(module, names):
         elif isinstance(value, set):
             value = set()
         out[name] = value
-        if name not in ("eagle_sample", "_draft_extend_for_decode"):
+        if name not in ("_tree_accept", "_draft_extend_for_decode"):
             g[name] = value
     g.setdefault("_spec_switches", switches)
     return out
 
 
-def _eagle_sample():
+def _tree_accept():
     import sglang.srt.speculative.eagle_utils as eagle_utils
 
     return _rebind(
@@ -295,11 +295,9 @@ def _eagle_sample():
         (
             "_chunked_verify_sampling_logged",
             "_log_chunked_verify_sampling_once",
-            "_alloc_verify_outputs",
-            "_broadcast_verify_outputs",
-            "eagle_sample",
+            "_tree_accept",
         ),
-    )["eagle_sample"]
+    )["_tree_accept"]
 
 
 def _draft_extend_for_decode():
@@ -404,9 +402,9 @@ def hooks():
     ):
         out += [
             (
-                "sglang.srt.speculative.eagle_utils.eagle_sample",
+                "sglang.srt.speculative.eagle_utils._tree_accept",
                 "REPLACE",
-                _lazy(_eagle_sample),
+                _lazy(_tree_accept),
             ),
             (
                 "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
