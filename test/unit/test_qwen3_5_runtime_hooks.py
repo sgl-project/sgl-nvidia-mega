@@ -480,3 +480,135 @@ def test_failure_after_rng_is_hard_and_does_not_set_engagement(monkeypatch, capl
         assert "slot sharded_gumbel runs" not in caplog.text
         local(view)
     assert caplog.text.count("slot sharded_gumbel runs at 2 rows") == 1
+
+
+def test_checkpoint_provider_declines_before_writes_and_never_replays_errors(
+    monkeypatch,
+):
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import checkpoint_commit as cp
+
+    callback = cp._CheckpointCommit.__new__(cp._CheckpointCommit)
+    callback.shape = (0, 2, 8)
+    callback.engaged = False
+    callback.kernels = {False: object(), True: object()}
+    view = SimpleNamespace(
+        checkpoint=SimpleNamespace(
+            device=torch.device("cuda:0"), shape=(45, 129, 8, 128, 128)
+        ),
+        keys=SimpleNamespace(shape=(45, 128, 2, 16, 128)),
+        state_indices=SimpleNamespace(numel=lambda: 128),
+        track_state_indices=None,
+        track_steps=None,
+    )
+    calls = []
+    monkeypatch.setattr(cp, "supported", lambda _: False)
+    monkeypatch.setattr(cp, "_params", lambda **kw: calls.append("params"))
+    monkeypatch.setattr(cp, "_launch", lambda *a: calls.append("launch"))
+    assert callback(view) is False
+    assert calls == []
+    monkeypatch.setattr(cp, "supported", lambda _: True)
+    monkeypatch.setattr(cp, "_kwargs", lambda _: {})
+    assert callback(view) is True
+    assert calls == ["params", "launch"]
+
+    def fail(*args):
+        raise RuntimeError("owned launch failed")
+
+    monkeypatch.setattr(cp, "_launch", fail)
+    with pytest.raises(RuntimeError, match="owned launch failed"):
+        callback(view)
+
+
+def test_checkpoint_factory_preserves_verifier_and_prebuilds_both_track_variants(
+    monkeypatch,
+):
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import checkpoint_commit as cp
+
+    builds = []
+    monkeypatch.setattr(cp, "_kernel", lambda *args: builds.append(args))
+    factory = cp.bind(None, 0, 8)
+    defaults = _defaults()
+    selected = factory(defaults)
+    assert selected.post_verify is defaults.post_verify
+    assert callable(selected.checkpoint_commit)
+    assert builds == [(0, 2, 8, 16, False), (0, 2, 8, 16, True)]
+    wrapped = _defaults(lambda view: "wrapped")
+    assert cp.bind(lambda _: wrapped, 0, 8)(defaults).post_verify is wrapped.post_verify
+
+
+def test_checkpoint_provider_refuses_cpu_inputs_without_writing():
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import checkpoint_commit as cp
+
+    checkpoint = torch.randn((1, 2, 8, 128, 128), dtype=torch.bfloat16)
+    before = checkpoint.clone()
+    view = SimpleNamespace(
+        checkpoint=checkpoint,
+        updates=torch.empty((1, 2, 8, 16, 128), dtype=torch.bfloat16),
+        keys=torch.empty((1, 2, 2, 16, 128), dtype=torch.bfloat16),
+        log_decays=torch.empty((1, 2, 8, 16)),
+    )
+    assert cp.supported(view) is False
+    assert torch.equal(before, checkpoint)
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+def test_checkpoint_provider_writes_only_after_acceptance_and_propagates_errors(
+    monkeypatch, takeover
+):
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import checkpoint_commit as cp
+
+    state = torch.zeros(1)
+    calls = []
+    monkeypatch.setattr(cp, "_kernel", lambda *args: object())
+    callback = cp._CheckpointCommit(0, 2, 8)
+    view = SimpleNamespace(
+        checkpoint=SimpleNamespace(
+            device=torch.device("cuda:0"), shape=(45, 129, 8, 128, 128)
+        ),
+        keys=SimpleNamespace(shape=(45, 128, 2, 16, 128)),
+        state_indices=SimpleNamespace(numel=lambda: 128),
+        track_state_indices=None,
+        track_steps=None,
+    )
+
+    def supported(_):
+        assert state.item() == 0
+        calls.append("check")
+        return takeover
+
+    def launch(*args):
+        calls.append("launch")
+        state.add_(1)
+        raise RuntimeError("failed after checkpoint write")
+
+    monkeypatch.setattr(cp, "supported", supported)
+    monkeypatch.setattr(cp, "_kwargs", lambda _: {})
+    monkeypatch.setattr(cp, "_params", lambda **kwargs: None)
+    monkeypatch.setattr(cp, "_launch", launch)
+    if takeover:
+        with pytest.raises(RuntimeError, match="failed after checkpoint write"):
+            callback(view)
+        assert calls == ["check", "launch"]
+        assert state.item() == 1
+        assert not callback.engaged
+    else:
+        assert callback(view) is False
+        assert calls == ["check"]
+        assert state.item() == 0
+
+
+def test_checkpoint_provider_shape_refusal_precedes_parameter_build(monkeypatch):
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import checkpoint_commit as cp
+
+    monkeypatch.setattr(cp, "_kernel", lambda *args: object())
+    callback = cp._CheckpointCommit(0, 2, 8)
+    view = SimpleNamespace(
+        checkpoint=SimpleNamespace(
+            device=torch.device("cuda:0"), shape=(45, 129, 16, 128, 128)
+        ),
+        keys=SimpleNamespace(shape=(45, 128, 2, 16, 128)),
+    )
+    monkeypatch.setattr(cp, "supported", lambda _: True)
+    monkeypatch.setattr(cp, "_params", lambda **kwargs: pytest.fail("built parameters"))
+    monkeypatch.setattr(cp, "_launch", lambda *args: pytest.fail("launched kernel"))
+    assert callback(view) is False
