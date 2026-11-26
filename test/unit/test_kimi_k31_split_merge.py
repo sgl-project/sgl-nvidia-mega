@@ -947,3 +947,49 @@ class K31DcpQueryGather(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state.comm_buff.item(), 0)  # the padding heads start zero
         self.assertEqual(made[-1], (_CP_MAX_ROWS, 128 * 576 // 2))
+
+
+class K31AttnResCarveout(unittest.TestCase):
+    """Every AttnRes consumer variant launches with a 100 % shared-memory carve-out, the value of the
+    GB300 TP8/DCP8 Q5 reference run; the side-stream AuxMixture keeps the default."""
+
+    def test_every_consumer_variant_keeps_a_full_carveout(self):
+        carved = []
+
+        def prepare_shared_carveout(code, device_index, value):
+            carved.append((code, device_index, value))
+            return "carved", code
+
+        scope = _load(
+            "sm103/k3/attn_res/prepared.py",
+            {"PreparedAttnRes"},
+            Any=object,
+            architecture=lambda device: "sm_103a",
+            compile_consumer=lambda *key: ("consumer", *key),
+            compile_aux_mixture=lambda *key: ("mixture", *key),
+            prepare_shared_carveout=prepare_shared_carveout,
+            to_cute=lambda tensor: tensor,
+            cutlass=types.SimpleNamespace(Float32=float),
+        )
+        weight = types.SimpleNamespace(
+            device=torch.device("cuda", 3), reshape=lambda *shape: "weight"
+        )
+        attn = scope["PreparedAttnRes"](
+            (weight,) * 3, (2, True, -1, False), (1e-6, 1e-6), 5
+        )
+        attn.bind_ring(torch.zeros(16, 4, 1))
+        attn.bind_aux()
+        plain, ring, aux, aux_ring = (
+            ("consumer", 2, True, -1, False, slots, cap, "sm_103a", 5, mix, mix)
+            for mix in (False, True)
+            for slots, cap in ((0, 0), (16, 4))
+        )
+        # build order: the plain consumer, bind_ring, then bind_aux (its ring variant first)
+        self.assertEqual(
+            carved, [(code, 3, 100) for code in (plain, ring, aux_ring, aux)]
+        )
+        self.assertEqual(
+            (attn.code, attn.ring[0], *attn.aux),
+            tuple(("carved", code) for code in (plain, ring, aux, aux_ring)),
+        )
+        self.assertEqual(attn.aux_side[0][0], "mixture")
