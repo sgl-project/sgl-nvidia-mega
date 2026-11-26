@@ -33,8 +33,9 @@ _NONE: Mapping = MappingProxyType({})
 
 @dataclass(frozen=True)
 class Target:
-    """What one architecture changes in the plans ``sm103/`` holds. An empty field
-    changes nothing, so the kernels run exactly as ``sm103/`` plans them."""
+    """What one architecture changes in the plans ``sm103/`` holds, and which of its
+    kernels it replaces. A field at its default changes nothing, so the kernels are
+    ``sm103/``'s and run exactly as it plans them."""
 
     name: str
     # KDA verify schedules by heads per rank, then by (requests, queries). A key that is
@@ -44,6 +45,9 @@ class Target:
     )
     # The TP sizes served on this architecture; empty: every size the spec admits.
     tp_sizes: Tuple[int, ...] = ()
+    # The package whose ``attn_res.prepared`` compiles and launches the attention
+    # residual (``PreparedAttnRes``).
+    attn_res_package: str = "sgl_nvidia_mega.kimi_k31.sm103.k3"
 
     def __post_init__(self):
         frozen = {

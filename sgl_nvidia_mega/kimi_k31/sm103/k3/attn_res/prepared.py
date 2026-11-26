@@ -84,6 +84,8 @@ def compile_aux_mixture(nb, slots, cap, arch):
 class PreparedAttnRes:
     """Ordinary-input code plus the Lamport variant of its bound mailbox ring."""
 
+    join_aux = staticmethod(join_aux)
+
     def __init__(self, weights, key, eps, deadline_ns):
         self.device = weights[0].device
         self.views = tuple(to_cute(w.reshape(-1)) for w in weights)

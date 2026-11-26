@@ -300,5 +300,32 @@ class KdaVerifySchedules(unittest.TestCase):
         self.assertEqual(compiled, {(3, 5): (0, 8, 1, 8), (2, 5): DEFAULT})
 
 
+class RubinAttnRes(unittest.TestCase):
+    """Rubin's attention residual is its own (``sm107/k3/attn_res``); it takes its
+    mailbox rows with the checked bulk copy."""
+
+    def test_the_attention_residual_package_by_architecture(self):
+        cases = (((10, 7), "sm107"), ((10, 3), "sm103"), ((10, 0), "sm103"))
+        for sm, directory in cases:
+            package = targets.select(sm).attn_res_package
+            self.assertEqual(package, f"{PACKAGE}.{directory}.k3")
+            self.assertTrue((K31 / directory / "k3/attn_res/prepared.py").is_file())
+
+    def test_the_copy_reports_on_the_mailbox_sentinel(self):
+        # The assembler takes only this marker; the mailbox must be armed with it.
+        primitives = _load(
+            "sm107/k3/common/primitives.py",
+            {"CHECKED_SENTINEL", "copy_g2s_checked"},
+            asm=lambda *a, **k: lambda fn: fn,
+            Int32=lambda value: value,
+        )
+        mailbox = _load("sm107/k3/common/mailbox.py", {"SENTINEL"})
+        self.assertEqual(primitives["CHECKED_SENTINEL"], 0x80000000)
+        self.assertEqual(mailbox["SENTINEL"], primitives["CHECKED_SENTINEL"])
+        code, _, _ = primitives["copy_g2s_checked"]("dst", "src", 2048, "bar")
+        self.assertIn("report::validity::per_16bytes::80000000.b128", code)
+        self.assertIn("[$0], [$1], 2048, [$2]", code)
+
+
 if __name__ == "__main__":
     unittest.main()

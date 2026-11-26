@@ -7,7 +7,6 @@ from functools import partial
 
 import torch
 
-from .sm103.k3.attn_res.prepared import join_aux
 from .sm103.k3.mla.verify_overlap import VerifyMlaIndexOverlap
 from .verify_binding import VerifyStepView
 from .verify_contract import verify_keys
@@ -111,7 +110,8 @@ class K31VerifyExecutor:
                 core.run(
                     projected, local, pools=self.kda_pools[layer_id], step=view.kda
                 )
-            join_aux(torch.cuda.current_stream())  # the o-proj rewrites the prefix row
+            # the o-proj rewrites the prefix row
+            res.final.join_aux(torch.cuda.current_stream())
             attn.output.run(local, prefix, blocks, second)
             if attn.kind == "mla" and overlap is not None:
                 # feed.run may overwrite first, including through fused consumers.
@@ -131,5 +131,5 @@ class K31VerifyExecutor:
         if not ready:
             res.final.run(hidden, prefix, blocks, output, aux=self._aux(view, 92))
         # The draft reads aux_hidden after the step.
-        join_aux(torch.cuda.current_stream())
+        res.final.join_aux(torch.cuda.current_stream())
         return output, view.aux_hidden

@@ -4,7 +4,8 @@
 ``kimi_k31/targets.py`` picks on SM107.
 
 Rubin (VR200, SM107, 212 SMs) is in the SM100 family and runs the kernels of
-``kimi_k31/sm103``, CuTe DSL compiled for the device. Their plans were measured on
+``kimi_k31/sm103``, CuTe DSL compiled for the device, except the attention residual,
+which is its own (``sm107/k3/attn_res``). The plans were measured on
 GB300; this module holds the ones Rubin replaces. The o-proj producer's staged K
 blocks have SM107 values in ``sm103/k3/oproj/prepared.py``; every other plan is
 GB300's, not tuned for 212 SMs.
@@ -33,4 +34,11 @@ KDA_VERIFY = {
 }
 
 # Rubin serves TP8 only: TP16 has no plans here.
-RUBIN = Target(name="Rubin (VR200)", kda_verify={KDA_HEADS: KDA_VERIFY}, tp_sizes=(8,))
+RUBIN = Target(
+    name="Rubin (VR200)",
+    kda_verify={KDA_HEADS: KDA_VERIFY},
+    tp_sizes=(8,),
+    # Rubin's own attention residual (``sm107/k3/attn_res``): it takes its mailbox rows
+    # with SM107's checked bulk copy instead of polling them.
+    attn_res_package="sgl_nvidia_mega.kimi_k31.sm107.k3",
+)

@@ -111,8 +111,10 @@ def _float(value: Any) -> float:
     return float(value)
 
 
-def _module(suffix: str, origins: dict[str, str]) -> Any:
-    name = f"{PAYLOAD_PACKAGE}.{suffix}"
+def _module(
+    suffix: str, origins: dict[str, str], package: str = PAYLOAD_PACKAGE
+) -> Any:
+    name = f"{package}.{suffix}"
     module = importlib.import_module(name)
     origins[name] = str(Path(inspect.getsourcefile(module) or "").resolve())
     return module
@@ -667,7 +669,6 @@ def build_resources(
     projection_module = _module("gemm.projection", origins)
     mla_module = _module("mla.prepared", origins)
     kda_module = _module("kda.prepared", origins)
-    attnres_module = _module("attn_res.prepared", origins)
     oproj_module = _module("oproj.prepared", origins)
     twoshot_module = _module("common.twoshot", origins)
     dense_module = _module("moe.dense", origins)
@@ -691,6 +692,7 @@ def build_resources(
         raise ValueError(
             f"Kimi K3.1 megakernel has no plans for CUDA capability {capability}"
         )
+    attnres_module = _module("attn_res.prepared", origins, target.attn_res_package)
     owner = (group, device, tp, rank)
     backbone = model.model
     layers = tuple(backbone.layers[backbone.start_layer : backbone.end_layer])
