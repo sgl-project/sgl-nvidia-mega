@@ -80,7 +80,9 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     # Stock, SGLang aa3e34aa, and the SGLang follow-up's CP-lite dispatch; the metadata
     # this module mirrors is unchanged by the dispatch around the fixed-q-length call.
-    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": "9ddde6d7d3f6d4be",
+    # sgl-project/sglang#53185/#53249/#53314 size its trtllm-gen max_seq_len from the
+    # req_to_token row width (max_kv_len); this module passes no max_seq_len of its own.
+    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": "4e969397e09f4fed",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": (
         "363661c3585e6a0f",

@@ -113,12 +113,11 @@ SGLANG_READS = {
     ),
     "kernels/ops/attention/utils.py": ("canonicalize_stride",),
     "srt/mem_cache/layout/paged_view.py": ("paged_kv_view",),
-    # TRTLLMHAAttnBackend: its shared workspace, its counters and max_context_len, and
+    # TRTLLMHAAttnBackend: its shared workspace, its counters, and
     # _run_fixed_q_len_decode's trtllm-gen call
     "srt/layers/attention/trtllm_mha_backend.py": (
         "DEFAULT_WORKSPACE_SIZE_MB",
         '"trtllm_mha_zero_workspace"',
-        "max_context_len",
         "_multi_ctas_kv_counter_buffer",
         "_run_fixed_q_len_decode",
         "flashinfer",
@@ -131,9 +130,11 @@ SGLANG_READS = {
     "srt/model_executor/runner_utils/capture_mode.py": (
         "get_capture_attention_variant",
     ),
-    # ModelConfig._derive_context_length writes the backend's max_context_len into the
-    # HF config the draft's build gets
+    # ModelConfig._derive_context_length writes the model context length into the HF
+    # config the draft's build gets; the backend's max_seq_len is the req_to_token row
+    # width built from it (sgl-project/sglang#53185, #53249)
     "srt/configs/model_config.py": ("context_len",),
+    "srt/mem_cache/allocation_sizing.py": ("get_req_to_token_row_width",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
@@ -144,13 +145,16 @@ SGLANG_MIRRORS = {
 
 
 def _context_len(draft) -> int:
-    """The max_seq_len SGLang's TRT-LLM MHA backend gives trtllm-gen: the draft's
+    """The max_seq_len SGLang's TRT-LLM MHA backend gives trtllm-gen: the
+    req_to_token row width (req_to_token_pool.row_width) for the draft's
     ModelConfig.context_len, which it writes into the HF config the build gets."""
+    from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
+
     if draft.context_len is None:
         raise RuntimeError(
             "NVIDIA megakernel: the draft's HF config has no context_len"
         )
-    return int(draft.context_len)
+    return get_req_to_token_row_width(int(draft.context_len))
 
 
 class Attention:
