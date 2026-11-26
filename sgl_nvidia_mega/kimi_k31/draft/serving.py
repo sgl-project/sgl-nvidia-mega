@@ -190,14 +190,17 @@ class DraftLayersOnChain:
         group = get_tp_group()
         self.model = model
         device = model.norm.weight.device
+        weights = [self._layer_weights(layer) for layer in model.layers]
         shapes = DraftShapes(
             tp=group.world_size,
             rank=group.rank_in_group,
+            # per-rank widths from the loaded shards, not TP16's defaults
+            inter=int(weights[0].down.shape[1]),
+            heads=int(weights[0].o_proj.shape[1]) // 128,
             eps=float(hf_config.rms_norm_eps),
             # the head box; a default of 16 against a K 32 selector raises in attach_draft_head (walk K check)
             topk=int(getattr(getattr(model, "candidate_selector", None), "top_k", 16)),
         )
-        weights = [self._layer_weights(layer) for layer in model.layers]
         comm = DraftComm(group.device_group, device, shapes, layers=len(weights))
         cos_sin = model.layers[0].self_attn.rotary_emb.cos_sin_cache
         if not INSTANCES:
