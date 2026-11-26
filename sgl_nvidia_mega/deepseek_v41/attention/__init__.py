@@ -66,9 +66,11 @@ def _q_cluster_default_takes(attn) -> bool:
 def build(model, ctx, group) -> dict[int, AttentionStep]:
     """Each covered layer's ``AttentionStep`` by layer id; the result is
     ``st.bound["attention"]``."""
-    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+    from sgl_nvidia_mega.deepseek_v41 import runtime
 
     m = model.model
+    # the requested slots less those a default start leaves off at this head count
+    SLOTS = runtime.slots_here(m.layers[m.start_layer].self_attn.n_local_heads)
     chain_on = "attn" in SLOTS
     q_cluster_on = "attn_q_cluster" in SLOTS and _q_cluster_default_takes(
         m.layers[m.start_layer].self_attn

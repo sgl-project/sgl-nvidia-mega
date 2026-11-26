@@ -55,7 +55,11 @@ SGLANG_READS = {
         "num_experts",
         "top_k",
         "quant_method",
+        "uses_expert_location",
     ),
+    # router_experts: the layer's slots less SGLang's redundant experts
+    "srt/runtime_context.py": ("get_exec",),
+    "srt/arg_groups/fields/*.py": ("ep_num_redundant_experts",),
     "srt/models/deepseek_v2.py": (
         "e_score_correction_bias_vl",
         "is_hash",
@@ -287,6 +291,20 @@ def expert_offset(experts: torch.nn.Module) -> int:
     return experts.moe_ep_rank * experts.num_local_experts
 
 
+def router_experts(experts: torch.nn.Module) -> int:
+    """The router's expert count: the layer's slots less SGLang's redundant ones."""
+    from sglang.srt.runtime_context import get_exec
+
+    if not experts.uses_expert_location:
+        return experts.num_experts
+    return experts.num_experts - get_exec().moe.ep_num_redundant_experts
+
+
+def _redundant_holds_all(experts: torch.nn.Module) -> bool:
+    routed = router_experts(experts)
+    return experts.num_experts != routed and experts.num_local_experts == routed
+
+
 def layer_weights(experts: torch.nn.Module, method, deal: bool):
     """The pair's (w13, w13 scales, w2, w2 scales), SwiGLU clamp, expert offset and deal
     group (-1: none). Under SGLang's balanced expert storage (every routed expert held,
@@ -300,6 +318,10 @@ def layer_weights(experts: torch.nn.Module, method, deal: bool):
         experts.w2_weight_scale_inv,
     )
     clamp = method._gemm1_clamp_limit_tensor
+    if deal and experts.moe_ep_size == 2 and _redundant_holds_all(experts):
+        # --ep-num-redundant-experts = the routed count, trivial placement: each EP
+        # rank's slots hold every routed expert in router-id order
+        return weights, clamp, 0, int(experts.moe_ep_rank)
     if not getattr(experts, "balanced_expert_storage", False):
         return weights, clamp, expert_offset(experts), -1
     if not deal:
@@ -394,7 +416,7 @@ def build_layers(
                 top_k=experts.top_k,
                 max_rows=SERVED_MAX_ROWS,
                 gate_topk=gate_topk,
-                router_experts=experts.num_experts,
+                router_experts=router_experts(experts),
                 expert_offset=offset,
                 deal_group=deal_group,
                 gate_route=gate_route,

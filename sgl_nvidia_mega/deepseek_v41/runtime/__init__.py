@@ -12,12 +12,15 @@ from typing import Any
 import msgspec
 
 # Slots described with the opt-in slots below that run by default: each measured faster
-# served at batch 1 (a 95 % interval below zero) and passed the accuracy checks, and each
+# served at batch 1 (a 95 % interval below zero; the TP8_DEFAULT_SLOTS and attn_core_lean
+# as a group, in the full stack at attention TP8) and passed the accuracy checks, and each
 # is bitwise with the path it replaces except those in NUMERICS_CHANGE_SLOTS. On a default
 # start (no SLOTS_ENV) one that has nothing to serve stays off instead of refusing the
-# start; listed in SLOTS_ENV it must build like any other slot. markov_shard_logits and
-# moe_balanced act only when SGLang asks for them (step_logits_shard_only; its balanced
-# expert storage), and otherwise leave the step as it was.
+# start (see default_takes for where a default start takes the TP8_DEFAULT_SLOTS and
+# attn_core_lean); listed in SLOTS_ENV it must build like any other slot.
+# markov_shard_logits and moe_balanced act only when SGLang asks for them
+# (step_logits_shard_only; balanced or redundant expert storage), and otherwise leave the
+# step as it was.
 DEFAULT_ON_SLOTS = (
     "gate_route",
     "gate_route_quant",
@@ -41,6 +44,14 @@ DEFAULT_ON_SLOTS = (
     "gemm2_reg_pool",
     "markov_shard_logits",
     "target_lm_head_xload",
+    # measured in the full batch-1 stack at attention TP8 (TP8_DEFAULT_SLOTS)
+    "attn_wo_a_fp8",
+    "attn_index_weights_bf16",
+    "attn_index_q_first",
+    "attn_cluster_merge",
+    "draft_stage0_first",
+    "draft_embed",
+    "draft_final_collapse",
     # numerics changes (NUMERICS_CHANGE_SLOTS)
     "swapab_h8",
     "wo_a_g1",
@@ -50,7 +61,26 @@ DEFAULT_ON_SLOTS = (
     "draft_shared_ll",
     "wo_b_publish_split",
     "moe_balanced",
+    "attn_core_lean",
 )
+# Default-on slots a default start takes at attention TP8 (8 local heads) only: at
+# attention TP4 (16 local heads) the group measured about 70 us per step slower served at
+# batch 1, and seeded T=1 outputs changed (attn_cluster_merge and draft_final_collapse do
+# not build there: 8 local heads only, no draft hop); listed, they run at TP4 too
+TP8_DEFAULT_SLOTS = frozenset(
+    {
+        "attn_wo_a_fp8",
+        "attn_index_weights_bf16",
+        "attn_index_q_first",
+        "attn_cluster_merge",
+        "draft_stage0_first",
+        "draft_embed",
+        "draft_final_collapse",
+    }
+)
+TP8_LOCAL_HEADS = 8
+# The SGLang KV layout slot attn_core_lean reads; a default start takes the slot only on it
+CORE_LEAN_KV_LAYOUT = "v41_new"
 # The slots that are not bitwise with the path they replace (a different summation order
 # or encoding; the step's accuracy is checked with evals, not bit for bit)
 NUMERICS_CHANGE_SLOTS = frozenset(
@@ -167,7 +197,7 @@ DRAFT_SLOTS = frozenset(
         "draft_shared_ll",
     }
 )
-# Slots that run only when listed, except those in DEFAULT_ON_SLOTS (draft_embed: the
+# Slots that run only when listed (OPT_IN_SLOTS), and what the others do (draft_embed: the
 # draft's tokens from the target's gathered table; hop_b_cap16: hop_b_wide's row tiles at 9-16 rows only, no 48-row
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
@@ -266,8 +296,9 @@ DRAFT_SLOTS = frozenset(
 # rows' all-reduce at the first Engram layer; a later Engram layer's columns start at
 # the layer 4 before it (muLLM's late-layer schedule), off layer 1's path (engram/exchange.py;
 # bitwise: SGLang's whole WKV GEMM bit for bit);
-# moe_balanced: with SGLang's balanced expert storage (every rank holds its MoE-TP slice
-# of all routed experts, SGLANG_OPT_MOE_BALANCED_EXPERT_STORAGE), the route record deals
+# moe_balanced: when every rank holds its MoE-TP slice of all routed experts (SGLang's
+# --ep-num-redundant-experts 384, which the user passes, or SGLang's balanced expert
+# storage), the route record deals
 # each step's distinct experts, in id order, to the two expert-parallel groups in turn
 # (muLLM's balanced groups), so each group runs half of them whatever the routing; a
 # numerics change: the experts' partial sums meet at hop B in another grouping
@@ -282,21 +313,11 @@ DRAFT_SLOTS = frozenset(
 # of x in as 16-byte loads all issued before their shared stores, so the first MMAs wait one
 # L2 round trip for x, not several (bitwise: the same shared bytes, MMAs and order)
 OPT_IN_SLOTS = (
-    "draft_embed",
     "hop_b_cap16",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
     "hop_final_collapse",
     "draft_lm_head_mxfp8",
-    "attn_index_q_first",
-    "attn_index_weights_bf16",
-    "attn_cluster_merge",
-    "attn_wo_a_fp8",
-    # needs SGLANG_DSV4_KV_LAYOUT=v41_new, which the plugin does not select
-    "attn_core_lean",
-    "draft_final_collapse",
-    # no resolved served gain alone (its gain needs SGLang-side draft-metadata changes)
-    "draft_stage0_first",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -320,6 +341,34 @@ def default_start() -> bool:
     """No ``SLOTS_ENV``: the default slots, each left off where it has nothing to serve
     (or, as wo_b_publish_split at TP4, where it measured slower)."""
     return os.environ.get(SLOTS_ENV) is None
+
+
+def kv_layout() -> str:
+    """SGLang's DeepSeek-V4 KV layout setting (``SGLANG_DSV4_KV_LAYOUT``), lower case."""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
+
+
+def default_takes(slot: str, local_heads: int) -> bool:
+    """Whether slot ``slot`` of ``SLOTS`` runs on a layer with ``local_heads`` attention
+    heads: listed, always; on a default start a TP8_DEFAULT_SLOTS slot only at attention
+    TP8, and attn_core_lean only on SGLang's CORE_LEAN_KV_LAYOUT (it builds nothing a
+    step could take on another layout)."""
+    if slot not in SLOTS:
+        return False
+    if not default_start():
+        return True
+    if slot in TP8_DEFAULT_SLOTS and local_heads != TP8_LOCAL_HEADS:
+        return False
+    if slot == "attn_core_lean" and kv_layout() != CORE_LEAN_KV_LAYOUT:
+        return False
+    return True
+
+
+def slots_here(local_heads: int) -> frozenset:
+    """``SLOTS`` less those a default start leaves off at ``local_heads`` heads."""
+    return frozenset(s for s in SLOTS if default_takes(s, local_heads))
 
 
 def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
@@ -435,6 +484,8 @@ SGLANG_READS = {
         '"tp_group"',
         '"attn_dp_size"',
     ),
+    # kv_layout: the layout slot attn_core_lean reads
+    "srt/environ.py": ("envs", "SGLANG_DSV4_KV_LAYOUT"),
     "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "widths",
         "tokens_per_request",

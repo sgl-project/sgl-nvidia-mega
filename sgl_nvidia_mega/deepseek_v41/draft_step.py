@@ -97,6 +97,17 @@ class DraftDecode(DraftProposal):
         self.widths = tuple(range(tokens, DRAFT_MAX_ROWS + 1, tokens))
         self._view = _DraftLm(lm)
         stages = self._view.model.layers
+        # the requested slots less those a default start leaves off at this head count
+        from sgl_nvidia_mega.deepseek_v41 import runtime
+
+        attn = getattr(stages[0], "self_attn", None) if len(stages) else None
+        if attn is not None:
+            slots = frozenset(
+                s
+                for s in slots
+                if s not in runtime.SLOTS
+                or runtime.default_takes(s, attn.n_local_heads)
+            )
         moe_bound = moe.routed.Bound(reason="stock (slot draft_moe off)")
         if "draft_moe" in slots:
             from sglang.srt.runtime_context import get_parallel
@@ -500,6 +511,15 @@ def _embed_table(lm, slots):
     if "draft_embed" not in slots:
         return None
     if lm.uses_own_vocab_modules:
+        from sgl_nvidia_mega.deepseek_v41 import runtime
+
+        # a default start leaves the slot off: it has nothing to serve
+        if runtime.default_start():
+            logger.info(
+                "NVIDIA megakernel: default slot draft_embed left off: the draft has "
+                "its own vocabulary modules"
+            )
+            return None
         # attach_shared_modules then keeps the draft's own table: a second whole one
         raise RuntimeError(
             "NVIDIA megakernel: slot draft_embed: the draft has its own vocabulary "
