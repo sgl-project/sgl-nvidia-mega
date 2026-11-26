@@ -74,6 +74,7 @@ SGLANG_READS = {
         "alt_stream",
         "rotary_emb",
         "use_dsa_indexer_fusion",
+        "skip_rope",
         "use_gfx950_fused_indexer",
         "dsa_enable_prefill_cp",
         "_aiter_fused_fp8_active",
@@ -133,6 +134,7 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_batch_info.py": ("attn_cp_metadata",),
     "srt/layers/rotary_embedding/base.py": ("is_neox_style",),
+    "srt/mem_cache/memory_pool.py": ("KVWriteLoc", "for_batch"),
 }
 
 # The SGLang function bodies this module's stock steps copy, by the digest of their
@@ -151,6 +153,10 @@ SGLANG_MIRRORS = {
         # above; no SGLang class overrides them) and #38943 (the DCP extend
         # gather): the same verify step
         "19896b37f7714fbd",
+        # sgl-project/sglang#48414 (the Q absorb on the alt stream under
+        # dsa_decode_absorb_under_indexer, a Kimi-K3 class flag) and #49943 (a DCP-only
+        # extend gather): the same verify step
+        "b5725ae563f87c3f",
     ),
     # before and after sgl-project/sglang#45946, which added a SAIL-only fp8 condition
     "srt/models/deepseek_common/attention_forward_methods/forward_mla.py:DeepseekMLAForwardMixin.forward_absorb_core": (
@@ -159,14 +165,28 @@ SGLANG_MIRRORS = {
         # sgl-project/sglang#44503: the W_UV projection moved into the
         # project_mla_values hook (same branches; the bf16 bmm the spec serves)
         "a4d250aebbab19fb",
+        # sgl-project/sglang#48740 (DCP V pre-projection, refused here; the output tail
+        # moved into _finish_absorb_output, same steps) and #48414 (the KV store skipped
+        # after the Kimi-K3 early store)
+        "bfc8a005b3dd63a9",
     ),
     # before and after sgl-project/sglang#46890 (a prefill-CP condition on the
     # split-op prefill surface; verify unchanged)
     "srt/layers/attention/dsa/dsa_indexer.py:Indexer.forward_cuda": (
         "805ab11bf040ed52",
         "a2619a55994b4ec8",
+        # sgl-project/sglang#48414 and #51000 (a merged K / head-gate GEMM that only
+        # Kimi-K3 prepares; ROCm and FP4 index-K branches) and #48547 (the query
+        # quantization behind _quantize_query, the same act_quant)
+        "c66ceb7c2d877a5f",
     ),
-    "srt/layers/attention/dsa/dsa_indexer.py:Indexer._fused_q_prepare_and_store": "6ac8fd1c71413a93",
+    "srt/layers/attention/dsa/dsa_indexer.py:Indexer._fused_q_prepare_and_store": (
+        "6ac8fd1c71413a93",
+        # sgl-project/sglang#48414: the key/gate GEMM and the query quantization behind
+        # _fused_k_weights / _fused_q_quant; with the fused projections and an
+        # interleaved indexer RoPE (refused otherwise) the same calls
+        "7d65bb3d06e2b7ca",
+    ),
     # before and after sgl-project/sglang#46990, which stores and reads the KV through
     # the pool's layer router: on the DSA pool, the same set_mla_kv_buffer and
     # get_key_buffer calls
@@ -176,12 +196,21 @@ SGLANG_MIRRORS = {
         # sgl-project/sglang#46890: prefill-CP rows narrowed before the store
         # (no change without prefill CP)
         "bc7b885acb04e4d7",
+        # sgl-project/sglang#48602 (the Prims-TS backend), #48414 / #48712 / #51289
+        # (Kimi-K3.1 fused Q, DCP / CP live-row planning) and the store through
+        # KVWriteLoc (ported above); the single-rank TRT-LLM path is unchanged
+        "55b7e463512ba3cd",
     ),
     # the fused top-k page table is the top-k indices on the top-k backends the spec
     # serves (attention_step_reasons); the two padding helpers are copied below
     "srt/layers/attention/dsa_backend.py:DeepseekSparseAttnBackend._get_fused_topk_page_table": "b4cc1d5b7eef0b8d",
     "srt/layers/attention/dsa_backend.py:DeepseekSparseAttnBackend._pad_topk_indices": "a6c6754bca9b3add",
-    "srt/layers/attention/dsa_backend.py:DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table": "af41a74e3fc0830b",
+    "srt/layers/attention/dsa_backend.py:DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table": (
+        "af41a74e3fc0830b",
+        # sgl-project/sglang#48602 / #52451: the Prims-TS backend padding (TRT-LLM pads
+        # as before)
+        "52959c49a35bf083",
+    ),
 }
 
 
@@ -315,6 +344,9 @@ def attention_step_reasons(model, forward_batch, view) -> List[str]:
         elif not attn.skip_topk:
             if not indexer.use_dsa_indexer_fusion:
                 why.append("the indexer projections are not fused")
+            if indexer.skip_rope:
+                # index_q applies the indexer RoPE in the fused quantization
+                why.append("the indexer has no RoPE")
             if (
                 indexer.use_gfx950_fused_indexer
                 or indexer.dsa_enable_prefill_cp
@@ -506,6 +538,7 @@ class AttentionStep:
         """RoPE, the FP8 query ``[rows, heads, kv_lora_rank + rope]`` (returned)
         and the key's MLA cache rows."""
         from sglang.kernels.ops.attention.utils import mla_quantize_and_rope_for_fp8
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
         dsa = step.view.dsa
         layer = attn.attn_mqa
@@ -525,7 +558,9 @@ class AttentionStep:
             dsa.kv_lora_rank,
             dsa.qk_rope_head_dim,
         )
-        step.view.kv_pool.set_mla_kv_buffer(layer, fb.out_cache_loc, k, k_rope)
+        # The batch's write loc with its physical mark (a unified pool refuses a
+        # bare loc), as the backend's forward_decode hands it.
+        step.view.kv_pool.set_mla_kv_buffer(layer, KVWriteLoc.for_batch(fb), k, k_rope)
         return q
 
     def sparse_mla(

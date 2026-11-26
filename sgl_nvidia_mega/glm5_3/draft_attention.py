@@ -109,6 +109,10 @@ SGLANG_MIRRORS = {
     "srt/layers/attention/dsa_backend.py:DeepseekSparseAttnBackend.forward_decode": (
         "52e50cfcdda18bea",
         "35f75d4c546f4c15",
+        # sgl-project/sglang#48602 (the raw-FP8 layout check also admits Prims-TS),
+        # #40328 (the KV store through KVWriteLoc.for_layer: the batch loc for self-
+        # attention, as the step stores) and #48414 (FlashMLA Q padding, DCP partials)
+        "57de1662b8b623f2",
     ),
 }
 

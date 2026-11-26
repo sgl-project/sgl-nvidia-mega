@@ -163,7 +163,12 @@ SGLANG_READS = {
 # The SGLang function bodies this module's draft step copies, by the digest of their
 # code (test/unit/test_contract.py pins them)
 SGLANG_MIRRORS = {
-    "srt/models/deepseek_nextn.py:DeepseekModelNextN.forward": "d6329c2e1025a6ef",
+    "srt/models/deepseek_nextn.py:DeepseekModelNextN.forward": (
+        "d6329c2e1025a6ef",
+        # sgl-project/sglang#46784: the eh projection moved into
+        # _project_with_target_hidden (same code)
+        "c779de58258cf814",
+    ),
     # before and after sgl-project/sglang#43449, whose lines run only with
     # --enable-return-aux-hidden-states, which turns speculative decoding off
     "srt/layers/logits_processor.py:LogitsProcessor.forward": (
@@ -172,8 +177,16 @@ SGLANG_MIRRORS = {
         # sgl-project/sglang#47200: vocab-sharded target-verify logits (a target verify only; the draft
         # steps take the gather as before)
         "48c24aac22ca5303",
+        # sgl-project/sglang#44349 and #51899: the beam-search trie head and input
+        # candidate selectors (neither serves a draft step)
+        "f1604e7bcf4cd8fa",
     ),
-    "srt/layers/logits_processor.py:LogitsProcessor._get_logits": "0bfb8f2f72aa5755",
+    "srt/layers/logits_processor.py:LogitsProcessor._get_logits": (
+        "0bfb8f2f72aa5755",
+        # sgl-project/sglang#48414: a deferred target-verify gather (a target verify
+        # only)
+        "835923a6dc3f1a84",
+    ),
 }
 
 # draft decode: one row per request (1-4 requests); the draft extend: the covered
