@@ -15,14 +15,14 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from sglang.kernels.plugin_kernels.nvidia.spec import (
+
+from sgl_nvidia_mega._sglang_spec import (
     HooksFactory,
     LocalKeysFn,
     PostVerifyStrategy,
     ShardedLogitsView,
     SpeculativeRuntimeHooks,
 )
-
 from sgl_nvidia_mega.qwen3_5.sm103 import sharded_gumbel
 
 logger = logging.getLogger(__name__)

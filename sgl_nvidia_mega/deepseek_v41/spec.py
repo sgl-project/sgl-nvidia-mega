@@ -14,23 +14,13 @@ import importlib.util
 import os
 from pathlib import Path
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-
+from sgl_nvidia_mega._sglang_spec import (
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+)
 from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG
 from sgl_nvidia_mega.deepseek_v41.plan import max_rows
 from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS

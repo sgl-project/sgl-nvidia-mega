@@ -46,9 +46,14 @@ PACKAGE = Path(sgl_nvidia_mega.__file__).resolve().parent
 def _files(pattern: str) -> list:
     """The files a ``SGLANG_READS`` key names: its first alternative that exists.
     A key like ``"new.py|old.py"`` tries the first path; if no file matches, tries
-    the next, so files that moved between SGLang versions are named newest first."""
+    the next, so files that moved between SGLang versions are named newest first.
+    The NVIDIA spec keeps its integration settings when it re-exports the shared
+    megakernel contract. Read both files on SGLang versions with that split.
+    """
     for alternative in pattern.split("|"):
         files = sorted(ROOT.glob(alternative))
+        if alternative == "kernels/plugin_kernels/nvidia/spec.py":
+            files.extend(ROOT.glob("kernels/plugin_kernels/megakernel/spec.py"))
         if files:
             return files
     return []
@@ -249,7 +254,7 @@ def _has_k31_host() -> bool:
 
 
 def _has_draft_check() -> bool:
-    return DRAFT_CHECK_NAMES[0] in _provided(_files(DRAFT_CHECK)[0])
+    return any(DRAFT_CHECK_NAMES[0] in _provided(path) for path in _files(DRAFT_CHECK))
 
 
 def _has_dsa_view() -> bool:

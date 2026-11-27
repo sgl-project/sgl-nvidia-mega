@@ -32,11 +32,7 @@ from typing import Dict, Optional
 
 import torch
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
-
+from sgl_nvidia_mega._sglang_spec import Step
 from sgl_nvidia_mega.glm5_3 import logits
 from sgl_nvidia_mega.glm5_3.attention.step import (
     StepContext,

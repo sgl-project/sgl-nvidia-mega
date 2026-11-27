@@ -12,14 +12,12 @@ import msgspec
 import pytest
 from sglang.srt.environ import envs
 
+from sgl_nvidia_mega._sglang_spec import Feature, load_spec
+
 try:
-    from sglang.kernels.plugin_kernels.nvidia import spec as registry
-    from sglang.kernels.plugin_kernels.nvidia.spec import Feature
     from sglang.srt.kernel_plugins.nvidia import binding as guards
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels import guards
-    from sglang.srt.megakernels import spec as registry
-    from sglang.srt.megakernels.spec import Feature
 
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -31,6 +29,9 @@ from sglang.srt.server_args import ServerArgs
 
 from sgl_nvidia_mega import plugin
 from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, spec
+
+registry = load_spec()
+
 
 DOCUMENTED = dict(
     model_path="dummy",

@@ -36,23 +36,13 @@ from __future__ import annotations
 
 import importlib.util
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-
+from sgl_nvidia_mega._sglang_spec import (
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+)
 from sgl_nvidia_mega.glm5_3 import HF_CONFIG, MODEL_TYPE, ll
 from sgl_nvidia_mega.glm5_3.plan import MAX_ROWS
 from sgl_nvidia_mega.glm5_3.profile import ACCEPTED
@@ -444,10 +434,7 @@ def draft_capture_reasons() -> list[str]:
 
     if "draft" not in runtime.SLOTS:
         return []
-    try:
-        import sglang.kernels.plugin_kernels.nvidia.spec as layer
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        import sglang.srt.megakernels.spec as layer
+    from sgl_nvidia_mega import _sglang_spec as layer
 
     if getattr(layer, "EAGLE_DRAFT_CAPTURE_CHECK", False):
         return []

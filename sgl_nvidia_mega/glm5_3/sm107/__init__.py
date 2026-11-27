@@ -132,10 +132,8 @@ def model_reasons(model) -> list[str]:
 
 @functools.lru_cache(maxsize=None)
 def _step_class():
-    try:
-        from sglang.kernels.plugin_kernels.nvidia.spec import Step
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.megakernels.spec import Step
+    from sgl_nvidia_mega._sglang_spec import Step
+
     return Step
 
 

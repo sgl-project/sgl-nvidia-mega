@@ -5,12 +5,10 @@ registry and no hook on SGLang's code, except the parity test's own."""
 
 import pytest
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia import spec as registry
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels import spec as registry
-
 from sgl_nvidia_mega import plugin
+from sgl_nvidia_mega._sglang_spec import load_spec
+
+registry = load_spec()
 
 
 @pytest.fixture
@@ -28,7 +26,7 @@ def hooks(monkeypatch):
 def test_register_registers_every_spec_and_no_hook(hooks, monkeypatch):
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
     plugin.register()
-    assert registry._REGISTRY == dict(plugin.SPECS)
+    assert registry.registered_architectures() == sorted(dict(plugin.SPECS))
     assert hooks == []
     # Every registered path resolves to the spec SGLang checks.
     for architecture, _ in plugin.SPECS:
@@ -48,4 +46,5 @@ def test_the_entry_point_is_the_one_sglang_checks():
 
     project = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())
     entry_points = project["project"]["entry-points"]["sglang.srt.plugins"]
-    assert entry_points == {registry.ENTRY_POINT: "sgl_nvidia_mega.plugin:register"}
+    # The static contract test checks the entry point against SGLang's settings.
+    assert entry_points == {"nvidia_megakernel": "sgl_nvidia_mega.plugin:register"}

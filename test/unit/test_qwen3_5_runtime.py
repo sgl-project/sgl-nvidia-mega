@@ -7,16 +7,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.kernels.plugin_kernels.nvidia import spec as registry
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
 
 from sgl_nvidia_mega import plugin
+from sgl_nvidia_mega._sglang_spec import Step, load_spec
 from sgl_nvidia_mega.qwen3_5 import (
     runtime,
     topology,
 )
 from sgl_nvidia_mega.qwen3_5.runtime import executor, hooks, parity
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
+
+registry = load_spec()
 
 
 @pytest.fixture(autouse=True)
@@ -634,8 +635,7 @@ def test_the_build_covers_more_requests_only_where_a_slot_runs(
 
 
 def test_the_build_hands_over_the_binding_and_ships_the_bitwise_draft_entries():
-    from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
-
+    from sgl_nvidia_mega._sglang_spec import ENTRIES
     from sgl_nvidia_mega.qwen3_5 import draft
 
     built = _verify()
@@ -737,8 +737,7 @@ def _draft_ctx():
 
 
 def test_the_mtp_draft_covers_no_step():
-    from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
-
+    from sgl_nvidia_mega._sglang_spec import ENTRIES
     from sgl_nvidia_mega.qwen3_5 import draft
 
     built = draft.SPEC.build("lm", SimpleNamespace(context_len=4096), _draft_ctx())
@@ -756,8 +755,7 @@ def test_the_mtp_draft_covers_no_step():
 
 
 def test_an_explicit_policy_controls_the_draft_entries(monkeypatch):
-    from sglang.kernels.plugin_kernels.nvidia.spec import ENTRIES
-
+    from sgl_nvidia_mega._sglang_spec import ENTRIES
     from sgl_nvidia_mega.qwen3_5 import draft
 
     monkeypatch.setattr(runtime, "SLOTS", frozenset({"draft_loop", "draft_extend"}))
@@ -1863,8 +1861,7 @@ def test_prefill_plan_keeps_real_multimodal_batches_on_stock():
 
 
 def test_prefill_unsupported_view_returns_the_original_before_state_writes():
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-
+    from sgl_nvidia_mega._sglang_spec import Step
     from sgl_nvidia_mega.qwen3_5.runtime.prefill import Qwen35Prefill
 
     model = SimpleNamespace(

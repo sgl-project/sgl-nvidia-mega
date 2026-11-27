@@ -10,23 +10,13 @@ launcher.
 
 from __future__ import annotations
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-
+from sgl_nvidia_mega._sglang_spec import (
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+)
 from sgl_nvidia_mega.qwen3_5 import TEXT_CONFIG, runtime, topology
 from sgl_nvidia_mega.qwen3_5.plan import MAX_ROWS
 

@@ -7,13 +7,9 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, cast
 
-try:
-    import sglang.kernels.plugin_kernels.nvidia.spec as _host_spec
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    import sglang.srt.megakernels.spec as _host_spec
-
 from sglang.srt.runtime_context import get_model
 
+from sgl_nvidia_mega import _sglang_spec as _host_spec
 from sgl_nvidia_mega.kimi_k31.k3._host import (  # noqa: E402
     BuildContext,
     BuiltMegakernel,

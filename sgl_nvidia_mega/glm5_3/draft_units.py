@@ -751,10 +751,7 @@ class ComposedBuiltDraft:
         """A draft step for the captured draft graphs the composed draft serves (draft decode at one row per
         request is off the width grid: SGLang's dispatch does not check widths); None elsewhere (SGLang's
         draft forward)."""
-        try:
-            from sglang.kernels.plugin_kernels.nvidia.spec import Step
-        except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-            from sglang.srt.megakernels.spec import Step
+        from sgl_nvidia_mega._sglang_spec import Step
 
         if pp_proxy_tensors is not None or not self.fused.engaged():
             return None

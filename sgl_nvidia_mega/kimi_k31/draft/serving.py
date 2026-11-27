@@ -33,25 +33,14 @@ from typing import Optional
 
 import torch
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-        Step,
-    )
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-        Step,
-    )
-
+from sgl_nvidia_mega._sglang_spec import (
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+    Step,
+)
 from sgl_nvidia_mega.kimi_k31 import spec as target
 from sgl_nvidia_mega.kimi_k31.dflash.protocol import DRAFT_CHAINS, RUNTIME
 

@@ -9,8 +9,8 @@ from __future__ import annotations
 import logging
 
 import torch
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
 
+from sgl_nvidia_mega._sglang_spec import Step
 from sgl_nvidia_mega.qwen3_5.gdn import prefill as gdn_prefill
 from sgl_nvidia_mega.qwen3_5.runtime import parity
 

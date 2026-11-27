@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.kernels.plugin_kernels.nvidia import spec
 
+from sgl_nvidia_mega import _sglang_spec as spec
 from sgl_nvidia_mega.qwen3_5.runtime import hooks
 
 

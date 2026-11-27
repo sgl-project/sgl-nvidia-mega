@@ -13,17 +13,7 @@ from unittest.mock import Mock, call, patch
 
 import torch
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import BuildContext
-except ModuleNotFoundError as error:
-    if error.name not in (
-        "sglang.kernels",
-        "sglang.kernels.plugin_kernels",
-        "sglang.kernels.plugin_kernels.nvidia",
-        "sglang.kernels.plugin_kernels.nvidia.spec",
-    ):
-        raise
-    from sglang.srt.megakernels.spec import BuildContext
+from sgl_nvidia_mega._sglang_spec import BuildContext
 
 try:
     from sglang.srt.kernel_plugins.nvidia.binding import (

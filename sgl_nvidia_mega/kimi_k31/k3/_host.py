@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""The SGLang megakernel contract names the Kimi K3/K3.1 megakernels import, from either host layout:
-sglang.kernels.plugin_kernels.nvidia.spec + sglang.srt.kernel_plugins.nvidia.binding (sgl-project/sglang#45389
-and later) or sglang.srt.megakernels.{spec,binding} (before it)."""
+"""SGLang megakernel contract and runtime views used by Kimi K3/K3.1."""
+
+from sgl_nvidia_mega._sglang_spec import (
+    BuildContext,
+    BuiltMegakernel,
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+    Step,
+)
 
 try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        BuildContext,
-        BuiltMegakernel,
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-        Step,
-    )
     from sglang.srt.kernel_plugins.nvidia.binding import (
         HybridPoolView,
         HybridStepView,
@@ -25,16 +24,6 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         HybridPoolView,
         HybridStepView,
         PreparationView,
-    )
-    from sglang.srt.megakernels.spec import (
-        BuildContext,
-        BuiltMegakernel,
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-        Step,
     )
 
 # Names read from SGLang. A contract test checks these before GPU use.

@@ -13,23 +13,13 @@ target spec checks the draft's server arguments at argument resolution.
 
 from __future__ import annotations
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import (
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-    )
-
+from sgl_nvidia_mega._sglang_spec import (
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+)
 from sgl_nvidia_mega.glm5_3 import HF_CONFIG, MODEL_TYPE
 from sgl_nvidia_mega.glm5_3 import spec as target
 from sgl_nvidia_mega.glm5_3.plan import MAX_ROWS

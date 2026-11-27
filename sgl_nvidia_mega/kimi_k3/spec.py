@@ -21,35 +21,16 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sglang.srt.runtime_context import get_model
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import (
-        BuildContext,
-        BuiltMegakernel,
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-        Step,
-    )
-except ModuleNotFoundError as error:  # SGLang before sgl-project/sglang#45389
-    if error.name not in (
-        "sglang.kernels",
-        "sglang.kernels.plugin_kernels",
-        "sglang.kernels.plugin_kernels.nvidia",
-        "sglang.kernels.plugin_kernels.nvidia.spec",
-    ):
-        raise
-    from sglang.srt.megakernels.spec import (
-        BuildContext,
-        BuiltMegakernel,
-        Feature,
-        MegakernelSpec,
-        Numerics,
-        NumericsKind,
-        Requirements,
-        Step,
-    )
+from sgl_nvidia_mega._sglang_spec import (
+    BuildContext,
+    BuiltMegakernel,
+    Feature,
+    MegakernelSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+    Step,
+)
 
 from .shape_policy import (
     DECODE_WIDTHS,

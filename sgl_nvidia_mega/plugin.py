@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The SGLang plugin entry point: it registers the megakernel specs with SGLang's
-``sglang.kernels.plugin_kernels.nvidia``, which runs them on a server started with
+the shared megakernel registry, which serves them on a server started with
 ``--enable-nvidia-megakernel``."""
 
 from __future__ import annotations
 
 import logging
 import os
+
+from sgl_nvidia_mega._sglang_spec import load_spec
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +50,10 @@ TEST_HOOKS = (
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     # the entry point name pyproject.toml declares (test/unit/test_plugin.py)
-    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
+    "srt/kernel_plugins/nvidia/settings.py|kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         '"nvidia_megakernel"',
+    ),
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "register",
         "register(architecture)",
         "register(path)",
@@ -61,13 +65,12 @@ SGLANG_READS = {
 def register() -> None:
     """SGLang's plugin loader calls this in every process, before any model is built."""
     try:
-        import sglang.kernels.plugin_kernels.nvidia.spec as megakernels
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        try:
-            import sglang.srt.megakernels.spec as megakernels
-        except ImportError:
-            logger.warning("sgl-nvidia-mega: this SGLang has no megakernel interface")
-            return
+        megakernels = load_spec()
+    except ModuleNotFoundError as error:
+        if error.name not in ("sglang.srt.megakernels", "sglang.srt.megakernels.spec"):
+            raise
+        logger.warning("sgl-nvidia-mega: this SGLang has no megakernel interface")
+        return
     for architecture, path in SPECS:
         megakernels.register(architecture=architecture, path=path)
     # Muse Spark's kernels hook SGLang's own forward rather than replacing a

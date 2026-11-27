@@ -18,11 +18,7 @@ from scheduler_init import (  # noqa: E402
     SchedulerInit,
 )
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
-
+from sgl_nvidia_mega._sglang_spec import Step
 from sgl_nvidia_mega.deepseek_v41 import runtime, spec  # noqa: E402
 from sgl_nvidia_mega.deepseek_v41.engram import prefetch  # noqa: E402
 from sgl_nvidia_mega.deepseek_v41.runtime import executor  # noqa: E402

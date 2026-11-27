@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding as guards
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -19,6 +18,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.server_args import ServerArgs
 
 from sgl_nvidia_mega import plugin
+from sgl_nvidia_mega._sglang_spec import load_spec
 from sgl_nvidia_mega.qwen3_5 import (
     TEXT_CONFIG,
     plan,
@@ -26,6 +26,8 @@ from sgl_nvidia_mega.qwen3_5 import (
     spec,
     topology,
 )
+
+registry = load_spec()
 
 
 @pytest.fixture(autouse=True)
@@ -596,7 +598,7 @@ def test_bal_internal_row_cap_selects_the_static_split(monkeypatch, rows, plain)
 
 
 def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
-    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
+    from sgl_nvidia_mega._sglang_spec import NumericsKind
 
     route = spec.numerics(frozenset({"route", "hop"}))
     assert route.kind is NumericsKind.TOLERANCE
@@ -641,8 +643,7 @@ def test_a_numeric_slot_turns_the_claim_into_its_tolerances():
 
 
 def test_plugin_runtime_slot_declares_its_actual_numerics():
-    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
-
+    from sgl_nvidia_mega._sglang_spec import NumericsKind
     from sgl_nvidia_mega.qwen3_5 import draft
 
     sampled = spec.numerics(frozenset({"sharded_gumbel"}))
@@ -657,8 +658,7 @@ def test_plugin_runtime_slot_declares_its_actual_numerics():
 
 
 def test_the_shipped_policy_claims_bitwise_numerics():
-    from sglang.kernels.plugin_kernels.nvidia.spec import NumericsKind
-
+    from sgl_nvidia_mega._sglang_spec import NumericsKind
     from sgl_nvidia_mega.qwen3_5 import draft
 
     shipped = frozenset(runtime.SHIPPED_SLOTS)

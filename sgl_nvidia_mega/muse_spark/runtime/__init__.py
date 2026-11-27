@@ -12,11 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
-
+from sgl_nvidia_mega._sglang_spec import Step
 from sgl_nvidia_mega.muse_spark.plan import Facts, plan
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them against the supported SGLang)

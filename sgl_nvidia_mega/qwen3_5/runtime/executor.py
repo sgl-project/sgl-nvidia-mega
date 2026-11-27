@@ -30,11 +30,7 @@ from functools import partial
 
 import torch
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
-
+from sgl_nvidia_mega._sglang_spec import Step
 from sgl_nvidia_mega.qwen3_5 import attention, boundary, gdn, logits, moe
 from sgl_nvidia_mega.qwen3_5.attention import route as _attention_route  # noqa: F401
 from sgl_nvidia_mega.qwen3_5.gdn import verify as _gdn_verify  # noqa: F401

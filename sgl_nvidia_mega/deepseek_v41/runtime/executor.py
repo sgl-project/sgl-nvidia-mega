@@ -32,11 +32,7 @@ import os
 
 import torch
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
-
+from sgl_nvidia_mega._sglang_spec import Step
 from sgl_nvidia_mega.deepseek_v41 import attention, boundary, engram, logits, moe
 from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS, bench, embedding, prologue
 from sgl_nvidia_mega.deepseek_v41.runtime.state import StepState

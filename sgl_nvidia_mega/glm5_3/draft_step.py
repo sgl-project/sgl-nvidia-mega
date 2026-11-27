@@ -38,11 +38,7 @@ import torch
 from sglang.srt.distributed import tensor_model_parallel_all_gather
 from sglang.srt.distributed.parallel_state import get_tp_group
 
-try:
-    from sglang.kernels.plugin_kernels.nvidia.spec import Step
-except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.megakernels.spec import Step
-
+from sgl_nvidia_mega._sglang_spec import Step
 from sgl_nvidia_mega.glm5_3 import HIDDEN, draft_attention, runtime
 from sgl_nvidia_mega.glm5_3.runtime import parity
 from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached, cu_stream
