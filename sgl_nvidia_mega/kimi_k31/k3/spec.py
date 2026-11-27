@@ -263,8 +263,10 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
 SPEC = MegakernelSpec(
     name="Kimi K3 packed-MXFP4",
     requires=Requirements(
-        # sm_100: GB200/B200; the kernels JIT for the live arch (sm_100a), no kernel change
-        isas=frozenset({"sm_100", "sm_103"}),
+        # sm_100: GB200/B200; the kernels JIT for the live arch (sm_100a), no kernel change.
+        # sm_107: VR200; the same kernels with Rubin's plans (kimi_k31/targets.py). Each
+        # ISA here has a target there.
+        isas=frozenset({"sm_100", "sm_103", "sm_107"}),
         tp_sizes=frozenset({8, 16}),
         resident_blocks=resident_blocks(),  # 152, or 148 with "sm148" in SGLANG_NVIDIA_MEGAKERNEL_SLOTS
         dtypes=frozenset({"bfloat16"}),

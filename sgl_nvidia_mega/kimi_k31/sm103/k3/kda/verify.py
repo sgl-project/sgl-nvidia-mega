@@ -73,6 +73,9 @@ class PreparedKdaVerify:
     shaped [S,H,L,128] for the first three and [S,H,L] for beta.
     Raw V/K are BF16, g/beta FP32; L >= Q. Metadata is int32[Breq],
     state slot 0 is valid and a negative state/scratch row is padding.
+    ``schedules``: the caller's schedules (early, lanes per state row, minimum
+    CTAs per SM, CTAs per head) by (Breq, Q), the plans of its GPU; a key it
+    lacks runs ``verify_schedule``.
     """
 
     def __init__(
@@ -87,6 +90,7 @@ class PreparedKdaVerify:
         eps,
         policies,
         conv_dim_first=False,
+        schedules=None,
     ):
         if any(not isinstance(key, tuple) or len(key) != 2 for key in policies):
             raise ValueError("KDA verify policies require explicit (Breq, Q) keys")
@@ -105,6 +109,7 @@ class PreparedKdaVerify:
         )
         self.scalars = tuple(map(cutlass.Float32, (lower_bound, 128**-0.5, eps)))
         self.policies, self.conv_dim_first, self.kernels = policies, conv_dim_first, {}
+        self.schedules = dict(schedules or {})
 
     def _verify_operands(
         self, caches, projected, state_slots, out, scratch_rows, conv_window, rings
@@ -188,7 +193,8 @@ class PreparedKdaVerify:
                 mode,
                 self.has_bias,
                 self.device.index,
-                verify_schedule(requests, queries, self.device, heads=h),
+                self.schedules.get((requests, queries))
+                or verify_schedule(requests, queries, self.device, heads=h),
             )
         return self
 

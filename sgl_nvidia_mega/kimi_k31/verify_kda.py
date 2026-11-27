@@ -7,7 +7,10 @@ from sgl_nvidia_mega.kimi_k31.sm103.k3.kda.verify import (
 
 
 class PreparedKdaVerify:
-    def __init__(self, weights, policies, device_index):
+    def __init__(self, weights, policies, device_index, schedules=None):
+        """``schedules``: the KDA verify schedules of the build's target by (Breq, Q)
+        (``targets.Target.kda_verify_schedules``); the front provider runs its own
+        for every other key."""
         if weights.has_bias or weights.scale != 128**-0.5:
             raise ValueError("K31 verify requires bias-free KDA and scale=128**-0.5")
         # Preserve FP32 coefficients while undoing the existing prepared decode
@@ -23,6 +26,7 @@ class PreparedKdaVerify:
             eps=weights.norm_eps,
             policies={(b, q): (pitch, mode) for b, q, pitch, mode in policies},
             conv_dim_first=True,
+            schedules=schedules,
         )
         self.pools = None
 
