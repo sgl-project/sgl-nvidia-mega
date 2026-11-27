@@ -22,8 +22,8 @@ Stated limits of this spec:
   ``sm107/tp4.py``), picked once per build by ``targets.py``;
   a width no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
   rows (``plan.py``).
-* PD disaggregation is served at the TP4 profiles' decode role (``pd_reasons``); the
-  prefill role runs without the flag.
+* PD disaggregation is served at the decode role of the TP4 profiles and of the TP8
+  envelope (``pd_reasons``); the prefill role runs without the flag.
 * TP16 on Rubin (SM107) at one request, EAGLE 7 steps / 8 draft tokens, runs
   ``glm5_3/sm107``: its own kernels, server arguments and environment
   (``sm107.config_reasons``), selected here by the TP size. The TP8 / TP4 server
@@ -37,6 +37,7 @@ from __future__ import annotations
 import importlib.util
 
 try:
+    from sglang.kernels.plugin_kernels.nvidia import spec as _host_spec
     from sglang.kernels.plugin_kernels.nvidia.spec import (
         Feature,
         MegakernelSpec,
@@ -45,6 +46,7 @@ try:
         Requirements,
     )
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels import spec as _host_spec
     from sglang.srt.megakernels.spec import (
         Feature,
         MegakernelSpec,
@@ -140,8 +142,10 @@ SGLANG_READS = {
 }
 
 ARCHITECTURE = "GlmMoeDsaForCausalLM"
-# the SGLang megakernel contract this spec is written against
-API_VERSION = 3
+# The SGLang megakernel contract this spec is written against: API 3 changed only
+# verify sampling penalties (VerifyPenaltiesView), which GB300 steps do not read and
+# sm107 checks via getattr, so API 2 hosts remain compatible alongside API 3 (main).
+API_VERSION = 3 if hasattr(_host_spec, "VerifyPenaltiesView") else 2
 
 # The co-resident cooperative grid the served kernels need at one CTA per SM: the
 # 9-16-row MoE fold hop (sm103/hop/moe_fold.py, MoeFoldArBsum) launches rows x CLUSTER
@@ -476,19 +480,23 @@ def deadline_reasons(cfg) -> list[str]:
 
 
 def pd_reasons(cfg) -> list[str]:
-    """PD disaggregation is served at the TP4 kernel-unit profiles (their decode
-    role: KV arrives through the transfer backend into pool slots before a request's
-    first verify step, outside the covered step); the TP8 envelope keeps it
-    refused."""
-    from sgl_nvidia_mega.glm5_3.profile import UNITS, tokens_per_request
+    """PD disaggregation is served at the TP4 kernel-unit profiles and at the decode
+    role of the TP8 envelope: KV arrives through the transfer backend into pool slots
+    before a request's first verify step, outside the covered step, and the first
+    draft round reads the prefill instance's outputs through SGLang's draft input."""
+    from sgl_nvidia_mega.glm5_3.profile import TP8, UNITS, tokens_per_request
 
     mode = getattr(cfg, "disaggregation_mode", None) or "null"
     tp = int(getattr(cfg, "tp_size", None) or 1)
-    if mode == "null" or (tp, tokens_per_request(cfg)) in UNITS:
+    tokens = tokens_per_request(cfg)
+    if mode == "null" or (tp, tokens) in UNITS:
+        return []
+    if mode == "decode" and (tp, tokens) in TP8:
         return []
     return [
-        f"PD disaggregation ({mode} role) is served at the TP4 profiles only, not at "
-        f"TP{tp}"
+        f"PD disaggregation ({mode} role) is served at the TP4 profiles and at the "
+        f"decode role of the TP8 profiles, not at TP{tp} with {tokens} tokens per "
+        "request"
     ]
 
 
@@ -550,7 +558,7 @@ SPEC = MegakernelSpec(
             Feature.MULTI_NODE_TP,
             # HiCache: the covered steps read only the running requests' device KV pages
             Feature.KV_OFFLOAD,
-            # the TP4 decode role of a PD-disaggregated deployment (pd_reasons)
+            # the TP4 and TP8 decode roles of a PD-disaggregated deployment (pd_reasons)
             Feature.PD_DISAGGREGATION,
         }
     ),

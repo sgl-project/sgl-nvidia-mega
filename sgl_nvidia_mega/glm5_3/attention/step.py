@@ -384,15 +384,22 @@ class AttentionStep:
         try:
             with attn.maybe_use_decode_attn_tp(fb):
                 qkv_latent = self.qkv_a(attn, x, step)
-                pro = self.prologue(attn, qkv_latent, step)
-                index_q = None
-                if attn.should_run_indexer(prev_topk_indices):
-                    if self._stock_index_steps():
-                        index_q = self._index_k_and_q(attn, x, pro.q_lora, step)
-                    else:
-                        self.index_k(attn, x, step.positions, step)
-                        index_q = self.index_q(attn, x, pro.q_lora, step)
-                topk_indices = self.indexer(attn, index_q, prev_topk_indices, step)
+                run_indexer = attn.should_run_indexer(prev_topk_indices)
+                fork = self.indexer_split(attn, step, run_indexer)
+                if fork is not None:
+                    pro, topk_indices = self._split_indexer_layer(
+                        attn, x, qkv_latent, prev_topk_indices, step, fork
+                    )
+                else:
+                    pro = self.prologue(attn, qkv_latent, step)
+                    index_q = None
+                    if run_indexer:
+                        if self._stock_index_steps():
+                            index_q = self._index_k_and_q(attn, x, pro.q_lora, step)
+                        else:
+                            self.index_k(attn, x, step.positions, step)
+                            index_q = self.index_q(attn, x, pro.q_lora, step)
+                    topk_indices = self.indexer(attn, index_q, prev_topk_indices, step)
                 q_nope_out = self.q_absorb(attn, pro.q_nope, step)
                 q_fp8 = self.rope_cache(
                     attn, q_nope_out, pro.q_pe, pro.k_nope, pro.k_pe, step
@@ -403,6 +410,37 @@ class AttentionStep:
             ctx.clear_attn_inputs()
             step.index_kw = step.q_fp8 = None
         return out, (topk_indices if attn.next_skip_topk else None)
+
+    def indexer_split(self, attn, step: StepContext, run_indexer: bool):
+        """Where a layer with its own indexer forks the rest of its prologue onto a
+        side stream (``"qkv"``: after the q_a / kv_a projection; ``"iq"``: after the
+        indexer query projection), or None: the steps run in order on one stream (the
+        stock steps never split)."""
+        return None
+
+    def _split_indexer_layer(
+        self, attn, x, qkv_latent, prev_topk_indices, step: StepContext, fork: str
+    ):
+        """(prologue out, top-k indices) of a layer whose prologue splits: the
+        indexer's share (``prologue_front``: the q_a norm out and the index-K rows), the
+        indexer query and the indexer (logits + top-k) on the current stream; the rest
+        (``prologue_back``) on the side stream, forked after the q_a / kv_a projection
+        or after the indexer query projection and joined before the sparse MLA. Every
+        output is the unsplit steps' bit for bit."""
+        main = torch.cuda.current_stream()
+        side = self.split_stream(attn)
+        if fork == "qkv":
+            side.wait_stream(main)
+        q_lora = self.prologue_front(attn, x, qkv_latent, step)
+        if fork == "qkv":
+            pro = self.prologue_back(attn, qkv_latent, step, side)
+        index_q = self.index_q(attn, x, q_lora, step)
+        if fork != "qkv":
+            side.wait_stream(main)
+            pro = self.prologue_back(attn, qkv_latent, step, side)
+        topk_indices = self.indexer(attn, index_q, prev_topk_indices, step)
+        main.wait_stream(side)
+        return pro, topk_indices
 
     def check_mode(self, attn, mode) -> None:
         # The stock bodies copy the branches of target-verify forwards only.
@@ -454,12 +492,15 @@ class AttentionStep:
         key, _ = self._index_kw(attn.indexer, x, step)
         _store_index_k(attn, key, positions, step)
 
+    def _wq_b(self, indexer, q_lora: torch.Tensor) -> torch.Tensor:
+        return indexer.wq_b(q_lora)[0]
+
     def index_q(self, attn, x, q_lora: torch.Tensor, step: StepContext) -> IndexQ:
         """The indexer query (``wq_b``, RoPE, FP8) and its head gates."""
         # _fused_q_prepare_and_store (main af856717), single-stream query half.
         indexer = attn.indexer
         _, weights_raw = self._index_kw(indexer, x, step)
-        q = indexer.wq_b(q_lora)[0].view(-1, indexer.n_heads, indexer.head_dim)
+        q = self._wq_b(indexer, q_lora).view(-1, indexer.n_heads, indexer.head_dim)
         return IndexQ(*_index_q_quant(indexer, q, weights_raw, step.positions))
 
     def _stock_index_steps(self) -> bool:
@@ -486,7 +527,7 @@ class AttentionStep:
         indexer.alt_stream.wait_stream(current_stream)
         key, weights_raw = self._index_kw(indexer, x, step)
         with torch.cuda.stream(indexer.alt_stream):
-            q = indexer.wq_b(q_lora)[0].view(-1, indexer.n_heads, indexer.head_dim)
+            q = self._wq_b(indexer, q_lora).view(-1, indexer.n_heads, indexer.head_dim)
         current_stream.wait_stream(indexer.alt_stream)
         indexer.alt_stream.wait_stream(current_stream)
         q_fp8, weights = _index_q_quant(indexer, q, weights_raw, positions)

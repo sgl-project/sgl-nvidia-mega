@@ -97,7 +97,6 @@ SGLANG_READS = {
         "org_vocab_start_index",
         "num_org_elements",
     ),
-    "srt/utils/common.py": ("BumpAllocator",),
     "srt/layers/logits_processor.py": (
         "LogitsMetadata",
         "LogitsProcessor",
@@ -473,13 +472,12 @@ class ComposedDraft(DraftFront):
             set_written,
             start,
         )
-        from sglang.srt.utils import BumpAllocator
 
         if groups is None:
             groups = {"draft_front": self, "draft_eh": self}
-        # the zero fill stays the plain launch right before the front kernel (its ids / rows are read after its
-        # grid-dependency wait, which orders it only after the immediately preceding grid)
-        zero_allocator = BumpAllocator(
+        # no eager zero fill (runtime.LazyZeroAllocator; draft_step.FusedDraft.forward_steps says why the
+        # front kernel's grid-dependency wait still orders it after every earlier grid)
+        zero_allocator = runtime.LazyZeroAllocator(
             buffer_size=2, dtype=torch.float32, device=input_ids.device
         )
         hidden_states = None

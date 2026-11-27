@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 # Verify rows a request: MTP / EAGLE with top-1 drafts verifies speculative_num_steps
-# draft tokens + 1 (SGLang's speculative_num_draft_tokens). The values served, each
-# tested at its widths: 3 and 5 steps.
-SERVED_TOKENS_PER_REQUEST = (4, 6)
+# draft tokens + 1 (SGLang's speculative_num_draft_tokens). Unlock K=3..7 (4..8 draft tokens)
+# so low-latency TP8 c1/c2 can run K=5 (6), K=6 (7), and K=7 (8) through the sm103 families.
+SERVED_TOKENS_PER_REQUEST = (4, 5, 6, 7, 8)
 # The widest covered step (the kernels' row cap)
 MAX_ROWS = 16
 

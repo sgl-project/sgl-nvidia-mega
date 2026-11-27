@@ -82,12 +82,16 @@ class RowParallelEhProj:
         self.rank, self.world, self.width = rank, world, width
         self.col = rank * width
         self.weight = weight[:, self.col : self.col + width].contiguous()
+        self._use_ll = False
 
     def partial(self, eh_input: torch.Tensor) -> torch.Tensor:
         """This rank's ``[rows, H]`` contribution: its K window of ``eh_input`` (``[rows, 2H]``) times its shard."""
-        return torch.nn.functional.linear(
-            eh_input[:, self.col : self.col + self.width], self.weight
-        )
+        x = eh_input[:, self.col : self.col + self.width]
+        if self._use_ll:
+            from sgl_nvidia_mega.glm5_3 import ll
+
+            return ll.linear("eh_proj", self, x)
+        return torch.nn.functional.linear(x, self.weight)
 
     def __call__(self, eh_input: torch.Tensor) -> torch.Tensor:
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -119,11 +123,21 @@ class RowParallelEhFamily:
     def compile(self, widths) -> None:
         from sglang.srt.distributed.parallel_state import get_tp_group
 
+        from sgl_nvidia_mega.glm5_3 import ll
+
         tp = get_tp_group()
         self.rp = RowParallelEhProj(
             self.model.model.eh_proj.weight, tp.rank_in_group, tp.world_size
         )
         self.derived.add("draft.eh_proj_row_parallel", self.rp.weight)
+        ll.build_linear(
+            "eh_proj",
+            self.rp,
+            widths,
+            target=self.profile.target,
+            sms=self.profile.sms,
+        )
+        self.rp._use_ll = True
         hop = target_hop_family(self.model)
         why = "the target's LL hops are not served" if hop is None else None
         if hop is not None:

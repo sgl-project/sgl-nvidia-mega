@@ -7,7 +7,7 @@ then import it from there."""
 
 from __future__ import annotations
 
-from cutlass import Float32, Int32, Int64, Uint16, Uint32
+from cutlass import Float32, Int32, Int64, Uint16, Uint32, Uint64
 
 from ..primitives.ptx_core import ptx_arith, ptx_op
 
@@ -116,6 +116,16 @@ def atom_or_global(address, bits):
         "{ .reg .b32 o; atom.global.or.b32 o, [$0], $1; }",
         "l,r",
         (Int64(address), Uint32(bits)),
+    )
+
+
+@ptx_op()
+def red_global_add_f32(address, value):
+    """Relaxed global FP32 reduction add (no return value; L2-resident accumulate)."""
+    return (
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        (Int64(address), Float32(value)),
     )
 
 
@@ -251,4 +261,43 @@ def st_async_v4_f32(remote, remote_bar, a, b, c, d):
             Float32(c),
             Float32(d),
         ),
+    )
+
+
+# ------------------------------------------------ trace counters (side-effecting)
+
+
+@ptx_op(Uint64)
+def globaltimer():
+    """``%globaltimer`` (ns; trace builds only)."""
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@ptx_op(Uint64)
+def globaltimer_after(dep):
+    """``%globaltimer`` read after ``dep`` is computed (unused operand; trace builds
+    only)."""
+    return "mov.u64 $0, %globaltimer;", "=l,r", (Uint32(dep),)
+
+
+@ptx_op(Uint64)
+def clock64():
+    """``%clock64`` (SM cycles; trace builds only)."""
+    return "mov.u64 $0, %clock64;", "=l", ()
+
+
+@ptx_op()
+def red_add_u64(address, value):
+    """Relaxed GPU-scope ``red.add.u64`` into a global word (trace builds only)."""
+    return "red.global.add.u64 [$0], $1;", "l,l", (Int64(address), Uint64(value))
+
+
+@ptx_arith(Int32)
+def fns(mask, base, offset):
+    """Bit position of the ``offset``-th (1-based) set bit of ``mask`` from bit ``base``
+    upward (0xffffffff if none)."""
+    return (
+        "fns.b32 $0, $1, $2, $3;",
+        "=r,r,r,r",
+        (Uint32(mask), Uint32(base), Int32(offset)),
     )

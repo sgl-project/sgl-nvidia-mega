@@ -47,7 +47,11 @@ def compile_specs(
                 DistributedArgmax(max_rows),
                 {"max_rows": max_rows},
                 (
-                    *(z,) * 6,
+                    # logits, mailbox, peers, ctrl, ids, vals, partials, p, tokens
+                    *(z,) * 9,
+                    Int32(1),  # tok_stride
+                    Int32(0),  # tok_col
+                    z,  # positions
                     *(Int32(1),) * 5,
                     Uint64(1),
                     Int32(0),

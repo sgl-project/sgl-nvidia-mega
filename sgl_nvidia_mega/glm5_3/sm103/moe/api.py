@@ -19,6 +19,7 @@ output). With bit 1 clear the scratch buffers are the output (the fold ABI: ``pa
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -33,6 +34,90 @@ REQUEST_ROWS = 4
 SHARED_PARTS = 4
 MIN_CLUSTERS_SHARED = 8
 ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
+
+# Opt-in forms of the four-request engine (mode g4, 9..16 rows), read at build; the
+# defaults are the served form. Every form leaves each output bit unchanged.
+#   ..._MOE16_XPIPE=1         per unit, push all groups' K-split partials before waiting
+#   ..._MOE16_RECV_BUFS=n     exchange receive buffers (default 5)
+#   ..._MOE16_LOOKAHEAD=n     FC2(k) after FC1(k + n) (default 2)
+#   ..._MOE16_PRE=n           unit 0's first n FC1 chunks issue before the unit table
+#                             is built (1..3, default 1)
+#   ..._MOE16_FASTTAB=1       lane-parallel unit table (batched id loads, no union list)
+#   ..._MOE16_XGATE=1         (with FASTTAB) unit 0's first chunks wait for the x loads' issue
+#   ..._MOE16_SHARED_WEIGHT=w schedule weight of the shared quarter in units (default 4)
+#   ..._MOE16_SHARED_FILL=1   the shared clusters also take up to cap - weight routed units
+#   ..._MOE16_XTMA=n          (with FASTTAB, no XGATE) routed clusters stage x with bulk copies
+#                             in ring slot 3 right after the id loads; n = 1: unrolled
+#                             quantization, n = 2..4: rolled, n - 1 warp tiles per iteration
+#   ..._MOE16_SNAKE=1         snake order of the routed experts over the routed clusters
+MOE16_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE16_"
+# Opt-in form of the one- and two-request engines (modes g1 / g2), read at build; the
+# default is the served form and the form leaves each output bit unchanged.
+#   SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3=1  unit 0's three FC1 chunks issue as soon as
+#                                            unit 0 is resolved (engine ``pre`` = 3); the
+#                                            die-local g1 / g2 forms ignore it
+MOE_PRE3_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(MOE16_ENV + name, "").strip()
+    return int(raw) if raw else default
+
+
+def g4_knobs() -> dict:
+    """The g4 engine's build-time choices from the environment (defaults: served)."""
+    from .engine import LOOKAHEAD
+    from .engine16 import RECV_BUFS
+
+    return {
+        "xpipe": _env_int("XPIPE", 0) != 0,
+        "recv_bufs": _env_int("RECV_BUFS", RECV_BUFS),
+        "lookahead": _env_int("LOOKAHEAD", LOOKAHEAD),
+        "pre": _env_int("PRE", 1),
+        "fasttab": _env_int("FASTTAB", 0) != 0,
+        "xgate": _env_int("XGATE", 0) != 0,
+        "xtma": _env_int("XTMA", 0),
+    }
+
+
+def g4_schedule_knobs() -> dict:
+    """The g4 schedule's choices from the environment: shared-quarter weight, shared
+    fill and snake order (``schedule.g4_table`` keywords)."""
+    return {
+        "shared_weight": _env_int("SHARED_WEIGHT", S.G4_SHARED_WEIGHT),
+        "fill_shared": _env_int("SHARED_FILL", 0) != 0,
+        "snake": _env_int("SNAKE", 0) != 0,
+    }
+
+
+def g12_pre3_requested() -> bool:
+    """``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3`` is 1 (0 or unset: no; else ValueError)."""
+    raw = os.environ.get(MOE_PRE3_ENV, "").strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{MOE_PRE3_ENV}={raw!r}: expected 0 or 1")
+    return raw == "1"
+
+
+def g12_knobs(localize: bool = False) -> dict:
+    """The g1 / g2 engines' build-time choices from the environment (default: served):
+    ``pre`` 3 with ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_PRE3=1``, else 1; the die-local
+    forms (``localize``) keep 1 (their unit 0 comes from the claimed slot, after the
+    table)."""
+    return {"pre": 3 if g12_pre3_requested() and not localize else 1}
+
+
+G12_SHARED_WEIGHT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_SHARED_WEIGHT_G"
+
+
+def g12_schedule_knobs(mode: str) -> dict:
+    """The g1 / g2 schedule's shared-quarter weight in routed units from
+    ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_SHARED_WEIGHT_G1`` / ``..._G2`` (default: served,
+    ``schedule.G12_SHARED_WEIGHT``); only the unit-to-cluster assignment changes."""
+    raw = os.environ.get(G12_SHARED_WEIGHT_ENV + mode[1:], "").strip()
+    w = int(raw) if raw else S.G12_SHARED_WEIGHT
+    if not 0 <= w <= 8:
+        raise ValueError(f"{G12_SHARED_WEIGHT_ENV}{mode[1:]}={raw!r}: expected 0..8")
+    return {"shared_weight": w}
 
 
 @dataclass
@@ -52,15 +137,16 @@ class LayerTensors:
     gs1: float  # 1 / FC1 input scale
     gs2: float  # 1 / FC2 input scale
 
-    def check(self) -> None:
+    def check(self, quarters: int = 4) -> None:
         def need(ok: bool, what: str) -> None:
             if not ok:
                 raise ValueError(f"small-M MoE: {what}")
 
+        fc1_rows = 128 * quarters
         for name, t, shape in (
-            ("w13", self.w13, (NUM_EXPERTS, 512, 3072)),
-            ("w13_scales", self.w13_scales, (NUM_EXPERTS, 512 * 384)),
-            ("fc2_records", self.fc2_records, (NUM_EXPERTS, 4, 4, 3 * 18432)),
+            ("w13", self.w13, (NUM_EXPERTS, fc1_rows, 3072)),
+            ("w13_scales", self.w13_scales, (NUM_EXPERTS, fc1_rows * 384)),
+            ("fc2_records", self.fc2_records, (NUM_EXPERTS, quarters, 4, 3 * 18432)),
         ):
             need(
                 t.dtype == torch.uint8
@@ -77,10 +163,10 @@ class LayerTensors:
             sp = self.shared_pack
             need(
                 sp.dtype == torch.uint8
-                and sp.numel() == 4 * 4 * 18 * 32768
+                and sp.numel() == quarters * 4 * 18 * 32768
                 and sp.is_contiguous()
                 and sp.data_ptr() % 16 == 0,
-                "shared_pack must be contiguous 16-byte aligned uint8 [4, 4, 589824]",
+                f"shared_pack must be contiguous 16-byte aligned uint8 [{quarters}, 4, 589824]",
             )
         for name, t in (("g1_alpha", self.g1_alpha), ("g2_alpha", self.g2_alpha)):
             need(
@@ -95,13 +181,13 @@ class Scratch:
     """Engine outputs / finalize inputs for up to 16 rows (one set, reused in stream
     order)."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, quarters: int = 4) -> None:
         f32, i32 = torch.float32, torch.int32
         self.partials = torch.empty(
-            4 * MAX_ROWS * TOP_K * HIDDEN, dtype=f32, device=device
+            quarters * MAX_ROWS * TOP_K * HIDDEN, dtype=f32, device=device
         )
         self.shared_partials = torch.empty(
-            SHARED_PARTS * MAX_ROWS * HIDDEN, dtype=f32, device=device
+            quarters * MAX_ROWS * HIDDEN, dtype=f32, device=device
         )
         self.slot_ids = torch.empty(MAX_ROWS * TOP_K, dtype=i32, device=device)
         self.slot_weights = torch.empty(MAX_ROWS * TOP_K, dtype=f32, device=device)
@@ -144,7 +230,12 @@ def default_clusters(device: torch.device | None = None) -> int:
     return int(cutlass.utils.HardwareInfo(index).get_max_active_clusters(4))
 
 
-def compile_specs(shared: bool = True) -> dict[str, tuple[object, tuple]]:
+def compile_specs(
+    shared: bool = True,
+    quarters: int = 4,
+    include_g4: bool | None = None,
+    pre3_default: bool = False,
+) -> dict[str, tuple[object, tuple]]:
     """The served compile units: name -> (kernel object, example arguments for
     ``cute.compile``)."""
     from cutlass import Float32, Int32, Int64
@@ -154,6 +245,9 @@ def compile_specs(shared: bool = True) -> dict[str, tuple[object, tuple]]:
     from .engine16 import Nvfp4MoeSmallM16
     from .finalize import MoeFinalize
     from .routing import MoeRouteTop8
+
+    if include_g4 is None:
+        include_g4 = quarters == 4
 
     z = Int64(0)
     one = Float32(1.0)
@@ -184,15 +278,16 @@ def compile_specs(shared: bool = True) -> dict[str, tuple[object, tuple]]:
             make_fake_stream(),
         )
 
-    return {
-        "g1": (Nvfp4MoeSmallM("g1", shared), eng(4, 4)),
-        "g2": (Nvfp4MoeSmallM("g2", shared), eng(8, 4)),
-        "g4": (
-            Nvfp4MoeSmallM16(shared),
-            eng(16, pack_rows((4, 4, 4, 4))),
-        ),
+    k12 = (
+        {"pre": 3}
+        if pre3_default and not os.environ.get(MOE_PRE3_ENV, "").strip()
+        else g12_knobs()
+    )
+    specs: dict[str, tuple[object, tuple]] = {
+        "g1": (Nvfp4MoeSmallM("g1", shared, quarters=quarters, **k12), eng(4, 4)),
+        "g2": (Nvfp4MoeSmallM("g2", shared, quarters=quarters, **k12), eng(8, 4)),
         "finalize": (
-            MoeFinalize(shared),
+            MoeFinalize(shared, quarters=quarters),
             (z, z, z, z, z, z, Int32(1), make_fake_stream()),
         ),
         "route": (
@@ -200,15 +295,21 @@ def compile_specs(shared: bool = True) -> dict[str, tuple[object, tuple]]:
             (z, z, Float32(2.5), z, z, Int32(1), make_fake_stream()),
         ),
     }
+    if include_g4:
+        specs["g4"] = (
+            Nvfp4MoeSmallM16(shared, **g4_knobs()),
+            eng(16, pack_rows((4, 4, 4, 4))),
+        )
+    return specs
 
 
 class SmallMMoe:
     """Launches the compiled engines on one device.
 
     ``compiled``: name -> compiled callable for the names of ``compile_specs``;
-    ``nclusters``: the engine grid in 4-CTA clusters (at least 31; with fewer, the
-    schedule tables do not fit and the constructor raises ``ValueError``; the
-    co-resident maximum from the occupancy query is the fast one)."""
+    ``nclusters``: the engine grid in 4-CTA clusters (at least 31 for quarters=4,
+    at least 36 for quarters=8 g2; with fewer, the schedule tables do not fit and
+    the constructor raises ``ValueError``)."""
 
     def __init__(
         self,
@@ -216,21 +317,30 @@ class SmallMMoe:
         nclusters: int,
         device: torch.device,
         shared: bool = True,
+        quarters: int = 4,
     ) -> None:
-        if shared and nclusters < MIN_CLUSTERS_SHARED:
+        min_sh = 2 * quarters
+        if shared and nclusters < min_sh:
             raise ValueError(
                 "small-M MoE: the in-engine shared expert needs "
-                f">= {MIN_CLUSTERS_SHARED} clusters"
+                f">= {min_sh} clusters"
             )
         self.fn = compiled
         self.nclusters = nclusters
         self.shared = shared
+        self.quarters = int(quarters)
         self.device = device
-        self.scratch = Scratch(device)
+        self.scratch = Scratch(device, quarters=self.quarters)
+        sk = g4_schedule_knobs()
         self.tables = {}
-        for mode, build in (("g1", S.g1_table), ("g2", S.g2_table), ("g4", S.g4_table)):
-            for nc in sorted({nclusters, min(nclusters, 32)}):
-                self.tables[(mode, nc)] = build(nc, shared).to(device)
+        modes = [("g1", S.g1_table), ("g2", S.g2_table)]
+        if "g4" in compiled and self.quarters == 4:
+            modes.append(("g4", S.g4_table))
+        for mode, build in modes:
+            kw = sk if mode == "g4" else {**g12_schedule_knobs(mode), "quarters": self.quarters}
+            ncs = sorted({nclusters, min(nclusters, 32)}) if mode == "g1" else [nclusters]
+            for nc in ncs:
+                self.tables[(mode, nc)] = build(nc, shared, **kw).to(device)
 
     def clusters(self, mode: str, rows: int) -> int:
         return min(self.nclusters, 32) if mode == "g1" and rows == 1 else self.nclusters

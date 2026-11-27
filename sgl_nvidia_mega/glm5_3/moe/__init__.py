@@ -259,9 +259,12 @@ class MoeGlue:
         modes = {self.api.mode_for(moe_split(m)) for m in rows if 1 <= m <= MAX_ROWS}
         for name in sorted({"route", "finalize"} | modes):
             kernel, args = self.specs[name]
+            constexprs = {"unit": name, "shared": True}
+            if hasattr(kernel, "knobs"):  # the engines' opt-in forms
+                constexprs.update(kernel.knobs())
             self.fn[name] = compile_cached(
                 kernel,
-                {"unit": name, "shared": True},
+                constexprs,
                 lambda k=kernel, a=args: cute.compile(k, *a),
             )
         nclusters = self.api.default_clusters(self.device)
@@ -364,5 +367,22 @@ def build(model, derived) -> Optional[MoeGlue]:
         layers[layer.layer_id] = lt
     logger.info(
         "NVIDIA megakernel: GLM-5.3 / GLM-5.2: MoE engine on %d layers", len(layers)
+    )
+    from sgl_nvidia_mega.glm5_3.sm103.moe import api as _moe_api
+
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: four-request MoE engine form %s, schedule %s",
+        _moe_api.g4_knobs(),
+        _moe_api.g4_schedule_knobs(),
+    )
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: one- / two-request MoE engine schedule "
+        "shared weight g1 %d, g2 %d",
+        _moe_api.g12_schedule_knobs("g1")["shared_weight"],
+        _moe_api.g12_schedule_knobs("g2")["shared_weight"],
+    )
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: one- / two-request MoE engine form pre %d",
+        _moe_api.g12_knobs()["pre"],
     )
     return MoeGlue(api, layers, specs)

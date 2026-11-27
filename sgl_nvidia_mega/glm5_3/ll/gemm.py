@@ -379,16 +379,20 @@ def linear(
                 "build (outside capture)"
             )
         return _cast(stock(role, module, x), out_dtype)
+    row_major_aligned = x.is_contiguous() or (
+        served.kernel == plan.TGV and x.stride(1) == 1 and x.stride(0) % 16 == 0
+    )
     if not (
         x.dim() == 2
         and x.dtype == torch.bfloat16
         and x.shape[1] == key[2]
-        and x.is_contiguous()
+        and row_major_aligned
         and x.data_ptr() % 32 == 0
     ):
         raise ValueError(
-            f"ll.gemm: {role} needs a contiguous, 32-byte aligned BF16 [M, {key[2]}] "
-            f"input; got {x.dtype} {tuple(x.shape)} stride {x.stride()}"
+            f"ll.gemm: {role} needs a contiguous (or 32-byte row-aligned K-major for "
+            f"TGV), 32-byte aligned BF16 [M, {key[2]}] input; got {x.dtype} "
+            f"{tuple(x.shape)} stride {x.stride()}"
         )
     return _cast(_run(served, x, weight, _DTYPES[plan.ROLE_DTYPES[role]]), out_dtype)
 

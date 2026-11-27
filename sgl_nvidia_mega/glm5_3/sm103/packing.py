@@ -15,10 +15,12 @@ VALUE_DIM = 256  # v_head_dim
 KV_B_ROWS_PER_HEAD = NOPE + VALUE_DIM
 
 
-def pack_uv_proj(kv_b_weight: torch.Tensor, values_per_cta: int = 16) -> torch.Tensor:
+def pack_uv_proj(
+    kv_b_weight: torch.Tensor, values_per_cta: int = 16, heads: int = HEADS
+) -> torch.Tensor:
     """W_UV tiles for ``attn.mla_uv_proj``.
 
-    ``kv_b_weight``: ``kv_b_proj.weight`` of one rank, ``[8 * 448, 512]`` BF16 (rows
+    ``kv_b_weight``: ``kv_b_proj.weight`` of one rank, ``[heads * 448, 512]`` BF16 (rows
     ``[448 h + 192, 448 h + 448)`` are head ``h``'s value rows, each a contiguous
     512-element latent row). Result: flat BF16, ordered
     ``[head][value tile j][latent step s][value row r][32 latent]``, so the tile of
@@ -26,15 +28,35 @@ def pack_uv_proj(kv_b_weight: torch.Tensor, values_per_cta: int = 16) -> torch.T
     """
     if kv_b_weight.dtype != torch.bfloat16:
         raise ValueError(f"kv_b_proj weight must be bf16, got {kv_b_weight.dtype}")
-    if tuple(kv_b_weight.shape) != (HEADS * KV_B_ROWS_PER_HEAD, LATENT):
+    if tuple(kv_b_weight.shape) != (heads * KV_B_ROWS_PER_HEAD, LATENT):
         raise ValueError(
-            f"kv_b_proj weight must be [{HEADS * KV_B_ROWS_PER_HEAD}, {LATENT}], "
+            f"kv_b_proj weight must be [{heads * KV_B_ROWS_PER_HEAD}, {LATENT}], "
             f"got {tuple(kv_b_weight.shape)}"
         )
-    if values_per_cta != 16:
-        raise ValueError("values_per_cta must be 16")
-    w = kv_b_weight.view(HEADS, KV_B_ROWS_PER_HEAD, LATENT)[:, NOPE:, :]
-    w = w.reshape(HEADS, VALUE_DIM // values_per_cta, values_per_cta, LATENT // 32, 32)
+    if values_per_cta not in (16, 32, 64):
+        raise ValueError(f"values_per_cta must be 16, 32 or 64, got {values_per_cta}")
+    w = kv_b_weight.view(heads, KV_B_ROWS_PER_HEAD, LATENT)[:, NOPE:, :]
+    w = w.reshape(heads, VALUE_DIM // values_per_cta, values_per_cta, LATENT // 32, 32)
+    return w.permute(0, 1, 3, 2, 4).contiguous().view(-1)
+
+
+def pack_uv_proj_from_w_vc(
+    w_vc: torch.Tensor, values_per_cta: int = 32
+) -> torch.Tensor:
+    """Pack ``attn.w_vc`` (``[heads, 512, 256]`` BF16) into ``mla_uv_proj`` CTA tiles."""
+    if w_vc.dtype != torch.bfloat16 or w_vc.dim() != 3 or w_vc.shape[1:] != (
+        LATENT,
+        VALUE_DIM,
+    ):
+        raise ValueError(
+            f"w_vc must be bf16 [heads, {LATENT}, {VALUE_DIM}], got {w_vc.dtype} {tuple(w_vc.shape)}"
+        )
+    if values_per_cta not in (16, 32, 64):
+        raise ValueError(f"values_per_cta must be 16, 32 or 64, got {values_per_cta}")
+    heads = int(w_vc.shape[0])
+    # w_vc is [heads, 512 (latent), 256 (value)] -> transpose to [heads, 256, 512]
+    w = w_vc.transpose(1, 2).contiguous()
+    w = w.reshape(heads, VALUE_DIM // values_per_cta, values_per_cta, LATENT // 32, 32)
     return w.permute(0, 1, 3, 2, 4).contiguous().view(-1)
 
 
@@ -109,31 +131,45 @@ def _pack_rows_k(w: torch.Tensor) -> torch.Tensor:
     return v.permute(0, 3, 1, 2, 4, 5).contiguous().view(-1)
 
 
-def pack_q_b(w_qb: torch.Tensor) -> torch.Tensor:
-    """q_b tiles for ``attn.mla_prologue``: ``q_b_proj.weight`` of one rank, ``[8 * 256,
+def pack_q_b(w_qb: torch.Tensor, heads: int = HEADS) -> torch.Tensor:
+    """q_b tiles for ``attn.mla_prologue``: ``q_b_proj.weight`` of one rank, ``[heads * 256,
     2048]`` BF16."""
-    if tuple(w_qb.shape) != (HEADS * Q_HEAD, 2048):
+    if tuple(w_qb.shape) != (heads * Q_HEAD, 2048):
         raise ValueError(
-            f"q_b_proj weight must be [{HEADS * Q_HEAD}, 2048], got {tuple(w_qb.shape)}"
+            f"q_b_proj weight must be [{heads * Q_HEAD}, 2048], got {tuple(w_qb.shape)}"
         )
     return _pack_rows_k(w_qb)
 
 
-def pack_w_uk_t(kv_b_weight: torch.Tensor) -> torch.Tensor:
+def pack_w_uk_t(kv_b_weight: torch.Tensor, heads: int = HEADS) -> torch.Tensor:
     """W_UK^T tiles for ``attn.mla_prologue``: from ``kv_b_proj.weight`` of one rank
-    (``[8 * 448, 512]`` BF16, the
+    (``[heads * 448, 512]`` BF16, the
     first 192 rows of each head are W_UK), per head ``[512 (latent), 192 (nope)]``
     packed, heads concatenated."""
     if kv_b_weight.dtype != torch.bfloat16 or tuple(kv_b_weight.shape) != (
-        HEADS * KV_B_ROWS_PER_HEAD,
+        heads * KV_B_ROWS_PER_HEAD,
         LATENT,
     ):
         raise ValueError(
-            f"kv_b_proj weight must be bf16 [{HEADS * KV_B_ROWS_PER_HEAD}, {LATENT}]"
+            f"kv_b_proj weight must be bf16 [{heads * KV_B_ROWS_PER_HEAD}, {LATENT}]"
         )
     wt = (
-        kv_b_weight.view(HEADS, KV_B_ROWS_PER_HEAD, LATENT)[:, :NOPE, :]
+        kv_b_weight.view(heads, KV_B_ROWS_PER_HEAD, LATENT)[:, :NOPE, :]
         .transpose(1, 2)
         .contiguous()
     )
-    return torch.cat([_pack_rows_k(wt[h]) for h in range(HEADS)])
+    return torch.cat([_pack_rows_k(wt[h]) for h in range(heads)])
+
+
+def pack_w_uk_t_from_w_kc(w_kc: torch.Tensor) -> torch.Tensor:
+    """W_UK^T tiles for ``attn.mla_prologue`` from ``attn.w_kc`` (``[heads, 192, 512]`` BF16)."""
+    if w_kc.dtype != torch.bfloat16 or w_kc.dim() != 3 or w_kc.shape[1:] != (
+        NOPE,
+        LATENT,
+    ):
+        raise ValueError(
+            f"w_kc must be bf16 [heads, {NOPE}, {LATENT}], got {w_kc.dtype} {tuple(w_kc.shape)}"
+        )
+    heads = int(w_kc.shape[0])
+    wt = w_kc.transpose(1, 2).contiguous()
+    return torch.cat([_pack_rows_k(wt[h]) for h in range(heads)])

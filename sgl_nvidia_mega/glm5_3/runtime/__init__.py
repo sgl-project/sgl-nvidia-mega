@@ -51,6 +51,7 @@ LL_SLOTS = (
     "ll.attention",
     "ll.attention.kv_norm_fold",
     "ll.sparse_mla_fd",
+    "ll.uv_proj",
     "ll.hops",
     "ll.moe.nvfp4",
     "ll.moe",
@@ -62,6 +63,9 @@ LL_SLOTS = (
     "ll.gemm.eh_proj",
     "ll.gemm.lm_head",
     "ll.gemm.q_b",
+    "ll.gemm.wq_b",
+    "ll.gemm.shared_gate_up",
+    "ll.gemm.shared_down",
 )
 SHIPPED_SLOTS += LL_SLOTS
 # Slots that run only when listed in SLOTS_ENV. ll.moe.alt_stream_priority: the TP4
@@ -197,6 +201,36 @@ def target_hops(weight):
     if entry is None or entry[0]() is not weight:
         return None
     return entry[1]()
+
+
+class LazyZeroAllocator:
+    """SGLang's ``BumpAllocator`` (``srt/utils/common.py``: slices of one zeroed fp32
+    buffer) with the buffer made at the first ``allocate``, not at construction.
+
+    A captured step builds one per forward, and only the FP8 ``w_kc`` / ``w_vc`` absorb
+    paths of the stock attention bodies allocate from it; GLM-5.2's are BF16, so the
+    eager zero fill only recorded a memset node per graph forward. A kernel node after a
+    memset node waits for it with a plain edge, which cost 5-15 us of idle GPU per node
+    on GB300 (T81: 15 us at the target-verify graph's start, 5-6 us before each draft
+    forward's front kernel). Without the node, each first kernel follows a non-PDL
+    launch (the graph's input copies, ``_small_copy_kernel``, the embedding gather), so
+    its grid-dependency wait still orders it after all earlier work."""
+
+    def __init__(self, buffer_size: int, dtype, device) -> None:
+        self._size = int(buffer_size)
+        self._dtype, self._device = dtype, device
+        self._buffer: Optional[torch.Tensor] = None
+        self._pointer = 0
+
+    def allocate(self, size: int) -> torch.Tensor:
+        if self._buffer is None:
+            self._buffer = torch.zeros(
+                (self._size,), dtype=self._dtype, device=self._device
+            )
+        assert self._pointer + size <= self._size
+        output = self._buffer[self._pointer : self._pointer + size]
+        self._pointer += size
+        return output
 
 
 def tp_gather(obj) -> list:
@@ -565,17 +599,29 @@ def _hops_for_draft(model, family) -> None:
     registered for the draft under the shared embedding table."""
     import cutlass.cute as cute
 
-    from sgl_nvidia_mega.glm5_3.draft_step import SITE_NAMES
+    from sgl_nvidia_mega.glm5_3.draft_step import SITE_NAMES, draft_front_mode
     from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
     from sgl_nvidia_mega.glm5_3.sm103.hop import api as hop_api
 
-    unit = {s.name: s for s in hop_api.unit_specs(plain_allreduce=True)}["allreduce"]
-    family.kernels.compiled.setdefault(
-        "allreduce",
-        compile_cached(
-            unit.obj, unit.constexprs, lambda: cute.compile(unit.obj, *unit.args)
-        ),
-    )
+    # DRAFT_FRONT_ENV=rowpar: also the residual-free all-reduce + RMSNorm (the
+    # row-parallel eh_proj sum through the draft layer's input norm)
+    names = ("allreduce", "allreduce_rmsnorm") if draft_front_mode() else ("allreduce",)
+    units = {
+        s.name: s
+        for s in hop_api.unit_specs(
+            plain_allreduce=True, allreduce_rmsnorm="allreduce_rmsnorm" in names
+        )
+    }
+    for name in names:
+        unit = units[name]
+        family.kernels.compiled.setdefault(
+            name,
+            compile_cached(
+                unit.obj,
+                unit.constexprs,
+                lambda unit=unit: cute.compile(unit.obj, *unit.args),
+            ),
+        )
     family.register_sites(SITE_NAMES)
     register_target_hops(model.model.embed_tokens.weight, family.kernels)
 

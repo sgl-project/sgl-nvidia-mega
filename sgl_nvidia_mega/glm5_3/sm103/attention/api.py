@@ -32,6 +32,7 @@ def example_args() -> dict[str, tuple]:
         "index_q": (z,) * 8 + (f, one, z, z, z, z, s),
         "qkv_a": (z, z, z, one, z, z, z, z, s),
         "qkv_a_dn": (z, z, z, one, z, z, z, z, z, f, s),
+        "front": (z,) * 7 + (one, z, f, z, z, f) + (z,) * 5 + (z, z, s),
         "prologue": (z,) * 11
         + (one, one)
         + (z,) * 4
@@ -57,6 +58,16 @@ def compile_specs(
     prologue_end: bool = False,
     qkv_a_shared: int | None = None,
     qkv_a_shared_dn: bool = False,
+    prologue16_overlap: bool = False,
+    prologue16_kv_split: bool = False,
+    prologue8_overlap: bool = False,
+    prologue_push: bool = False,
+    prologue_f32x2: bool = False,
+    idx_front: bool = False,
+    prologue16_row_norm: bool = False,
+    prologue16_early_arm: bool = False,
+    prologue8_early_arm: bool = False,
+    uv_values_per_cta: int = 16,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -65,10 +76,30 @@ def compile_specs(
     ``qkv_a = (n_rows, n_main)`` adds the skinny q_a / kv_a (+ indexer key) projection
     at 8 rows on ``grid`` CTAs (default: the current device's multiprocessor count).
     ``prologue_end`` adds ``prologue_end.<cap>``: the prologue that triggers its
-    dependents after its last output store. ``qkv_a_shared = n_rows`` adds
+    dependents after its last output store.
+    ``prologue16_overlap`` builds the 16-row prologues in the overlapped issue order
+    (``MlaPrologue(overlap16=True)``: same outputs). ``qkv_a_shared = n_rows`` adds
     ``qkv_a_shared.8``: the skinny projection of the q_a / kv_a rows alone (the layers
     without their own indexer), at 8 rows on ``grid`` CTAs; ``qkv_a_shared_dn`` adds
-    its epilogue-scaled form ``qkv_a_shared_dn.8`` (deferred input norm)."""
+    its epilogue-scaled form ``qkv_a_shared_dn.8`` (deferred input norm).
+    ``prologue16_kv_split`` builds ``prologue[_end].16`` with the kv cluster's rows
+    8..15 on their own CTAs (same outputs).
+    ``prologue8_overlap`` builds the 8-row prologues in the overlapped issue order
+    (``MlaPrologue(overlap8=True)``: same outputs).
+    ``prologue_push`` / ``prologue_f32x2`` add the pushed q_nope hand-off / the packed
+    branch-free normalize to the overlapped forms (``MlaPrologue(push=True)`` /
+    ``f32x2=True``; same outputs).
+    ``idx_front`` adds ``front.<cap>``: the indexer's share of the prologue as its own
+    launch (``IndexerFront``: the q_a norm out and the index-K rows, the prologue's
+    arithmetic), for the indexer-layer prologue split.
+    ``prologue16_row_norm`` (with ``prologue16_overlap`` and the strided q_a sums) builds
+    the 16-row prologues with the q rows summed and normalized by the warp that loads
+    them (``MlaPrologue(row_norm=True)``); ``prologue16_early_arm`` (with
+    ``prologue16_overlap`` and ``prologue_push``) arms their QN barrier before the weight
+    copies (``MlaPrologue(early_arm=True)``). ``prologue8_early_arm`` arms the 8-row overlapped
+    pushed form's QN barrier before its weight copies (``early_arm8=True``; same
+    outputs; only with ``prologue8_overlap`` and ``prologue_push``)."""
+    from .indexer_front import IndexerFront
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -79,7 +110,15 @@ def compile_specs(
     specs: dict[str, tuple] = {}
     caps = sorted(set(caps))
     for cap in caps:
-        specs[f"uv.{cap}"] = (MlaUvProj(cap), {"max_rows": cap}, args["uv"])
+        vpc = uv_values_per_cta if cap == 8 else min(uv_values_per_cta, 32)
+        uv_key = {"max_rows": cap}
+        if vpc != 16:
+            uv_key["values_per_cta"] = vpc
+        specs[f"uv.{cap}"] = (
+            MlaUvProj(cap, values_per_cta=vpc),
+            uv_key,
+            args["uv"],
+        )
         key = {
             "max_rows": cap,
             **dataclasses.asdict(numerics),
@@ -88,6 +127,34 @@ def compile_specs(
         }
         if index_scale_ue8m0x4:
             key["index_scale_ue8m0x4"] = True
+        overlap16 = prologue16_overlap and cap == 16
+        if overlap16:
+            key["overlap16"] = True
+        kvs = bool(prologue16_kv_split and cap == 16)
+        if kvs:
+            key["kv_split"] = True
+        overlap8 = prologue8_overlap and cap == 8
+        if overlap8:
+            key["overlap8"] = True
+        ov = overlap8 or overlap16
+        push, f32x2 = bool(prologue_push and ov), bool(prologue_f32x2 and ov)
+        if push:
+            key["push"] = True
+        if f32x2:
+            key["f32x2"] = True
+        row_norm = bool(
+            prologue16_row_norm
+            and overlap16
+            and numerics.norm_order == "strided_8x256"
+        )
+        early_arm = bool(prologue16_early_arm and overlap16 and push)
+        arm8 = bool(prologue8_early_arm and overlap8 and push)
+        if row_norm:
+            key["row_norm"] = True
+        if early_arm:
+            key["early_arm"] = True
+        if arm8:
+            key["early_arm8"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -95,6 +162,14 @@ def compile_specs(
                 rope_cache_fp32,
                 index_rope_cache_fp32,
                 index_scale_ue8m0x4,
+                overlap16=overlap16,
+                kv_split=kvs,
+                overlap8=overlap8,
+                push=push,
+                f32x2=f32x2,
+                row_norm=row_norm,
+                early_arm=early_arm,
+                early_arm8=arm8,
             ),
             key,
             args["prologue"],
@@ -108,9 +183,30 @@ def compile_specs(
                     index_rope_cache_fp32,
                     index_scale_ue8m0x4,
                     trigger_at_end=True,
+                    overlap16=overlap16,
+                    kv_split=kvs,
+                    overlap8=overlap8,
+                    push=push,
+                    f32x2=f32x2,
+                    row_norm=row_norm,
+                    early_arm=early_arm,
+                    early_arm8=arm8,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],
+            )
+        if idx_front:
+            fkey = {
+                "max_rows": cap,
+                **dataclasses.asdict(numerics),
+                "index_rope_cache_fp32": index_rope_cache_fp32,
+            }
+            if index_scale_ue8m0x4:
+                fkey["index_scale_ue8m0x4"] = True
+            specs[f"front.{cap}"] = (
+                IndexerFront(cap, numerics, index_rope_cache_fp32, index_scale_ue8m0x4),
+                fkey,
+                args["front"],
             )
         key = {
             "max_rows": cap,

@@ -53,6 +53,9 @@ ROLE_DTYPES = {
     "eh_proj": "bfloat16",
     "lm_head": "bfloat16",
     "q_b": "bfloat16",
+    "wq_b": "bfloat16",
+    "shared_gate_up": "bfloat16",
+    "shared_down": "bfloat16",
 }
 ROLES = tuple(ROLE_DTYPES)
 
@@ -130,6 +133,14 @@ PLAN: Tuple[Entry, ...] = (
     # 3-48 rows (04); the sgl-mega stack served it at 1-60. The logits processors of the
     # covered verify step and the fused draft run it (LmHeadMixin).
     Entry("lm_head", (38720, 6144), (_tgv(1, 60),)),
+    # v7 TP4 mid-batch (GB300 SM103 152 SMs):
+    # - shared_gate_up (1024, 6144): TGV uses only 16 CTAs (vs 128 CTAs for splitk
+    #   which starved main-stream MoE at bs=4 in job 2350027) and eliminates cuBLAS +
+    #   splitKreduce at bs=3 (M=18..21).
+    # - shared_down (6144, 512): TGV beats cuBLAS at M=9..32 with PDL.
+    # - q_b / wq_b keep stock SGLang Tgv64x16 (faster cold than warp_sk in 2350027).
+    Entry("shared_gate_up", (1024, 6144), (_tgv(9, 32),)),
+    Entry("shared_down", (6144, 512), (_tgv(9, 32),)),
     # Deferred (measured, not served by default):
     # TP8 shapes: the TP8 families own these sections at TP8.
     Entry("o_proj", (6144, 2048), (_tgv(1, 96),), preferred=False),

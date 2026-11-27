@@ -51,7 +51,7 @@ SGLANG_READS = {
 # run the kernel units (registry, units.py) up to 48 rows (8 requests at 6 tokens: a
 # PD decode role at --max-running-requests 24 runs 92-95% of its steps within that).
 TP8 = {(TP_SIZE, t): PLAN_MAX_ROWS for t in SERVED_TOKENS_PER_REQUEST}
-UNITS = {(4, t): 48 for t in (3, 4, 5, 6)}
+UNITS = {(4, t): 48 for t in (3, 4, 5, 6, 7, 8)}
 ACCEPTED = {**TP8, **UNITS}
 # The spec's max_rows: SGLang asks for the widths range(tokens, MAX_ROWS + 1, tokens)
 MAX_ROWS = 48

@@ -289,6 +289,7 @@ def _module(kind: str, world: int, trigger_early: bool, *extra) -> Any:
             "plain": "GlmLLMnnvlOneshot",
             "finalize": "GlmLLMnnvlFinalizeOneshot",
             "nvfp4": "GlmLLMnnvlOneshotNvfp4",
+            "fp32_zero": "GlmLLMnnvlFp32ZeroOneshot",
         }[kind]
         mod = _load(f"glm_ll_hop_{kind}", f"glm_ll_mnnvl::{cls}<{args}>", tuple(args))
         mod.configure()  # load every instantiation now (not in a hop, not in capture)
@@ -316,6 +317,10 @@ def finalize_module(
 
 def nvfp4_module(world: int, trigger_early: bool = False) -> Any:
     return _module("nvfp4", world, trigger_early)
+
+
+def fp32_zero_module(world: int, trigger_early: bool = False) -> Any:
+    return _module("fp32_zero", world, trigger_early)
 
 
 # =================================================================== launches
@@ -454,11 +459,41 @@ def ar_rmsnorm_nvfp4(
     return norm_out, residual_out, fp4, sf
 
 
+def fp32_zero_ar_rmsnorm(
+    buf: LamportBuffer,
+    fp32_acc: torch.Tensor,
+    shared_output: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    launch: Launch,
+    *,
+    site: int = 0,
+    trigger_early: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Consume an atomic-accumulated [M, H] fp32 MoE partial (zeroing it in place),
+    optionally add bf16 ``shared_output``, round once to bf16, and run AR+residual+RMSNorm."""
+    _check_rows(buf, residual.shape[0], launch)
+    norm_out = torch.empty_like(residual)
+    residual_out = torch.empty_like(residual)
+    fp32_zero_module(buf.world, trigger_early).run(
+        fp32_acc,
+        shared_output,
+        residual,
+        gamma,
+        norm_out,
+        residual_out,
+        *_tail(buf, eps, launch, site),
+    )
+    return norm_out, residual_out
+
+
 def compile_all(
     world: int,
     *,
     finalize: Tuple[Tuple[int, torch.dtype], ...] = ((8, torch.float32),),
     nvfp4: bool = True,
+    fp32_zero: bool = True,
 ) -> List[str]:
     """Build (and load) every module a hop family may launch; the names built."""
     built = [f"plain W{world}"]
@@ -469,4 +504,7 @@ def compile_all(
     if nvfp4:
         nvfp4_module(world)
         built.append(f"nvfp4 W{world}")
+    if fp32_zero:
+        fp32_zero_module(world)
+        built.append(f"fp32_zero W{world}")
     return built

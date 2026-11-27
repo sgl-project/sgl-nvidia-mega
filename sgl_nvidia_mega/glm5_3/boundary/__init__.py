@@ -29,6 +29,7 @@ and initialized before the first capture.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import torch
@@ -78,7 +79,7 @@ SGLANG_READS = {
 O_PROJ_IN = 2048
 TOP_K = 8  # routed experts per row
 SMALL_ROWS = 8  # mailbox instance A (instance B: 9..16 rows)
-DENSE_MAX_ROWS = 6  # plain hops on the dense layers beside the fold; stock above
+DENSE_MAX_ROWS = 8  # plain hops on the dense layers beside the fold (up to 8 rows for K=6/7)
 # Error sites: layer * 4 + {0: o_proj, 1: MLP output, 2: final}; sites from
 # EXTERNAL_SITES on are other kernels' (named with ``HopFamily.register_sites``).
 HOPS_PER_LAYER = 4
@@ -168,12 +169,46 @@ class HopFamily:
         small = any(m <= SMALL_ROWS for m in rows)
         big = any(m > SMALL_ROWS for m in rows)
         names = set()
+        # SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS: the 9..16-row routing producer
+        rows16 = big and self.api.hop16_router_rows()
+        specs = list(self.api.unit_specs(router_rows16=rows16))
         if small:
             names |= {"allreduce_norm", "o_proj_produce", "o_proj_consume"}
             names |= {"o_proj_produce_router", "o_proj_consume_router"}
+            n_as = self.api.oproj_async_min_rows()
+            if n_as and any(n_as <= m <= SMALL_ROWS for m in rows):
+                # opt-in (env): the producer forms that stage with cp.async
+                specs += self.api.oproj_async_specs()
+                names |= {"o_proj_produce_as", "o_proj_produce_router_as"}
+                # engagement line (the T90a in-job gate reads it)
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: o_proj producer stages "
+                    "its activations with cp.async from %d rows",
+                    n_as,
+                )
+            remap = {m: p for m, p in self.api.oproj_remap().items() if m in rows}
+            if remap:
+                # opt-in (env): the router producer's launch order at these rows
+                rf = self.api.oproj_remap_specs(
+                    remap.values(),
+                    [p for m, p in remap.items() if n_as and m >= n_as],
+                )
+                specs += rf
+                names |= {sp.name for sp in rf}
+                # engagement line (the T90a in-job gate reads it)
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: o_proj router producer "
+                    "launch order %s: router CTAs after GEMV CTA position by rows %s "
+                    "(units %s)",
+                    os.environ.get(self.api.OPROJ_REMAP_ENV, ""),
+                    dict(sorted(remap.items())),
+                    ",".join(sp.name for sp in rf),
+                )
             names |= {"moe_fold_split", "moe_fold_plain"}
             if self.dnorm_layers:
                 names |= {"moe_fold_split_dn", "moe_fold_plain_dn"}
+                if "split8dn" in self.api.fold_form():
+                    names |= {"moe_fold_split_dn_nc"}
         if big:
             names |= {"o_proj_produce_router16", "o_proj_consume_router16"}
             names |= {"moe_fold_block_sums16", "rmsnorm_from_block_sums16"}
@@ -181,7 +216,7 @@ class HopFamily:
         if not reason:
             import cutlass.cute as cute
 
-            for spec in (s for s in self.api.unit_specs() if s.name in names):
+            for spec in (s for s in specs if s.name in names):
                 compiled[spec.name] = compile_cached(
                     spec.obj,
                     spec.constexprs,
@@ -231,8 +266,23 @@ class HopFamily:
             barrier_group=self.group.cpu_group,
         )
         megakernel_agree(
-            kernels.split_max_rows, what="GLM-5.3 / GLM-5.2 split-fold row limits"
+            kernels.fold_limits(), what="GLM-5.3 / GLM-5.2 split-fold row limits"
         )
+        if kernels.form:
+            # engagement line of the opt-in fold forms (the T90a in-job gate reads it)
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: MoE fold forms %s "
+                "(split / cluster-free deferred-norm split row limits %s)",
+                ",".join(sorted(kernels.form)),
+                kernels.fold_limits()[:2],
+            )
+        # (the store form changes no address or value: ranks need not agree on it)
+        if rows16:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 9-16-row o_proj hop stores its "
+                "router partials row-contiguous (%s=1)",
+                self.api.HOP16_ROUTER_ROWS_ENV,
+            )
         self.kernels = kernels
 
     def register_sites(self, names: dict) -> None:

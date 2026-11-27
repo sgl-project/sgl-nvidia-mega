@@ -77,15 +77,16 @@ ERR_MAGIC = 0x48455252
 class Mbox:
     """Device-side view of one mailbox instance (built inside a kernel)."""
 
-    peers: tuple  # 8 x Int64, rotated: peers[i] = base of rank (rank + i) mod 8
+    peers: tuple  # world x Int64, rotated: peers[i] = base of rank (rank + i) mod world
     rank: Int32
     max_rows: int  # rows of the instance (Constexpr)
     err_host: Int64  # host-mapped error record (device address)
     site: Int32  # caller's site id, copied into the error record
+    world: int = WORLD  # tensor-parallel ranks (Constexpr: 8 or 4)
 
     @property
     def rec_bytes(self) -> int:
-        return record_bytes(self.max_rows)
+        return record_bytes(self.max_rows, self.world)
 
     def ctrl(self, word):
         """Address of control word ``word`` of this rank's own mailbox."""
@@ -93,7 +94,7 @@ class Mbox:
 
     def rec_off(self, buf, src, m, j):
         return (
-            ((Int64(buf) * WORLD + Int64(src)) * self.max_rows + Int64(m)) * NREC
+            ((Int64(buf) * self.world + Int64(src)) * self.max_rows + Int64(m)) * NREC
             + Int64(j)
         ) * 8
 
@@ -179,13 +180,16 @@ class Transport:
         es: EpochSmem,
         check: cutlass.Constexpr[bool],
         rt0: cutlass.Constexpr[int] = 0,
+        async_wait: cutlass.Constexpr[bool] = False,
     ) -> Uint32:
         """Every thread, after ``griddepcontrol.wait``. Threads ``rt0 .. rt0 + 7`` read
         ``E`` and one row epoch each (rows ``max_rows`` > 8 use threads ``rt0 .. rt0 +
         max_rows - 1``), thread ``rt0`` the error word, and (``check``) acquire the
-        acknowledgement of rank ``t - rt0``; the CTA barrier publishes the snapshot."""
+        acknowledgement of rank ``t - rt0``; the CTA barrier publishes the snapshot
+        (``async_wait``: and the threads' ``cp.async`` copies, awaited just before
+        it)."""
         t = P.thread_index() - rt0
-        nread: cutlass.Constexpr = max(WORLD, mb.max_rows)
+        nread: cutlass.Constexpr = max(mb.world, mb.max_rows)
         if t >= 0 and t < nread:
             e = sys_ops.ld_relaxed_gpu_u32(mb.ctrl(W_E))
             er = Uint32(0)
@@ -196,7 +200,7 @@ class Transport:
                 pz = sys_ops.ld_relaxed_gpu_u32(mb.ctrl(W_ERR))
             a = Uint32(0)
             if cutlass.const_expr(check and self.check_ack_enabled()):  # noqa: SIM102
-                if t < WORLD:
+                if t < mb.world:
                     a = sys_ops.ld_acquire_sys_u32(
                         mb.ctrl(W_ACK) + Int64(4 * 32) * Int64(t)
                     )
@@ -206,7 +210,7 @@ class Transport:
                 es.e[0] = e
                 es.pz[0] = Int32(pz)
             if cutlass.const_expr(check and self.check_ack_enabled()):  # noqa: SIM102
-                if t < WORLD:
+                if t < mb.world:
                     need = e - Uint32(NBUF)
                     if Int32(a - need) < 0:
                         self.delay(mb, 5)
@@ -223,6 +227,9 @@ class Transport:
                                     t0 = now
                                 elif now - t0 > Uint64(self.timeout_ns):
                                     self.fail(mb, ERR_ACK_WAIT, 2, t, 0, e)
+        if cutlass.const_expr(async_wait):
+            # the caller's cp.async copies, which this barrier publishes
+            sys_ops.cp_async_wait_all()
         cute.arch.sync_threads()
         return es.e[0]
 
@@ -266,7 +273,7 @@ class Transport:
                     self.delay(mb, 4)
                     self.release_fence()
                     a = self.ack_value(e)
-                    for i in cutlass.range_constexpr(WORLD):
+                    for i in cutlass.range_constexpr(mb.world):
                         addr = (
                             mb.peers[i]
                             + Int64(mb.rec_bytes)
@@ -288,8 +295,40 @@ class Transport:
         """Record pair ``j`` of row ``m`` into slot ``buf`` of every rank, starting with
         this rank's own copy (destinations staggered across ranks)."""
         off = mb.rec_off(buf, mb.rank, m, j)
-        for i in cutlass.range_constexpr(WORLD):
+        for i in cutlass.range_constexpr(mb.world):
             sys_ops.st_relaxed_sys_v2_b64(mb.peers[i] + off, r0, r1)
+
+    @cute.jit
+    def poll_record_one(self, mb: Mbox, buf, m, j, src, tag: Uint32, poisoned, x0):
+        """Poll record pair ``j`` of row ``m`` from single source ``src`` (used when
+        ``mb.world == 4``); unpack the six values into ``x0``."""
+        a0 = mb.peers[0] + mb.rec_off(buf, src, m, j)
+        r00, r01 = sys_ops.ld_relaxed_sys_v2_b64(a0)
+        pending = Uint32(0)
+        if not (self.tag_ok(r00, tag) and self.tag_ok(r01, tag)):
+            pending = Uint32(1)
+        t0 = Uint64(0)
+        it = Uint32(0)
+        lim = Uint64(self.timeout_ns)
+        if poisoned != 0 and lim > Uint64(self.poisoned_timeout_ns):
+            lim = Uint64(self.poisoned_timeout_ns)
+        while pending != Uint32(0):
+            r00, r01 = sys_ops.ld_relaxed_sys_v2_b64(a0)
+            if self.tag_ok(r00, tag) and self.tag_ok(r01, tag):
+                pending = Uint32(0)
+            else:
+                it = it + Uint32(1)
+                if (it & Uint32(POLL_TIMER_STRIDE - 1)) == Uint32(0):
+                    now = sys_ops.globaltimer()
+                    if t0 == Uint64(0):
+                        t0 = now
+                    elif now - t0 > lim:
+                        self.fail(mb, ERR_RECORD_POLL, 1, Int32(src), m, tag)
+        if poisoned != 0:
+            for k in cutlass.range_constexpr(6):
+                x0[k] = P.bits_f32(Uint32(0x7FC00000))
+        else:
+            self.unpack_records(r00, r01, x0)
 
     @cute.jit
     def poll_records(self, mb: Mbox, buf, m, j, s0, tag: Uint32, poisoned, x0, x1):
@@ -410,12 +449,14 @@ class HopMailbox:
         device,
         start: int = -1,
         barrier_group=None,
+        world: int = WORLD,
     ):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.max_rows = max_rows
+        self.world = int(world)
         self.device = torch.device(device)
-        self.nbytes = mailbox_bytes(max_rows)
+        self.nbytes = mailbox_bytes(max_rows, self.world)
         # symmetric allocations need not be page aligned: over-allocate and use the 4
         # KiB
         # aligned window of every rank's buffer (each rank's offset follows from its own
@@ -425,9 +466,9 @@ class HopMailbox:
         )
         handle = symm_mem.rendezvous(self.storage, group_name)
         self.rank = int(handle.rank)
-        if int(handle.world_size) != WORLD:
+        if int(handle.world_size) != self.world:
             raise ValueError(
-                f"hop mailbox needs {WORLD} ranks, got {handle.world_size}"
+                f"hop mailbox needs {self.world} ranks, got {handle.world_size}"
             )
         self.peers = [_aligned(int(p)) for p in handle.buffer_ptrs]
         off = self.peers[self.rank] - self.storage.data_ptr()
@@ -446,6 +487,7 @@ class HopMailbox:
         device=None,
         start: int = -1,
         barrier_group=None,
+        world: int = WORLD,
     ):
         return cls(
             group_name,
@@ -453,10 +495,11 @@ class HopMailbox:
             device or torch.accelerator.current_accelerator(),
             start,
             barrier_group,
+            world=world,
         )
 
     def rotated_peers(self):
-        return [self.peers[(self.rank + i) % WORLD] for i in range(WORLD)]
+        return [self.peers[(self.rank + i) % self.world] for i in range(self.world)]
 
     def init(self, start: int = -1, before_last_barrier=None):
         """Records zero (tag 0), acknowledgements ``start - 1``, epochs ``start`` (NBUF:
@@ -469,7 +512,7 @@ class HopMailbox:
             group = _group(self.group_name)
         torch.accelerator.synchronize()
         dist.barrier(group=group)
-        _init_mailbox(self.tensor, self.max_rows, start)
+        _init_mailbox(self.tensor, self.max_rows, start, self.world)
         if before_last_barrier is not None:
             before_last_barrier()
         torch.accelerator.synchronize()
@@ -489,17 +532,19 @@ def _group(group_name):
     return _resolve_process_group(group_name)
 
 
-def _init_mailbox(tensor: torch.Tensor, max_rows: int, start: int):
+def _init_mailbox(
+    tensor: torch.Tensor, max_rows: int, start: int, world: int = WORLD
+):
     """Mailbox image, written with torch ops (stream-ordered): records 0; control
     block 0 except each source's ack word (``start - 1``) and the E and per-row
     E_row words (``start``), as 32-bit values."""
-    rb = record_bytes(max_rows)
+    rb = record_bytes(max_rows, world)
     tensor.zero_()
     ctrl = tensor[rb : rb + CTRL_BYTES].view(torch.int32)
     s = start & 0xFFFFFFFF
     sm1 = (start - 1) & 0xFFFFFFFF
     as_i32 = lambda v: v - (1 << 32) if v >= (1 << 31) else v  # noqa: E731
-    for src in range(WORLD):
+    for src in range(world):
         ctrl[W_ACK + 32 * src] = as_i32(sm1)
     ctrl[W_E] = as_i32(s)
     for m in range(max_rows):
@@ -547,6 +592,10 @@ class Consumer(Transport):
     cluster-rank-order total, ``rsqrt(fma(total, rcp(HIDDEN), eps))``, ``y = bf16((x *
     inv) * (0 + g))``."""
 
+    # launched without clusters (only the deferred-norm consumer, which exchanges nothing
+    # in the cluster): no cluster barrier in the prologue / epilogue
+    nocluster = False
+
     @cute.jit
     def cons_prologue(self, cs: ConsSmem):
         """Initialize the mbarrier, then cluster arrive (before cluster accesses)."""
@@ -558,7 +607,8 @@ class Consumer(Transport):
         # the cluster-scope release arrive is issued by the idle epoch-warp thread
         if t == 512:
             P.mbar_arrive_expect_tx_release_cluster(cs.mbar_addr(), 8 * 4)
-        P.cluster_arrive_relaxed()
+        if cutlass.const_expr(not self.nocluster):
+            P.cluster_arrive_relaxed()
 
     def block_reduce(self, v0, v1, v2):
         """Block sum of the three warp sums: ``(w0 + w2) + w1``."""
@@ -604,24 +654,39 @@ class Consumer(Transport):
         x1 = cute.make_rmem_tensor((6,), Float32)
         acc.fill(0.0)
         self.delay(mb, 2)
-        self.poll_records(mb, buf, m, j, 2 * grp, tag, poisoned, x0, x1)
-        if grp > 0:
-            for k in cutlass.range_constexpr(6):
-                cs.raw[grp - 1, f, k] = x0[k]
-                cs.raw[grp - 1, f, 6 + k] = x1[k]
+        if cutlass.const_expr(mb.world == 4):
+            self.poll_record_one(mb, buf, m, j, grp, tag, poisoned, x0)
+            if grp > 0:
+                for k in cutlass.range_constexpr(6):
+                    cs.raw[grp - 1, f, k] = x0[k]
+            else:
+                for k in cutlass.range_constexpr(6):
+                    acc[k] = C.add_rn(Float32(0.0), x0[k])
         else:
-            for k in cutlass.range_constexpr(6):
-                acc[k] = C.add_rn(C.add_rn(Float32(0.0), x0[k]), x1[k])
+            self.poll_records(mb, buf, m, j, 2 * grp, tag, poisoned, x0, x1)
+            if grp > 0:
+                for k in cutlass.range_constexpr(6):
+                    cs.raw[grp - 1, f, k] = x0[k]
+                    cs.raw[grp - 1, f, 6 + k] = x1[k]
+            else:
+                for k in cutlass.range_constexpr(6):
+                    acc[k] = C.add_rn(C.add_rn(Float32(0.0), x0[k]), x1[k])
         P.bar_sync(1, 512)
         r = cute.make_rmem_tensor((6,), Float32)
         r.fill(0.0)
         h0 = c * 768 + 6 * f
         if grp == 0:
-            for q in cutlass.range_constexpr(1, 4):
-                for k in cutlass.range_constexpr(6):
-                    acc[k] = C.add_rn(
-                        C.add_rn(acc[k], cs.raw[q - 1, f, k]), cs.raw[q - 1, f, 6 + k]
-                    )
+            if cutlass.const_expr(mb.world == 4):
+                for q in cutlass.range_constexpr(1, 4):
+                    for k in cutlass.range_constexpr(6):
+                        acc[k] = C.add_rn(acc[k], cs.raw[q - 1, f, k])
+            else:
+                for q in cutlass.range_constexpr(1, 4):
+                    for k in cutlass.range_constexpr(6):
+                        acc[k] = C.add_rn(
+                            C.add_rn(acc[k], cs.raw[q - 1, f, k]),
+                            cs.raw[q - 1, f, 6 + k],
+                        )
             rb = cute.make_rmem_tensor((3,), Uint32)
             for k in cutlass.range_constexpr(3):
                 ab = P.no_neg_zero(C.cvt_rn_bf16x2_f32(acc[2 * k], acc[2 * k + 1]))
@@ -675,7 +740,8 @@ class Consumer(Transport):
                         sys_ops.st_global_u32(row + Int64(4 * k), u)
                     sys_ops.fence_proxy_async_global()  # thread 0 is in group 0
                 # completes the cluster barrier phase the consumer prologue opened
-                P.cluster_wait()
+                if cutlass.const_expr(not self.nocluster):
+                    P.cluster_wait()
             else:
                 # cluster exchange of the 8 block sums (st.async + mbarrier complete_tx)
                 crank = Int32(cute.arch.block_idx_in_cluster())
@@ -762,22 +828,41 @@ class Consumer(Transport):
         x1 = cute.make_rmem_tensor((6,), Float32)
         acc.fill(0.0)
         self.delay(mb, 2)
-        self.poll_records(mb, buf, m, c * 256 + 2 * f, 2 * grp, tag, poisoned, x0, x1)
-        if grp > 0:
-            for k in cutlass.range_constexpr(6):
-                cs.raw[grp - 1, f, k] = x0[k]
-                cs.raw[grp - 1, f, 6 + k] = x1[k]
+        if cutlass.const_expr(mb.world == 4):
+            self.poll_record_one(
+                mb, buf, m, c * 256 + 2 * f, grp, tag, poisoned, x0
+            )
+            if grp > 0:
+                for k in cutlass.range_constexpr(6):
+                    cs.raw[grp - 1, f, k] = x0[k]
+            else:
+                for k in cutlass.range_constexpr(6):
+                    acc[k] = C.add_rn(Float32(0.0), x0[k])
         else:
-            for k in cutlass.range_constexpr(6):
-                acc[k] = C.add_rn(C.add_rn(Float32(0.0), x0[k]), x1[k])
+            self.poll_records(
+                mb, buf, m, c * 256 + 2 * f, 2 * grp, tag, poisoned, x0, x1
+            )
+            if grp > 0:
+                for k in cutlass.range_constexpr(6):
+                    cs.raw[grp - 1, f, k] = x0[k]
+                    cs.raw[grp - 1, f, 6 + k] = x1[k]
+            else:
+                for k in cutlass.range_constexpr(6):
+                    acc[k] = C.add_rn(C.add_rn(Float32(0.0), x0[k]), x1[k])
         P.bar_sync(1, 512)
         h0 = c * 768 + 6 * f
         if grp == 0:
-            for q in cutlass.range_constexpr(1, 4):
-                for k in cutlass.range_constexpr(6):
-                    acc[k] = C.add_rn(
-                        C.add_rn(acc[k], cs.raw[q - 1, f, k]), cs.raw[q - 1, f, 6 + k]
-                    )
+            if cutlass.const_expr(mb.world == 4):
+                for q in cutlass.range_constexpr(1, 4):
+                    for k in cutlass.range_constexpr(6):
+                        acc[k] = C.add_rn(acc[k], cs.raw[q - 1, f, k])
+            else:
+                for q in cutlass.range_constexpr(1, 4):
+                    for k in cutlass.range_constexpr(6):
+                        acc[k] = C.add_rn(
+                            C.add_rn(acc[k], cs.raw[q - 1, f, k]),
+                            cs.raw[q - 1, f, 6 + k],
+                        )
             rb = cute.make_rmem_tensor((3,), Uint32)
             for k in cutlass.range_constexpr(3):
                 ab = P.no_neg_zero(C.cvt_rn_bf16x2_f32(acc[2 * k], acc[2 * k + 1]))

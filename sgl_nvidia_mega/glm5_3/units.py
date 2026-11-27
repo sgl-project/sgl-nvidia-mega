@@ -77,8 +77,14 @@ _put(
 )
 _put(
     "attention",
-    CORE_STEPS,
+    ("sparse_mla",),
     Pref("ll.sparse_mla_fd", note="TP4: P1 one-tile, 16 heads, <= 7 rows (WP1)"),
+)
+_put(
+    "attention",
+    ("uv_proj",),
+    Pref("ll.sparse_mla_fd", note="TP4: P1 one-tile + MlaUvProj16, <= 7 rows (WP1)"),
+    Pref("ll.uv_proj", note="TP4: SM103 MlaUvProj16(max_rows=32), 8..32 rows (v6)"),
 )
 _put(
     "hops",
@@ -113,8 +119,14 @@ _put(
 )
 _put(
     "draft_attention",
-    CORE_STEPS,
+    ("sparse_mla",),
     Pref("ll.sparse_mla_fd", note="D2 TP4: P1 one-tile (16 heads, <= 7 rows)"),
+)
+_put(
+    "draft_attention",
+    ("uv_proj",),
+    Pref("ll.sparse_mla_fd", note="D2 TP4: P1 one-tile + MlaUvProj16 (<= 7 rows)"),
+    Pref("ll.uv_proj", note="D2 TP4: SM103 MlaUvProj16(max_rows=32), 8..32 rows (v6)"),
 )
 _put(
     "draft_mlp",
@@ -140,6 +152,9 @@ GEMM_UNITS = tuple(
         "eh_proj",
         "lm_head",
         "q_b",
+        "wq_b",
+        "shared_gate_up",
+        "shared_down",
     )
 )
 OPTIONS: Tuple[str, ...] = (

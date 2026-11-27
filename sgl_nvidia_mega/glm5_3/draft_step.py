@@ -17,9 +17,20 @@ kernels inside the draft-decode and draft-extend CUDA graphs.
 * the draft top-1 runs as a distributed argmax over each rank's logit shard (one cooperative kernel that exchanges a
   (value, index) candidate per row through a symmetric-memory mailbox) instead of the logits all-gather; the stock
   ``draft_topk1_postprocess`` then reads a one-hot logits row, so the token it picks is unchanged;
+* ``SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_FRONT=rowpar`` (default off): with the target's hops and a draft attention step
+  group, ``eh_proj`` runs row-parallel (each rank multiplies its 1536-column K window of the front's output with the
+  same columns of the weight, cuBLAS) and the hop family's residual-free all-reduce + RMSNorm sums the partials and
+  applies the draft layer's input norm in one launch (``draft_attention.PreparedInput``: the attention prepare is
+  skipped). Each partial rounds to BF16 before the sum and the norm is the hop's, so only the draft's proposals can
+  change (acceptance); served at 2-8 rows (1-row and wider steps keep the column shard).
 * slot ``draft_rowselect``: in the draft extend the layer keeps only the ``select_index`` rows (one per request:
   the rows its LM head reads) after the post-attention norm, so the MLP, its all-reduce and the final norm run on
   one row per request (the attention still writes every row's KV and indexer key).
+* SGLang's draft top-1 sink (``SGLANG_SPEC_DRAFT_TOPK1_SINK``, a ``DraftTopk1Sink`` in the forward flags of a
+  draft-decode step): the distributed argmax also writes the step's ``topk_index`` / ``topk_p``, its draft-token
+  column and ``positions += 1`` (what SGLang's partials finalizer writes), so SGLang's draft loop does not launch
+  the finalizer (and, with ``SGLANG_SPEC_DRAFT_INPUT_NO_COPY``, reads the step inputs in place). Same token, same
+  writes: bitwise.
 
 The kernels, the derived eh_proj shard and the top-1 mailboxes are built with the draft spec. The target's build
 registers its hop kernels (with the eh gather's unit and the draft's error-record sites) under the embedding table
@@ -31,6 +42,7 @@ elsewhere); eager steps run SGLang's draft forward (the parity switch excepted, 
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 from typing import TYPE_CHECKING, Optional
 
@@ -92,8 +104,22 @@ SGLANG_READS = {
         "start",
         "complete_output",
         "final_norm",
+        # DRAFT_FRONT_ENV: the summed eh_proj is the stream's written residual
+        "set_written",
     ),
-    "srt/utils/common.py": ("BumpAllocator",),
+    # SGLANG_SPEC_DRAFT_TOPK1_SINK: the draft-decode step's sink in the forward flags
+    "srt/runtime_context.py": ("get_forward", "\"draft_topk1_sink\""),
+    "kernels/ops/speculative/topk1.py": (
+        "DraftTopk1Sink",
+        "topk_p",
+        "topk_index",
+        "positions",
+        "draft_tokens",
+        "column",
+        "filled",
+    ),
+    # DRAFT_FRONT_ENV: the draft layer's input norm, applied in the hop
+    "srt/layers/layernorm.py": ("weight", "variance_epsilon"),
     "srt/model_executor/forward_batch_info.py": (
         "ForwardBatch",
         "spec_info",
@@ -111,7 +137,7 @@ SGLANG_READS = {
         "FULL",
     ),
     "srt/speculative/eagle_info.py|srt/speculative/*.py": ("select_index",),
-    "srt/models/deepseek_v2.py": ("DeepseekV2MoE", "_enable_a2a_moe"),
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE", "_enable_a2a_moe", "input_layernorm"),
     # the replaced model's modules and its logits processor (and the residual module
     # as the NextN model imports it)
     "srt/models/deepseek_nextn.py": (
@@ -148,6 +174,9 @@ SGLANG_READS = {
         "_copy_logits_to_buffer",
         "vocab_size",
         "next_token_logits",
+        # SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE: the top-1 partials output
+        "_draft_argmax_requested",
+        "next_token_argmax_partials",
         "hidden_states",
         "mm_input_embeds",
     ),
@@ -201,10 +230,13 @@ TOP1_EXTEND_ROWS = 8
 TOP1_TIMEOUT_S = 30.0
 # call-site ids of the draft's waits in the error record (the target's hops use layer * 4 + kind)
 SITE_TOP1_DECODE, SITE_TOP1_EXTEND, SITE_EH_GATHER = 1001, 1002, 1003
+# DRAFT_FRONT_ENV: the row-parallel eh_proj sum + input norm (ll.draft's TP4 sum is 1004)
+SITE_EH_NORM = 1005
 SITE_NAMES = {
     SITE_TOP1_DECODE: "draft top-1 (decode)",
     SITE_TOP1_EXTEND: "draft top-1 (extend)",
     SITE_EH_GATHER: "draft eh gather",
+    SITE_EH_NORM: "draft eh_proj sum + input norm",
 }
 # rows per hop launch (the target's mailbox instance A); 12 / 16 rows run as two launches
 HOP_ROWS = 8
@@ -219,6 +251,65 @@ EH_NORM_OPTIONS = dict(
 # draft extend: torch.argmax (NaN is the maximum, the first NaN wins)
 NAN_REPLACEMENT_BITS = 0xF149F2CA
 ONE_HOT_FILL = -torch.finfo(torch.float32).max
+# lanes per candidate of SGLang's draft top-1 partials (kernels/ops/speculative/topk1.py:
+# DRAFT_TOPK1_PARTIAL_LANES)
+PARTIAL_LANES = 4
+# the draft front (off unless "rowpar"): eh_proj row-parallel + the hop's all-reduce with the input norm
+DRAFT_FRONT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_FRONT"
+# the TP8 K window of a rank (2H / 8 input columns: ranks 0-3 the embedding half, 4-7 the hidden half)
+ROWPAR_WORLD = 8
+ROWPAR_WINDOW = 2 * HIDDEN // ROWPAR_WORLD
+# rows from which the row-parallel front serves: at 1 row it measured no faster than the column shard
+# (T90a frontbench, GB300 TP8: +0.4 us at 1 row, -2.5 / -4.8 / -7.5 us at 2 / 4 / 8 rows)
+ROWPAR_MIN_ROWS = 2
+
+
+def draft_front_mode() -> Optional[str]:
+    """``DRAFT_FRONT_ENV``: "rowpar", or None (the column shard and its gather)."""
+    mode = os.environ.get(DRAFT_FRONT_ENV, "").strip().lower()
+    if mode in ("", "0", "off"):
+        return None
+    if mode != "rowpar":
+        raise ValueError(
+            f"NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: {DRAFT_FRONT_ENV}={mode!r} "
+            "(expected rowpar or unset)"
+        )
+    return mode
+
+
+def _topk1_sink():
+    """SGLang's draft top-1 sink of the running draft-decode step (``draft_topk1_sink``
+    in the forward flags, SGLANG_SPEC_DRAFT_TOPK1_SINK), or None (also on an SGLang
+    without the flag)."""
+    try:
+        from sglang.srt.runtime_context import get_forward
+    except ImportError:
+        return None
+    try:
+        return getattr(get_forward(), "draft_topk1_sink", None)
+    except Exception:
+        return None
+
+
+def sink_reason(sink, rows: int) -> str:
+    """Why the distributed argmax cannot write ``sink`` (a ``DraftTopk1Sink``) at
+    ``rows`` rows, or "" (host-only facts, fixed per captured shape)."""
+    ti, tp, pos, tok = sink.topk_index, sink.topk_p, sink.positions, sink.draft_tokens
+    if ti.dtype != torch.int64 or tuple(ti.shape) != (rows, 1) or not ti.is_contiguous():
+        return f"topk_index {tuple(ti.shape)} {ti.dtype}"
+    if tp.dtype != torch.float32 or tuple(tp.shape) != (rows, 1) or not tp.is_contiguous():
+        return f"topk_p {tuple(tp.shape)} {tp.dtype}"
+    if pos.dtype != torch.int64 or tuple(pos.shape) != (rows,) or not pos.is_contiguous():
+        return f"positions {tuple(pos.shape)} {pos.dtype}"
+    if (
+        tok.dtype != torch.int64
+        or tok.dim() != 2
+        or tok.shape[0] != rows
+        or tok.stride(1) != 1
+        or not 0 <= int(sink.column) < tok.shape[1]
+    ):
+        return f"draft tokens {tuple(tok.shape)} {tok.dtype} column {sink.column}"
+    return ""
 
 
 def eh_rows(widths) -> tuple:
@@ -266,6 +357,17 @@ class FusedDraft:
         self.binding = binding
         # the top-1 wait bound: TOP1_TIMEOUT_S within SGLang's wait deadline
         self.top1_timeout_ns = int(min(TOP1_TIMEOUT_S, deadline_s) * 1e9)
+        # DRAFT_FRONT_ENV: this rank's K window of eh_proj, the input norm, and whether the
+        # target's hops serve the sum (decided at the first capture, on every rank alike)
+        self.front_mode = draft_front_mode()
+        self._rp_w: Optional[torch.Tensor] = None
+        self._rp_win = 0
+        self._rp_gamma: Optional[torch.Tensor] = None
+        self._rp_eps = 0.0
+        self._rp_ready = False
+        self._rp_why = "off"
+        # the draft top-1 sink: logged once per rank at its first fill
+        self._sink_logged = False
         self._arm(nextn)
 
     def _arm(self, nextn) -> None:
@@ -289,6 +391,8 @@ class FusedDraft:
                 "the GLM-5.3 / GLM-5.2 shape"
             )
         self.eh_weight = w[self.col_off : self.col_off + self.n_local].contiguous()
+        if self.front_mode:
+            self._arm_rowpar(nextn, w)
         specs = compile_specs(
             eh_rows=self.eh_rows,
             top1_rows=(TOP1_DECODE_ROWS, TOP1_EXTEND_ROWS),
@@ -313,15 +417,15 @@ class FusedDraft:
         torch.cuda.synchronize(dev)
         # every rank has built the same draft kernels (also the barrier before any
         # rank's first use of the mailboxes)
-        megakernel_agree(
-            (
-                self.eh_rows,
-                TOP1_DECODE_ROWS,
-                TOP1_EXTEND_ROWS,
-                self._attn_family is not None,
-            ),
-            what="GLM-5.3 / GLM-5.2 draft kernels built",
+        built = (
+            self.eh_rows,
+            TOP1_DECODE_ROWS,
+            TOP1_EXTEND_ROWS,
+            self._attn_family is not None,
         )
+        if self.front_mode:
+            built += (self._rp_w is not None,)
+        megakernel_agree(built, what="GLM-5.3 / GLM-5.2 draft kernels built")
         self.armed = True
 
     def summary(self) -> str:
@@ -330,11 +434,77 @@ class FusedDraft:
             f"draft: eh_proj shard rows {list(self.eh_rows)}, top-1 rows <= "
             f"{TOP1_DECODE_ROWS} / {TOP1_EXTEND_ROWS}; derived eh_proj shard "
             f"{self.eh_weight.numel() * 2 / 2**20:.1f} MiB; attention kernels: "
-            + ("MLA prologue + extend q_a / kv_a GEMM" if self._attn_family else "no")
+            + (
+                "MLA prologue + extend q_a / kv_a GEMM"
+                + (
+                    " + sparse MLA + value up-projection"
+                    if draft_attention.draft_sparse_mla_on()
+                    else ""
+                )
+                if self._attn_family
+                else "no"
+            )
             + "; draft-extend MLP on the select_index rows: "
             + ("yes" if self.row_select else "no")
         )
 
+    def _arm_rowpar(self, nextn, w: torch.Tensor) -> None:
+        """``DRAFT_FRONT_ENV``: this rank's K window of eh_proj ([H, 2H / 8], 18 MiB) and
+        the draft layer's input norm; the hop unit is the target's (``_attach_target_hops``)."""
+        norm = nextn.model.decoder.input_layernorm
+        gamma = norm.weight
+        if self.world != ROWPAR_WORLD:
+            self._rp_why = f"TP{self.world} (served at TP{ROWPAR_WORLD})"
+        elif gamma.dtype != torch.bfloat16 or tuple(gamma.shape) != (HIDDEN,):
+            self._rp_why = f"input norm weight {tuple(gamma.shape)} {gamma.dtype}"
+        else:
+            self._rp_win = self.rank * ROWPAR_WINDOW
+            self._rp_w = w[:, self._rp_win : self._rp_win + ROWPAR_WINDOW].contiguous()
+            self._rp_gamma, self._rp_eps = gamma, float(norm.variance_epsilon)
+            self._rp_why = "waiting for the target's hops"
+
+    def eh_prepared(self, eh_input: torch.Tensor):
+        """``DRAFT_FRONT_ENV``: eh_proj summed through the draft layer's input norm in
+        the hop (``draft_attention.PreparedInput``), or None:
+        * at ``ROWPAR_MIN_ROWS``-8 rows: row-parallel matmul + ``allreduce_rmsnorm``;
+        * at 1 row (when ``1 in self._eh``): column-sharded ``EhProjShard(1)`` into the
+          zero-padded buffer + ``allreduce_rmsnorm`` (eliminates the standalone draft
+          ``input_layernorm`` launch on every draft-decode step)."""
+        rows = eh_input.shape[0]
+        if (
+            not self._rp_ready
+            or not self.engaged()
+            or not 1 <= rows <= HOP_ROWS
+            or not eh_input.is_contiguous()
+        ):
+            return None
+        if rows >= ROWPAR_MIN_ROWS:
+            part = torch.matmul(
+                eh_input[:, self._rp_win : self._rp_win + ROWPAR_WINDOW], self._rp_w.t()
+            )
+        elif rows in self._eh:
+            from cutlass import Int32, Int64
+
+            k, fn = self._eh[rows]
+            part = self._pad[:rows]
+            fn(
+                Int64(self.eh_weight.data_ptr()),
+                Int64(eh_input.data_ptr()),
+                Int64(part.data_ptr()),
+                Int32(self.n_local),
+                Int32(HIDDEN),
+                Int32(self.col_off),
+                Int32(k.grid(self.n_local)),
+                cu_stream(),
+            )
+        else:
+            return None
+        out_res = torch.empty_like(part)
+        out_norm = torch.empty_like(part)
+        self._hops.allreduce_rmsnorm(
+            part, self._rp_gamma, out_res, out_norm, site=SITE_EH_NORM
+        )
+        return draft_attention.PreparedInput(out_norm, out_res)
     def _arm_attention(self, nextn) -> None:
         """Build and compile the draft layer's attention kernels; a reason on any rank
         stops every rank (the draft slot is requested)."""
@@ -384,12 +554,40 @@ class FusedDraft:
             self.error_record = hops.err
         else:
             self._errors = runtime.ErrorReporter([self.failure])
+        if self.front_mode:
+            self._attach_rowpar(hops, megakernel_agree)
         logger.info(
             "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: hops on the target's "
             "mailbox: %s (rank %d)",
             "eh gather" if self._hops is not None else "no",
             self.rank,
         )
+
+    def _attach_rowpar(self, hops, megakernel_agree) -> None:
+        """``DRAFT_FRONT_ENV``: serve the row-parallel front when this rank has its window,
+        the target's hops carry the all-reduce + RMSNorm unit and their eps is the input
+        norm's; every rank must agree."""
+        why = self._rp_why if self._rp_w is None else ""
+        if not why and hops is None:
+            why = "the target's hops are not served"
+        elif not why and "allreduce_rmsnorm" not in hops.compiled:
+            why = "the hops have no all-reduce + RMSNorm unit"
+        elif not why and float(hops.eps) != self._rp_eps:
+            why = f"the hops' eps {hops.eps} is not the input norm's {self._rp_eps}"
+        megakernel_agree(
+            why == "", what="GLM-5.3 / GLM-5.2 draft: row-parallel eh_proj served"
+        )
+        self._rp_ready = why == ""
+        self._rp_why = why or "served"
+        if self.rank == 0:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: %s=rowpar: %s",
+                DRAFT_FRONT_ENV,
+                "eh_proj row-parallel (K window %d) + the hops' all-reduce + input RMSNorm at %d-%d rows"
+                % (ROWPAR_WINDOW, ROWPAR_MIN_ROWS, HOP_ROWS)
+                if self._rp_ready
+                else f"declined ({why}); the column shard and its gather serve",
+            )
 
     def failure(self) -> Optional[dict]:
         """The timeout record of the draft's waits (host memory: readable after the CUDA
@@ -467,10 +665,19 @@ class FusedDraft:
             self._hops.allreduce(part[lo:hi], out[lo:hi], site=SITE_EH_GATHER)
         return out
 
-    def top1_one_hot(
-        self, logits_shard: torch.Tensor, n_valid: int, vocab: int, extend: bool
+    def _top1_ids(
+        self,
+        logits_shard: torch.Tensor,
+        n_valid: int,
+        extend: bool,
+        partials: Optional[torch.Tensor] = None,
+        sink=None,
     ) -> Optional[torch.Tensor]:
-        """A [rows, vocab] fp32 one-hot of the global top-1 (stock NaN rule), or None."""
+        """The global top-1 ids ``[rows]`` int64 (stock NaN rule) by the distributed
+        argmax, also written as SGLang's top-1 partials into ``partials`` (``[rows, 4]``
+        fp32) when given, and with ``sink`` (a checked ``DraftTopk1Sink``) into its
+        ``topk_index`` / ``topk_p`` / draft-token column with ``positions += 1``; or
+        None (not engaged / not served)."""
         from cutlass import Int32, Int64, Uint32, Uint64
 
         rows, vloc = logits_shard.shape
@@ -482,7 +689,10 @@ class FusedDraft:
         ):
             return None
         k.check_shapes(rows, vloc, n_valid, self.world, self.rank)
-        ids = torch.empty(rows, dtype=torch.int64, device=logits_shard.device)
+        if sink is not None:
+            ids = sink.topk_index.view(rows)
+        else:
+            ids = torch.empty(rows, dtype=torch.int64, device=logits_shard.device)
         vals = torch.empty(rows, dtype=torch.float32, device=logits_shard.device)
         fn(
             Int64(logits_shard.data_ptr()),
@@ -491,6 +701,12 @@ class FusedDraft:
             Int64(ctrl.data_ptr()),
             Int64(ids.data_ptr()),
             Int64(vals.data_ptr()),
+            Int64(0 if partials is None else partials.data_ptr()),
+            Int64(0 if sink is None else sink.topk_p.data_ptr()),
+            Int64(0 if sink is None else sink.draft_tokens.data_ptr()),
+            Int32(1 if sink is None else sink.draft_tokens.stride(0)),
+            Int32(0 if sink is None else int(sink.column)),
+            Int64(0 if sink is None else sink.positions.data_ptr()),
             Int32(rows),
             Int32(vloc),
             Int32(n_valid),
@@ -503,11 +719,69 @@ class FusedDraft:
             Int32(SITE_TOP1_EXTEND if extend else SITE_TOP1_DECODE),
             cu_stream(),
         )
+        return ids
+
+    def top1_one_hot(
+        self, logits_shard: torch.Tensor, n_valid: int, vocab: int, extend: bool
+    ) -> Optional[torch.Tensor]:
+        """A [rows, vocab] fp32 one-hot of the global top-1 (stock NaN rule), or None."""
+        ids = self._top1_ids(logits_shard, n_valid, extend)
+        if ids is None:
+            return None
         one_hot = torch.full(
-            (rows, vocab), ONE_HOT_FILL, dtype=torch.float32, device=logits_shard.device
+            (ids.shape[0], vocab),
+            ONE_HOT_FILL,
+            dtype=torch.float32,
+            device=logits_shard.device,
         )
         one_hot.scatter_(1, ids[:, None], 0.0)
         return one_hot
+
+    def top1_partials(
+        self, logits_shard: torch.Tensor, n_valid: int, extend: bool
+    ) -> Optional[torch.Tensor]:
+        """The global top-1 (stock NaN rule) as SGLang's draft top-1 partials, one
+        candidate per row (``[rows, 4]`` fp32, written by the distributed argmax
+        itself), or None. SGLang's partials finalizers then take the token without a
+        logits row: no one-hot fill and scatter, no logits-buffer copy, no argmax."""
+        rows = logits_shard.shape[0]
+        partials = torch.empty(
+            (rows, PARTIAL_LANES), dtype=torch.float32, device=logits_shard.device
+        )
+        if self._top1_ids(logits_shard, n_valid, extend, partials) is None:
+            return None
+        return partials
+
+    def top1_sink(self, logits_shard: torch.Tensor, n_valid: int, sink) -> bool:
+        """SGLang's draft top-1 sink (draft decode): the distributed argmax writes its
+        outputs and ``sink.filled`` is set; False (nothing launched) when the sink's
+        layout does not fit (the caller then takes the partials)."""
+        rows = logits_shard.shape[0]
+        why = sink_reason(sink, rows)
+        if why:
+            if not self._sink_logged:
+                self._sink_logged = True
+                logger.warning(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: the draft top-1 sink "
+                    "is not written by the distributed argmax (%s); the partials "
+                    "serve (rank %d)",
+                    why,
+                    self.rank,
+                )
+            return False
+        if self._top1_ids(logits_shard, n_valid, False, None, sink) is None:
+            return False
+        sink.filled = True
+        if not self._sink_logged:
+            self._sink_logged = True
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: the distributed argmax "
+                "writes the draft-decode top-1 sink (topk_index, topk_p, draft-token "
+                "column, positions) at %d rows (rank %d)",
+                rows,
+                self.rank,
+            )
+        return True
 
     def attention_for(self, rows: int, forward_batch: ForwardBatch, view):
         """The draft layer's attention step group served at ``rows`` in this forward mode (a
@@ -670,11 +944,11 @@ class FusedDraft:
         )
         from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-        from sglang.srt.utils import BumpAllocator
 
-        # the zero fill stays the plain launch right before the front kernel (its ids / rows are read after its
-        # grid-dependency wait, which orders it only after the immediately preceding grid)
-        zero_allocator = BumpAllocator(
+        # no eager zero fill (runtime.LazyZeroAllocator): the front kernel's ids / rows are read after its
+        # grid-dependency wait, and the launch before it (the graph's input copies or the previous step's
+        # _small_copy_kernel) is a plain launch, so the wait orders it after every earlier grid
+        zero_allocator = runtime.LazyZeroAllocator(
             buffer_size=2, dtype=torch.float32, device=input_ids.device
         )
         hidden_states = None
@@ -704,13 +978,24 @@ class FusedDraft:
                     model.hnorm.weight,
                     model.enorm.variance_epsilon,
                 )
-            hidden_states = self.eh_proj(eh_input)
+            # DRAFT_FRONT_ENV: only for a step group, which takes the normed input
+            hidden_states = (
+                self.eh_prepared(eh_input) if attention is not None else None
+            )
+            if hidden_states is None:
+                hidden_states = self.eh_proj(eh_input)
             if hidden_states is None:
                 hidden_states = model.eh_proj(eh_input)
         else:
             hidden_states = model.embed_input_ids(input_ids, forward_batch)
 
-        residual_batch.start(forward_batch)
+        prepared = isinstance(hidden_states, draft_attention.PreparedInput)
+        if prepared:
+            # the hop applied the draft layer's input norm: the attention prepare is skipped
+            residual_batch.set_written(hidden_states.residual, forward_batch)
+            hidden_states = hidden_states.norm
+        else:
+            residual_batch.start(forward_batch)
         index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             decoder = model.decoder
@@ -721,6 +1006,7 @@ class FusedDraft:
                     attention,
                     view=view,
                     ffn_rows=ffn_rows,
+                    **({"prepared": True} if prepared else {}),
                 )
             hidden_states, topk_indices = decoder(
                 positions,
@@ -779,16 +1065,37 @@ def draft_logits(
     lm_head = nextn.lm_head
     shard = lp._compute_lm_head(pruned, lm_head, None)
     si = lm_head.shard_indices
-    one_hot = None
-    if (
+    extend = meta.forward_mode.is_draft_extend_v2()
+    served = (
         si.num_added_elements == 0
         and si.org_vocab_start_index == fd.rank * shard.shape[1]
-    ):
+    )
+    if served and _argmax_partials_requested(lp):
+        # SGLANG_SPEC_DRAFT_TOPK1_SINK: in a draft-decode step the argmax writes the
+        # finalizer's outputs itself (SGLang's loop then reads the sink)
+        sink = None if extend or sample_indices is not None else _topk1_sink()
+        if sink is not None and fd.top1_sink(shard, si.num_org_elements, sink):
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=hidden_states_to_store,
+                mm_input_embeds=meta.mm_input_embeds,
+            )
+        # SGLang's draft_argmax_only forward (SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE): the
+        # top-1 as its partials, which its draft loop and draft extend finalize
+        partials = fd.top1_partials(shard, si.num_org_elements, extend=extend)
+        if partials is not None:
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                next_token_argmax_partials=(
+                    partials if sample_indices is None else partials[sample_indices]
+                ),
+                hidden_states=hidden_states_to_store,
+                mm_input_embeds=meta.mm_input_embeds,
+            )
+    one_hot = None
+    if served:
         one_hot = fd.top1_one_hot(
-            shard,
-            si.num_org_elements,
-            lp.vocab_size,
-            extend=meta.forward_mode.is_draft_extend_v2(),
+            shard, si.num_org_elements, lp.vocab_size, extend=extend
         )
     # same ranks, same decision: everyone takes the stock gather
     if one_hot is None:
@@ -801,6 +1108,14 @@ def draft_logits(
         hidden_states=hidden_states_to_store,
         mm_input_embeds=meta.mm_input_embeds,
     )
+
+
+def _argmax_partials_requested(lp) -> bool:
+    """Whether SGLang asks this draft LM-head processor for top-1 partials instead of
+    logits (its ``draft_argmax_only`` forward flag on an opted-in processor; the same on
+    every rank)."""
+    requested = getattr(lp, "_draft_argmax_requested", None)
+    return bool(requested is not None and requested())
 
 
 def _plain_tp_logits(fd: FusedDraft, lp, forward_batch, metadata=None):

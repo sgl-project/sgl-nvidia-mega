@@ -23,14 +23,23 @@ layer (the draft replica test checks it in both modes). With slot
 
 ``DraftFusedAttention`` serves the attention family's MLA prologue in every draft
 pass and its q_a / kv_a GEMM (with the indexer key / head-gate projection) in the
-draft extend at up to 8 rows; the indexer query, the indexer, the sparse MLA and
-the value up-projection stay stock. The draft layer has its own weights and KV
-pool, hence its own ``AttentionGlue``; compiled forms are shared with the target
-through the compile cache.
+draft extend at up to 8 rows; with ``SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA=1``
+(default off) also its sparse MLA and value up-projection in every draft pass; the indexer query and the indexer stay
+stock. The draft layer has its own weights and KV pool, hence its own
+``AttentionGlue``; compiled forms are shared with the target through the compile
+cache.
+
+The family's sparse MLA reads the top-k ids as physical cache rows, as the stock
+call does (the fused top-k page table), and takes no cache lengths: the stock
+kernel's lengths only bound rows the ids already list (a -1 id is skipped by both),
+so the draft decode's full cache lengths and the draft extend's verify lengths read
+the same rows. A draft decode pass reuses the draft extend's top-k (the MTP
+index-share carry) with either kernel.
 """
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional
@@ -38,6 +47,7 @@ from typing import List, NamedTuple, Optional
 import torch
 
 from sgl_nvidia_mega.glm5_3.attention.fused import (
+    TOPK,
     AttentionGlue,
     FusedAttention,
     kernel_rows,
@@ -192,20 +202,54 @@ def _check_decode_branches(attn, view) -> None:
         )
 
 
-class DraftFusedAttention(FusedAttention, DraftAttention):
-    """Draft attention with the MLA prologue on the family's kernel."""
+DRAFT_SPARSE_MLA_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA"
 
-    # The draft rule: these steps stay stock in the draft layer (the sparse MLA
-    # with the draft's cache lengths, DraftAttention.sparse_mla_seq_lens).
+
+def draft_sparse_mla_on() -> bool:
+    """The draft layer's sparse MLA and value up-projection on the family's kernels
+    (``SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA=1``; default off: SGLang's)."""
+    return os.environ.get(DRAFT_SPARSE_MLA_ENV, "0") == "1"
+
+
+class DraftFusedAttention(FusedAttention, DraftAttention):
+    """Draft attention with the MLA prologue on the family's kernel (and, opt-in, the
+    sparse MLA and the value up-projection)."""
+
+    # The draft rule: the indexer query stays stock in the draft layer
     index_q = AttentionStep.index_q
-    sparse_mla = AttentionStep.sparse_mla
-    uv_proj = AttentionStep.uv_proj
 
     def __init__(self, glue: AttentionGlue, rows: int) -> None:
+        from sgl_nvidia_mega.glm5_3.runtime import SLOTS
+
         super().__init__(glue, rows)
         # qkv_a (per forward): the family's GEMM in the draft extend, else the
         # stock fused-A GEMM (+ the indexer key / head-gate projection)
         self._qa_extend, self.qa = self.qa, None
+        # static per (mode, rows) and equal on every rank; opt-in (default off):
+        # SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_SPARSE_MLA=1 (needs slot draft)
+        self.fused_sparse = draft_sparse_mla_on() and "draft" in SLOTS
+
+    def sparse_mla(self, attn, q_fp8: torch.Tensor, topk_indices, step):
+        """The family's sparse MLA over the top-k cache rows when the ids are the
+        kernel's layout (int32 ``[rows, top-k]``, contiguous, a static fact of the
+        captured shape), else the stock call with the draft's cache lengths
+        (``DraftAttention.sparse_mla_seq_lens``)."""
+        if (
+            self.fused_sparse
+            and topk_indices is not None
+            and topk_indices.dtype == torch.int32
+            and topk_indices.dim() == 2
+            and topk_indices.shape[1] == TOPK
+            and topk_indices.shape[0] <= q_fp8.shape[0]
+            and topk_indices.is_contiguous()
+        ):
+            return FusedAttention.sparse_mla(self, attn, q_fp8, topk_indices, step)
+        return AttentionStep.sparse_mla(self, attn, q_fp8, topk_indices, step)
+
+    def uv_proj(self, attn, attn_output: torch.Tensor) -> torch.Tensor:
+        if self.fused_sparse:
+            return FusedAttention.uv_proj(self, attn, attn_output)
+        return AttentionStep.uv_proj(self, attn, attn_output)
 
     def runs_indexer(self, attn, step) -> bool:
         # The draft layer runs its own indexer in the forwards without a top-k

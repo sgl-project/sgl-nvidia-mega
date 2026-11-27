@@ -19,7 +19,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 
 from ..primitives import ptx_sys as sys_ops
 from . import _ptx_local as P
-from .constants import BF16_NAN, CONSUMER_THREADS, HIDDEN, POLL_THREADS, TAG_MASK
+from .constants import BF16_NAN, CONSUMER_THREADS, HIDDEN, POLL_THREADS, TAG_MASK, WORLD
 from .transport import ConsSmem, Consumer, Mbox
 
 
@@ -27,12 +27,25 @@ class AllreduceNormHop(Consumer):
     """``out_res = residual + allreduce(partial)`` (or the plain all-reduce without a
     residual), ``out_norm = rmsnorm(out_res) * gamma`` when ``norm``."""
 
-    def __init__(self, *, residual: bool = True, norm: bool = True, max_rows: int = 8):
+    world = WORLD
+
+    def __init__(
+        self,
+        *,
+        residual: bool = True,
+        norm: bool = True,
+        max_rows: int = 8,
+        world: int = WORLD,
+    ):
         if residual and not norm:
             raise ValueError("residual without RMSNorm is not provided")
         if max_rows != 8:
             raise ValueError("this hop is provided for up to 8 rows")
+        if world not in (4, 8):
+            raise ValueError(f"AllreduceNormHop: world {world} (4 or 8)")
         self.residual, self.norm, self.max_rows = residual, norm, max_rows
+        if world != WORLD:
+            self.world = world
 
     @cute.jit
     def __call__(
@@ -109,7 +122,15 @@ class AllreduceNormHop(Consumer):
         err_host: Int64,
         site: Int32,
     ):
-        mb = Mbox((p0, p1, p2, p3, p4, p5, p6, p7), rank, self.max_rows, err_host, site)
+        peers_all = (p0, p1, p2, p3, p4, p5, p6, p7)
+        mb = Mbox(
+            peers_all[: self.world],
+            rank,
+            self.max_rows,
+            err_host,
+            site,
+            self.world,
+        )
         t = P.thread_index()
         bx = P.block_index()
         smem = cutlass.utils.SmemAllocator()

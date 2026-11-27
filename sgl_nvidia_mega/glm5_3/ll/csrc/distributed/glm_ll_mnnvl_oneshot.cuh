@@ -133,8 +133,19 @@ struct Fp4Ext {
   const float* scale;  // [1] global scale
 };
 
-template <int kTopK, bool kFp4Out>
-using HopExt = std::conditional_t<(kTopK > 0), FinalizeExt, std::conditional_t<kFp4Out, Fp4Ext, NoExt>>;
+// FP32 read-and-zero + optional BF16 shared-expert add prologue (kFp32Zero).
+// Consumes atomic-accumulated SM103 MoE FP32 output, adds optional shared_output,
+// rounds once to bf16, and zeroes acc in place (eliminating out_fp32.zero_()).
+struct Fp32ZeroExt {
+  float* acc;                    // [M, H] fp32, read and zeroed in place
+  const __nv_bfloat16* shared;   // [M, H] bf16 shared-expert output, or null
+};
+
+template <int kTopK, bool kFp4Out, bool kFp32Zero = false>
+using HopExt = std::conditional_t<
+    kFp32Zero,
+    Fp32ZeroExt,
+    std::conditional_t<(kTopK > 0), FinalizeExt, std::conditional_t<kFp4Out, Fp4Ext, NoExt>>>;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 #define SGL_GLM_LL_SM90 1
@@ -365,6 +376,28 @@ __device__ __forceinline__ Pack finalize_rows(const FinalizeExt& p, int token, i
   return out;
 }
 
+__device__ __forceinline__ Pack fp32_zero_read(const Fp32ZeroExt& p, int64_t thread_offset) {
+  float* acc_ptr = p.acc + thread_offset;
+  const float4 a0 = *reinterpret_cast<const float4*>(acc_ptr);
+  const float4 a1 = *reinterpret_cast<const float4*>(acc_ptr + 4);
+  *reinterpret_cast<uint4*>(acc_ptr) = make_uint4(0u, 0u, 0u, 0u);
+  *reinterpret_cast<uint4*>(acc_ptr + 4) = make_uint4(0u, 0u, 0u, 0u);
+  const bool has_shared = p.shared != nullptr;
+  Pack shared_row;
+  if (has_shared) {
+    shared_row.u4 = *reinterpret_cast<const uint4*>(p.shared + thread_offset);
+  }
+  const float fa[kElts] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+  Pack out;
+#pragma unroll
+  for (int i = 0; i < kElts; ++i) {
+    float v = fa[i];
+    if (has_shared) v = add_rn_ieee(v, __bfloat162float(shared_row.e[i]));
+    out.e[i] = __float2bfloat16(v);
+  }
+  return out;
+}
+
 // FlashInfer v0.7.1 trtllm_allreduce_fusion.cuh fp32_pair_to_e2m1.
 __device__ __forceinline__ uint8_t fp32_pair_to_e2m1(float2 pair) {
   uint32_t val32;
@@ -423,14 +456,16 @@ template <
     int kTopK = 0,
     typename WeightT = __nv_bfloat16,
     bool kIdentityRows = false,
-    bool kFp4Out = false>
+    bool kFp4Out = false,
+    bool kFp32Zero = false>
 __global__ void __launch_bounds__((kTopK == 0 && !kFp4Out) ? 1024 : kMaxWarps * kWarpSize)
-    oneshot_ar_rmsnorm_kernel(const Params p, const HopExt<kTopK, kFp4Out> e) {
+    oneshot_ar_rmsnorm_kernel(const Params p, const HopExt<kTopK, kFp4Out, kFp32Zero> e) {
 #if SGL_GLM_LL_SM90
   static_assert(kWorldSize >= 2 && kWorldSize <= 8);
   static_assert(kMaxWarps >= 2 && kMaxWarps <= 32 && (kMaxWarps & (kMaxWarps - 1)) == 0);
   static_assert(kTopK >= 0 && kTopK <= 16);
   static_assert(!(kTopK > 0 && kFp4Out), "the finalize hop feeds attention, not the MoE");
+  static_assert(!(kFp32Zero && (kTopK > 0 || kFp4Out)), "fp32_zero is mutually exclusive with finalize/fp4");
   extern __shared__ __align__(16) uint4 s_rows[];  // [2 * blockDim.x]: residual, gamma
   __shared__ __align__(16) float s_warp_sums[kMaxClusterSize * kMaxWarps];
   __shared__ __align__(8) uint64_t s_bar;
@@ -501,7 +536,11 @@ __global__ void __launch_bounds__((kTopK == 0 && !kFp4Out) ? 1024 : kMaxWarps * 
   // ---- Publish this rank's vector to every rank: one multicast store, or one
   // unicast store per peer (this rank reduces its own vector from registers).
   Pack val;
-  if constexpr (kTopK == 0) {
+  if constexpr (kFp32Zero) {
+    __pipeline_memcpy_async(&s_residual[threadIdx.x], p.residual_in + thread_offset, sizeof(uint4));
+    __pipeline_commit();
+    val = fp32_zero_read(e, thread_offset);
+  } else if constexpr (kTopK == 0) {
     val.u4 = *reinterpret_cast<const uint4*>(p.input + thread_offset);
     __pipeline_memcpy_async(&s_residual[threadIdx.x], p.residual_in + thread_offset, sizeof(uint4));
     __pipeline_commit();
@@ -717,13 +756,15 @@ template <
     int kTopK = 0,
     typename WeightT = __nv_bfloat16,
     bool kIdentityRows = false,
-    bool kFp4Out = false>
+    bool kFp4Out = false,
+    bool kFp32Zero = false>
 __global__ void __launch_bounds__(kMaxWarps * kWarpSize)
-    twoshot_ar_rmsnorm_kernel(const Params p, const HopExt<kTopK, kFp4Out> e) {
+    twoshot_ar_rmsnorm_kernel(const Params p, const HopExt<kTopK, kFp4Out, kFp32Zero> e) {
 #if SGL_GLM_LL_SM90
   static_assert(kWorldSize >= 2 && kWorldSize <= 8);
   static_assert(kMaxWarps >= 2 && kMaxWarps <= 32 && (kMaxWarps & (kMaxWarps - 1)) == 0);
   static_assert(!(kTopK > 0 && kFp4Out), "the finalize hop feeds attention, not the MoE");
+  static_assert(!(kFp32Zero && (kTopK > 0 || kFp4Out)), "fp32_zero is mutually exclusive with finalize/fp4");
   constexpr uint32_t kScatter = 0;
   constexpr uint32_t kBroadcast = 1;
   constexpr uint32_t kStages = 2;
@@ -781,7 +822,11 @@ __global__ void __launch_bounds__(kMaxWarps * kWarpSize)
 
   // ---- This rank's row t, into the owner's SCATTER stage.
   Pack val;
-  if constexpr (kTopK == 0) {
+  if constexpr (kFp32Zero) {
+    __pipeline_memcpy_async(&s_residual[threadIdx.x], p.residual_in + thread_offset, sizeof(uint4));
+    __pipeline_commit();
+    val = fp32_zero_read(e, thread_offset);
+  } else if constexpr (kTopK == 0) {
     val.u4 = *reinterpret_cast<const uint4*>(p.input + thread_offset);
     __pipeline_memcpy_async(&s_residual[threadIdx.x], p.residual_in + thread_offset, sizeof(uint4));
     __pipeline_commit();
@@ -1006,15 +1051,16 @@ template <
     int kTopK = 0,
     typename WeightT = __nv_bfloat16,
     bool kIdentityRows = false,
-    bool kFp4Out = false>
-inline HopKernel<HopExt<kTopK, kFp4Out>> select_kernel(int num_warps) {
+    bool kFp4Out = false,
+    bool kFp32Zero = false>
+inline HopKernel<HopExt<kTopK, kFp4Out, kFp32Zero>> select_kernel(int num_warps) {
   return num_warps <= 4
-             ? &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 4, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out>
+             ? &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 4, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>
          : num_warps <= 8
-             ? &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 8, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out>
+             ? &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 8, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>
          : num_warps <= 16
-             ? &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 16, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out>
-             : &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 32, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out>;
+             ? &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 16, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>
+             : &oneshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 32, kUnicast, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>;
 }
 
 template <
@@ -1023,33 +1069,48 @@ template <
     int kTopK = 0,
     typename WeightT = __nv_bfloat16,
     bool kIdentityRows = false,
-    bool kFp4Out = false>
-inline HopKernel<HopExt<kTopK, kFp4Out>> select_twoshot(int num_warps) {
-  return num_warps <= 4    ? &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 4, kTopK, WeightT, kIdentityRows, kFp4Out>
-         : num_warps <= 8  ? &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 8, kTopK, WeightT, kIdentityRows, kFp4Out>
-         : num_warps <= 16 ? &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 16, kTopK, WeightT, kIdentityRows, kFp4Out>
-                           : &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 32, kTopK, WeightT, kIdentityRows, kFp4Out>;
+    bool kFp4Out = false,
+    bool kFp32Zero = false>
+inline HopKernel<HopExt<kTopK, kFp4Out, kFp32Zero>> select_twoshot(int num_warps) {
+  return num_warps <= 4    ? &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 4, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>
+         : num_warps <= 8  ? &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 8, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>
+         : num_warps <= 16 ? &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 16, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>
+                           : &twoshot_ar_rmsnorm_kernel<kWorldSize, kTriggerEarly, 32, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>;
 }
 
 // One-shot (unicast or multicast publish) or two-shot kernel of a variant.
-template <int kWorldSize, bool kTriggerEarly, int kTopK, typename WeightT, bool kIdentityRows, bool kFp4Out>
-inline HopKernel<HopExt<kTopK, kFp4Out>> select_hop(int num_warps, int64_t unicast, int64_t two_shot) {
+template <
+    int kWorldSize,
+    bool kTriggerEarly,
+    int kTopK,
+    typename WeightT,
+    bool kIdentityRows,
+    bool kFp4Out,
+    bool kFp32Zero = false>
+inline HopKernel<HopExt<kTopK, kFp4Out, kFp32Zero>> select_hop(int num_warps, int64_t unicast, int64_t two_shot) {
   if (two_shot != 0) {
-    return select_twoshot<kWorldSize, kTriggerEarly, kTopK, WeightT, kIdentityRows, kFp4Out>(num_warps);
+    return select_twoshot<kWorldSize, kTriggerEarly, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>(num_warps);
   }
   return unicast != 0
-             ? select_kernel<kWorldSize, kTriggerEarly, true, kTopK, WeightT, kIdentityRows, kFp4Out>(num_warps)
-             : select_kernel<kWorldSize, kTriggerEarly, false, kTopK, WeightT, kIdentityRows, kFp4Out>(num_warps);
+             ? select_kernel<kWorldSize, kTriggerEarly, true, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>(num_warps)
+             : select_kernel<kWorldSize, kTriggerEarly, false, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>(num_warps);
 }
 
 // Loads every instantiation of one variant on the current device (call before
 // graph capture), so a load failure shows up in the host-side vote, not in a hop.
-template <int kWorldSize, bool kTriggerEarly, int kTopK, typename WeightT, bool kIdentityRows, bool kFp4Out>
+template <
+    int kWorldSize,
+    bool kTriggerEarly,
+    int kTopK,
+    typename WeightT,
+    bool kIdentityRows,
+    bool kFp4Out,
+    bool kFp32Zero = false>
 inline void load_variant() {
   for (int num_warps : {4, 8, 16, 32}) {
-    load_kernel(select_kernel<kWorldSize, kTriggerEarly, false, kTopK, WeightT, kIdentityRows, kFp4Out>(num_warps));
-    load_kernel(select_kernel<kWorldSize, kTriggerEarly, true, kTopK, WeightT, kIdentityRows, kFp4Out>(num_warps));
-    load_kernel(select_twoshot<kWorldSize, kTriggerEarly, kTopK, WeightT, kIdentityRows, kFp4Out>(num_warps));
+    load_kernel(select_kernel<kWorldSize, kTriggerEarly, false, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>(num_warps));
+    load_kernel(select_kernel<kWorldSize, kTriggerEarly, true, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>(num_warps));
+    load_kernel(select_twoshot<kWorldSize, kTriggerEarly, kTopK, WeightT, kIdentityRows, kFp4Out, kFp32Zero>(num_warps));
   }
 }
 
@@ -1392,6 +1453,69 @@ struct GlmLLMnnvlOneshotNvfp4 {
     const int num_warps = static_cast<int>(block_size / kWarpSize);
     launch_hop(
         select_hop<kWorldSize, kTriggerEarly, 0, __nv_bfloat16, false, true>(num_warps, unicast, two_shot),
+        params, ext, num_tokens, block_size, cluster_size, max_carveout, norm_out.device());
+  }
+};
+
+/// \brief FP32-read-and-zero hop: consumes an atomic-accumulated [M, hidden] fp32
+///        MoE partial (zeroing it in place), optionally adds a [M, hidden] bf16
+///        shared-expert partial, rounds once to bf16, and runs the AR+residual+RMSNorm.
+template <int kWorldSize, bool kTriggerEarly>
+struct GlmLLMnnvlFp32ZeroOneshot {
+  static void configure() {
+    load_variant<kWorldSize, kTriggerEarly, 0, __nv_bfloat16, false, false, true>();
+  }
+
+  static void
+  run(tvm::ffi::TensorView fp32_acc,
+      std::optional<tvm::ffi::TensorView> shared_output,
+      tvm::ffi::TensorView residual_in,
+      tvm::ffi::TensorView gamma,
+      tvm::ffi::TensorView norm_out,
+      tvm::ffi::TensorView residual_out,
+      tvm::ffi::TensorView buffer_flags,
+      int64_t mcast_ptr,
+      int64_t buffer_ptrs_dev,
+      int64_t rank,
+      double eps,
+      double weight_bias,
+      int64_t block_size,
+      int64_t cluster_size,
+      int64_t unicast,
+      int64_t max_carveout,
+      int64_t two_shot,
+      int64_t err_ptr,
+      int64_t deadline_ns,
+      int64_t site) {
+    using namespace host;
+    const auto [num_tokens, hidden] = verify_hop<kWorldSize>(
+        residual_in, gamma, norm_out, residual_out, buffer_flags, mcast_ptr, buffer_ptrs_dev, rank, block_size,
+        cluster_size, two_shot, err_ptr, deadline_ns);
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({num_tokens, hidden}).with_strides({hidden, 1}).with_dtype<fp32_t>().with_device(device).verify(fp32_acc);
+    CHECK_HOST(reinterpret_cast<uintptr_t>(fp32_acc.data_ptr()) % 16 == 0) << "fp32_acc must be 16-byte aligned";
+    const __nv_bfloat16* shared_ptr = nullptr;
+    if (shared_output.has_value()) {
+      TensorMatcher({num_tokens, hidden})
+          .with_strides({-1, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(shared_output.value());
+      shared_ptr = static_cast<const __nv_bfloat16*>(shared_output.value().data_ptr());
+      CHECK_HOST(reinterpret_cast<uintptr_t>(shared_ptr) % 16 == 0) << "shared_output must be 16-byte aligned";
+    }
+    CHECK_HOST(device.unwrap().device_id == norm_out.device().device_id) << "fp32_acc on another device";
+    Params params = hop_params(
+        residual_in, gamma, norm_out, residual_out, buffer_flags, mcast_ptr, buffer_ptrs_dev, rank, num_tokens, hidden,
+        eps, weight_bias, err_ptr, deadline_ns, site);
+    const Fp32ZeroExt ext{
+        .acc = static_cast<float*>(fp32_acc.data_ptr()),
+        .shared = shared_ptr,
+    };
+    const int num_warps = static_cast<int>(block_size / kWarpSize);
+    launch_hop(
+        select_hop<kWorldSize, kTriggerEarly, 0, __nv_bfloat16, false, false, true>(num_warps, unicast, two_shot),
         params, ext, num_tokens, block_size, cluster_size, max_carveout, norm_out.device());
   }
 };

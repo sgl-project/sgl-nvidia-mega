@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -76,7 +77,19 @@ SGLANG_READS = {
 }
 
 NAME = "ll.sparse_mla_fd"
+UV_NAME = "ll.uv_proj"
 STEPS = ("sparse_mla", "uv_proj")
+# Mid-batch (rows > 8) SM103 TP4 uv_proj ceiling: default 16 (single-chunk
+# MlaUvProj(16, vpc=64), covering TP4 bs=2 K=5/6/7 at 12-16 rows). Setting
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_MIDBAND_MAX_ROWS=32 enables the 2-chunk
+# 32-row form (measured slower than cuBLAS nvjet on GB300 152 SMs at 18-28 rows).
+UV32_MAX_ROWS = 32
+
+
+def _midband_max_rows() -> int:
+    raw = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_MIDBAND_MAX_ROWS", "16")
+    val = int(raw or "16")
+    return max(8, min(UV32_MAX_ROWS, val))
 
 HEAD_DIM_QK = 576  # 512 latent + 64 RoPE, one FP8 byte each
 HEAD_DIM_V = 512
@@ -465,6 +478,25 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
     return f"{rows} rows (TRTLLM-Gen is faster above {MT_MAX_ROWS[8]})"
 
 
+def covers_uv(profile, rows: int, mode: str) -> Optional[str]:
+    """None when ``ll.uv_proj`` serves ``rows`` rows (8..32) at 16 heads."""
+    from sgl_nvidia_mega.glm5_3.ll import target as ll_target
+
+    why = ll_target.reason(profile)
+    if why is not None:
+        return why
+    if profile.heads != 16:
+        return f"{profile.heads} heads per rank (16 heads only)"
+    if os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_PROJ", "1") == "0":
+        return "TP4 uv_proj disabled by env"
+    if os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_MIDBAND_UV", "1") == "0":
+        return "TP4 midband uv_proj disabled by env"
+    max_r = _midband_max_rows()
+    if not (8 <= rows <= max_r):
+        return f"{rows} rows outside 8..{max_r}"
+    return None
+
+
 def _model_layers(model) -> list:
     """The decoder layers whose attention this family serves: the target's, or the
     NextN draft's one layer."""
@@ -497,6 +529,7 @@ class SparseMlaFdFamily:
 
     def __init__(self, model, derived, profile) -> None:
         self.profile = profile
+        self.derived = derived
         self.heads = int(profile.heads)
         self.layers = _model_layers(model)
         # the NextN draft (one decoder layer) runs the draft-decode passes the fold serves
@@ -504,65 +537,209 @@ class SparseMlaFdFamily:
         self.plan: Optional[Plan] = None
         # width -> why it declines (a derived target that cannot launch it in one wave)
         self.declined: Dict[int, str] = {}
+        # SM103 TP4 (16 heads, rows <= 8 and 9..uv16_mid_max) PDL CuTe DSL uv_proj (replaces cuBLAS torch.bmm)
+        self.uv16_fn = None
+        self.uv16_fn32 = None
+        self.uv16_mid_max = 8
+        self.uv16_weights: Dict[int, int] = {}
+        self.uv16_weights32: Dict[int, int] = {}
+        self.uv16_stages: Dict[int, tuple] = {}
+        self._uv16_keep: list = []
+
+    def _compile_uv16(self, widths: Sequence[int]) -> None:
+        if (
+            self.heads != 16
+            or tuple(self.profile.sm) != (10, 3)
+            or os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_PROJ", "1") == "0"
+        ):
+            return
+        midband_on = (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_MIDBAND_UV", "1") != "0"
+        )
+        mid_max = _midband_max_rows() if midband_on else 8
+        need8 = any(1 <= w <= 8 for w in widths)
+        need32 = mid_max > 8 and any(9 <= w <= mid_max for w in widths)
+        if not (need8 or need32):
+            return
+        import cutlass.cute as cute
+
+        from sgl_nvidia_mega.glm5_3.attention.fused import (
+            EVICT_LAST,
+            NO_SLOT,
+            _prefetch_slot,
+        )
+        from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
+        from sgl_nvidia_mega.glm5_3.sm103.attention.api import example_args
+        from sgl_nvidia_mega.glm5_3.sm103.attention.mla_uv_proj import MlaUvProj
+        from sgl_nvidia_mega.glm5_3.sm103.packing import pack_uv_proj_from_w_vc
+
+        vpc = int(os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_VPC", "64") or "64")
+        # Single-chunk MlaUvProj(16) fits vpc=64 (32 CTAs, zero extra weight memory);
+        # 2-chunk MlaUvProj(32) needs vpc=32 to fit 228 KiB SMEM.
+        mid_target = 16 if mid_max <= 16 else 32
+        default_vpc_mid = "64" if mid_target == 16 else "32"
+        vpc32 = int(
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV32_VPC", default_vpc_mid)
+            or default_vpc_mid
+        )
+        if vpc not in (16, 32, 64):
+            raise ValueError(f"SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_VPC={vpc}")
+        if vpc32 not in (16, 32, 64):
+            raise ValueError(f"SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV32_VPC={vpc32}")
+        stage_prefix_kb = int(
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_OPROJ_STAGE_PREFIX_KB", "96")
+            or "96"
+        )
+        slab_bytes = 48 * 4096 * 2  # one GEMV CTA's o_proj weight slab at TP4
+        prefix_bytes = min(max(0, stage_prefix_kb * 1024), slab_bytes)
+
+        weights: Dict[int, int] = {}
+        weights32: Dict[int, int] = {}
+        stages: Dict[int, tuple] = {}
+        keep: list = []
+        for idx, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            w_vc = getattr(attn, "w_vc", None)
+            if (
+                not isinstance(w_vc, torch.Tensor)
+                or w_vc.dtype != torch.bfloat16
+                or tuple(w_vc.shape) != (16, HEAD_DIM_V, V_HEAD_DIM)
+            ):
+                return
+            if need8:
+                packed = pack_uv_proj_from_w_vc(w_vc, values_per_cta=vpc)
+                if self.derived is not None:
+                    packed = self.derived.add("ll.uv_proj_16", packed)
+                keep.append(packed)
+                weights[attn.layer_id] = packed.data_ptr()
+            if need32:
+                if need8 and vpc32 == vpc:
+                    weights32[attn.layer_id] = weights[attn.layer_id]
+                else:
+                    packed32 = pack_uv_proj_from_w_vc(w_vc, values_per_cta=vpc32)
+                    if self.derived is not None:
+                        packed32 = self.derived.add("ll.uv_proj_16_32", packed32)
+                    keep.append(packed32)
+                    weights32[attn.layer_id] = packed32.data_ptr()
+            s0, s1 = NO_SLOT, NO_SLOT
+            if not self.draft and prefix_bytes > 0:
+                wo = getattr(getattr(attn, "o_proj", None), "weight", None)
+                if (
+                    isinstance(wo, torch.Tensor)
+                    and wo.dtype == torch.bfloat16
+                    and tuple(wo.shape) == (6144, 4096)
+                ):
+                    s0 = _prefetch_slot(
+                        wo, wo.numel() * wo.element_size(), slab_bytes, prefix_bytes
+                    )
+                if idx + 1 < len(self.layers):
+                    nxt_w = getattr(
+                        getattr(
+                            self.layers[idx + 1].self_attn,
+                            "fused_qkv_a_proj_with_mqa",
+                            None,
+                        ),
+                        "weight",
+                        None,
+                    )
+                    if isinstance(nxt_w, torch.Tensor):
+                        s1 = _prefetch_slot(nxt_w, 4 * 1024 * 1024)
+            stages[attn.layer_id] = (s0, s1)
+        args = example_args()["uv"]
+        if need8:
+            kernel = MlaUvProj(max_rows=8, heads=16, values_per_cta=vpc)
+            self.uv16_fn = compile_cached(
+                kernel,
+                {"max_rows": 8, "heads": 16, "values_per_cta": vpc},
+                lambda k=kernel, a=args: cute.compile(k, *a),
+            )
+        if need32:
+            kernel32 = MlaUvProj(max_rows=mid_target, heads=16, values_per_cta=vpc32)
+            self.uv16_fn32 = compile_cached(
+                kernel32,
+                {"max_rows": mid_target, "heads": 16, "values_per_cta": vpc32},
+                lambda k=kernel32, a=args: cute.compile(k, *a),
+            )
+            self.uv16_mid_max = mid_max
+        self.uv16_weights = weights
+        self.uv16_weights32 = weights32
+        self.uv16_stages = stages
+        self._uv16_keep = keep
+        logger.info(
+            "%s: SM103 TP4 MlaUvProj16 compiled for %d layers (uv8=%s vpc=%d, uv_mid=%s target=%d max=%d vpc_mid=%d, stage_prefix=%d KiB)",
+            NAME,
+            len(self.layers),
+            self.uv16_fn is not None,
+            vpc,
+            self.uv16_fn32 is not None,
+            mid_target,
+            self.uv16_mid_max,
+            vpc32,
+            prefix_bytes // 1024,
+        )
 
     def compile(self, widths: Sequence[int]) -> None:
         """Build the kernels ``widths`` need and agree on the launch plan over the TP
         group. Raises on every rank when any rank's build fails, or when the device cannot
         launch a width ``covers`` promised in one wave."""
-        widths = [w for w in widths if covers(self.profile, w, VERIFY) is None]
-        with_mt = (
-            any(w > ONE_TILE_MAX_ROWS for w in widths) and MT_MAX_ROWS[self.heads] > 0
-        )
-        with_fold = self.draft and self.heads == FOLD_HEADS
-        caps = error = None
-        try:
-            caps = device_caps(self.heads, with_mt=with_mt, with_fold=with_fold)
-            if with_fold:
-                for layer in self.layers:
-                    _w_uv(layer.self_attn)
-        except Exception as e:  # every rank raises after the agreement below
-            error = e
-        derived = derived_caps(self.profile)
-        caps = agree_caps(
-            caps,
-            error,
-            _tp_group(),
-            with_mt=with_mt,
-            with_fold=with_fold,
-            allow_zero=derived,
-        )
-        plan = make_plan(self.heads, caps)
-        missing = [w for w in widths if plan.splits(w) == 0]
-        if missing and not derived:
-            raise RuntimeError(
-                f"{NAME}: the device runs {missing} rows in more than one wave "
-                f"(plan {plan}); the row caps were measured on GB300"
+        all_widths = list(widths)
+        fd_widths = [w for w in all_widths if covers(self.profile, w, VERIFY) is None]
+        if fd_widths:
+            with_mt = (
+                any(w > ONE_TILE_MAX_ROWS for w in fd_widths)
+                and MT_MAX_ROWS[self.heads] > 0
             )
-        sm = self.profile.sm
-        self.declined = {
-            w: (
-                f"sm_{sm[0]}{sm[1]} co-schedules {caps.spread_rows} one-tile clusters "
-                f"of 16 CTAs at {self.heads} heads, not {w} rows in one wave"
+            with_fold = self.draft and self.heads == FOLD_HEADS
+            caps = error = None
+            try:
+                caps = device_caps(self.heads, with_mt=with_mt, with_fold=with_fold)
+                if with_fold:
+                    for layer in self.layers:
+                        _w_uv(layer.self_attn)
+            except Exception as e:  # every rank raises after the agreement below
+                error = e
+            derived = derived_caps(self.profile)
+            caps = agree_caps(
+                caps,
+                error,
+                _tp_group(),
+                with_mt=with_mt,
+                with_fold=with_fold,
+                allow_zero=derived,
             )
-            for w in missing
-        }
-        self.plan = plan
-        logger.info(
-            "%s: %d heads, one-tile <= %d rows (spread <= %d), multi-tile %s, v_b fold <= %d rows in %s%s",
-            NAME,
-            self.heads,
-            plan.one_tile_rows,
-            plan.spread_rows,
-            f"<= {len(plan.mt_splits) - 1} rows" if plan.mt_splits else "off",
-            plan.fold_rows,
-            "/".join(FOLD_MODES),
-            (
-                f"; caps derived from GB300's on sm_{sm[0]}{sm[1]} (agreed {caps}); "
-                f"declines {sorted(missing)} rows"
-                if derived
-                else ""
-            ),
-        )
+            plan = make_plan(self.heads, caps)
+            missing = [w for w in fd_widths if plan.splits(w) == 0]
+            if missing and not derived:
+                raise RuntimeError(
+                    f"{NAME}: the device runs {missing} rows in more than one wave "
+                    f"(plan {plan}); the row caps were measured on GB300"
+                )
+            sm = self.profile.sm
+            self.declined = {
+                w: (
+                    f"sm_{sm[0]}{sm[1]} co-schedules {caps.spread_rows} one-tile clusters "
+                    f"of 16 CTAs at {self.heads} heads, not {w} rows in one wave"
+                )
+                for w in missing
+            }
+            self.plan = plan
+            logger.info(
+                "%s: %d heads, one-tile <= %d rows (spread <= %d), multi-tile %s, v_b fold <= %d rows in %s%s",
+                NAME,
+                self.heads,
+                plan.one_tile_rows,
+                plan.spread_rows,
+                f"<= {len(plan.mt_splits) - 1} rows" if plan.mt_splits else "off",
+                plan.fold_rows,
+                "/".join(FOLD_MODES),
+                (
+                    f"; caps derived from GB300's on sm_{sm[0]}{sm[1]} (agreed {caps}); "
+                    f"declines {sorted(missing)} rows"
+                    if derived
+                    else ""
+                ),
+            )
+        self._compile_uv16(all_widths)
 
     def step_reasons(self, model, forward_batch, view) -> list:
         """Host-only facts read at the first capture of a width (any reason on any
@@ -597,6 +774,12 @@ class SparseMlaFdFamily:
         return reasons
 
     def provider(self, candidate, rows: int, mode: str) -> SparseMlaFdSteps:
+        if candidate is not None and candidate.name == UV_NAME:
+            if self.uv16_fn32 is None:
+                if derived_caps(self.profile):
+                    raise Decline(f"{UV_NAME}: not compiled for derived target")
+                raise RuntimeError(f"{UV_NAME}: provider before compile")
+            return SparseMlaFdSteps(self, rows, mode)
         if self.plan is None:
             raise RuntimeError(f"{NAME}: provider before compile")
         if rows in self.declined:
@@ -717,6 +900,55 @@ class SparseMlaFdSteps:
                     "uv_proj got another tensor than the folded sparse_mla output"
                 )
             return folded
+        rows = attn_output.shape[0]
+        if 1 <= rows <= 8 and self.family.uv16_fn is not None:
+            uv_fn = self.family.uv16_fn
+            w_ptr = self.family.uv16_weights.get(attn.layer_id)
+        elif (
+            9 <= rows <= self.family.uv16_mid_max
+            and self.family.uv16_fn32 is not None
+        ):
+            uv_fn = self.family.uv16_fn32
+            w_ptr = self.family.uv16_weights32.get(attn.layer_id)
+        else:
+            uv_fn = None
+            w_ptr = None
+        if (
+            uv_fn is not None
+            and w_ptr is not None
+            and 1 <= rows <= max(8, self.family.uv16_mid_max)
+            and attn_output.dtype == torch.bfloat16
+            and attn_output.dim() == 3
+            and tuple(attn_output.shape[1:]) == (16, HEAD_DIM_V)
+            and attn_output.stride(2) == 1
+            and attn_output.data_ptr() % 16 == 0
+            and attn_output.stride(0) % 8 == 0
+            and attn_output.stride(1) % 8 == 0
+        ):
+            from cutlass import Int32, Int64
+
+            from sgl_nvidia_mega.glm5_3.attention.fused import NO_SLOT, _slot_args
+            from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
+
+            out = torch.empty(
+                (rows, 16 * V_HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=attn_output.device,
+            )
+            s0, s1 = self.family.uv16_stages.get(attn.layer_id, (NO_SLOT, NO_SLOT))
+            uv_fn(
+                Int64(w_ptr),
+                Int64(attn_output.data_ptr()),
+                Int64(attn_output.stride(0)),
+                Int64(attn_output.stride(1)),
+                Int64(out.data_ptr()),
+                Int64(out.stride(0)),
+                Int32(rows),
+                *_slot_args(s0),
+                *_slot_args(s1),
+                cu_stream(attn_output.device),
+            )
+            return out
         # the stock v_b BMM (forward_absorb_core)
         return AttentionStep.uv_proj(self, attn, attn_output)
 
@@ -726,5 +958,7 @@ class SparseMlaFdSteps:
 CANDIDATES = (
     Candidate(NAME, "attention", STEPS, NAME, covers),
     Candidate(NAME, "draft_attention", STEPS, NAME, covers),
+    Candidate(UV_NAME, "attention", ("uv_proj",), NAME, covers_uv),
+    Candidate(UV_NAME, "draft_attention", ("uv_proj",), NAME, covers_uv),
 )
 FAMILIES = {NAME: SparseMlaFdFamily}

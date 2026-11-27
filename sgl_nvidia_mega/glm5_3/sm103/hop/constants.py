@@ -59,10 +59,10 @@ ERR_KIND_NAMES = {
 }
 
 
-def record_bytes(max_rows: int) -> int:
+def record_bytes(max_rows: int, world: int = WORLD) -> int:
     """Bytes of the record area of a mailbox instance for ``max_rows`` rows."""
-    return NBUF * WORLD * max_rows * NREC * 8
+    return NBUF * world * max_rows * NREC * 8
 
 
-def mailbox_bytes(max_rows: int) -> int:
-    return record_bytes(max_rows) + CTRL_BYTES
+def mailbox_bytes(max_rows: int, world: int = WORLD) -> int:
+    return record_bytes(max_rows, world) + CTRL_BYTES

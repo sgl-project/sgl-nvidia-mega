@@ -10,6 +10,15 @@ slice is loaded into registers before ``griddepcontrol.wait`` (static weights on
 then the activations are staged, ``mma.sync.m16n8k16`` accumulates per K quarter (tokens
 on n8), and the four quarters are summed in a fixed order.
 
+Launch order: the CTAs are dispatched in block order (the synchronization CTA, then
+the GEMV CTAs, then the router CTAs). ``router_pos`` (opt-in, router producer up to 8
+rows) puts the 16 router CTAs at blocks ``router_pos`` .. ``router_pos + 15`` after the
+synchronization CTA instead of after all 128 GEMV CTAs (the served work order rotated;
+0 puts them first). Under a predecessor that leaves too few SMs free for every producer
+CTA, the last-dispatched CTAs start late and load their weights after the wait; the
+position decides which work they carry. Every CTA computes the same rows or experts in
+the same order wherever it is dispatched.
+
 Router (``router=True``, MoE layers): the router logits are computed through the o_proj
 hop. With ``W' = W_router * diag(gamma)`` and ``Q_r = W' W_o^(r)`` (fp32, split into
 bf16 hi + lo), ``logits[m] = rstd_m * sum_r (Q_r a_r + W'[:, slice r] residual_m[slice
@@ -66,10 +75,10 @@ RXS_STRIDE = ROUTER_K + 32
 ROUTED_SCALE = 2.5
 
 
-def router_partial_bytes(max_rows: int) -> int:
-    """Router-partial mailbox ``[NBUF][8 src][max_rows][256]`` of ``{fp32, tag32}``
+def router_partial_bytes(max_rows: int, world: int = WORLD) -> int:
+    """Router-partial mailbox ``[NBUF][world src][max_rows][256]`` of ``{fp32, tag32}``
     words."""
-    return NBUF * WORLD * max_rows * EXPERTS * 8
+    return NBUF * world * max_rows * EXPERTS * 8
 
 
 def _view(base, offset, dtype, shape, stride=None):
@@ -90,23 +99,82 @@ class OProjArProduce(Transport):
     terms)."""
 
     sync_ctas = 1  # the start-edge synchronization CTA
+    world = WORLD
+    o_proj_in = O_PROJ_IN
 
-    def __init__(self, *, router: bool = False, max_rows: int = 8):
+    def __init__(
+        self,
+        *,
+        router: bool = False,
+        max_rows: int = 8,
+        async_stage: bool = False,
+        epoch_overlap: bool = False,
+        router_pos: int = GEMV_CTAS,
+        world: int = WORLD,
+        o_proj_in: int = O_PROJ_IN,
+    ):
         if max_rows not in (8, 16) or (max_rows == 16 and not router):
             raise ValueError(
                 "provided for up to 8 rows, or up to 16 rows with the router"
             )
+        if world not in (4, 8):
+            raise ValueError(f"OProjArProduce: world {world} (4 or 8)")
+        if o_proj_in not in (2048, 4096):
+            raise ValueError(f"OProjArProduce: o_proj_in {o_proj_in} (2048 or 4096)")
+        if o_proj_in == 4096 and max_rows != 8:
+            raise ValueError("OProjArProduce: o_proj_in=4096 supports max_rows=8 only")
+        if router and o_proj_in + HIDDEN // world not in (2816, 5632):
+            raise ValueError(
+                f"OProjArProduce: unsupported router_k={o_proj_in + HIDDEN // world}"
+            )
+        if router_pos != GEMV_CTAS:
+            if not router or max_rows != 8 or not 0 <= router_pos < GEMV_CTAS:
+                raise ValueError(
+                    "router_pos: 0..127, the router producer up to 8 rows"
+                )
+            # opt-in form: the router CTAs are dispatched after the first router_pos
+            # GEMV CTAs (the served forms keep their attributes)
+            self.router_pos = router_pos
         self.router, self.max_rows = router, max_rows
+        if world != WORLD:
+            self.world = world
+        if o_proj_in != O_PROJ_IN:
+            self.o_proj_in = o_proj_in
         # rows 9..16: a second n8 token tile per mma (same A fragments, same k order),
         # and the
         # activations staged by 16-byte cp.async copies (one wait before the epoch
-        # barrier)
+        # barrier); ``async_stage``: the copies also up to 8 rows (opt-in form: every
+        # copy of a thread in flight at once instead of one load -> store at a time;
+        # the same bytes land in shared memory)
         self.two_tiles = max_rows == 16
-        self.async_stage = max_rows == 16
+        self.async_stage = max_rows == 16 or async_stage
+        if epoch_overlap and self.async_stage:
+            # opt-in form: the copies are awaited inside the epoch read, after its
+            # control loads were issued (the served forms keep their attributes)
+            self.epoch_overlap = True
+
+    epoch_overlap = False
+    router_pos = GEMV_CTAS
+
+    @property
+    def xs_stride(self) -> int:
+        return self.o_proj_in + 32
+
+    @property
+    def router_k(self) -> int:
+        return self.o_proj_in + HIDDEN // self.world
+
+    @property
+    def rxs_stride(self) -> int:
+        return self.router_k + 32
+
+    @property
+    def k_halves(self) -> int:
+        return self.o_proj_in // 2048
 
     def smem_bytes(self):
         gemv = (
-            self.max_rows * XS_STRIDE * 2
+            self.max_rows * self.xs_stride * 2
             + 4 * 3 * 16 * self.max_rows * 4
             + 8
             + 4 * self.max_rows
@@ -114,7 +182,7 @@ class OProjArProduce(Transport):
         if not self.router:
             return gemv
         rt = (
-            self.max_rows * RXS_STRIDE * 2
+            self.max_rows * self.rxs_stride * 2
             + 12 * 16 * self.max_rows * 4
             + 8
             + 4 * self.max_rows
@@ -132,7 +200,7 @@ class OProjArProduce(Transport):
 
     @cute.jit
     def stage_done(self):
-        if cutlass.const_expr(self.async_stage):
+        if cutlass.const_expr(self.async_stage and not self.epoch_overlap):
             # this thread's copies landed; the epoch barrier publishes them
             sys_ops.cp_async_wait_all()
 
@@ -249,7 +317,15 @@ class OProjArProduce(Transport):
         err_host: Int64,
         site: Int32,
     ):
-        mb = Mbox((p0, p1, p2, p3, p4, p5, p6, p7), rank, self.max_rows, err_host, site)
+        peers_all = (p0, p1, p2, p3, p4, p5, p6, p7)
+        mb = Mbox(
+            peers_all[: self.world],
+            rank,
+            self.max_rows,
+            err_host,
+            site,
+            self.world,
+        )
         bx = P.block_index()
         smem = cutlass.utils.SmemAllocator()
         raw = smem.allocate_tensor(
@@ -262,12 +338,17 @@ class OProjArProduce(Transport):
                 sys_ops.exit_thread()
         cta = bx - self.sync_ctas
         pol = sys_ops.create_policy_evict_first()
-        if cutlass.const_expr(self.router):  # noqa: SIM102
-            if cta >= GEMV_CTAS:
+        if cutlass.const_expr(self.router_pos != GEMV_CTAS):
+            # the served work order (GEMV CTAs 0..127, router CTAs 0..15) rotated so
+            # that the router CTAs sit at blocks router_pos..router_pos + 15
+            nwork: cutlass.Constexpr = GEMV_CTAS + ROUTER_CTAS
+            rot: cutlass.Constexpr = (GEMV_CTAS - self.router_pos) % nwork
+            wk = (cta + rot) % nwork
+            if wk >= GEMV_CTAS:
                 self.router_cta(
                     mb,
                     base,
-                    cta - GEMV_CTAS,
+                    wk - GEMV_CTAS,
                     x,
                     qh,
                     ql,
@@ -277,7 +358,24 @@ class OProjArProduce(Transport):
                     pol,
                 )
                 sys_ops.exit_thread()
-        self.gemv_cta(mb, base, cta, x, w, rows, pol)
+            self.gemv_cta(mb, base, wk, x, w, rows, pol)
+        else:
+            if cutlass.const_expr(self.router):  # noqa: SIM102
+                if cta >= GEMV_CTAS:
+                    self.router_cta(
+                        mb,
+                        base,
+                        cta - GEMV_CTAS,
+                        x,
+                        qh,
+                        ql,
+                        residual,
+                        rows,
+                        (q0, q1, q2, q3, q4, q5, q6, q7),
+                        pol,
+                    )
+                    sys_ops.exit_thread()
+            self.gemv_cta(mb, base, cta, x, w, rows, pol)
 
     @cute.jit
     def pdl_edge(self, rows: Int32):
@@ -292,7 +390,11 @@ class OProjArProduce(Transport):
         self, mb: Mbox, base, cta, x: Int64, w: Int64, rows: Int32, pol: Uint64
     ):
         t = P.thread_index()
-        xs_bytes: cutlass.Constexpr = self.max_rows * XS_STRIDE * 2
+        o_proj_in: cutlass.Constexpr = self.o_proj_in
+        xs_stride: cutlass.Constexpr = self.xs_stride
+        k_halves: cutlass.Constexpr = self.k_halves
+        k_per_q: cutlass.Constexpr = o_proj_in // 4
+        xs_bytes: cutlass.Constexpr = self.max_rows * xs_stride * 2
         mx: cutlass.Constexpr = self.max_rows
         red = _view(
             base, xs_bytes, Float32, (4, 3, 16, mx), (3 * 16 * mx, 16 * mx, mx, 1)
@@ -305,11 +407,11 @@ class OProjArProduce(Transport):
         tile = warp % 3
         kq = warp // 3
         row0 = cta * GEMV_ROWS + tile * 16
-        wa = w + Int64(2) * (Int64(row0 + g) * O_PROJ_IN + Int64(kq * 512 + 8 * q))
-        wb = wa + Int64(2 * 8 * O_PROJ_IN)
+        wa = w + Int64(2) * (Int64(row0 + g) * o_proj_in + Int64(kq * k_per_q + 8 * q))
+        wb = wa + Int64(2 * 8 * o_proj_in)
         a = cute.make_rmem_tensor((GEMV_STEPS, 4), Uint32)
         b = cute.make_rmem_tensor((GEMV_STEPS, 4), Uint32)
-        # static weights: issued before the wait
+        # static weights (half 0): issued before the wait
         for st in cutlass.range_constexpr(GEMV_STEPS):
             v = sys_ops.ld_nc_hint_v4_u32(wa + Int64(64 * st), pol)
             u = sys_ops.ld_nc_hint_v4_u32(wb + Int64(64 * st), pol)
@@ -320,13 +422,13 @@ class OProjArProduce(Transport):
         sys_ops.fence_proxy_async_global()  # x may come from an async-proxy writer
         xs_base = Uint32(base.toint())
         i = t
-        nchunk = rows * (O_PROJ_IN // 8)
+        nchunk = rows * (o_proj_in // 8)
         while i < nchunk:
-            mm = i // (O_PROJ_IN // 8)
-            kc = i % (O_PROJ_IN // 8)
+            mm = i // (o_proj_in // 8)
+            kc = i % (o_proj_in // 8)
             self.stage16(
-                xs_base + Uint32(2 * (mm * XS_STRIDE + kc * 8)),
-                x + Int64(2) * (Int64(mm) * O_PROJ_IN + Int64(kc * 8)),
+                xs_base + Uint32(2 * (mm * xs_stride + kc * 8)),
+                x + Int64(2) * (Int64(mm) * o_proj_in + Int64(kc * 8)),
             )
             i = i + GEMV_THREADS
         self.stage_done()
@@ -334,7 +436,8 @@ class OProjArProduce(Transport):
             if t < 8:
                 # a slow GEMV CTA between its trigger and its read of E
                 self.delay(mb, 6)
-        self.epoch_begin(mb, es, True)  # its CTA barrier also covers the staging
+        # its CTA barrier also covers the staging
+        self.epoch_begin(mb, es, True, 0, self.epoch_overlap)
         pz = es.pz[0]
         c0 = Float32(0.0)
         c1 = Float32(0.0)
@@ -347,8 +450,8 @@ class OProjArProduce(Transport):
         tok = g < rows
         tok2 = g + 8 < rows
         two = rows > 8
-        xr = xs_base + Uint32(2 * (g * XS_STRIDE + kq * 512 + 8 * q))
-        xr2 = xr + Uint32(2 * 8 * XS_STRIDE)
+        xr = xs_base + Uint32(2 * (g * xs_stride + kq * k_per_q + 8 * q))
+        xr2 = xr + Uint32(2 * 8 * xs_stride)
         for st in cutlass.range_constexpr(GEMV_STEPS):
             x0 = Uint32(0)
             x1 = Uint32(0)
@@ -380,6 +483,49 @@ class OProjArProduce(Transport):
                         (a[st, 2], b[st, 2], a[st, 3], b[st, 3]),
                         (y2, y3),
                     )
+            if cutlass.const_expr(k_halves == 2):
+                # pipeline half-1 weight loads directly into consumed half-0 slots
+                v1 = sys_ops.ld_nc_hint_v4_u32(wa + Int64(1024 + 64 * st), pol)
+                u1 = sys_ops.ld_nc_hint_v4_u32(wb + Int64(1024 + 64 * st), pol)
+                for k in cutlass.range_constexpr(4):
+                    a[st, k] = v1[k]
+                    b[st, k] = u1[k]
+        if cutlass.const_expr(k_halves == 2):
+            for st in cutlass.range_constexpr(GEMV_STEPS):
+                x0 = Uint32(0)
+                x1 = Uint32(0)
+                x2 = Uint32(0)
+                x3 = Uint32(0)
+                if tok:
+                    x0, x1, x2, x3 = P.ld_shared_v4_u32(
+                        xr + Uint32(1024 + 2 * 32 * st)
+                    )
+                c0, c1, c2, c3 = P.mma_bf16_m16n8k16(
+                    (c0, c1, c2, c3), (a[st, 0], b[st, 0], a[st, 1], b[st, 1]), (x0, x1)
+                )
+                c0, c1, c2, c3 = P.mma_bf16_m16n8k16(
+                    (c0, c1, c2, c3), (a[st, 2], b[st, 2], a[st, 3], b[st, 3]), (x2, x3)
+                )
+                if cutlass.const_expr(self.two_tiles):  # noqa: SIM102
+                    if two:
+                        y0 = Uint32(0)
+                        y1 = Uint32(0)
+                        y2 = Uint32(0)
+                        y3 = Uint32(0)
+                        if tok2:
+                            y0, y1, y2, y3 = P.ld_shared_v4_u32(
+                                xr2 + Uint32(1024 + 2 * 32 * st)
+                            )
+                        d0, d1, d2, d3 = P.mma_bf16_m16n8k16(
+                            (d0, d1, d2, d3),
+                            (a[st, 0], b[st, 0], a[st, 1], b[st, 1]),
+                            (y0, y1),
+                        )
+                        d0, d1, d2, d3 = P.mma_bf16_m16n8k16(
+                            (d0, d1, d2, d3),
+                            (a[st, 2], b[st, 2], a[st, 3], b[st, 3]),
+                            (y2, y3),
+                        )
         red[kq, tile, g, 2 * q] = c0
         red[kq, tile, g, 2 * q + 1] = c1
         red[kq, tile, g + 8, 2 * q] = c2
@@ -448,7 +594,12 @@ class OProjArProduce(Transport):
         published as ``{fp32, tag32 = E_row[m]}`` words to every rank's router-partial
         mailbox."""
         t = P.thread_index()
-        xs_bytes: cutlass.Constexpr = self.max_rows * RXS_STRIDE * 2
+        o_proj_in: cutlass.Constexpr = self.o_proj_in
+        router_k: cutlass.Constexpr = self.router_k
+        rxs_stride: cutlass.Constexpr = self.rxs_stride
+        k_halves: cutlass.Constexpr = self.k_halves
+        half_k: cutlass.Constexpr = router_k // k_halves
+        xs_bytes: cutlass.Constexpr = self.max_rows * rxs_stride * 2
         mx: cutlass.Constexpr = self.max_rows
         red = _view(base, xs_bytes, Float32, (12, 16, mx), (16 * mx, mx, 1))
         es = _epoch_view(base, xs_bytes + 12 * 16 * mx * 4, self.max_rows)
@@ -461,8 +612,8 @@ class OProjArProduce(Transport):
         if warp >= 4:
             s0 = 32 + 7 * (warp - 4)
             ns = 7
-        ra = Int64(16 * h + g) * ROUTER_K + Int64(8 * q)
-        rb = ra + Int64(8 * ROUTER_K)
+        ra = Int64(16 * h + g) * router_k + Int64(8 * q)
+        rb = ra + Int64(8 * router_k)
         ah = cute.make_rmem_tensor((ROUTER_STEPS, 4), Uint32)
         bh = cute.make_rmem_tensor((ROUTER_STEPS, 4), Uint32)
         al = cute.make_rmem_tensor((ROUTER_STEPS, 4), Uint32)
@@ -487,21 +638,21 @@ class OProjArProduce(Transport):
         sys_ops.fence_proxy_async_global()
         xs_base = Uint32(base.toint())
         i = t
-        nchunk = rows * (ROUTER_K // 8)
+        nchunk = rows * (router_k // 8)
         while i < nchunk:  # B' = [x | residual slice of this rank]
-            mm = i // (ROUTER_K // 8)
-            kc = i % (ROUTER_K // 8)
-            src = x + Int64(2) * (Int64(mm) * O_PROJ_IN + Int64(kc * 8))
-            if kc >= O_PROJ_IN // 8:
+            mm = i // (router_k // 8)
+            kc = i % (router_k // 8)
+            src = x + Int64(2) * (Int64(mm) * o_proj_in + Int64(kc * 8))
+            if kc >= o_proj_in // 8:
                 src = residual + Int64(2) * (
                     Int64(mm) * HIDDEN
-                    + Int64(mb.rank) * (HIDDEN // WORLD)
-                    + Int64((kc - O_PROJ_IN // 8) * 8)
+                    + Int64(mb.rank) * (HIDDEN // mb.world)
+                    + Int64((kc - o_proj_in // 8) * 8)
                 )
-            self.stage16(xs_base + Uint32(2 * (mm * RXS_STRIDE + kc * 8)), src)
+            self.stage16(xs_base + Uint32(2 * (mm * rxs_stride + kc * 8)), src)
             i = i + GEMV_THREADS
         self.stage_done()
-        self.epoch_begin(mb, es, True)
+        self.epoch_begin(mb, es, True, 0, self.epoch_overlap)
         hi0 = Float32(0.0)
         hi1 = Float32(0.0)
         hi2 = Float32(0.0)
@@ -530,7 +681,7 @@ class OProjArProduce(Transport):
                 x3 = Uint32(0)
                 if tok:
                     x0, x1, x2, x3 = P.ld_shared_v4_u32(
-                        xs_base + Uint32(2 * (g * RXS_STRIDE + k0))
+                        xs_base + Uint32(2 * (g * rxs_stride + k0))
                     )
                 hi0, hi1, hi2, hi3 = P.mma_bf16_m16n8k16(
                     (hi0, hi1, hi2, hi3),
@@ -560,7 +711,7 @@ class OProjArProduce(Transport):
                         y3 = Uint32(0)
                         if tok2:
                             y0, y1, y2, y3 = P.ld_shared_v4_u32(
-                                xs_base + Uint32(2 * ((g + 8) * RXS_STRIDE + k0))
+                                xs_base + Uint32(2 * ((g + 8) * rxs_stride + k0))
                             )
                         e0, e1, e2, e3 = P.mma_bf16_m16n8k16(
                             (e0, e1, e2, e3),
@@ -582,6 +733,79 @@ class OProjArProduce(Transport):
                             (al[i, 2], bl[i, 2], al[i, 3], bl[i, 3]),
                             (y2, y3),
                         )
+                if cutlass.const_expr(k_halves == 2):
+                    k1 = Int64(half_k + 32 * (s0 + i))
+                    v0 = sys_ops.ld_nc_hint_v4_u32(qh + Int64(2) * (ra + k1), pol)
+                    v1 = sys_ops.ld_nc_hint_v4_u32(qh + Int64(2) * (rb + k1), pol)
+                    v2 = sys_ops.ld_nc_hint_v4_u32(ql + Int64(2) * (ra + k1), pol)
+                    v3 = sys_ops.ld_nc_hint_v4_u32(ql + Int64(2) * (rb + k1), pol)
+                    for k in cutlass.range_constexpr(4):
+                        ah[i, k] = v0[k]
+                        bh[i, k] = v1[k]
+                        al[i, k] = v2[k]
+                        bl[i, k] = v3[k]
+        if cutlass.const_expr(k_halves == 2):
+            for i in cutlass.range_constexpr(ROUTER_STEPS):
+                if i < ns:
+                    k0 = half_k + 32 * (s0 + i) + 8 * q
+                    x0 = Uint32(0)
+                    x1 = Uint32(0)
+                    x2 = Uint32(0)
+                    x3 = Uint32(0)
+                    if tok:
+                        x0, x1, x2, x3 = P.ld_shared_v4_u32(
+                            xs_base + Uint32(2 * (g * rxs_stride + k0))
+                        )
+                    hi0, hi1, hi2, hi3 = P.mma_bf16_m16n8k16(
+                        (hi0, hi1, hi2, hi3),
+                        (ah[i, 0], bh[i, 0], ah[i, 1], bh[i, 1]),
+                        (x0, x1),
+                    )
+                    hi0, hi1, hi2, hi3 = P.mma_bf16_m16n8k16(
+                        (hi0, hi1, hi2, hi3),
+                        (ah[i, 2], bh[i, 2], ah[i, 3], bh[i, 3]),
+                        (x2, x3),
+                    )
+                    lo0, lo1, lo2, lo3 = P.mma_bf16_m16n8k16(
+                        (lo0, lo1, lo2, lo3),
+                        (al[i, 0], bl[i, 0], al[i, 1], bl[i, 1]),
+                        (x0, x1),
+                    )
+                    lo0, lo1, lo2, lo3 = P.mma_bf16_m16n8k16(
+                        (lo0, lo1, lo2, lo3),
+                        (al[i, 2], bl[i, 2], al[i, 3], bl[i, 3]),
+                        (x2, x3),
+                    )
+                    if cutlass.const_expr(self.two_tiles):  # noqa: SIM102
+                        if two:
+                            y0 = Uint32(0)
+                            y1 = Uint32(0)
+                            y2 = Uint32(0)
+                            y3 = Uint32(0)
+                            if tok2:
+                                y0, y1, y2, y3 = P.ld_shared_v4_u32(
+                                    xs_base + Uint32(2 * ((g + 8) * rxs_stride + k0))
+                                )
+                            e0, e1, e2, e3 = P.mma_bf16_m16n8k16(
+                                (e0, e1, e2, e3),
+                                (ah[i, 0], bh[i, 0], ah[i, 1], bh[i, 1]),
+                                (y0, y1),
+                            )
+                            e0, e1, e2, e3 = P.mma_bf16_m16n8k16(
+                                (e0, e1, e2, e3),
+                                (ah[i, 2], bh[i, 2], ah[i, 3], bh[i, 3]),
+                                (y2, y3),
+                            )
+                            f0, f1, f2, f3 = P.mma_bf16_m16n8k16(
+                                (f0, f1, f2, f3),
+                                (al[i, 0], bl[i, 0], al[i, 1], bl[i, 1]),
+                                (y0, y1),
+                            )
+                            f0, f1, f2, f3 = P.mma_bf16_m16n8k16(
+                                (f0, f1, f2, f3),
+                                (al[i, 2], bl[i, 2], al[i, 3], bl[i, 3]),
+                                (y2, y3),
+                            )
         red[warp, g, 2 * q] = C.add_rn(hi0, lo0)
         red[warp, g, 2 * q + 1] = C.add_rn(hi1, lo1)
         red[warp, g + 8, 2 * q] = C.add_rn(hi2, lo2)
@@ -605,13 +829,14 @@ class OProjArProduce(Transport):
             word = Uint64(P.f32_bits(v)) | (Uint64(em) << 32)
             off = (
                 (
-                    (Int64(self.buffer_of(em)) * WORLD + Int64(mb.rank)) * self.max_rows
+                    (Int64(self.buffer_of(em)) * mb.world + Int64(mb.rank))
+                    * self.max_rows
                     + Int64(m)
                 )
                 * EXPERTS
                 + Int64(16 * h + ex)
             ) * 8
-            for d in cutlass.range_constexpr(WORLD):
+            for d in cutlass.range_constexpr(mb.world):
                 sys_ops.st_relaxed_sys_u64(rp[d] + off, word)
 
 
@@ -622,6 +847,7 @@ class OProjArConsume(Consumer):
     records; its shared-memory exchange is between the CTAs of one cluster."""
 
     wait_prod = True  # start edge: the last arriver waits for the producer grid
+    world = WORLD
 
     def __init__(
         self,
@@ -630,6 +856,7 @@ class OProjArConsume(Consumer):
         residual: bool = True,
         norm: bool = True,
         max_rows: int = 8,
+        world: int = WORLD,
     ):
         if residual and not norm:
             raise ValueError("residual without RMSNorm is not provided")
@@ -639,12 +866,16 @@ class OProjArConsume(Consumer):
             raise ValueError(
                 "provided for up to 8 rows, or up to 16 rows with the router"
             )
+        if world not in (4, 8):
+            raise ValueError(f"OProjArConsume: world {world} (4 or 8)")
         self.router, self.residual, self.norm, self.max_rows = (
             router,
             residual,
             norm,
             max_rows,
         )
+        if world != WORLD:
+            self.world = world
 
     @cute.jit
     def __call__(
@@ -743,7 +974,15 @@ class OProjArConsume(Consumer):
         err_host: Int64,
         site: Int32,
     ):
-        mb = Mbox((p0, p1, p2, p3, p4, p5, p6, p7), rank, self.max_rows, err_host, site)
+        peers_all = (p0, p1, p2, p3, p4, p5, p6, p7)
+        mb = Mbox(
+            peers_all[: self.world],
+            rank,
+            self.max_rows,
+            err_host,
+            site,
+            self.world,
+        )
         t = P.thread_index()
         bx = P.block_index()
         smem = cutlass.utils.SmemAllocator()
@@ -876,21 +1115,30 @@ class OProjArConsume(Consumer):
         x0 = cute.make_rmem_tensor((6,), Float32)
         x1 = cute.make_rmem_tensor((6,), Float32)
         acc.fill(0.0)
-        self.poll_records(mb, buf, m, c * 256 + 2 * f, 2 * grp, tag, poisoned, x0, x1)
-        if grp > 0:
-            for k in cutlass.range_constexpr(6):
-                cs.raw[grp - 1, f, k] = x0[k]
-                cs.raw[grp - 1, f, 6 + k] = x1[k]
+        if cutlass.const_expr(mb.world == 4):
+            self.poll_record_one(mb, buf, m, c * 256 + 2 * f, grp, tag, poisoned, x0)
+            if grp > 0:
+                for k in cutlass.range_constexpr(6):
+                    cs.raw[grp - 1, f, k] = x0[k]
+            else:
+                for k in cutlass.range_constexpr(6):
+                    acc[k] = C.add_rn(Float32(0.0), x0[k])
         else:
-            for k in cutlass.range_constexpr(6):
-                acc[k] = C.add_rn(C.add_rn(Float32(0.0), x0[k]), x1[k])
-        # router terms of (m, expert t - 128): the eight source words are issued now
+            self.poll_records(mb, buf, m, c * 256 + 2 * f, 2 * grp, tag, poisoned, x0, x1)
+            if grp > 0:
+                for k in cutlass.range_constexpr(6):
+                    cs.raw[grp - 1, f, k] = x0[k]
+                    cs.raw[grp - 1, f, 6 + k] = x1[k]
+            else:
+                for k in cutlass.range_constexpr(6):
+                    acc[k] = C.add_rn(C.add_rn(Float32(0.0), x0[k]), x1[k])
+        # router terms of (m, expert t - 128): the world source words are issued now
         rtr = (c == 0) and (t >= 128) and (t < 128 + EXPERTS)
         ex = t - 128
-        pw = cute.make_rmem_tensor((WORLD,), Uint64)
+        pw = cute.make_rmem_tensor((mb.world,), Uint64)
         pw.fill(0)
         if rtr:
-            for s in cutlass.range_constexpr(WORLD):
+            for s in cutlass.range_constexpr(mb.world):
                 pw[s] = sys_ops.ld_relaxed_sys_u64(
                     rp_local + self.rp_off(buf, s, m, ex)
                 )
@@ -903,11 +1151,17 @@ class OProjArConsume(Consumer):
         r.fill(0.0)
         h0 = c * 768 + 6 * f
         if grp == 0:
-            for q in cutlass.range_constexpr(1, 4):
-                for k in cutlass.range_constexpr(6):
-                    acc[k] = C.add_rn(
-                        C.add_rn(acc[k], cs.raw[q - 1, f, k]), cs.raw[q - 1, f, 6 + k]
-                    )
+            if cutlass.const_expr(mb.world == 4):
+                for q in cutlass.range_constexpr(1, 4):
+                    for k in cutlass.range_constexpr(6):
+                        acc[k] = C.add_rn(acc[k], cs.raw[q - 1, f, k])
+            else:
+                for q in cutlass.range_constexpr(1, 4):
+                    for k in cutlass.range_constexpr(6):
+                        acc[k] = C.add_rn(
+                            C.add_rn(acc[k], cs.raw[q - 1, f, k]),
+                            cs.raw[q - 1, f, 6 + k],
+                        )
             rb = cute.make_rmem_tensor((3,), Uint32)
             for k in cutlass.range_constexpr(3):
                 ab = P.no_neg_zero(C.cvt_rn_bf16x2_f32(acc[2 * k], acc[2 * k + 1]))
@@ -984,18 +1238,19 @@ class OProjArConsume(Consumer):
 
     def rp_off(self, buf, src, m, ex):
         return (
-            ((Int64(buf) * WORLD + Int64(src)) * self.max_rows + Int64(m)) * EXPERTS
+            ((Int64(buf) * self.world + Int64(src)) * self.max_rows + Int64(m))
+            * EXPERTS
             + Int64(ex)
         ) * 8
 
     @cute.jit
     def router_gather(self, mb: Mbox, pw, rp_local: Int64, buf, m, ex, e):
-        """Poll the eight words until each carries ``tag32 = e``; their fp32 halves
+        """Poll the world words until each carries ``tag32 = e``; their fp32 halves
         summed in rank order. Returns (sum, timed out)."""
         t0 = Uint64(0)
         it = Uint32(0)
         hto = Int32(0)
-        for s in cutlass.range_constexpr(WORLD):
+        for s in cutlass.range_constexpr(mb.world):
             while (Uint32(pw[s] >> 32) != Uint32(e)) and (hto == 0):
                 pw[s] = sys_ops.ld_relaxed_sys_u64(
                     rp_local + self.rp_off(buf, s, m, ex)
@@ -1008,7 +1263,7 @@ class OProjArConsume(Consumer):
                     elif now - t0 > Uint64(self.timeout_ns):
                         hto = Int32(1)
         hsum = P.bits_f32(Uint32(pw[0] & Uint64(0xFFFFFFFF)))
-        for s in cutlass.range_constexpr(1, WORLD):
+        for s in cutlass.range_constexpr(1, mb.world):
             hsum = C.add_rn(hsum, P.bits_f32(Uint32(pw[s] & Uint64(0xFFFFFFFF))))
         return hsum, hto
 

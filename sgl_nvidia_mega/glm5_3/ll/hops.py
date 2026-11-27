@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
@@ -190,8 +191,9 @@ WORLD_DEFAULTS = {
 # one-shot geometry, 0 = the plain rule, 2 / 4 / 8 = that cluster.
 FINALIZE_CLUSTER = 1
 # P10: rows where the standalone quantize stays (the shared expert
-# loses its SM race against an earlier FC1): TP4 1-3 and 21 rows, TP8 11-16, 36.
-NVFP4_SKIP_ROWS = {4: ((1, 3), (21, 21)), 8: ((11, 16), (36, 36))}
+# loses its SM race against an earlier FC1): TP4 1-3 rows, TP8 11-16, 36.
+# (TP4 21 rows removed in v6: fused P10 saves ~300 us/step at K=6 bs=3.)
+NVFP4_SKIP_ROWS = {4: ((1, 3),), 8: ((11, 16), (36, 36))}
 
 
 def world_defaults(world: int) -> WorldDefaults:
@@ -302,6 +304,19 @@ class DeferredFinalize:
 
 
 @dataclass
+class DeferredFp32:
+    """Atomic-accumulated [M, H] fp32 MoE partial (+ optional [M, H] bf16 shared
+    output) consumed and zeroed in place by the next hop (GlmLLMnnvlFp32ZeroOneshot)."""
+
+    fp32_acc: torch.Tensor
+    shared_output: Optional[torch.Tensor] = None
+
+    @property
+    def rows(self) -> int:
+        return int(self.fp32_acc.shape[0])
+
+
+@dataclass
 class Nvfp4Input:
     """The NVFP4 quant of a MoE layer's input (P10), handed from its post-attention
     hop to its routed experts: ``fp4`` ``[M, H / 2]`` uint8, ``sf`` ``[M, H / 16]``
@@ -351,6 +366,23 @@ class LlHopFamily:
         # the GEMM plans' target (``ll.target``), set by ``_family`` from the profile;
         # None: o_proj keeps SGLang's GEMM
         self.target: Any = None
+        self.derived: Any = None
+        cap = (
+            torch.cuda.get_device_capability(self.device)
+            if torch.cuda.is_available()
+            else (0, 0)
+        )
+        self.sm: Tuple[int, int] = (int(cap[0]), int(cap[1]))
+        # SM103 TP4 (world=4, rows <= 8) fused OProjAr + MoeFoldArNorm hops
+        self.sm103_kernels: Any = None
+        self.sm103_layers: list = []
+        self.sm103_first: int = 0
+        self.sm103_last: int = 0
+        self.sm103_is_moe: list = []
+        self.sm103_w_o: list = []
+        self.sm103_router: list = []
+        self.sm103_dnorm_layers: frozenset = frozenset()
+        self._sm103_keep: list = []
 
     # ---------------------------------------------------------- build
     def reason(self, rows: int) -> Optional[str]:
@@ -405,14 +437,207 @@ class LlHopFamily:
             allocator=self.allocator,
             device=self.device,
         )
+        self._compile_sm103(widths)
         if self.rank == 0:
             logger.info(
-                "GLM LL hops: W=%d, rows %s, buffer %s, nvfp4=%s; plans %s",
+                "GLM LL hops: W=%d, rows %s, buffer %s, nvfp4=%s, sm103_hop=%s; plans %s",
                 self.world,
                 widths,
                 self.buffer.describe(),
                 self.nvfp4,
+                self.sm103_kernels is not None,
                 self.describe_plans(widths),
+            )
+
+    def _compile_sm103(self, widths) -> None:
+        if (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_HOP_MOE", "1") != "1"
+            or self.world != 4
+            or self.sm != (10, 3)
+            or self.model is None
+            or not any(1 <= w <= 8 for w in widths)
+        ):
+            return
+        from sgl_nvidia_mega.glm5_3.runtime import SLOTS
+        from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
+        from sgl_nvidia_mega.glm5_3.sm103.hop import api
+
+        inner, config = self.model.model, self.model.config
+        span = range(inner.start_layer, inner.end_layer)
+        layers = [inner.layers[i] for i in span]
+        is_moe = [bool(getattr(layer, "is_layer_sparse", False)) for layer in layers]
+        w_o = [layer.self_attn.o_proj.weight for layer in layers]
+
+        reason = ""
+        for w in w_o:
+            if (
+                w.dtype != torch.bfloat16
+                or tuple(w.shape) != (HIDDEN, 4096)
+                or not w.is_contiguous()
+            ):
+                reason = f"o_proj weight {w.dtype} {tuple(w.shape)} (need bf16 [6144, 4096])"
+                break
+        if not reason:
+            for layer, moe in zip(layers, is_moe):
+                if moe:
+                    bias = getattr(layer.mlp.gate, "e_score_correction_bias", None)
+                    if bias is None or bias.dtype != torch.float32:
+                        reason = "router has no fp32 score-correction bias"
+                        break
+        if not reason:
+            import torch.distributed._symmetric_memory as symm_mem
+
+            get_backend = getattr(symm_mem, "get_backend", None)
+            backend = get_backend(self.device) if get_backend is not None else None
+            if backend not in (None, "CUDA"):
+                reason = f"symmetric-memory backend {backend!r}"
+            elif not api.fenced_trigger_supported():
+                reason = "fenced_trigger_supported is False"
+
+        dnorm_on = (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_ATTN_FRONT", "1")
+            == "1"
+            and os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_DNORM", "1")
+            == "1"
+            and "ll.attention" in SLOTS
+            and "dnorm" in SLOTS
+            and "qkv_a_small_m_shared" in SLOTS
+        )
+        dnorm_layers = frozenset(
+            layer.layer_id
+            for i, layer in enumerate(layers)
+            if dnorm_on
+            and i > 0
+            and is_moe[i - 1]
+            and getattr(layer.self_attn, "skip_topk", False)
+        )
+
+        specs = list(
+            api.unit_specs(
+                world=4, o_proj_in=4096, quarters=8, include_instance_b=False
+            )
+        )
+        names = {
+            "allreduce_norm",
+            "o_proj_produce",
+            "o_proj_consume",
+            "o_proj_produce_router",
+            "o_proj_consume_router",
+            "moe_fold_split",
+            "moe_fold_plain",
+        }
+        n_as = (
+            api.oproj_async_min_rows()
+            if api.OPROJ_ASYNC_STAGE_MIN_ROWS_ENV in os.environ
+            else 4
+        )
+        if n_as and any(n_as <= m <= 8 for m in widths):
+            specs += api.oproj_async_specs(world=4, o_proj_in=4096)
+            names |= {"o_proj_produce_as", "o_proj_produce_router_as"}
+        raw_remap = (
+            api.oproj_remap()
+            if api.OPROJ_REMAP_ENV in os.environ
+            else api.oproj_remap("4-8@0")
+        )
+        remap = {m: p for m, p in raw_remap.items() if m in widths and m <= 8}
+        if remap:
+            rf = api.oproj_remap_specs(
+                remap.values(),
+                [p for m, p in remap.items() if n_as and m >= n_as],
+                world=4,
+                o_proj_in=4096,
+            )
+            specs += rf
+            names |= {sp.name for sp in rf}
+        if dnorm_layers:
+            names |= {"moe_fold_split_dn", "moe_fold_plain_dn"}
+            if "split8dn" in api.fold_form():
+                names |= {"moe_fold_split_dn_nc"}
+
+        compiled, probe = {}, None
+        if not reason:
+            try:
+                import cutlass.cute as cute
+
+                for spec in (s for s in specs if s.name in names):
+                    compiled[spec.name] = compile_cached(
+                        spec.obj,
+                        spec.constexprs,
+                        lambda spec=spec: cute.compile(spec.obj, *spec.args),
+                    )
+                    if spec.name == "moe_fold_split" and not hasattr(
+                        compiled[spec.name], "library"
+                    ):
+                        probe = cute.compile(spec.obj, *spec.args)
+            except Exception as e:  # noqa: BLE001
+                reason = f"{type(e).__name__}: {' '.join(str(e).split())[:300]}"
+
+        gathered = [None] * self.world
+        torch.distributed.all_gather_object(gathered, reason, group=self.cpu_group)
+        if any(gathered):
+            if self.rank == 0:
+                logger.warning(
+                    "GLM LL hops: SM103 TP4 fused OProjAr/MoeFold declined: %s",
+                    "; ".join(g for g in gathered if g),
+                )
+            return
+
+        router = []
+        keep = []
+        for layer, moe in zip(layers, is_moe):
+            hoist = None
+            if moe:
+                hoist = api.router_hoist_weights(
+                    layer.mlp.gate.weight,
+                    layer.post_attention_layernorm.weight,
+                    layer.self_attn.o_proj.weight,
+                    self.rank,
+                    world=4,
+                )
+                for t in hoist:
+                    if self.derived is not None:
+                        self.derived.add("ll.hops.router_hoist", t)
+                    keep.append(t)
+            router.append(hoist)
+
+        rscale = float(getattr(config, "routed_scaling_factor", 1.0))
+        kernels = api.HopKernels.build(
+            compiled,
+            self.device_group.group_name,
+            self.device,
+            self.eps,
+            rscale,
+            self.device.index,
+            instance_b=False,
+            router=True,
+            probe=probe,
+            barrier_group=self.cpu_group,
+            world=4,
+            async_min_rows=n_as,
+            remap=raw_remap,
+        )
+        limits = [None] * self.world
+        torch.distributed.all_gather_object(
+            limits, kernels.fold_limits(), group=self.cpu_group
+        )
+        if len(set(limits)) != 1:
+            raise RuntimeError(
+                f"GLM LL hops SM103 TP4 split-fold limits disagree across ranks: {limits}"
+            )
+        self.sm103_kernels = kernels
+        self.sm103_layers = layers
+        self.sm103_first = inner.start_layer
+        self.sm103_last = inner.end_layer - 1
+        self.sm103_is_moe = is_moe
+        self.sm103_w_o = w_o
+        self.sm103_router = router
+        self.sm103_dnorm_layers = dnorm_layers
+        self._sm103_keep = keep
+        if self.rank == 0:
+            logger.info(
+                "GLM LL hops: SM103 TP4 OProjAr+Router + MoeFoldArNorm (world=4, quarters=8, dnorm=%d layers, fold_limits=%s) built for rows <= 8",
+                len(dnorm_layers),
+                kernels.fold_limits(),
             )
 
     def describe_plans(self, widths) -> str:
@@ -444,6 +669,8 @@ class LlHopFamily:
         """The decoded error record of a timed-out hop wait, or None (host memory:
         readable after the CUDA context is lost)."""
         rec = self.buffer.err.read() if self.buffer is not None else None
+        if rec is None and self.sm103_kernels is not None:
+            rec = self.sm103_kernels.err.read()
         if rec is None:
             return None
         site = int(rec["site"])
@@ -520,6 +747,73 @@ class LlHopFamily:
             identity_rows=fin.identity_rows,
         )
 
+    def fp32_zero(self, df: DeferredFp32, residual, gamma, *, site: int):
+        """``(norm, residual out)`` consuming an atomic-accumulated [M, H] fp32 MoE
+        partial (zeroed in place) + optional bf16 shared partial."""
+        rows = residual.shape[0]
+        if df.rows != rows:
+            raise RuntimeError(f"MoE fp32 handoff of {df.rows} rows at a {rows}-row hop")
+        plan = self._need(
+            plain_plan(self.world, rows, self.hidden, self.sm_count),
+            rows,
+            "fp32_zero",
+        )
+        return transport.fp32_zero_ar_rmsnorm(
+            self.buffer,
+            df.fp32_acc,
+            df.shared_output,
+            residual,
+            gamma,
+            self.eps,
+            plan,
+            site=site,
+        )
+
+    def sm103_o_proj(self, layer, o_input, residual, step=None):
+        i = layer.layer_id - self.sm103_first
+        site = self.site(layer.layer_id, 0)
+        out_res, out_norm = torch.empty_like(residual), torch.empty_like(residual)
+        tail = (residual, layer.post_attention_layernorm.weight, out_res, out_norm)
+        if step is None:
+            self.sm103_kernels.o_proj(o_input, self.sm103_w_o[i], *tail, site=site)
+            return out_norm, out_res
+        rows, dev = residual.shape[0], residual.device
+        ids = torch.empty((rows, self.top_k), dtype=torch.int32, device=dev)
+        wts = torch.empty((rows, self.top_k), dtype=torch.float32, device=dev)
+        bias = layer.mlp.gate.e_score_correction_bias
+        self.sm103_kernels.o_proj_router(
+            o_input,
+            self.sm103_w_o[i],
+            *self.sm103_router[i],
+            bias,
+            *tail,
+            ids,
+            wts,
+            site=site,
+        )
+        step.routing = (ids, wts)
+        return out_norm, out_res
+
+    def sm103_allreduce_norm(self, partial, residual, gamma, *, site: int):
+        out_res, out_norm = torch.empty_like(residual), torch.empty_like(residual)
+        self.sm103_kernels.allreduce_norm(
+            partial, residual, gamma, out_res, out_norm, site=site
+        )
+        return out_norm, out_res
+
+    def sm103_fold(self, rec, residual, gamma, *, site: int, dn: bool = False):
+        rows = residual.shape[0]
+        out_res, out = torch.empty_like(residual), torch.empty_like(residual)
+        args = (rec.pq, rec.shpartials, rec.ids_fin, rec.w_fin, rec.g2s, residual)
+        if dn:
+            bsum = torch.empty((rows, 8), dtype=torch.float32, device=residual.device)
+            self.sm103_kernels.moe_fold_dn(
+                *args, gamma, out_res, out, bsum, site=site
+            )
+            return out, out_res, bsum
+        self.sm103_kernels.moe_fold(*args, gamma, out_res, out, site=site)
+        return out, out_res
+
     @staticmethod
     def site(layer_id: int, kind: int) -> int:
         return layer_id * HOPS_PER_LAYER + kind
@@ -549,6 +843,7 @@ class LlHops(HopSteps):
 
     def __init__(self, family: LlHopFamily, rows: int, *, nvfp4: bool = False) -> None:
         self.f, self.rows, self.nvfp4 = family, rows, nvfp4
+        self.use_sm103 = rows <= 8 and family.sm103_kernels is not None
 
     def wire(self, token: str) -> None:
         """A taken unit consumes ``token`` at this width (``registry``)."""
@@ -557,7 +852,26 @@ class LlHops(HopSteps):
                 raise RuntimeError("the NVFP4 hop variant is not built")
             self.nvfp4 = True
 
-    def _hop(self, mlp_out, residual, gamma, site: int):
+    def _hop(self, mlp_out, residual, gamma, site: int, layer_id: Optional[int] = None, step=None):
+        if self.use_sm103:
+            if not isinstance(mlp_out, (torch.Tensor, DeferredFinalize, DeferredFp32)):
+                if (
+                    step is not None
+                    and layer_id is not None
+                    and layer_id in self.f.sm103_dnorm_layers
+                ):
+                    u, out_res, bsum = self.f.sm103_fold(
+                        mlp_out, residual, gamma, site=site, dn=True
+                    )
+                    step.dnorm = (layer_id, bsum)
+                    return u, out_res
+                return self.f.sm103_fold(mlp_out, residual, gamma, site=site)
+            if isinstance(mlp_out, torch.Tensor):
+                return self.f.sm103_allreduce_norm(
+                    mlp_out, residual, gamma, site=site
+                )
+        if isinstance(mlp_out, DeferredFp32):
+            return self.f.fp32_zero(mlp_out, residual, gamma, site=site)
         if isinstance(mlp_out, DeferredFinalize):
             return self.f.finalize(mlp_out, residual, gamma, site=site)
         if isinstance(mlp_out, torch.Tensor):
@@ -568,9 +882,21 @@ class LlHops(HopSteps):
         if residual is None:  # the first layer: the embedding, no all-reduce
             return super().pre_attention(layer, mlp_out, residual, step)
         norm = layer.input_layernorm
-        return self._hop(mlp_out, residual, norm.weight, self.f.site(layer.layer_id, 1))
+        return self._hop(
+            mlp_out,
+            residual,
+            norm.weight,
+            self.f.site(layer.layer_id, 1),
+            layer_id=layer.layer_id,
+            step=step,
+        )
 
     def post_attention(self, layer, o_input, residual, step):
+        if self.use_sm103:
+            i = layer.layer_id - self.f.sm103_first
+            if self.f.sm103_is_moe[i]:
+                return self.f.sm103_o_proj(layer, o_input, residual, step)
+            return self.f.sm103_o_proj(layer, o_input, residual, None)
         partial = _o_proj(layer, o_input)
         gamma = layer.post_attention_layernorm.weight
         site = self.f.site(layer.layer_id, 0)
@@ -668,6 +994,7 @@ def _family(model: Any, derived: Any, profile: Any):
         return DeclinedFamily(why)
     family = build(model, deadline_s=profile.deadline_s, sm_count=profile.sms)
     family.model, family.target = model, profile.target
+    family.sm, family.derived = tuple(profile.sm), derived
     if profile.target is not None:
         profile.target.note("ll.hops")
     return family

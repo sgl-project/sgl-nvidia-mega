@@ -56,9 +56,9 @@ STEPS_PER_WARP = LATENT // 32 // WARPS
 N_TILES = VALUES_PER_CTA // 8
 WEIGHT_TILE_BYTES = (LATENT // 32) * VALUES_PER_CTA * 64
 STAGE_CHUNK = 4096
-MAX_ROWS = (8, 16)
+MAX_ROWS = (8, 16, 32)
 POLICIES = ("evict_last", "evict_normal", "evict_first")
-assert max(MAX_ROWS) * VALUES_PER_CTA <= THREADS
+assert 16 * VALUES_PER_CTA <= THREADS
 
 
 class MlaUvProj:
@@ -72,10 +72,19 @@ class MlaUvProj:
     stream.
     """
 
-    def __init__(self, max_rows: int):
+    def __init__(self, max_rows: int, heads: int = HEADS, values_per_cta: int = VALUES_PER_CTA):
         if max_rows not in MAX_ROWS:
             raise ValueError(f"max_rows must be one of {MAX_ROWS}, got {max_rows}")
+        if values_per_cta not in (16, 32, 64) or VALUE_DIM % values_per_cta:
+            raise ValueError(f"unsupported values_per_cta={values_per_cta}")
         self.max_rows = max_rows
+        self.chunk_rows = 8 if max_rows == 8 else 16
+        self.heads = heads
+        self.values_per_cta = values_per_cta
+        self.ctas_per_head = VALUE_DIM // values_per_cta
+        self.grid = heads * self.ctas_per_head
+        self.n_tiles = values_per_cta // 8
+        self.weight_tile_bytes = (LATENT // 32) * values_per_cta * 64
 
     @cute.jit
     def __call__(
@@ -118,7 +127,7 @@ class MlaUvProj:
             stage1_prefix,
             stage1_policy,
         ).launch(
-            grid=[GRID, 1, 1],
+            grid=[self.grid, 1, 1],
             block=[THREADS, 1, 1],
             stream=stream,
             use_pdl=True,
@@ -148,15 +157,19 @@ class MlaUvProj:
         stage1_policy: Int32,
     ):
         max_rows = self.max_rows
+        chunk_rows = self.chunk_rows
+        values_per_cta = self.values_per_cta
+        ctas_per_head = self.ctas_per_head
+        weight_tile_bytes = self.weight_tile_bytes
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
         tile = smem.allocate_tensor(
-            Uint8, cute.make_layout(WEIGHT_TILE_BYTES), byte_alignment=1024
+            Uint8, cute.make_layout(weight_tile_bytes), byte_alignment=1024
         )
         partial = smem.allocate_tensor(
             Float32,
-            cute.make_layout(WARPS * max_rows * VALUES_PER_CTA),
+            cute.make_layout(WARPS * chunk_rows * values_per_cta),
             byte_alignment=16,
         )
         mbar = smem.allocate_array(Int64, 1)
@@ -171,16 +184,16 @@ class MlaUvProj:
         warp = tid // 32
         g = lane // 4
         t = lane % 4
-        head = cta // CTAS_PER_HEAD
-        part = cta % CTAS_PER_HEAD
+        head = cta // ctas_per_head
+        part = cta % ctas_per_head
 
         # Constant weight tile: one bulk copy, issued before the PDL wait.
         if tid == 0:
             ptx.mbarrier_init(bar, 1)
             ptx.fence_mbarrier_init_release_cluster()
-            ptx.mbarrier_arrive_expect_tx(bar, WEIGHT_TILE_BYTES)
-            src = weights + Int64(cta) * WEIGHT_TILE_BYTES
-            ptx.bulk_copy_g2s(tile_s, src, WEIGHT_TILE_BYTES, bar)
+            ptx.mbarrier_arrive_expect_tx(bar, weight_tile_bytes)
+            src = weights + Int64(cta) * weight_tile_bytes
+            ptx.bulk_copy_g2s(tile_s, src, weight_tile_bytes, bar)
         ptx.sync_threads()
 
         self.stage_l2(
@@ -200,8 +213,99 @@ class MlaUvProj:
 
         self.wait_inputs()
 
+        if cutlass.const_expr(max_rows == 32):
+            c0 = rows
+            if c0 > 16:
+                c0 = Int32(16)
+            self.run_chunk(
+                tile_s,
+                partial_s,
+                bar,
+                attn,
+                attn_row_stride,
+                attn_head_stride,
+                out,
+                out_row_stride,
+                c0,
+                Int32(0),
+                head,
+                part,
+                warp,
+                g,
+                t,
+                tid,
+                True,
+            )
+            if rows > 16:
+                self.sync_partials()
+                self.run_chunk(
+                    tile_s,
+                    partial_s,
+                    bar,
+                    attn,
+                    attn_row_stride,
+                    attn_head_stride,
+                    out,
+                    out_row_stride,
+                    rows - Int32(16),
+                    Int32(16),
+                    head,
+                    part,
+                    warp,
+                    g,
+                    t,
+                    tid,
+                    False,
+                )
+        else:
+            self.run_chunk(
+                tile_s,
+                partial_s,
+                bar,
+                attn,
+                attn_row_stride,
+                attn_head_stride,
+                out,
+                out_row_stride,
+                rows,
+                Int32(0),
+                head,
+                part,
+                warp,
+                g,
+                t,
+                tid,
+                True,
+            )
+        self.release_outputs()
+
+    @cute.jit
+    def run_chunk(
+        self,
+        tile_s: Int32,
+        partial_s: Int32,
+        bar: Int32,
+        attn: Int64,
+        attn_row_stride: Int64,
+        attn_head_stride: Int64,
+        out: Int64,
+        out_row_stride: Int64,
+        c_rows: Int32,
+        row_off: Int32,
+        head: Int32,
+        part: Int32,
+        warp: Int32,
+        g: Int32,
+        t: Int32,
+        tid: Int32,
+        wait_w: cutlass.Constexpr[bool],
+    ):
+        chunk_rows = self.chunk_rows
+        values_per_cta = self.values_per_cta
+        n_tiles = self.n_tiles
+
         # A fragments: lane (g, t) of warp w holds latent [64 w + 32 i + 8 t, +8) of
-        # rows g and (16-row form) g + 8.
+        # rows row_off + g and (16-row chunk) row_off + g + 8.
         lo = cute.make_rmem_tensor((STEPS_PER_WARP, 4), cutlass.Uint32)
         lo.fill(0)
         hi = cute.make_rmem_tensor((STEPS_PER_WARP, 4), cutlass.Uint32)
@@ -209,7 +313,7 @@ class MlaUvProj:
         row_lo = (
             attn
             + (
-                Int64(g) * attn_row_stride
+                Int64(row_off + g) * attn_row_stride
                 + Int64(head) * attn_head_stride
                 + Int64(warp * (STEPS_PER_WARP * 32) + 8 * t)
             )
@@ -217,23 +321,24 @@ class MlaUvProj:
         )
         row_hi = row_lo + Int64(8) * attn_row_stride * 2
         for i in cutlass.range_constexpr(STEPS_PER_WARP):
-            if g < rows:
+            if g < c_rows:
                 v = ptx.ld_global_v4(row_lo + i * 64)
                 for k in cutlass.range_constexpr(4):
                     lo[i, k] = v[k]
-            if cutlass.const_expr(max_rows == 16):  # noqa: SIM102
-                if g + 8 < rows:
+            if cutlass.const_expr(chunk_rows == 16):  # noqa: SIM102
+                if g + 8 < c_rows:
                     v = ptx.ld_global_v4(row_hi + i * 64)
                     for k in cutlass.range_constexpr(4):
                         hi[i, k] = v[k]
 
-        self.wait_weights(bar)
+        if cutlass.const_expr(wait_w):
+            self.wait_weights(bar)
 
-        acc = cute.make_rmem_tensor((N_TILES, 4), Float32)
+        acc = cute.make_rmem_tensor((n_tiles, 4), Float32)
         acc.fill(0.0)
         for i in cutlass.range_constexpr(STEPS_PER_WARP):
-            block = tile_s + (warp * STEPS_PER_WARP + i) * (VALUES_PER_CTA * 64)
-            for n in cutlass.range_constexpr(N_TILES):
+            block = tile_s + (warp * STEPS_PER_WARP + i) * (values_per_cta * 64)
+            for n in cutlass.range_constexpr(n_tiles):
                 b = ptx.ld_shared_v4(block + (8 * n + g) * 64 + t * 16)
                 c = (acc[n, 0], acc[n, 1], acc[n, 2], acc[n, 3])
                 c = ptx.mma_m16n8k16_bf16(
@@ -246,37 +351,38 @@ class MlaUvProj:
                     acc[n, k] = c[k]
 
         # Warp partials -> shared memory -> fixed-order sum -> BF16.
-        if g < rows:
-            for n in cutlass.range_constexpr(N_TILES):
+        if g < c_rows:
+            for n in cutlass.range_constexpr(n_tiles):
                 at = (
                     partial_s
-                    + ((warp * max_rows + g) * VALUES_PER_CTA + 8 * n + 2 * t) * 4
+                    + ((warp * chunk_rows + g) * values_per_cta + 8 * n + 2 * t) * 4
                 )
                 ptx.st_shared_v2_f32(at, acc[n, 0], acc[n, 1])
-        if cutlass.const_expr(max_rows == 16):  # noqa: SIM102
-            if g + 8 < rows:
-                for n in cutlass.range_constexpr(N_TILES):
+        if cutlass.const_expr(chunk_rows == 16):  # noqa: SIM102
+            if g + 8 < c_rows:
+                for n in cutlass.range_constexpr(n_tiles):
                     at = (
                         partial_s
-                        + ((warp * max_rows + g + 8) * VALUES_PER_CTA + 8 * n + 2 * t)
+                        + ((warp * chunk_rows + g + 8) * values_per_cta + 8 * n + 2 * t)
                         * 4
                     )
                     ptx.st_shared_v2_f32(at, acc[n, 2], acc[n, 3])
         self.sync_partials()
 
-        # One output element per thread (rows * 16 <= 256 threads): thread tid owns row
-        # tid / 16, value tid % 16 of this CTA's slice.
-        if tid < rows * VALUES_PER_CTA:
-            r = tid // VALUES_PER_CTA
-            d = tid % VALUES_PER_CTA
+        # Each thread writes ceil(c_rows * values_per_cta / THREADS) output elements.
+        total_out = c_rows * values_per_cta
+        elem = tid
+        while elem < total_out:
+            r = elem // values_per_cta
+            d = elem % values_per_cta
             s = Float32(0.0)
             for w in cutlass.range_constexpr(WARPS):
-                at = partial_s + ((w * max_rows + r) * VALUES_PER_CTA + d) * 4
+                at = partial_s + ((w * chunk_rows + r) * values_per_cta + d) * 4
                 s = ptx.add_rn(s, ptx.ld_shared_f32(at))
-            col = head * VALUE_DIM + part * VALUES_PER_CTA + d
-            dst = out + (Int64(r) * out_row_stride + Int64(col)) * 2
+            col = head * VALUE_DIM + part * values_per_cta + d
+            dst = out + (Int64(row_off + r) * out_row_stride + Int64(col)) * 2
             ptx.st_global_b16(dst, ptx.cvt_rn_bf16_f32(s))
-        self.release_outputs()
+            elem = elem + THREADS
 
     # Synchronization points, one method each.
 
@@ -333,7 +439,7 @@ class MlaUvProj:
         if total > Int64(0):
             policy0 = self.policy(stage0_policy)
             policy1 = self.policy(stage1_policy)
-            item = Int64(tid) * GRID + Int64(cta)
+            item = Int64(tid) * self.grid + Int64(cta)
             while item < total:
                 base = stage0
                 size = stage0_bytes
@@ -363,7 +469,7 @@ class MlaUvProj:
                     nbytes32 = Int32(nbytes) & Int32(-16)
                     if nbytes32 != Int32(0):
                         self.issue_prefetch(base + offset, nbytes32, policy)
-                item += Int64(GRID * THREADS)
+                item += Int64(self.grid * THREADS)
 
     @cute.jit
     def slot_items(self, base: Int64, size: Int64, stride: Int64, prefix: Int64):

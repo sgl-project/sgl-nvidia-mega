@@ -68,13 +68,14 @@ class IndexerQProj:
     def __init__(
         self, max_rows: int, rope_form: str = "mul_sub", rope_cache_fp32: bool = True
     ):
-        if max_rows not in (8, 16):
-            raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
+        if max_rows not in (8, 16, 32):
+            raise ValueError(f"max_rows must be 8, 16 or 32, got {max_rows}")
         if rope_form not in ROPE_FORMS:
             raise ValueError(
                 f"rope_form must be one of {ROPE_FORMS}, got {rope_form!r}"
             )
         self.max_rows = max_rows
+        self.chunk_rows = 8 if max_rows == 8 else 16
         self.rope_form = rope_form
         self.rope_cache_fp32 = rope_cache_fp32
 
@@ -141,6 +142,7 @@ class IndexerQProj:
         w_out_stride: Int64,
     ):
         max_rows = self.max_rows
+        chunk_rows = self.chunk_rows
         tid_, _, _ = cute.arch.thread_idx()
         cta_, _, _ = cute.arch.block_idx()
         tid = Int32(tid_)
@@ -151,11 +153,11 @@ class IndexerQProj:
         )
         red_buf = smem.allocate_tensor(
             Float32,
-            cute.make_layout(WARPS * max_rows * ROWS_PER_CTA),
+            cute.make_layout(WARPS * chunk_rows * ROWS_PER_CTA),
             byte_alignment=16,
         )
         amax_buf = smem.allocate_tensor(
-            Float32, cute.make_layout(max_rows + 16), byte_alignment=16
+            Float32, cute.make_layout(chunk_rows + 16), byte_alignment=16
         )
         bars = smem.allocate_array(Int64, WARPS)
         s_w = ptx.shared_address(wbuf.iterator)
@@ -183,44 +185,174 @@ class IndexerQProj:
 
         self.wait_inputs()
 
-        # A fragments: rows g (and g + 8), latent [256 warp + 32 i + 8 t, +8)
+        if cutlass.const_expr(max_rows == 32):
+            c0 = rows
+            if c0 > 16:
+                c0 = Int32(16)
+            self.run_chunk(
+                ring,
+                s_red,
+                s_amax,
+                bar,
+                x,
+                x_stride,
+                positions,
+                rope_cache,
+                rope_stride,
+                index_weights,
+                index_weights_stride,
+                w_scale,
+                c0,
+                Int32(0),
+                q_fp8,
+                q_stride,
+                w_out,
+                w_out_stride,
+                head,
+                part,
+                warp,
+                lane,
+                g,
+                t,
+                True,
+            )
+            if rows > 16:
+                self.exit_wait()
+                self.sync_partials()
+                self.run_chunk(
+                    ring,
+                    s_red,
+                    s_amax,
+                    bar,
+                    x,
+                    x_stride,
+                    positions,
+                    rope_cache,
+                    rope_stride,
+                    index_weights,
+                    index_weights_stride,
+                    w_scale,
+                    rows - Int32(16),
+                    Int32(16),
+                    q_fp8,
+                    q_stride,
+                    w_out,
+                    w_out_stride,
+                    head,
+                    part,
+                    warp,
+                    lane,
+                    g,
+                    t,
+                    False,
+                )
+        else:
+            self.run_chunk(
+                ring,
+                s_red,
+                s_amax,
+                bar,
+                x,
+                x_stride,
+                positions,
+                rope_cache,
+                rope_stride,
+                index_weights,
+                index_weights_stride,
+                w_scale,
+                rows,
+                Int32(0),
+                q_fp8,
+                q_stride,
+                w_out,
+                w_out_stride,
+                head,
+                part,
+                warp,
+                lane,
+                g,
+                t,
+                True,
+            )
+        self.release_outputs()
+        self.exit_wait()
+
+    @cute.jit
+    def run_chunk(
+        self,
+        ring: Int32,
+        s_red: Int32,
+        s_amax: Int32,
+        bar: Int32,
+        x: Int64,
+        x_stride: Int64,
+        positions: Int64,
+        rope_cache: Int64,
+        rope_stride: Int64,
+        index_weights: Int64,
+        index_weights_stride: Int64,
+        w_scale: Float32,
+        c_rows: Int32,
+        row_off: Int32,
+        q_fp8: Int64,
+        q_stride: Int64,
+        w_out: Int64,
+        w_out_stride: Int64,
+        head: Int32,
+        part: Int32,
+        warp: Int32,
+        lane: Int32,
+        g: Int32,
+        t: Int32,
+        wait_w: cutlass.Constexpr[bool],
+    ):
+        chunk_rows = self.chunk_rows
+        # A fragments: rows row_off + g (and + 8), latent [256 warp + 32 i + 8 t, +8)
         zero4 = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
         row_lo = (
-            x + (Int64(g) * x_stride + Int64(warp * STEPS_PER_WARP * 32 + 8 * t)) * 2
+            x
+            + (
+                Int64(row_off + g) * x_stride
+                + Int64(warp * STEPS_PER_WARP * 32 + 8 * t)
+            )
+            * 2
         )
         row_hi = row_lo + Int64(8) * x_stride * 2
         lo = []
         hi = []
         for i in cutlass.range_constexpr(STEPS_PER_WARP):
-            lo.append(self.load_row(row_lo + i * 64, g < rows))
-            if cutlass.const_expr(max_rows == 16):
-                hi.append(self.load_row(row_hi + i * 64, g + 8 < rows))
+            lo.append(self.load_row(row_lo + i * 64, g < c_rows))
+            if cutlass.const_expr(chunk_rows == 16):
+                hi.append(self.load_row(row_hi + i * 64, g + 8 < c_rows))
             else:
                 hi.append(zero4)
 
-        # epilogue mapping: (row em, dim pair ep)
+        # epilogue mapping: (local row em, global row em_g, dim pair ep)
         ep = lane % 16
-        if cutlass.const_expr(max_rows == 16):
+        if cutlass.const_expr(chunk_rows == 16):
             em = 2 * warp + lane // 16
-            active = em < rows
+            active = em < c_rows
         else:
             em = warp
-            active = (em < rows) & (lane < 16)
+            active = (em < c_rows) & (lane < 16)
+        em_g = row_off + em
         rc = Float32(0.0)
         rs = Float32(0.0)
         wv = Float32(0.0)
         if active:
-            pos = ptx.ld_global_s64(positions + Int64(em) * 8)
+            pos = ptx.ld_global_s64(positions + Int64(em_g) * 8)
             if part < 2:
                 rc = self.rope_value(rope_cache, rope_stride, pos, 16 * part + ep)
                 rs = self.rope_value(rope_cache, rope_stride, pos, 32 + 16 * part + ep)
             if (part == 0) & (ep == 0):
                 at = (
-                    index_weights + (Int64(em) * index_weights_stride + Int64(head)) * 2
+                    index_weights
+                    + (Int64(em_g) * index_weights_stride + Int64(head)) * 2
                 )
                 wv = ptx.bf16_to_f32(ptx.ld_global_u16(at))
 
-        self.wait_weights(bar)
+        if cutlass.const_expr(wait_w):
+            self.wait_weights(bar)
 
         zero = Float32(0.0)
         acc = [(zero, zero, zero, zero) for _ in range(4)]
@@ -236,16 +368,16 @@ class IndexerQProj:
                 acc[j] = ptx.mma_m16n8k16_bf16(
                     (a[2], a8[2], a[3], a8[3]), (b[2], b[3]), c
                 )
-        if g < rows:
+        if g < c_rows:
             for j in cutlass.range_constexpr(4):
-                at = s_red + ((warp * max_rows + g) * ROWS_PER_CTA + 8 * j + 2 * t) * 4
+                at = s_red + ((warp * chunk_rows + g) * ROWS_PER_CTA + 8 * j + 2 * t) * 4
                 ptx.st_shared_v2_f32(at, acc[j][0], acc[j][1])
-        if cutlass.const_expr(max_rows == 16):  # noqa: SIM102
-            if g + 8 < rows:
+        if cutlass.const_expr(chunk_rows == 16):  # noqa: SIM102
+            if g + 8 < c_rows:
                 for j in cutlass.range_constexpr(4):
                     at = (
                         s_red
-                        + ((warp * max_rows + g + 8) * ROWS_PER_CTA + 8 * j + 2 * t) * 4
+                        + ((warp * chunk_rows + g + 8) * ROWS_PER_CTA + 8 * j + 2 * t) * 4
                     )
                     ptx.st_shared_v2_f32(at, acc[j][2], acc[j][3])
         self.sync_partials()
@@ -259,7 +391,7 @@ class IndexerQProj:
             s1 = Float32(0.0)
             for w in cutlass.range_constexpr(WARPS):
                 q0, q1 = ptx.ld_shared_v2_f32(
-                    s_red + ((w * max_rows + em) * ROWS_PER_CTA + 2 * ep) * 4
+                    s_red + ((w * chunk_rows + em) * ROWS_PER_CTA + 2 * ep) * 4
                 )
                 s0 = ptx.add_rn(s0, q0)
                 s1 = ptx.add_rn(s1, q1)
@@ -272,14 +404,14 @@ class IndexerQProj:
             am = ptx.max_f32(
                 ptx.max_f32(ptx.abs_f32(v0), ptx.abs_f32(v1)), Float32(AMAX_FLOOR)
             )
-        offsets = (16, 8, 4, 2, 1) if max_rows == 8 else (8, 4, 2, 1)
+        offsets = (16, 8, 4, 2, 1) if chunk_rows == 8 else (8, 4, 2, 1)
         for k in cutlass.range_constexpr(len(offsets)):
             am = ptx.max_f32(am, cute.arch.shuffle_sync_bfly(am, offsets[k]))
-        if cutlass.const_expr(max_rows == 8):  # noqa: SIM108
+        if cutlass.const_expr(chunk_rows == 8):  # noqa: SIM108
             publisher = lane == 0
         else:
             publisher = lane % 16 == 0
-        if publisher & (em < rows):
+        if publisher & (em < c_rows):
             ptx.st_shared_f32(s_amax + em * 4, am)
 
         self.publish_amax()
@@ -307,17 +439,15 @@ class IndexerQProj:
             ) & Uint32(0xFF)
             dst = (
                 q_fp8
-                + Int64(em) * q_stride
+                + Int64(em_g) * q_stride
                 + Int64(head * HEAD_DIM + 32 * part + 2 * ep)
             )
             ptx.st_global_b16(dst, cutlass.Uint16(b0 | (b1 << Uint32(8))))
             if (part == 0) & (ep == 0):
                 wo = ptx.mul_rn(ptx.mul_rn(wv, scale), w_scale)
                 ptx.st_global_f32(
-                    w_out + (Int64(em) * w_out_stride + Int64(head)) * 4, wo
+                    w_out + (Int64(em_g) * w_out_stride + Int64(head)) * 4, wo
                 )
-        self.release_outputs()
-        self.exit_wait()
 
     # ------------------------------------------------------------------ steps
     @cute.jit

@@ -22,6 +22,7 @@ which consumes the fold hop's deferred input norm.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -120,6 +121,96 @@ INDEX_Q_ROPE_FORM = "mul_sub"
 NEXT_QKV_A_PREFETCH_BYTES = 8 << 20
 O_PROJ_STAGE_SLAB_BYTES = 48 * 2048 * 2
 O_PROJ_STAGE_PREFIX_BYTES = 122_880
+# Measurement knobs (read at build; prefetches are hints, so no output changes):
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_PREFIX bytes of each o_proj slab (0 .. 196,608; "full" = the whole slab) and
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH bytes of the next layer's q_a / kv_a weight.
+OPROJ_STAGE_PREFIX_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_PREFIX"
+# ... applied from this row count on (fewer rows keep O_PROJ_STAGE_PREFIX_BYTES): at 4 rows the attention core is short,
+# and the longer staging delays the up-projection itself (T84: +0.9 us per layer at 4 rows, -1.5 us at 8 rows)
+OPROJ_STAGE_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_MIN_ROWS"
+NEXT_QKV_A_PREFETCH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH"
+
+
+_OPROJ_STAGE_MIN_ROWS = int(os.environ.get(OPROJ_STAGE_MIN_ROWS_ENV, "1") or "1")
+UV_VPC_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_UV_VPC"
+_UV_VPC = int(os.environ.get(UV_VPC_ENV, "16") or "16")
+if _UV_VPC not in (16, 32, 64):
+    raise ValueError(f"{UV_VPC_ENV}={_UV_VPC}: expected 16, 32 or 64")
+DRAFT_QKV_A_DECODE_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_QKV_A_DECODE"
+_DRAFT_QKV_A_DECODE = os.environ.get(DRAFT_QKV_A_DECODE_ENV, "1") == "1"
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_LL_MIN_ROWS=n (0 = off): the target's verify rows n..16 run the sparse MLA core
+# on the flash decode of ll.sparse_mla_fd instead of the 16-CTA SparseMlaDecode: its one-tile kernel (16-CTA
+# clusters, one CTA per SM, early gather) up to its one-wave rows (capped by ..._SPARSE_LL_ONE_TILE_MAX, default
+# ll's measured 7), its multi-tile kernel (clusters of 8 / 6 / 4 CTAs over several 128-position tiles) above, so
+# 9-16 rows fit one wave instead of the 16-CTA clusters' two or three. Its P rounding and merge order are
+# TRTLLM-Gen's (the stock decode's), not SparseMlaDecode's: numerics change. Co-resident clusters are agreed
+# over the TP group (MIN); a row count neither kernel holds in one wave keeps SparseMlaDecode. Read at build.
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_MT_MIN_ROWS=n is the same switch from max(n, 9) rows (the multi-tile rows).
+SPARSE_LL_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_LL_MIN_ROWS"
+SPARSE_LL_ONE_TILE_MAX_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_LL_ONE_TILE_MAX"
+SPARSE_MT_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_MT_MIN_ROWS"
+_SPARSE_LL_MIN_ROWS = int(os.environ.get(SPARSE_LL_MIN_ROWS_ENV, "0") or "0")
+_SPARSE_MT_MIN_ROWS = int(os.environ.get(SPARSE_MT_MIN_ROWS_ENV, "0") or "0")
+if _SPARSE_LL_MIN_ROWS <= 0 and _SPARSE_MT_MIN_ROWS > 0:
+    _SPARSE_LL_MIN_ROWS = max(_SPARSE_MT_MIN_ROWS, 9)
+_SPARSE_LL_ONE_TILE_MAX = int(os.environ.get(SPARSE_LL_ONE_TILE_MAX_ENV, "0") or "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_OVERLAP=1: the 16-row MLA prologue (9-16 verify rows) issues every load of
+# a phase before that phase's stores (MlaPrologue overlap16), so its row slots' latencies overlap. Same outputs.
+# Read at build.
+PROLOGUE16_OVERLAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_OVERLAP"
+_PROLOGUE16_OVERLAP = os.environ.get(PROLOGUE16_OVERLAP_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_KV_SPLIT=1: the 9-16-row prologue writes the MLA / index-K rows 8..15 on
+# their own CTAs of the kv cluster (CTAs 2 / 3, idle with the target's top-k width 0) beside rows 0..7, instead of a
+# second pass of the same warps; the same outputs. Read at build.
+PROLOGUE16_KV_SPLIT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_KV_SPLIT"
+_PROLOGUE16_KV_SPLIT = os.environ.get(PROLOGUE16_KV_SPLIT_ENV, "0").strip() == "1"
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_OVERLAP=1: the 8-row MLA prologue (1-8 verify rows) issues each phase's loads
+# before that phase's stores and stores its q_pe bytes after the hand-off (MlaPrologue overlap8). Same outputs.
+# Read at build.
+PROLOGUE8_OVERLAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_OVERLAP"
+_PROLOGUE8_OVERLAP = os.environ.get(PROLOGUE8_OVERLAP_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_PUSH=1: the overlapped prologues (PROLOGUE8 / PROLOGUE16_OVERLAP) hand the
+# q_nope rows to the head cluster by st.async pushes completing on each rank's mbarrier, instead of a release
+# cluster barrier + remote gather. SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_F32X2=1: their q_a normalize branch-free
+# with packed f32x2 multiplies. Same outputs. Read at build.
+PROLOGUE_PUSH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_PUSH"
+PROLOGUE_F32X2_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_F32X2"
+_PROLOGUE_PUSH = os.environ.get(PROLOGUE_PUSH_ENV, "0").strip() not in ("", "0")
+_PROLOGUE_F32X2 = os.environ.get(PROLOGUE_F32X2_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT=1: on the target's layers with their own indexer, the prologue splits in two
+# launches: P_front (IndexerFront: the q_a norm the indexer query projection reads and the index-K rows the logits read)
+# on the current stream ahead of the indexer, P_back (the stock MlaPrologue with has_indexer 0 and no q_a out, the
+# end-trigger form of the shared layers: q_b, W_UK, RoPE + FP8 query, MLA rows) on a side stream forked after the q_a /
+# kv_a projection (at 9-16 rows before the stock key / head-gate projection, which moves after the fork) and joined
+# before the sparse MLA. =2 forks P_back after the indexer query projection instead. Same outputs, bit for bit. The
+# layers without their own indexer and the draft are unchanged. SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT_MIN_ROWS=n
+# (default 9): only verify widths of n..16 rows split. Read at build.
+IDX_SPLIT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT"
+IDX_SPLIT_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT_MIN_ROWS"
+_IDX_SPLIT = (os.environ.get(IDX_SPLIT_ENV, "0").strip() or "0")
+if _IDX_SPLIT not in ("0", "1", "2"):
+    raise ValueError(f"{IDX_SPLIT_ENV}={_IDX_SPLIT!r}: expected 0, 1 or 2")
+_IDX_SPLIT = int(_IDX_SPLIT)
+_IDX_SPLIT_MIN_ROWS = int(os.environ.get(IDX_SPLIT_MIN_ROWS_ENV, "9").strip() or "9")
+PROLOGUE16_ROW_NORM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_ROW_NORM"
+PROLOGUE16_EARLY_ARM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_EARLY_ARM"
+_PROLOGUE16_ROW_NORM = os.environ.get(PROLOGUE16_ROW_NORM_ENV, "0").strip() not in ("", "0")
+_PROLOGUE16_EARLY_ARM = os.environ.get(PROLOGUE16_EARLY_ARM_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_EARLY_ARM=1 (with PROLOGUE8_OVERLAP and PROLOGUE_PUSH): the 8-row prologue's
+# head CTA arms its QN barrier with a CTA-scope arrive before the weight copies (MlaPrologue early_arm8), not with a
+# cluster-scope release arrive after them. Same outputs. Read at build.
+PROLOGUE8_EARLY_ARM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_EARLY_ARM"
+_PROLOGUE8_EARLY_ARM = os.environ.get(PROLOGUE8_EARLY_ARM_ENV, "0").strip() not in ("", "0")
+
+
+def _env_bytes(name: str, default: int, full: int) -> int:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    value = full if raw == "full" else int(raw)
+    if not 0 <= value <= full:
+        raise ValueError(f"{name}={raw!r}: expected 0..{full} bytes or 'full'")
+    return value
 EVICT_LAST = 0
 
 Slot = Tuple[int, int, int, int, int]
@@ -132,9 +223,9 @@ def kernel_rows(rows: int) -> Optional[int]:
 
 
 def sparse_warps(rows: int) -> int:
-    """Warps per CTA of the sparse MLA form: one CTA per SM up to 6 rows (one request
-    of up to 6 verify rows), two above."""
-    return 16 if rows <= 6 else 8
+    """Warps per CTA of the sparse MLA form: one CTA per SM up to 7 rows (7*16=112 CTAs
+    <= 152 SMs on GB300, covering K=6 c1), two above."""
+    return 16 if rows <= 7 else 8
 
 
 def _f32(x: float) -> float:
@@ -175,7 +266,9 @@ def _o_proj_stage_slot(w: torch.Tensor) -> Slot:
         w,
         w.numel() * w.element_size(),
         O_PROJ_STAGE_SLAB_BYTES,
-        O_PROJ_STAGE_PREFIX_BYTES,
+        _env_bytes(
+            OPROJ_STAGE_PREFIX_ENV, O_PROJ_STAGE_PREFIX_BYTES, O_PROJ_STAGE_SLAB_BYTES
+        ),
     )
 
 
@@ -241,6 +334,8 @@ class LayerArgs:
     # projection (0: not served) and the input RMSNorm epsilon (deferred input norm)
     w_qkva_s: int = 0
     in_eps: float = 0.0
+    # 16-row UV projection weight when cap=8 uses values_per_cta=64 (cap=16 uses 32)
+    w_uv16: int = 0
 
 
 class FusedAttention(AttentionStep):
@@ -251,6 +346,9 @@ class FusedAttention(AttentionStep):
         self.max_rows = cap = kernel_rows(rows)
         self.uv = fn[f"uv.{cap}"]
         self.sparse = fn[f"sparse.{sparse_warps(rows)}"]
+        # ll flash decode (CTAs per row, one-tile shared memory), or None: the
+        # 16-CTA kernel above
+        self.ll_fd = getattr(glue, "sparse_ll", {}).get(rows)
         self.pro = fn[f"prologue.{cap}"]
         # the target's layers that reuse the previous top-k: the end-trigger prologue
         self.pro_end = fn.get(f"prologue_end.{cap}")
@@ -261,6 +359,14 @@ class FusedAttention(AttentionStep):
         self.qa_s_dn = fn.get(f"qkv_a_shared_dn.{cap}")  # + deferred input norm
         # (slot dnorm; the composition wires its producer when ``takes_deferred_norm``)
         self.takes_deferred_norm = self.qa_s_dn is not None
+        # the indexer-layer prologue split (IDX_SPLIT_ENV; target only): P_front, or None
+        self.front = None
+        if glue.target and glue.idx_split and rows >= glue.idx_split_min_rows:
+            self.front = fn.get(f"front.{cap}")
+        self.fork_after_iq = glue.idx_split == 2
+        self._rows = rows
+        self._split_layers: Dict[int, bool] = {}  # first forward: layer id -> split
+        self._split_logged = False
 
     def runs_indexer(self, attn, step: StepContext) -> bool:
         """Whether this layer's indexer runs in this forward: the layers with their
@@ -289,7 +395,9 @@ class FusedAttention(AttentionStep):
             raise _fail(f"indexer layer {attn.layer_id} got a deferred input norm")
         if self.qa is None:
             qkv = super().qkv_a(attn, x, step)
-            step.index_kw, _ = attn.indexer.wk_weights_proj(x)
+            if self.front is None:
+                step.index_kw, _ = attn.indexer.wk_weights_proj(x)
+            # else the split's P_front projects it after the fork (_index_kw)
             return qkv
         w = self.glue.layers[attn.layer_id].w_qkva
         qkv, step.index_kw = self._small_m(self.qa, w, x, index_kw=True)
@@ -324,13 +432,19 @@ class FusedAttention(AttentionStep):
         return qkv, kw
 
     def prologue(
-        self, attn, qkv_latent: torch.Tensor, step: StepContext
+        self,
+        attn,
+        qkv_latent: torch.Tensor,
+        step: StepContext,
+        full: Optional[bool] = None,
+        stream=None,
     ) -> PrologueOut:
         from cutlass import Float32, Int32
 
         rows = qkv_latent.shape[0]
         _check_rows(qkv_latent, rows, QKV_A_ROWS, torch.bfloat16, "q_a / kv_a latent")
-        full = self.runs_indexer(attn, step)
+        if full is None:
+            full = self.runs_indexer(attn, step)
         dev = qkv_latent.device
         la = self.glue.layers[attn.layer_id]
         loc = step.forward_batch.out_cache_loc
@@ -389,10 +503,90 @@ class FusedAttention(AttentionStep):
             *_i64(0, 0),  # topk, topk_stride: unused
             Int32(0),  # topk_width: unused
             *_i64(*_addr(qc)),  # qc_out, qc_out_stride
-            cu_stream(dev),
+            cu_stream(dev) if stream is None else _cu(stream),
         )
         step.q_fp8 = mqa
         return PrologueOut(qc, None, None, None, None)
+
+    # ------------------------------------------------ the indexer-layer prologue split
+    def indexer_split(self, attn, step: StepContext, run_indexer: bool) -> Optional[str]:
+        """``"qkv"`` / ``"iq"`` (where P_back forks) on the layers whose prologue
+        splits, else None (called for every layer: the first forward is logged)."""
+        if self.front is None:
+            return None
+        split = run_indexer and self.runs_indexer(attn, step)
+        if not self._split_logged:
+            # the first forward of this width, logged at its last layer
+            self._split_layers[attn.layer_id] = split
+            if attn.layer_id == self.glue.last_layer_id:
+                self._log_split()
+        if not split:
+            return None
+        return "iq" if self.fork_after_iq else "qkv"
+
+    def _log_split(self) -> None:
+        self._split_logged = True
+        on = sorted(k for k, v in self._split_layers.items() if v)
+        off = sorted(k for k, v in self._split_layers.items() if not v)
+        logger.info(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: indexer-layer prologue split engaged "
+            "at %d rows: %d layers split (P_front + P_back, fork after %s), %d layers "
+            "unsplit; split layers %s (%s=%d)",
+            self._rows,
+            len(on),
+            "the indexer query" if self.fork_after_iq else "q_a / kv_a",
+            len(off),
+            on,
+            IDX_SPLIT_ENV,
+            self.glue.idx_split,
+        )
+
+    def split_stream(self, attn):
+        return self.glue.split_stream
+
+    def prologue_front(
+        self, attn, x, qkv_latent: torch.Tensor, step: StepContext
+    ) -> torch.Tensor:
+        """P_front on the current stream: the q_a norm (returned: the indexer query
+        projection's input) and the index-K rows of this layer."""
+        from cutlass import Float32, Int32
+
+        rows = qkv_latent.shape[0]
+        _check_rows(qkv_latent, rows, QKV_A_ROWS, torch.bfloat16, "q_a / kv_a latent")
+        self._index_kw(attn.indexer, x, step)  # at 9-16 rows the stock projection
+        kw = step.index_kw
+        _check_rows(kw, rows, INDEX_KW, torch.bfloat16, "indexer key projection")
+        la = self.glue.layers[attn.layer_id]
+        loc = step.forward_batch.out_cache_loc
+        pos = step.positions
+        _check_index(loc, rows, "cache slots")
+        _check_index(pos, rows, "positions")
+        buf = step.view.kv_pool.get_index_k_with_scale_buffer(layer_id=attn.layer_id)
+        dev = qkv_latent.device
+        qc = torch.empty((rows, Q_LORA), dtype=torch.bfloat16, device=dev)
+        self.front(
+            *_i64(*_addr(qkv_latent)),  # q_c, q_c_stride
+            *_i64(*_addr(kw)),  # idx_k, idx_k_stride
+            *_i64(pos.data_ptr(), loc.data_ptr(), loc.data_ptr()),  # positions, slots
+            Int32(rows),
+            *_i64(la.q_norm_w.data_ptr()),
+            Float32(la.q_eps),
+            *_i64(la.ik_w.data_ptr(), la.ik_b.data_ptr()),
+            Float32(la.ik_eps),
+            *_i64(*_addr(la.index_rope)),  # index_rope_cache, index_rope_stride
+            *_i64(buf.data_ptr(), buf.stride(0) * buf.element_size(), INDEX_PAGE),
+            *_i64(*_addr(qc)),  # qc_out, qc_out_stride
+            cu_stream(dev),
+        )
+        return qc
+
+    def prologue_back(
+        self, attn, qkv_latent: torch.Tensor, step: StepContext, stream
+    ) -> PrologueOut:
+        """P_back on ``stream``: the prologue of a layer without its own indexer (the
+        end-trigger form when built), its FP8 query left in ``step.q_fp8``; outputs
+        allocated on the current stream."""
+        return self.prologue(attn, qkv_latent, step, full=False, stream=stream)
 
     def _done(self, *args) -> None:
         """A step the prologue did: the index-K rows, the W_UK absorption.
@@ -464,6 +658,22 @@ class FusedAttention(AttentionStep):
         out = torch.empty(
             (rows, HEADS, KV_LORA), dtype=torch.bfloat16, device=q_fp8.device
         )
+        if self.ll_fd is not None:
+            from sgl_nvidia_mega.glm5_3.ll import sparse_mla as fd
+
+            splits, smem = self.ll_fd
+            # physical rows, every position used (masks: id < 0, id >= cache rows)
+            return fd.flash_decode(
+                q_fp8,
+                kv.view(-1, MQA_DIM),
+                ids,
+                self.glue.ll_lens,
+                _f32(bmm1_scale * LOG2E),
+                out=out,
+                smem_bytes=smem,
+                splits=splits,
+                out_scale=1.0,
+            )
         self.sparse(
             *_i64(q_fp8.data_ptr(), kv.data_ptr()),  # q, kv
             *_i64(ids.data_ptr(), out.data_ptr()),  # ids, out
@@ -503,12 +713,17 @@ class FusedAttention(AttentionStep):
             (rows, HEADS * VALUE_DIM), dtype=torch.bfloat16, device=attn_output.device
         )
         la = self.glue.layers[attn.layer_id]
+        stage0 = la.stage0
+        if rows < _OPROJ_STAGE_MIN_ROWS and stage0[2] == O_PROJ_STAGE_SLAB_BYTES:
+            # below OPROJ_STAGE_MIN_ROWS the o_proj slot stages the default prefix
+            stage0 = (*stage0[:3], O_PROJ_STAGE_PREFIX_BYTES, stage0[4])
+        w_uv = la.w_uv16 if (self.max_rows == 16 and la.w_uv16) else la.w_uv
         self.uv(
-            *_i64(la.w_uv),  # weights
+            *_i64(w_uv),  # weights
             *_i64(attn_output.data_ptr(), *attn_output.stride()[:2]),  # attn, strides
             *_i64(*_addr(out)),  # out, out_row_stride
             Int32(rows),
-            *_slot_args(la.stage0),
+            *_slot_args(stage0),
             *_slot_args(la.stage1),
             cu_stream(attn_output.device),
         )
@@ -575,7 +790,13 @@ class AttentionGlue:
                 ):
                     packed = pack_qkv_a(fused_a(attn), self.grid)
                     shared_qa[i] = derived.add("attention.qkv_a_shared", packed)
+        elif not self.target and _DRAFT_QKV_A_DECODE:
+            for i, layer in enumerate(layers):
+                packed = pack_qkv_a(fused_a(layer.self_attn), self.grid)
+                shared_qa[i] = derived.add("attention.qkv_a_shared", packed)
         self.shared_qkv_a_layers = len(shared_qa)
+        self.uv_vpc = _UV_VPC if self.target else 16
+        self._derived = derived
         for i, layer in enumerate(layers):
             attn = layer.self_attn
             kv_b = _bf16_weight(attn.kv_b_proj, (KV_B_ROWS, KV_LORA), "kv_b_proj")
@@ -590,8 +811,15 @@ class AttentionGlue:
             rope = attn.rotary_emb.cos_sin_cache
             rope_f32.add(_rope_cache_fp32(rope, "RoPE cache"))
             args = LayerArgs(
-                w_uv=derived.add("attention.uv_proj", pack_uv_proj(kv_b)).data_ptr(),
-                stage0=_prefetch_slot(nxt, NEXT_QKV_A_PREFETCH_BYTES),
+                w_uv=derived.add(
+                    "attention.uv_proj", pack_uv_proj(kv_b, values_per_cta=self.uv_vpc)
+                ).data_ptr(),
+                stage0=_prefetch_slot(
+                    nxt,
+                    _env_bytes(
+                        NEXT_QKV_A_PREFETCH_ENV, NEXT_QKV_A_PREFETCH_BYTES, 1 << 30
+                    ),
+                ),
                 w_qb=derived.add("attention.q_b", pack_q_b(q_b)).data_ptr(),
                 w_uk=derived.add("attention.w_uk_t", pack_w_uk_t(kv_b)).data_ptr(),
                 q_norm_w=attn.q_a_layernorm.weight,
@@ -644,8 +872,16 @@ class AttentionGlue:
             args.w_scale = _f32(ix.softmax_scale * ix.n_heads**-0.5)
         if len(rope_f32) != 1 or len(index_rope_f32) > 1:
             raise _fail("RoPE cache dtypes differ by layer", ValueError)
+        # the indexer-layer prologue split (IDX_SPLIT_ENV): the target's only, and only
+        # with layers that run their own indexer
+        self.idx_split = _IDX_SPLIT if self.target and index_rope_f32 else 0
+        self.idx_split_min_rows = _IDX_SPLIT_MIN_ROWS
         self.rope_f32 = rope_f32.pop()
         self.index_rope_f32 = index_rope_f32.pop() if index_rope_f32 else True
+        self.split_stream = (
+            torch.cuda.Stream(device=dev) if self.idx_split else None
+        )
+        self.last_layer_id = max(layer.self_attn.layer_id for layer in layers)
 
     def compile(self, rows: Tuple[int, ...]) -> None:
         import cutlass.cute as cute
@@ -653,9 +889,19 @@ class AttentionGlue:
         from sgl_nvidia_mega.glm5_3.runtime import SLOTS
         from sgl_nvidia_mega.glm5_3.sm103.attention import api
 
+        caps = sorted({kernel_rows(m) for m in rows} - {None})
+        if self.uv_vpc == 64 and 16 in caps:
+            from sgl_nvidia_mega.glm5_3.sm103.packing import pack_uv_proj
+
+            for layer in self.decoder_layers:
+                attn = layer.self_attn
+                kv_b = _bf16_weight(attn.kv_b_proj, (KV_B_ROWS, KV_LORA), "kv_b_proj")
+                self.layers[attn.layer_id].w_uv16 = self._derived.add(
+                    "attention.uv_proj16", pack_uv_proj(kv_b, values_per_cta=32)
+                ).data_ptr()
         shared = QKV_A_ROWS if self.shared_qkv_a_layers else None
         specs = api.compile_specs(
-            sorted({kernel_rows(m) for m in rows} - {None}),
+            caps,
             numerics=_prologue_numerics(),
             index_q_rope_form=INDEX_Q_ROPE_FORM,
             rope_cache_fp32=self.rope_f32,
@@ -665,8 +911,88 @@ class AttentionGlue:
             grid=self.grid,
             prologue_end=self.target,
             qkv_a_shared=shared,
-            qkv_a_shared_dn=bool(shared) and "dnorm" in SLOTS,
+            qkv_a_shared_dn=bool(shared) and self.target and "dnorm" in SLOTS,
+            prologue16_overlap=_PROLOGUE16_OVERLAP,
+            prologue16_kv_split=_PROLOGUE16_KV_SPLIT,
+            prologue8_overlap=_PROLOGUE8_OVERLAP,
+            prologue_push=_PROLOGUE_PUSH,
+            prologue_f32x2=_PROLOGUE_F32X2,
+            idx_front=bool(self.idx_split),
+            prologue16_row_norm=_PROLOGUE16_ROW_NORM,
+            prologue16_early_arm=_PROLOGUE16_EARLY_ARM,
+            prologue8_early_arm=_PROLOGUE8_EARLY_ARM,
+            uv_values_per_cta=self.uv_vpc,
         )
+        if self.idx_split:
+            split_rows = [m for m in sorted(rows) if self.idx_split_min_rows <= m <= 16]
+            fronts = {f"front.{kernel_rows(m)}" for m in split_rows}
+            for name in [k for k in specs if k.startswith("front.") and k not in fronts]:
+                del specs[name]  # no width splits at this capacity
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: indexer-layer prologue split built: "
+                "P_front %s, P_back = %s on a side stream forked after %s, at rows %s "
+                "(%s=%d, %s=%d)",
+                sorted(fronts),
+                sorted({f"prologue_end.{kernel_rows(m)}" for m in split_rows}),
+                "the indexer query" if self.idx_split == 2 else "q_a / kv_a",
+                split_rows,
+                IDX_SPLIT_ENV,
+                self.idx_split,
+                IDX_SPLIT_MIN_ROWS_ENV,
+                self.idx_split_min_rows,
+            )
+        if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 16-row MLA prologue in the "
+                "overlapped issue order (%s=1)",
+                PROLOGUE16_OVERLAP_ENV,
+            )
+        if _PROLOGUE16_KV_SPLIT and "prologue.16" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: the 9-16-row prologue writes the "
+                "kv rows 8-15 on their own CTAs (%s)",
+                "target" if self.target else "draft",
+            )
+        if "prologue.8" in specs and getattr(specs["prologue.8"][0], "early_arm8", False):
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 8-row MLA prologue's QN barrier "
+                "armed before its weight copies (%s=1)",
+                PROLOGUE8_EARLY_ARM_ENV,
+            )
+        if _PROLOGUE8_OVERLAP and "prologue.8" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 8-row MLA prologue in the "
+                "overlapped issue order (%s=1)",
+                PROLOGUE8_OVERLAP_ENV,
+            )
+        for on, env, what in (
+            (_PROLOGUE_PUSH, PROLOGUE_PUSH_ENV, "pushed q_nope hand-off"),
+            (_PROLOGUE_F32X2, PROLOGUE_F32X2_ENV, "packed branch-free normalize"),
+        ):
+            forms = [
+                c
+                for c, flag in ((8, _PROLOGUE8_OVERLAP), (16, _PROLOGUE16_OVERLAP))
+                if on and flag and f"prologue.{c}" in specs
+            ]
+            if forms:
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: MLA prologue %s at max rows %s "
+                    "(%s=1)",
+                    what,
+                    forms,
+                    env,
+                )
+        for key_name, env, what in (
+            ("row_norm", PROLOGUE16_ROW_NORM_ENV, "q rows summed and normalized by their loading warp"),
+            ("early_arm", PROLOGUE16_EARLY_ARM_ENV, "QN barrier armed before the weight copies"),
+        ):
+            if "prologue.16" in specs and specs["prologue.16"][1].get(key_name):
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 16-row MLA prologue: %s (%s=1)",
+                    what,
+                    env,
+                )
+        self.sparse_ll = self._sparse_ll_plan(rows)
         for name, (kernel, key, args) in specs.items():
             fn = compile_cached(
                 kernel, key, lambda k=kernel, a=args: cute.compile(k, *a)
@@ -685,6 +1011,48 @@ class AttentionGlue:
                     "NVIDIA megakernel: GLM-5.3 / GLM-5.2: deferred input norm: "
                     "epilogue-scaled q_a / kv_a projection built"
                 )
+
+    def _sparse_ll_plan(self, rows: Tuple[int, ...]) -> Dict[int, Tuple[int, Optional[int]]]:
+        """{verify rows: (ll flash-decode CTAs per row, one-tile shared memory or
+        None)} for the rows SPARSE_LL_MIN_ROWS_ENV moves to ll.sparse_mla_fd: the
+        one-tile kernel up to its one-wave (spread) rows, the multi-tile kernel above;
+        co-resident clusters agreed over the TP group, so every rank builds one plan."""
+        lo = _SPARSE_LL_MIN_ROWS
+        # the target's verify only (the draft layer keeps its stock sparse MLA)
+        want = sorted(m for m in rows if self.target and lo > 0 and lo <= m <= 16)
+        if not want:
+            return {}
+        from sgl_nvidia_mega.glm5_3.ll import sparse_mla as fd
+
+        caps = err = None
+        try:
+            caps = fd.device_caps(HEADS, with_mt=True, with_fold=False)
+        except Exception as e:  # noqa: BLE001 (agreed: raises on every rank)
+            err = e
+        caps = fd.agree_caps(caps, err, fd._tp_group(), with_mt=True, with_fold=False)
+        one_max = min(caps.spread_rows, _SPARSE_LL_ONE_TILE_MAX or fd.ONE_TILE_MAX_ROWS)
+        plan: Dict[int, Tuple[int, Optional[int]]] = {}
+        for m in want:
+            if m <= one_max:
+                plan[m] = (fd.ONE_TILE_SPLITS, caps.spread_smem_bytes)
+            else:
+                sp = fd.mt_splits_for_rows(m, caps.mt_rows)
+                if sp:
+                    plan[m] = (sp, None)
+        if plan:
+            dev = torch.device("cuda", torch.cuda.current_device())
+            self.ll_lens = torch.full((16,), TOPK, dtype=torch.int32, device=dev)
+        logger.info(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: sparse MLA on ll.sparse_mla_fd at "
+            "rows %s (CTAs per row %s; one-tile <= %d rows, spread clusters %d, "
+            "multi-tile co-resident %s) (target)",
+            sorted(plan),
+            [plan[m][0] for m in sorted(plan)],
+            one_max,
+            caps.spread_rows,
+            list(zip(fd.MT_SPLITS, caps.mt_rows)),
+        )
+        return plan
 
     def step_reasons(self, model, forward_batch, view) -> List[str]:
         """Host-only facts the attention kernels need beyond the stock copies
@@ -734,6 +1102,12 @@ class AttentionGlue:
         if f"uv.{kernel_rows(rows)}" not in self.fn:
             return None
         return FusedAttention(self, rows)
+
+
+def _cu(stream):
+    import cuda.bindings.driver as cuda
+
+    return cuda.CUstream(stream.cuda_stream)
 
 
 def _allow_cluster16(compiled):

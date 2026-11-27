@@ -72,8 +72,27 @@ def top8_rows(scores, keys, lane: Int32):
 
 class MoeRouteTop8:
     """ids_out [M][8] int32 (selection order) and weights_out [M][8] fp32 (BF16 values)
-    from fp32 logits [M][256] and an fp32 bias [256]; M <= 16. Launches its dependents
-    at entry, then waits for its own inputs."""
+    from fp32 logits [M][256] and an fp32 bias [256]; M <= max_rows (16 or 32).
+    Launches its dependents at entry, then waits for its own inputs."""
+
+    max_rows = MAX_ROWS
+    multi_cta = False
+
+    def __init__(self, max_rows: int = MAX_ROWS, multi_cta: bool = False):
+        if not 1 <= max_rows <= 32:
+            raise ValueError(f"MoeRouteTop8: max_rows {max_rows} (1..32)")
+        if max_rows != MAX_ROWS:
+            self.max_rows = int(max_rows)
+        if multi_cta:
+            self.multi_cta = True
+
+    def knobs(self) -> dict:
+        out = {}
+        if self.max_rows != MAX_ROWS:
+            out["max_rows"] = self.max_rows
+        if self.multi_cta:
+            out["multi_cta"] = True
+        return out
 
     @cute.jit
     def __call__(
@@ -86,13 +105,22 @@ class MoeRouteTop8:
         rows: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(logits, bias, scale, ids_out, weights_out, rows).launch(
-            grid=[1, 1, 1],
-            block=[32 * rows, 1, 1],
-            max_number_threads=[32 * MAX_ROWS, 1, 1],
-            stream=stream,
-            use_pdl=True,
-        )
+        if cutlass.const_expr(self.multi_cta):
+            self.kernel(logits, bias, scale, ids_out, weights_out, rows).launch(
+                grid=[rows, 1, 1],
+                block=[32, 1, 1],
+                max_number_threads=[32, 1, 1],
+                stream=stream,
+                use_pdl=True,
+            )
+        else:
+            self.kernel(logits, bias, scale, ids_out, weights_out, rows).launch(
+                grid=[1, 1, 1],
+                block=[32 * rows, 1, 1],
+                max_number_threads=[32 * self.max_rows, 1, 1],
+                stream=stream,
+                use_pdl=True,
+            )
 
     @cute.kernel
     def kernel(
@@ -107,8 +135,13 @@ class MoeRouteTop8:
         cute.arch.griddepcontrol_launch_dependents()
         cute.arch.griddepcontrol_wait()
         tid, _, _ = cute.arch.thread_idx()
-        n = tid >> 5
-        lane = tid & 31
+        if cutlass.const_expr(self.multi_cta):
+            bid, _, _ = cute.arch.block_idx()
+            n = bid
+            lane = tid
+        else:
+            n = tid >> 5
+            lane = tid & 31
         if n < rows:
             src = logits + Int64(n * NUM_EXPERTS + lane * PER_LANE) * 4
             l0 = ld_cg_v4_f32(src)

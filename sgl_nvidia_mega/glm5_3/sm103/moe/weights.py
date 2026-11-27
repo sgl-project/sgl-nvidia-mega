@@ -40,13 +40,13 @@ class LayoutMismatch(RuntimeError):
     """The processed weights do not have the layout the engine reads."""
 
 
-def fc1_sources(device=None) -> torch.Tensor:
-    """[512] source row of each processed FC1 row, indexing cat([gate, up]) (gate
-    0..255)."""
-    r = torch.arange(FC1_ROWS)
+def fc1_sources(device=None, inter: int = INTER) -> torch.Tensor:
+    """[2 * inter] source row of each processed FC1 row, indexing cat([gate, up]) (gate
+    0..inter-1)."""
+    r = torch.arange(2 * inter)
     i = r % 32
     h = 64 * (r // 128) + 16 * ((r // 32) % 4) + 2 * (i & 7) + (i >> 4)
-    return torch.where((i & 8) != 0, h, INTER + h).to(device)
+    return torch.where((i & 8) != 0, h, inter + h).to(device)
 
 
 def fc2_sources(device=None) -> torch.Tensor:
@@ -88,19 +88,21 @@ def _u8(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype == torch.uint8 else t.view(torch.uint8)
 
 
-def expected_processed(gate, up, gate_sf, up_sf, w2, w2_sf):
+def expected_processed(gate, up, gate_sf, up_sf, w2, w2_sf, inter: int = INTER):
     """The processed tensors the engine reads, from source-layout inputs (uint8):
-    gate / up [E, 256, 3072], their scales [E, 256, 384], w2 [E, 6144, 128], w2_sf
-    [E, 6144, 16]. Returns (w13 [E, 512, 3072], w13_sf [E, 512 * 384], w2, w2_sf
-    [E, 6144 * 16])."""
-    src1 = fc1_sources(gate.device)
+    gate / up [E, inter, 3072], their scales [E, inter, 384], w2 [E, 6144, inter/2],
+    w2_sf [E, 6144, inter/16]. Returns (w13 [E, 2*inter, 3072], w13_sf [E, 2*inter*384],
+    w2, w2_sf [E, 6144 * inter/16])."""
+    src1 = fc1_sources(gate.device, inter=inter)
     src2 = fc2_sources(w2.device)
     w13 = torch.cat([gate, up], dim=1)[:, src1]
     s13 = interleave(torch.cat([gate_sf, up_sf], dim=1)[:, src1])
     return w13, s13, w2[:, src2], interleave(w2_sf[:, src2])
 
 
-def layout_self_test(process, device, experts: int = 3, seed: int = 1000) -> int:
+def layout_self_test(
+    process, device, experts: int = 3, seed: int = 1000, inter: int = INTER
+) -> int:
     """Run ``process(gate, up, gate_sf, up_sf, w2, w2_sf) -> (w13, w13_sf, w2, w2_sf)``
     (the engine's own stock processing, from its loader layout) on a synthetic layer of
     random bytes and compare every byte with the layout the engine reads. Returns the
@@ -110,15 +112,17 @@ def layout_self_test(process, device, experts: int = 3, seed: int = 1000) -> int
     def rand(*shape):
         return torch.randint(0, 256, shape, generator=g, dtype=torch.uint8).to(device)
 
+    fc2_bytes = inter // 2
+    fc2_sf = inter // 16
     src = (
-        rand(experts, INTER, FC1_BYTES),
-        rand(experts, INTER, FC1_BYTES),
-        rand(experts, INTER, FC1_SF),
-        rand(experts, INTER, FC1_SF),
-        rand(experts, HIDDEN, FC2_BYTES),
-        rand(experts, HIDDEN, FC2_SF),
+        rand(experts, inter, FC1_BYTES),
+        rand(experts, inter, FC1_BYTES),
+        rand(experts, inter, FC1_SF),
+        rand(experts, inter, FC1_SF),
+        rand(experts, HIDDEN, fc2_bytes),
+        rand(experts, HIDDEN, fc2_sf),
     )
-    want = expected_processed(*src)
+    want = expected_processed(*src, inter=inter)
     got = process(*[t.clone() for t in src])
     names = ("w13", "w13 scales", "w2", "w2 scales")
     count = 0
@@ -137,40 +141,47 @@ def layout_self_test(process, device, experts: int = 3, seed: int = 1000) -> int
 
 
 # ---------------------------------------------------------------- FC2 records
-def fc2_records(w2: torch.Tensor, w2_sf: torch.Tensor, chunk: int = 32) -> torch.Tensor:
-    """Compact FC2 records [E][4 j][4 c][3 x 18,432 B] from one layer's processed w2
-    (uint8 [E, 6144, 128]) and its processed scales ([E, 6144 * 16] bytes), built
-    ``chunk`` experts at a time. Record (e, j, c), slot s, tile t (row block
-    ``1536 c + 512 s + 128 t``): 4 KiB of weights in the engine's K-major image
-    [16 row groups][2 K halves][8 rows][16 B] for K bytes ``32 j .. 32 j + 31``, then
-    512 B of scales [32 l][4 q][4 kb]."""
+def fc2_records(
+    w2: torch.Tensor,
+    w2_sf: torch.Tensor,
+    chunk: int = 32,
+    inter: int = INTER,
+) -> torch.Tensor:
+    """Compact FC2 records [E][quarters j][4 c][3 x 18,432 B] from one layer's
+    processed w2 (uint8 [E, 6144, inter/2]) and its processed scales ([E, 6144 *
+    inter/16] bytes), built ``chunk`` experts at a time."""
+    if inter % 64 != 0:
+        raise ValueError(f"inter must be a multiple of 64, got {inter}")
+    quarters = inter // 64
+    fc2_bytes = inter // 2
+    fc2_sf = inter // 16
     experts = w2.shape[0]
-    w2 = _u8(w2).reshape(experts, HIDDEN, FC2_BYTES)
-    sf = _u8(w2_sf).reshape(experts, HIDDEN * FC2_SF)
+    w2 = _u8(w2).reshape(experts, HIDDEN, fc2_bytes)
+    sf = _u8(w2_sf).reshape(experts, HIDDEN * fc2_sf)
     inv2 = torch.argsort(fc2_sources(w2.device))
     out = torch.empty(
-        experts, 4, 4, FC2_SLOTS * SLOT, dtype=torch.uint8, device=w2.device
+        experts, quarters, 4, FC2_SLOTS * SLOT, dtype=torch.uint8, device=w2.device
     )
     for e0 in range(0, experts, chunk):
         ne = min(chunk, experts - e0)
         raw = w2[e0 : e0 + ne][
             :, inv2
-        ]  # [ne, 6144 = c*1536 + t*128 + rg*8 + rr, 128 = j*32 + kc*16 + b]
+        ]  # [ne, 6144 = c*1536 + t*128 + rg*8 + rr, fc2_bytes = j*32 + kc*16 + b]
         a2 = (
-            raw.view(ne, 4, 12, 16, 8, 4, 2, 16)
+            raw.view(ne, 4, 12, 16, 8, quarters, 2, 16)
             .permute(0, 5, 1, 2, 3, 6, 4, 7)
-            .reshape(ne, 4, 4, 3, 4 * 4096)
+            .reshape(ne, quarters, 4, 3, 4 * 4096)
         )
-        rs = deinterleave(sf[e0 : e0 + ne], HIDDEN, FC2_SF)[
+        rs = deinterleave(sf[e0 : e0 + ne], HIDDEN, fc2_sf)[
             :, inv2
-        ]  # [ne, 6144 = c*1536 + t*128 + q*32 + l, 16]
+        ]  # [ne, 6144 = c*1536 + t*128 + q*32 + l, fc2_sf]
         s2 = (
-            rs.view(ne, 4, 12, 4, 32, 4, 4)
+            rs.view(ne, 4, 12, 4, 32, quarters, 4)
             .permute(0, 5, 1, 2, 4, 3, 6)
-            .reshape(ne, 4, 4, 3, 4 * 512)
+            .reshape(ne, quarters, 4, 3, 4 * 512)
         )
         out[e0 : e0 + ne] = torch.cat([a2, s2], dim=-1).reshape(
-            ne, 4, 4, FC2_SLOTS * SLOT
+            ne, quarters, 4, FC2_SLOTS * SLOT
         )
     return out
 
@@ -180,41 +191,45 @@ SHARED_CHUNK = 32768
 SHARED_RECORD = 18 * SHARED_CHUNK  # 589,824 bytes per (quarter, CTA)
 
 
-def shared_rows(device=None) -> torch.Tensor:
-    """[4 quarters x 128] row of gate_up [512, 6144] (gate 0..255, up 256..511) for each
-    local row: quarter sq, local row 32 q + i is gate row 64 sq + 16 q + i (i < 16) or
-    up row 64 sq + 16 q + i - 16."""
-    sq = torch.arange(4).view(4, 1, 1)
+def shared_rows(device=None, inter: int = INTER) -> torch.Tensor:
+    """[quarters x 128] row of gate_up [2*inter, 6144] (gate 0..inter-1, up
+    inter..2*inter-1) for each local row: quarter sq, local row 32 q + i is gate row
+    64 sq + 16 q + i (i < 16) or up row 64 sq + 16 q + i - 16."""
+    quarters = inter // 64
+    sq = torch.arange(quarters).view(quarters, 1, 1)
     q = torch.arange(4).view(1, 4, 1)
     i = torch.arange(32).view(1, 1, 32)
     h = 64 * sq + 16 * q + (i % 16)
-    return torch.where(i < 16, h, INTER + h).reshape(-1).to(device)
+    return torch.where(i < 16, h, inter + h).reshape(-1).to(device)
 
 
-def shared_pack(gate_up: torch.Tensor, down: torch.Tensor) -> torch.Tensor:
-    """BF16 shared expert (gate_up [512, 6144], gate rows first; down [6144, 256]) -> [4
-    quarters][4 CTAs][589,824 B]: FC1 as 24 boxes of 128 rows x 64 K (no-swizzle K-major
-    images [16][8 K groups][8 rows][16 B]) over K range ``1536 c .. +1536``, then FC2 as
-    12 tiles of 128 output rows x 64 K (``1536 c + 128 t + r``, K = h in the quarter).
-    """
-    if gate_up.dtype != torch.bfloat16 or tuple(gate_up.shape) != (FC1_ROWS, HIDDEN):
-        raise ValueError(f"gate_up must be bf16 [{FC1_ROWS}, {HIDDEN}]")
-    if down.dtype != torch.bfloat16 or tuple(down.shape) != (HIDDEN, INTER):
-        raise ValueError(f"down must be bf16 [{HIDDEN}, {INTER}]")
+def shared_pack(
+    gate_up: torch.Tensor, down: torch.Tensor, inter: int = INTER
+) -> torch.Tensor:
+    """BF16 shared expert (gate_up [2*inter, 6144], gate rows first; down [6144,
+    inter]) -> [quarters][4 CTAs][589,824 B]."""
+    if inter % 64 != 0:
+        raise ValueError(f"inter must be a multiple of 64, got {inter}")
+    quarters = inter // 64
+    fc1_rows = 2 * inter
+    if gate_up.dtype != torch.bfloat16 or tuple(gate_up.shape) != (fc1_rows, HIDDEN):
+        raise ValueError(f"gate_up must be bf16 [{fc1_rows}, {HIDDEN}]")
+    if down.dtype != torch.bfloat16 or tuple(down.shape) != (HIDDEN, inter):
+        raise ValueError(f"down must be bf16 [{HIDDEN}, {inter}]")
     w = (
-        gate_up[shared_rows(gate_up.device)].contiguous().view(torch.uint8)
-    )  # [512, 12288]
+        gate_up[shared_rows(gate_up.device, inter=inter)].contiguous().view(torch.uint8)
+    )  # [2*inter, 12288]
     a = (
-        w.view(4, 16, 8, 4, 24, 8, 16)
+        w.view(quarters, 16, 8, 4, 24, 8, 16)
         .permute(0, 3, 4, 1, 5, 2, 6)
-        .reshape(4, 4, 24 * 16384)
+        .reshape(quarters, 4, 24 * 16384)
     )
     d = down.contiguous().view(
         torch.uint8
-    )  # [6144 = c*1536 + t*128 + rg*8 + rr, 512 = sq*128 + kc*16 + b]
+    )  # [6144 = c*1536 + t*128 + rg*8 + rr, 2*inter = sq*128 + kc*16 + b]
     f2 = (
-        d.view(4, 12, 16, 8, 4, 8, 16)
+        d.view(4, 12, 16, 8, quarters, 8, 16)
         .permute(4, 0, 1, 2, 5, 3, 6)
-        .reshape(4, 4, 12 * 16384)
+        .reshape(quarters, 4, 12 * 16384)
     )
     return torch.cat([a, f2], dim=-1).contiguous()

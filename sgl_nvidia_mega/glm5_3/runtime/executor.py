@@ -92,7 +92,6 @@ SGLANG_READS = {
         "topk_indices",
         "update",
     ),
-    "srt/utils/common.py": ("BumpAllocator",),
     # GlmMoeDsaForCausalLM / DeepseekV2Model, which the executor stands in for
     "srt/models/deepseek_v2.py": (
         "capture_aux_hidden_states",
@@ -272,13 +271,15 @@ class GlmMegakernelVerify:
             maybe_prefetch_next_full_attention_kv,
         )
         from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-        from sglang.srt.utils import BumpAllocator
+
+        from sgl_nvidia_mega.glm5_3.runtime import LazyZeroAllocator
 
         mm = self.lm.model
         step = StepContext(
             forward_batch=forward_batch,
             positions=positions,
-            zero_allocator=BumpAllocator(
+            # no eager zero fill: its memset node delayed the graph's first kernel
+            zero_allocator=LazyZeroAllocator(
                 buffer_size=(mm.end_layer - mm.start_layer) * 2,
                 dtype=torch.float32,
                 device=positions.device,

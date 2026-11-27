@@ -44,8 +44,14 @@ class MoeFinalize:
     """``shared``: add the shared expert's partials (the served form); off is
     test-only."""
 
-    def __init__(self, shared: bool = True):
+    def __init__(self, shared: bool = True, quarters: int = QUARTERS):
         self.shared = shared
+        self.quarters = int(quarters)
+        if self.quarters not in (4, 8):
+            raise ValueError(f"MoeFinalize: quarters {quarters} (4 or 8)")
+
+    def knobs(self) -> dict:
+        return {"quarters": self.quarters} if self.quarters != QUARTERS else {}
 
     @cute.jit
     def __call__(
@@ -92,12 +98,12 @@ class MoeFinalize:
         r = idx - n * HIDDEN
         live = idx < rows * HIDDEN
 
-        part = cute.make_rmem_tensor(cute.make_layout(QUARTERS * TOP_K), Float32)
+        part = cute.make_rmem_tensor(cute.make_layout(self.quarters * TOP_K), Float32)
         part.fill(0.0)
         shared_sum = Float32(0.0)
         if live:
             column = partials + Int64(r) * 4
-            for q in cutlass.range_constexpr(QUARTERS):
+            for q in cutlass.range_constexpr(self.quarters):
                 for k in cutlass.range_constexpr(TOP_K):
                     row = (Int64(q) * Int64(rows) + Int64(n)) * TOP_K + k
                     part[q * TOP_K + k] = ld_cg_f32(column + row * (HIDDEN * 4))
@@ -105,12 +111,10 @@ class MoeFinalize:
                 element = shared_partials + Int64(idx) * 4
                 stride = Int64(rows) * (HIDDEN * 4)
                 s0 = ld_cg_f32(element)
-                s1 = ld_cg_f32(element + stride)
-                s2 = ld_cg_f32(element + 2 * stride)
-                s3 = ld_cg_f32(element + 3 * stride)
-                shared_sum = add_f32(
-                    add_f32(add_f32(add_f32(s0, Float32(0.0)), s1), s2), s3
-                )
+                shared_sum = add_f32(s0, Float32(0.0))
+                for q in cutlass.range_constexpr(1, self.quarters):
+                    sq = ld_cg_f32(element + Int64(q) * stride)
+                    shared_sum = add_f32(shared_sum, sq)
         if (tid < TOP_K) & (n < rows):
             offset = Int64(n * TOP_K + tid) * 4
             slot_ids[tid] = ld_cg_s32(ids + offset)
@@ -121,10 +125,9 @@ class MoeFinalize:
             routed = Float32(0.0)
             for k in cutlass.range_constexpr(TOP_K):
                 if slot_ids[k] >= 0:
-                    acc = add_f32(
-                        add_f32(add_f32(part[k], part[TOP_K + k]), part[2 * TOP_K + k]),
-                        part[3 * TOP_K + k],
-                    )
+                    acc = part[k]
+                    for q in cutlass.range_constexpr(1, self.quarters):
+                        acc = add_f32(acc, part[q * TOP_K + k])
                     expert = round_bf16(mul_f32(acc, slot_g[k]))
                     routed = fma_rn(slot_w[k], expert, routed)
             if cutlass.const_expr(self.shared):
