@@ -88,5 +88,18 @@ concurrency 1 with greedy or temperature / top-p sampling.
 
 ## Tests
 
-GLM-5.3 GPU and end-to-end suites are not yet part of the initial CI workflow.
 The GLM-5.3 CPU config and SGLang contract checks are included in `test/unit`.
+The end-to-end tests (`test/e2e/ci_models.yaml` key `glm5_3`, label
+`run-ci-sglang:glm5_3`) run the TP4 setup on the four-GPU GB300 runner, with
+`nvidia/GLM-5.2-NVFP4` unless `SGLANG_NVIDIA_MEGAKERNEL_E2E_MODEL_PATH` names another
+checkpoint:
+
+- `test_glm5_3_server.py`: GSM8K (5 shots, all 1319 questions, greedy) on SGLang's
+  own path, then with `--enable-nvidia-megakernel`, at 8 concurrent requests (every
+  verify step within the kernel units) and 16 (across their boundary); a verdict per
+  concurrency on accuracy and on the mean acceptance length, and the candidate's log
+  checked for the kernel units and the armed NextN draft.
+- `test_glm5_3_switch.py`: with every slot off and the test-only parity switch, each
+  eager verify step of 6 to 48 rows reproduces SGLang's logits bit for bit.
+
+TP8 and TP16 have no end-to-end test in CI.

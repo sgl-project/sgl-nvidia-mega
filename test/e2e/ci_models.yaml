@@ -16,6 +16,13 @@ deepseek_v41:
     - test_deepseek_v41_server.py
     - test_deepseek_v41_switch.py
 
+glm5_3:
+  gpu: GB300
+  gpus: 4
+  tests:
+    - test_glm5_3_server.py
+    - test_glm5_3_switch.py
+
 # The runner: four GB300 on one host, in SGLang's cu134 image: it carries the MSA
 # kernels SGLang's MiniMax-M3.1 support imports, at SGLang's pinned commit (no other
 # SGLang branch is needed). The server compiles the package's kernels when it loads,
