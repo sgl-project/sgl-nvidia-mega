@@ -154,6 +154,12 @@ def test_sglang_provides_what_the_plugin_reads(path):
         if skipped:
             unchecked.append(f"{reason}: {_id(path)} reads {sorted(skipped)}")
             names = [n for n in names if n not in skipped]
+        if files == _files(DRAFT_CHECK):
+            for marker, seam, why in SPEC_SEAMS:
+                hit = [n for n in names if n in seam]
+                if hit and marker not in _provided(files[0]):
+                    unchecked.append(f"{why}: {_id(path)} reads {sorted(hit)}")
+                    names = [n for n in names if n not in seam]
         missing += [
             f"{pattern}: {n}"
             for n in names
@@ -238,6 +244,36 @@ DRAFT_CHECK, DRAFT_CHECK_NAMES = (
     ("EAGLE_DRAFT_CAPTURE_CHECK",),
 )
 NO_DRAFT_CHECK = "this SGLang's EAGLE draft graph runners run no draft capture check"
+SPEC_SEAMS = (
+    (
+        "SupportsRecurrentCommit",
+        frozenset(
+            {
+                "SupportsRecurrentCommit",
+                "commit_recurrent_state",
+                "track_slots",
+                "request_rows",
+                "accept_lens",
+                "last_step",
+                "state_slots",
+                "src_indices_raw",
+                "state_bytes_per_slot",
+                "state_bytes_per_request_row",
+                "keeps_draft_ssm",
+                "tracks_decode_state",
+                "backs_up_state",
+                "reset_state_slots",
+            }
+        ),
+        "this SGLang commits no verify through a megakernel build "
+        "(SupportsRecurrentCommit)",
+    ),
+    (
+        "GatheredLogitsView",
+        frozenset({"GatheredLogitsView", "gathered_tokens", "values", "temperatures"}),
+        "this SGLang's post-verify strategy takes no gathered-logits sampler",
+    ),
+)
 
 
 # The Kimi K3.1 megakernel reads SGLang's K3.1 host bindings (sgl-project/sglang#48414);
@@ -557,6 +593,33 @@ def test_the_dflash_binding_binds_and_guards_what_the_runtime_declares(path):
         _assigned(binding, "GUARDS")
     )
     assert not unguarded, f"{_id(path)}: SGLang has no guard key {sorted(unguarded)}"
+
+
+FLASHINFER_PINS = [
+    (path, relative, digests)
+    for path in sorted(PACKAGE.rglob("*.py"))
+    for relative, digests in _declared(path, "FLASHINFER_SOURCES").items()
+]
+
+
+@pytest.mark.parametrize(
+    "path, relative, digests",
+    FLASHINFER_PINS,
+    ids=[f"{_id(p)}::{r}" for p, r, _ in FLASHINFER_PINS],
+)
+def test_the_mirrored_flashinfer_sources_are_unchanged(path, relative, digests):
+    import importlib.util
+
+    found = importlib.util.find_spec("flashinfer")
+    if found is None or found.origin is None:
+        pytest.skip("FlashInfer is not installed")
+    source = Path(found.origin).parent / relative
+    assert source.is_file(), f"{_id(path)}: FlashInfer no longer has {relative}"
+    got = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert got in digests, (
+        f"FlashInfer changed {relative}, which {_id(path)} mirrors: re-read it, update "
+        f"the mirror and its tests, then pin {got!r} in its FLASHINFER_SOURCES"
+    )
 
 
 def _built_classes() -> dict:

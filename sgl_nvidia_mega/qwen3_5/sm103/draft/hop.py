@@ -61,8 +61,8 @@ class GemvParams(ctypes.Structure):
     ]
 
 
-def consume_name(world: int, add_norm: bool, early: bool) -> str:
-    mode = "add_norm" if add_norm else "mnnvl"
+def consume_name(world: int, early: bool, cols: bool = False) -> str:
+    mode = "add_norm_cols" if cols else "add_norm"
     return f"q35hop_draft_{mode}{'_early' if early else ''}_w{world}"
 
 
@@ -76,9 +76,9 @@ def _consume_kernels(device_index: int, deadline_ns: int) -> dict[str, jit.Kerne
         ("-std=c++17", "-default-device", f"-DQ35_HOP_DEADLINE_NS={deadline_ns}ull"),
     )
     names = [
-        consume_name(w, add_norm, early)
+        consume_name(w, early, cols)
         for w in decode_hop.WORLDS
-        for add_norm in (False, True)
+        for cols in (False, True)
         for early in (False, True)
     ]
     return {n: jit.load(cubin, n, (decode_hop.ROW_THREADS, 1, 1), 0) for n in names}
@@ -136,32 +136,21 @@ def draft_all_reduce_rms_norm(
     gamma: torch.Tensor,
     eps: float,
     weight_bias: float,
-    add_norm: bool,
     early_release: bool = False,
     delay_ns: int = 0,
     pushed: bool = False,
+    cols: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(norm, residual_out) [M, 4096] bf16 of sum_ranks(partial) + residual on ``hop``
     (an ``sm103.hop.Hop``). ``pushed``: a producer already pushed this partial, so only
     the consume runs. ``early_release``: the consume releases its dependents at entry
     (they must read only static data before their PDL wait)."""
+    if cols and not pushed:
+        raise ValueError("draft hop: the column-owned consume needs a pushed partial")
     m = int(local_contribution.shape[0])
     shape = (m, HIDDEN)
-    if (
-        not hop.supports(m)
-        or tuple(residual.shape) != shape
-        or tuple(gamma.shape) != (HIDDEN,)
-        or residual.dtype != torch.bfloat16
-        or gamma.dtype != torch.bfloat16
-        or not (residual.is_contiguous() and gamma.is_contiguous())
-    ):
-        raise ValueError(
-            f"draft hop: rows {m} (1-{hop.max_m}), residual {residual.dtype} "
-            f"{tuple(residual.shape)}, gamma {gamma.dtype} {tuple(gamma.shape)}"
-        )
+    _check_consume_operands(hop, m, residual, gamma)
     stream = torch.cuda.current_stream(hop.device).cuda_stream
-    norm = torch.empty(shape, dtype=torch.bfloat16, device=hop.device)
-    residual_out = torch.empty(shape, dtype=torch.bfloat16, device=hop.device)
     if not pushed:
         if (
             tuple(local_contribution.shape) != shape
@@ -181,6 +170,119 @@ def draft_all_reduce_rms_norm(
             [publish],
             stream,
         )
+    return _consume(
+        hop,
+        m,
+        residual,
+        gamma,
+        eps,
+        weight_bias,
+        stream,
+        early_release=early_release,
+        delay_ns=delay_ns,
+        cols=cols,
+    )
+
+
+def draft_finalize_all_reduce_rms_norm(
+    hop,
+    *,
+    routed_output: torch.Tensor,
+    expert_weights: torch.Tensor,
+    permuted_indices: torch.Tensor,
+    gated_shared_output: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    weight_bias: float,
+    early_release: bool = False,
+    delay_ns: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, top_k = (int(n) for n in permuted_indices.shape)
+    if top_k > decode_hop.MAX_TOP_K:
+        raise ValueError(
+            f"draft hop: top-{top_k} routing (at most {decode_hop.MAX_TOP_K})"
+        )
+    shared = gated_shared_output
+    # the operand types the decode hop's finalize publish reads
+    if (
+        routed_output.dtype != torch.bfloat16
+        or expert_weights.dtype != torch.bfloat16
+        or permuted_indices.dtype != torch.int32
+        or (shared is not None and shared.dtype != torch.bfloat16)
+    ):
+        raise ValueError(
+            f"draft hop: finalize routed {routed_output.dtype}, weights "
+            f"{expert_weights.dtype}, rows {permuted_indices.dtype}, shared "
+            f"{None if shared is None else shared.dtype}"
+        )
+    _check_consume_operands(hop, m, residual, gamma)
+    hop._check_consumed()
+    stream = torch.cuda.current_stream(hop.device).cuda_stream
+    identity = (
+        permuted_indices.is_contiguous()
+        and decode_hop._IDENTITY_ROWS.get(permuted_indices.data_ptr(), 0)
+        >= permuted_indices.numel()
+    )
+    publish = decode_hop.Args(
+        site=hop.site,
+        routed=routed_output.data_ptr(),
+        expert_w=expert_weights.data_ptr(),
+        permuted=None if identity else permuted_indices.data_ptr(),
+        shared=jit.null_or_pointer(shared).value,
+        m=m,
+        top_k=top_k,
+        eps=eps,
+    )
+    name = "q35hop_publish_fin_top10" if top_k == 10 else "q35hop_publish_fin"
+    jit.launch(hop.kernels[name], (m, decode_hop.QUAD_CTAS, 1), [publish], stream)
+    return _consume(
+        hop,
+        m,
+        residual,
+        gamma,
+        eps,
+        weight_bias,
+        stream,
+        early_release=early_release,
+        delay_ns=delay_ns,
+    )
+
+
+def _check_consume_operands(
+    hop, m: int, residual: torch.Tensor, gamma: torch.Tensor
+) -> None:
+    if (
+        not hop.supports(m)
+        or tuple(residual.shape) != (m, HIDDEN)
+        or tuple(gamma.shape) != (HIDDEN,)
+        or residual.dtype != torch.bfloat16
+        or gamma.dtype != torch.bfloat16
+        or not (residual.is_contiguous() and gamma.is_contiguous())
+    ):
+        raise ValueError(
+            f"draft hop: rows {m} (1-{hop.max_m}), residual {residual.dtype} "
+            f"{tuple(residual.shape)}, gamma {gamma.dtype} {tuple(gamma.shape)}"
+        )
+
+
+def _consume(
+    hop,
+    m: int,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    weight_bias: float,
+    stream: int,
+    *,
+    early_release: bool,
+    delay_ns: int,
+    cols: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the draft consume of ``m`` rows on ``hop``: (norm, residual_out)."""
+    shape = (m, HIDDEN)
+    norm = torch.empty(shape, dtype=torch.bfloat16, device=hop.device)
+    residual_out = torch.empty(shape, dtype=torch.bfloat16, device=hop.device)
     args = Args(
         site=hop.site,
         residual_in=residual.data_ptr(),
@@ -192,9 +294,7 @@ def draft_all_reduce_rms_norm(
         weight_bias=weight_bias,
         delay_ns=delay_ns,
     )
-    kernel = _CONSUME[hop.device.index][
-        consume_name(hop.world, add_norm, early_release)
-    ]
+    kernel = _CONSUME[hop.device.index][consume_name(hop.world, early_release, cols)]
     jit.launch(
         kernel,
         (m, decode_hop.ROW_CTAS, 1),

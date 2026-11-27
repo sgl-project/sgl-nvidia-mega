@@ -158,9 +158,8 @@ def launch(
     arguments: list,
     stream: int,
     cluster: Optional[tuple[int, int, int]] = None,
+    pdl: bool = True,
 ) -> None:
-    """Launch with programmatic stream serialization (PDL), in thread-block clusters
-    of ``cluster`` blocks when given; graph-capturable."""
     cu = driver()
     addresses = [
         argument.getPtr()
@@ -179,7 +178,7 @@ def launch(
         cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
     )
     attribute.value.programmaticStreamSerializationAllowed = 1
-    attributes = [attribute]
+    attributes = [attribute] if pdl else []
     if cluster is not None:
         dims = cu.CUlaunchAttribute()
         dims.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION

@@ -74,9 +74,15 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": "80c4b54b62df6e29",
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward": (
+        "633ff9a686d3ea28",
+        "80c4b54b62df6e29",
+    ),
     "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock.forward_normal_dual_stream": "afae959064cc8cd7",
-    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": "251e3d343aec92fe",
+    "srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock._forward_router_experts": (
+        "32d09f01b77d76b5",
+        "251e3d343aec92fe",
+    ),
 }
 
 
@@ -89,6 +95,7 @@ def build(model, ctx) -> route.Bound:
     from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
 
     bound = route.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")
+    _configure_tep8_rows(False, False, False, False, False)
     if "route" in SLOTS:
         rows = plan.widest(ctx.widths, plan.ROUTE_MAX_ROWS)
         if not rows:
@@ -147,15 +154,73 @@ def build(model, ctx) -> route.Bound:
             if reason:
                 return msgspec.structs.replace(bound, reason=f"TEP8 MoE body: {reason}")
             bound = msgspec.structs.replace(bound, pre=True)
-            if (
-                plan.widest(ctx.widths, plan.ROUTE_BIG_MAX_ROWS)
-                >= plan.ROUTE_BIG_MIN_ROWS
-            ):
-                mlp = model.model.layers[model.model.start_layer].mlp
-                router.build_big(
-                    torch.cuda.current_device(), mlp.experts.num_local_experts
+            mlp = model.model.layers[model.model.start_layer].mlp
+            bound = _build_tep8_rows(mlp, bound)
+            # route-big from its own floor, or from tier M's with variant slot route_big_mid
+            big_min = (
+                plan.ROUTE_BIG_MID_MIN_ROWS
+                if bound.big_mid
+                else plan.ROUTE_BIG_MIN_ROWS
+            )
+            if plan.widest(ctx.widths, plan.ROUTE_BIG_MAX_ROWS) >= big_min:
+                device = torch.cuda.current_device()
+                local = mlp.experts.num_local_experts
+                router.build_big(device, local)
+                route.route_lean_build(
+                    device,
+                    local,
+                    range(
+                        big_min,
+                        min(plan.ROUTE_BIG_MAX_ROWS, router.LEAN_WIDE_MAX_ROWS) + 1,
+                    ),
                 )
     return _build_shared_act_quant(model, bound)
+
+
+TEP8_ROWS = (
+    "moe_engine",
+    "moe_ring",
+    "route_big_gemm",
+    "route_lean",
+    "moe_engine_route",
+    "route_big_mid",
+)
+
+
+def _configure_tep8_rows(
+    engine: bool, ring: bool, gemm: bool, lean: bool, engine_route: bool
+) -> None:
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    body.configure(engine, ring=ring)
+    route.configure(gemm=gemm, lean=lean, engine_route=engine_route)
+
+
+def _build_tep8_rows(mlp, bound: route.Bound) -> route.Bound:
+    import msgspec
+
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    slots = runtime.SLOTS
+    engine = "moe_engine" in slots
+    if engine:
+        reason = body.engine_unsupported(mlp.experts)
+        if reason:
+            runtime.unavailable_slots(
+                sorted({"moe_engine", "moe_ring", "moe_engine_route"} & slots), reason
+            )
+            engine = False
+    gemm = "route_big_gemm" in slots
+    lean = "route_lean" in slots
+    _configure_tep8_rows(
+        engine,
+        engine and lean and "moe_ring" in slots,
+        gemm,
+        lean,
+        engine and gemm and "moe_engine_route" in slots,
+    )
+    return msgspec.structs.replace(bound, big_mid="route_big_mid" in slots)
 
 
 def _build_shared_act_quant(model, bound):
@@ -265,18 +330,21 @@ def _dual_stream(mlp, x, use_fused_gate: bool, defer: bool, st):
         current.wait_stream(mlp.alt_stream)
         return routed, shared
     if defer:
-        # routed FC2 stays on the current stream, the finalize's PDL dependency
-        routed = _router_experts(mlp, x, True, st)
-        with torch.cuda.stream(mlp.alt_stream):
-            if st.slots.lowm_se:
-                from sgl_nvidia_mega.qwen3_5 import lowm
+        from sgl_nvidia_mega.qwen3_5.moe import fc2ar
 
-                x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
-                shared = lowm.shared_expert(mlp, x, st.bound["lowm"], x8)
-            else:
-                shared = _shared_expert(mlp, x, st)
-                if shared is not None:
-                    shared = mlp._gate_shared_output_out_of_place(x, shared)
+        with fc2ar.scope(x.shape[0], st):
+            routed = _router_experts(mlp, x, True, st)
+            with torch.cuda.stream(mlp.alt_stream):
+                if st.slots.lowm_se:
+                    from sgl_nvidia_mega.qwen3_5 import lowm
+
+                    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+                    shared = lowm.shared_expert(mlp, x, st.bound["lowm"], x8)
+                else:
+                    shared = _shared_expert(mlp, x, st)
+                    if shared is not None:
+                        shared = mlp._gate_shared_output_out_of_place(x, shared)
+                fc2ar.aux_fence()
         current.wait_stream(mlp.alt_stream)
         return routed, shared
     shared = (
@@ -318,7 +386,11 @@ def _router_experts(mlp, x, defer: bool, st):
         return route.routed_given(mlp, x, st.bound["moe"], "mkm_m512")
     if defer and st.slots.route_topk:
         return route.routed_topk(
-            mlp, x, gemm=st.slots.route_gemm, pre=st.slots.route_pre
+            mlp,
+            x,
+            gemm=st.slots.route_gemm,
+            pre=st.slots.route_pre,
+            big=st.slots.route_big_mid,
         )
     router_logits, _ = mlp.gate(x)
     topk_output = mlp.topk(x, router_logits)

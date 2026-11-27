@@ -20,6 +20,7 @@ returning: the deadline is compiled in, as SGLang's ``BuildContext.deadline_s``.
 from __future__ import annotations
 
 import ctypes
+import math
 from functools import cache
 from pathlib import Path
 
@@ -33,7 +34,10 @@ HEADER = Path(__file__).parent / "src" / "q35_hop.cuh"
 # all-reduce (src/rlin.cu), through a router mailbox next to the hidden one.
 RL_SOURCE = Path(__file__).parent / "src" / "rlin.cu"
 RL_EXPERTS, RL_WORLD, RL_CTAS, RL_STEPS = 512, 8, 16, 12
+RL_CORE_STEPS, RL_SLICE_STEPS = 8, 4
+RL_TAIL = 520
 RL_SENTINEL = -(2**31)  # f32 -0.0 as int32: an empty router slot
+RL_CELLS = 4096 // 32
 HIDDEN, STAGES, ROW_CTAS, ROW_THREADS, QUAD_CTAS, MAX_TOP_K = 4096, 3, 4, 128, 8, 16
 OPROJ_THREADS, OPROJ_MAX_M, OPROJ_STEPS = 256, 8, (4, 8)  # K = 256 * steps
 SENTINEL = -32768  # bf16 -0.0 as int16: an empty mailbox slot
@@ -105,6 +109,7 @@ class RlArgs(ctypes.Structure):
         ("x_fp4", ctypes.c_void_p),
         ("x_sf", ctypes.c_void_p),
         ("gs", ctypes.c_void_p),
+        ("trace", ctypes.c_void_p),
     ]
 
 
@@ -116,25 +121,51 @@ def pack_router_lin(
     weight_scale: torch.Tensor,
     rank: int,
 ) -> torch.Tensor:
-    """The router-before-all-reduce weights of one layer on this rank, packed as the
-    rl push's mma.m16n8k16 bf16 A fragments: [A W_out,r * sx * sw | A[:, K_r]] (512 x
-    (1024 + 512)), A = router_w [512, 4096] scaled by the post-attention norm's applied
-    gamma per column, W_out,r [4096, 1024] this rank's e4m3 out_proj (row-major), K_r =
-    columns [512 rank, 512 rank + 512); packed [16 cta][8 warp][12 step][2 mtile][32 lane]
-    x 8 bf16 (a0..a3 of lane (g, t): rows g / g + 8, columns 2t / 2t + 8 of the 16 x 16
-    tile)."""
-    a = router_w.float() * gamma.float()[None, :]
     n, k = out_w_nk.shape
-    if tuple(a.shape) != (RL_EXPERTS, HIDDEN) or (n, k) != (HIDDEN, 1024):
-        raise ValueError(f"router {tuple(a.shape)}, out_proj {(n, k)}")
-    core = (a @ out_w_nk.float()) * (
-        input_scale.float() * weight_scale.float()
-    ).reshape(1, 1)
+    if tuple(router_w.shape) != (RL_EXPERTS, HIDDEN) or (n, k) != (HIDDEN, 1024):
+        raise ValueError(f"router {tuple(router_w.shape)}, out_proj {(n, k)}")
+    if router_w.dtype != torch.bfloat16:
+        raise ValueError(f"router-lin needs a bf16 router, not {router_w.dtype}")
     sl = HIDDEN // RL_WORLD
-    w = torch.cat([core, a[:, sl * rank : sl * (rank + 1)]], dim=1).to(torch.bfloat16)
+    g = gamma.double()
+    a = router_w.double() * g[None, :]
+    alpha = input_scale.double().reshape(()) * weight_scale.double().reshape(())
+    core = (
+        torch.cat(
+            [a @ out_w_nk[:, c : c + 256].float().double() for c in range(0, k, 256)],
+            dim=1,
+        )
+        * alpha
+    )
+    top = float(core.abs().max())
+    s = 14 - math.frexp(top)[1] if top > 0.0 else 0
+    if not math.isfinite(top) or not -16 <= s <= 64:
+        raise ValueError(f"router-lin core max {top:.3e} has no fp16 scale")
+    g2s = g[sl * rank : sl * (rank + 1)] * 2.0**s
+    g2s_bf = g2s.to(torch.bfloat16)
+    if not torch.equal(g2s_bf.double(), g2s):
+        raise ValueError("router-lin gamma * 2^s is not exact in bf16")
+    cw = (core * 2.0**s).to(torch.float16).view(torch.int16)
+    sw = router_w[:, sl * rank : sl * (rank + 1)].contiguous().view(torch.int16)
+    w = torch.cat(
+        [
+            cw.view(RL_EXPERTS, 8, RL_CORE_STEPS, 16),
+            sw.view(RL_EXPERTS, 8, RL_SLICE_STEPS, 16),
+        ],
+        dim=2,
+    )
     # rows = cta * 32 + mtile * 16 + rh * 8 + g; cols = (warp * 12 + step) * 16 + kh * 8 + t * 2 + p
     v = w.view(RL_CTAS, 2, 2, 8, 8, RL_STEPS, 2, 4, 2)
-    return v.permute(0, 4, 5, 1, 3, 7, 6, 2, 8).contiguous().view(-1)
+    tail = torch.zeros(RL_TAIL, dtype=torch.int16, device=router_w.device)
+    tail[:sl] = g2s_bf.view(torch.int16)
+    tail[sl : sl + 2] = torch.tensor(
+        [2.0**-s], dtype=torch.float32, device=router_w.device
+    ).view(torch.int16)
+    return torch.cat([v.permute(0, 4, 5, 1, 3, 7, 6, 2, 8).reshape(-1), tail])
+
+
+def rl_box_words(world: int, max_m: int) -> int:
+    return STAGES * world * (max_m * RL_EXPERTS + RL_CELLS * ((max_m + 3) // 4 * 4))
 
 
 def pack_out_proj(weight_nk: torch.Tensor) -> torch.Tensor:
@@ -246,12 +277,11 @@ class Hop:
             self.world,
             self.max_m,
         )
-        # Slot route_lin's router mailbox [stages, world, rows, 512] f32.
         self.rl = None
-        self._pushed_rl = False
+        self._pushed_rl = self._pushed_cells = False
         if route_lin and self.world == RL_WORLD:
             self._rl_box = symm_mem.empty(
-                (STAGES, self.world, self.max_m, RL_EXPERTS),
+                (rl_box_words(self.world, self.max_m),),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -359,7 +389,7 @@ class Hop:
             torch.cuda.current_stream(self.device).cuda_stream,
         )
         self.mark_pushed(out)
-        self._pushed_rl = True
+        self._pushed_rl = self._pushed_cells = True
         return out
 
     def rl_push_args(self, rl_w, h0) -> RlArgs:
@@ -375,10 +405,10 @@ class Hop:
             k0=(HIDDEN // RL_WORLD) * self.rank,
         )
 
-    def mark_pushed_rl(self, partial: torch.Tensor) -> None:
-        """``mark_pushed`` of a producer that also pushed its router partial."""
+    def mark_pushed_rl(self, partial: torch.Tensor, *, cells: bool = False) -> None:
         self.mark_pushed(partial)
         self._pushed_rl = True
+        self._pushed_cells = bool(cells)
 
     def all_reduce_residual_rms_norm_rl(
         self, *, local_contribution, residual, gamma, global_scale, fp8_scale=None
@@ -390,6 +420,9 @@ class Hop:
         m = int(local_contribution.shape[0])
         if not (self._pushed_rl and self.has_pushed(local_contribution)):
             raise RuntimeError("no router-lin push of this partial to consume")
+        if not self._pushed_cells:
+            # the consume would wait for cells no producer pushed (until the deadline fault)
+            raise RuntimeError("the router-lin push carried no rounding cells")
         args, outs = self._args(m, residual, gamma, fp8_scale)
         logits = torch.empty((m, RL_EXPERTS), dtype=torch.bfloat16, device=self.device)
         x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=self.device)
@@ -403,7 +436,7 @@ class Hop:
             gs=global_scale.data_ptr(),
         )
         self._pushed = None
-        self._pushed_rl = False
+        self._pushed_rl = self._pushed_cells = False
         jit.launch(
             self.rl_kernels["q35hop_consume_rl_w8"],
             (m, ROW_CTAS, 1),

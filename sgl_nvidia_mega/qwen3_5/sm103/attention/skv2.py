@@ -57,6 +57,10 @@ from cutlass.cute import experimental as ex
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.experimental import primitives as prim
 
+from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_partial_attn import (
+    _e4m3x4_residual,
+)
+
 
 @cute.experimental.jit
 def load_keys(
@@ -129,6 +133,7 @@ class StockSplitDecode:
         # trigger: release the dependent (merge) after the wait; without it the merge launches at this grid's exit,
         # which measured faster (an early-resident merge returns from its wait later than a fresh launch starts).
         self.pdl, self.prefetch, self.trigger = pdl, prefetch, trigger
+        self.p_scale = 448.0
         self.rows = heads * qlen
         self.width = 32 if self.rows <= 32 else 64
         self.tile = 128
@@ -232,6 +237,13 @@ class StockSplitDecode:
             alignment=128,
         )
         sp = ex.allocate(
+            dtype,
+            cutlass.AddressSpace.smem,
+            cute.tile_to_shape(p_atom, (width, self.tile, self.slots), order=(0, 1, 2)),
+            alignment=128,
+        )
+        # the residual term of P, same layout and slots (released with them)
+        sp_lo = ex.allocate(
             dtype,
             cutlass.AddressSpace.smem,
             cute.tile_to_shape(p_atom, (width, self.tile, self.slots), order=(0, 1, 2)),
@@ -360,6 +372,7 @@ class StockSplitDecode:
             lane_alphas = cute.make_rmem_tensor((width // 32,), f32)
             running_l = cute.make_rmem_tensor((self.rows,), f32)
             packed = cute.make_rmem_tensor((width, 1), dtype)
+            packed_lo = cute.make_rmem_tensor((width, 1), dtype)
             running_m.fill(-f32.inf)
             running_l.fill(0)
             for it in cutlass.range(0, nblk):
@@ -416,12 +429,26 @@ class StockSplitDecode:
                     total = running_l[j] * alpha
                     probability = cute.math.exp2(scores[j, 0] - maximum, fastmath=True)
                     total += probability
-                    scores[j, 0] = probability * 256
+                    scores[j, 0] = probability * self.p_scale
                     running_l[j] = total
                 for j in cutlass.range_constexpr(self.rows, width):
                     scores[j, 0] = f32(0)
                 packed[None, 0].store(scores[None, 0].load().to(dtype))
                 cute.autovec_copy(packed[None, 0], sp[None, local_tid, slot])
+                words = cute.recast_tensor(packed, cutlass.Uint32)
+                words_lo = cute.recast_tensor(packed_lo, cutlass.Uint32)
+                for w4 in cutlass.range_constexpr((self.rows + 3) // 4):
+                    words_lo[w4, 0] = _e4m3x4_residual(
+                        words[w4, 0],
+                        scores[4 * w4, 0],
+                        scores[4 * w4 + 1, 0],
+                        scores[4 * w4 + 2, 0],
+                        scores[4 * w4 + 3, 0],
+                    )
+                # the pad rows' P is 0, so is its residual
+                for w4 in cutlass.range_constexpr((self.rows + 3) // 4, width // 4):
+                    words_lo[w4, 0] = cutlass.Uint32(0)
+                cute.autovec_copy(packed_lo[None, 0], sp_lo[None, local_tid, slot])
                 cute.arch.fence_view_async_shared()
                 cute.arch.mbarrier_arrive(bp + slot)
             for j in cutlass.range_constexpr(self.rows):
@@ -454,9 +481,7 @@ class StockSplitDecode:
                         cute.arch.mbarrier_arrive(bfree + slot)
             for j in cutlass.range_constexpr(self.rows):
                 for dm in cutlass.range_constexpr(2):
-                    partial[split, j, local_tid + dm * 128] = cutlass.BFloat16(
-                        accum[j, dm] * out_scale
-                    )
+                    partial[split, j, local_tid + dm * 128] = accum[j, dm] * out_scale
         else:
             if warp == 8:
                 q_frag = kq.get_slice(0).partition_B(sq)
@@ -489,6 +514,7 @@ class StockSplitDecode:
                     cute.arch.mbarrier_wait(bp + slot, phase=(it // self.slots) % 2)
                     cute.arch.mbarrier_wait(bv + stage, phase=(it // self.stages) % 2)
                     p_frag = vp.get_slice(0).partition_B(sp[None, None, slot])
+                    p_frag_lo = vp.get_slice(0).partition_B(sp_lo[None, None, slot])
                     for dm in cutlass.range_constexpr(2):
                         vtile = cute.local_tile(
                             sv[None, None, stage], (128, self.tile), (dm, 0)
@@ -503,6 +529,14 @@ class StockSplitDecode:
                                 to[None, None, None, 2 * slot + dm],
                             )
                             atom_vp.set(tcgen05.Field.ACCUMULATE, True)
+                        # + the residual term of P into the same accumulator
+                        for kk in cutlass.range_constexpr(cute.size(v_frag, mode=[2])):
+                            ex.dot(
+                                atom_vp,
+                                v_frag[None, None, kk],
+                                p_frag_lo[None, None, kk],
+                                to[None, None, None, 2 * slot + dm],
+                            )
                     with cute.arch.elect_one():
                         tcgen05.commit(bo + slot, None, tcgen05.CtaGroup.ONE)
                         tcgen05.commit(bvfree + stage, None, tcgen05.CtaGroup.ONE)
@@ -715,8 +749,11 @@ class StockSplitPlan:
         self.qlen, self.heads, _ = query.shape
         self.splits = splits
         rows = self.qlen * self.heads
+        self.p_scale = 448.0
         self.partial = torch.empty(
-            (splits, rows, 256), dtype=torch.bfloat16, device=query.device
+            (splits, rows, 256),
+            dtype=torch.float32,
+            device=query.device,
         )
         self.maximum = torch.empty(
             (splits, rows), dtype=torch.float32, device=query.device
@@ -757,11 +794,10 @@ class StockSplitPlan:
     def run(self, query, kv, table, lengths, *, qk_scale, v_scale, out):
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        # Same fp32 constants as the stock kernel's constexpr products.
         self.compiled(
             *views,
             cutlass.Float32(qk_scale * 1.4426950408889634),
-            cutlass.Float32(v_scale / 256.0),
+            cutlass.Float32(v_scale / self.p_scale),
             stream,
         )
         rows = self.qlen * self.heads

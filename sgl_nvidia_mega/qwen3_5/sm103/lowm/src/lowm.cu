@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Low-M projections of a Qwen3.5 verify step on warp MMA with register-prefetched weights: C = A @ W^T for
-// M_ROWS (<= 64) rows. The work layout follows TensorRT-LLM's lowm_mma_gemm (Qwen3.5 decode, Apache-2.0):
+// M_ROWS (<= 128) rows. The work layout follows TensorRT-LLM's lowm_mma_gemm (Qwen3.5 decode, Apache-2.0):
 // a CTA owns NT groups of 8 weight rows and splits K over its KW warps; each lane holds 16 contiguous K
 // columns of a 64-wide chunk for its weight row and its activation rows, which are the MMA fragments once
 // the reduction order inside the chunk is permuted the same way for both operands; the warps reduce through

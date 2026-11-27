@@ -3,7 +3,7 @@
 """The Qwen3.5 megakernel's runtime on CPU: the steps it covers, the binding and the
 EAGLE entries at build, the MTP draft spec, the step state and the parity check."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -18,6 +18,9 @@ from sgl_nvidia_mega.qwen3_5 import (
 from sgl_nvidia_mega.qwen3_5.runtime import executor, hooks, parity
 from sgl_nvidia_mega.qwen3_5.runtime.state import StepState
 
+# SGLang's switch of the megakernel runtime optimizations
+RUNTIME_ENV = "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION"
+
 
 @pytest.fixture(autouse=True)
 def registered(monkeypatch):
@@ -25,6 +28,7 @@ def registered(monkeypatch):
 
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
+    monkeypatch.delenv(RUNTIME_ENV, raising=False)
     monkeypatch.setattr(
         plugin_binding, "megakernel_agree", lambda *args, **kwargs: None
     )
@@ -495,7 +499,7 @@ def test_hook_slots_are_accepted_but_build_no_verify_width(monkeypatch):
     monkeypatch.setattr(
         hooks,
         "build",
-        lambda model, binding: calls.append((model, binding)) or factory,
+        lambda model, binding, **kw: calls.append((model, binding, kw)) or factory,
     )
 
     model = SimpleNamespace(
@@ -507,7 +511,9 @@ def test_hook_slots_are_accepted_but_build_no_verify_width(monkeypatch):
     built = runtime.build(model, ctx)
     assert built.summary() == "slots none (stock)"
     assert built.speculative_runtime_hooks is factory
-    assert calls == [(model, "EagleBinding")]
+    assert calls == [
+        (model, "EagleBinding", {"sharded": True, "gathered": False, "draft": False})
+    ]
 
 
 def test_draft_fin_owns_the_exact_bf16_finalize_policy():
@@ -981,7 +987,7 @@ def test_the_draft_decode_keeps_cp_lite_for_cp_variants_and_multi_request(
         )
     )
     attn.heads, attn.head_dim, attn.page_size = heads, dim, page
-    attn.q1 = attn.skv2 = None
+    attn.q1 = None
     attn._noted = set()
     attn.cp_b1 = draft_attention.DraftCP(
         split_kv, route, steps=True, extend=True, multi=requests > 1
@@ -1100,9 +1106,9 @@ def test_the_draft_extends_moe_output_is_reduced_once(
         log.append("mlp deferred" if defer_finalize else "mlp")
         return owed(reduced=True) if defer_finalize else h
 
-    def fin(*, residual, gamma, **_):
+    def fin(owed, residual, norm):
         log.append("fin")
-        return residual + gamma, residual
+        return residual + 100.0, residual
 
     def norm(h, residual):
         log.append("norm")
@@ -1114,13 +1120,10 @@ def test_the_draft_extends_moe_output_is_reduced_once(
 
     mlp.supports_deferred_finalize = True
     mkm.takes = lambda r, rows_per_request: True
-    norm.gemma_weight = 100.0
     extend_hop = SimpleNamespace(
-        hop=SimpleNamespace(
-            supports=lambda m: m <= rows,
-            moe_finalize_all_reduce_rms_norm=fin,
-        ),
+        hop=SimpleNamespace(supports=lambda m: m <= rows),
         ffn_input=lambda h, residual, norm, moe_single_launch: (h, residual),
+        fin_norm=fin,
     )
     parts = SimpleNamespace(
         layer=SimpleNamespace(
@@ -1132,6 +1135,8 @@ def test_the_draft_extends_moe_output_is_reduced_once(
         hop=extend_hop,
         moe=None,
         moe_mkm=mkm if path == "mkm" else None,
+        moe_block=None,
+        oproj_push=None,
         slots=frozenset({"draft_hop", "draft_fin"} if fused else {"draft_hop"}),
         model=SimpleNamespace(norm=norm),
     )
@@ -1154,7 +1159,7 @@ def test_only_tep8_draft_fin_uses_the_target_mnnvl_workspace(monkeypatch):
 
     from sgl_nvidia_mega.qwen3_5.draft import layer
 
-    workspace = SimpleNamespace(supports=lambda rows: rows <= 896)
+    workspace = SimpleNamespace(supports=lambda rows: rows <= 512)
     monkeypatch.setattr(flashinfer_mnnvl_cutedsl, "_WORKSPACE", workspace)
     parts = SimpleNamespace(slots=frozenset({"draft_fin"}))
 
@@ -1162,8 +1167,8 @@ def test_only_tep8_draft_fin_uses_the_target_mnnvl_workspace(monkeypatch):
         "sglang.srt.runtime_context.get_parallel",
         lambda: SimpleNamespace(tp_size=8, moe_ep_size=4),
     )
-    assert layer._mnnvl_workspace(parts, 896) is workspace
-    assert layer._mnnvl_workspace(parts, 897) is None
+    assert layer._mnnvl_workspace(parts, 512) is workspace
+    assert layer._mnnvl_workspace(parts, 513) is None
     assert layer._mnnvl_workspace(SimpleNamespace(slots=frozenset()), 32) is None
 
     monkeypatch.setattr(
@@ -1182,11 +1187,21 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
 
     def fused_ar(*, local_contribution, residual, gamma):
         calls.append("fused ar")
-        return local_contribution + gamma, residual
+        assert not residual.any()
+        return local_contribution + gamma, local_contribution
 
     def fused_fin(*, residual, gamma, **_):
         calls.append("fused finalize")
-        return residual + gamma, residual
+        assert not residual.any()
+        return residual + gamma, residual + 3.0
+
+    def gemma_norm(scale, name):
+        def norm(hidden, residual):
+            calls.append(name)
+            return (hidden + residual) * scale, hidden + residual
+
+        norm.gemma_weight = scale
+        return norm
 
     workspace = SimpleNamespace(
         all_reduce_residual_rms_norm=fused_ar,
@@ -1207,8 +1222,8 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
         )
 
     mlp.supports_deferred_finalize = deferred
-    post_norm = SimpleNamespace(gemma_weight=10.0)
-    final_norm = SimpleNamespace(gemma_weight=100.0)
+    post_norm = gemma_norm(10.0, "post norm")
+    final_norm = gemma_norm(100.0, "final norm")
     parts = SimpleNamespace(
         layer=SimpleNamespace(
             input_layernorm=lambda hidden: hidden,
@@ -1219,6 +1234,8 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
         hop=None,
         moe=None,
         moe_mkm=None,
+        moe_block=None,
+        oproj_push=None,
         slots=frozenset({"draft_hop", "draft_fin"}),
         model=SimpleNamespace(norm=final_norm),
     )
@@ -1230,12 +1247,19 @@ def test_tep8_draft_fin_uses_the_target_workspace_past_the_hop(monkeypatch, defe
         "sglang.srt.distributed.tensor_model_parallel_all_reduce", stock_all_reduce
     )
     out = layer.layer(parts, x, None, None, None, None, rows_per_request=1)
+    moe_in, residual = (x + x) * 10.0, x + x
     if deferred:
-        assert calls == ["fused ar", "mlp deferred", "fused finalize"]
-        assert torch.equal(out, x + 100.0)
+        assert calls == [
+            "fused ar",
+            "post norm",
+            "mlp deferred",
+            "fused finalize",
+            "final norm",
+        ]
+        assert torch.equal(out, (3.0 + residual) * 100.0)
     else:
-        assert calls == ["fused ar", "mlp", "fused ar"]
-        assert torch.equal(out, 2 * (x + 10.0) + 100.0)
+        assert calls == ["fused ar", "post norm", "mlp", "fused ar", "final norm"]
+        assert torch.equal(out, (2 * moe_in + residual) * 100.0)
 
 
 class _DraftParts:
@@ -1244,6 +1268,8 @@ class _DraftParts:
     def __init__(self, slots=frozenset(), tp_size=8):
         self.slots, self.mkd, self.top1x, self.engaged = slots, None, None, []
         self.binding = SimpleNamespace(tp_size=tp_size)
+        self.fc_input_table = None  # slot draft_fc_input off
+        self.fc_tp = None  # slot draft_fc_tp off
 
     def note_engaged(self, entry, bs):
         self.engaged.append((entry, bs))
@@ -1413,6 +1439,7 @@ def test_the_draft_embeds_through_the_exchange_where_it_fits():
     calls = []
     parts = Parts.__new__(Parts)
     parts.model = SimpleNamespace(embed_tokens=lambda t: calls.append("sglang") or t)
+    parts.embed_local = None
     parts.embedx = None
     parts.embed(torch.zeros(4, dtype=torch.int64))
     parts.embedx = lambda t: calls.append("exchange") or t
@@ -1986,9 +2013,15 @@ def _gdn_prefill_state_case(monkeypatch, strided):
                 supports_track_state_snapshot=False,
                 extend_honors_slot_pitch=False,
             ),
+            extend_honors_slot_pitch=False,
         ),
         _prefill_gates=lambda *args: (torch.zeros(1, 4, 1), torch.zeros(1, 4, 1)),
     )
+    # SGLang's own staging helpers, where its forward_extend calls them
+    for name in ("_prefill_kernels_follow_slot_pitch", "_prefill_state_staging"):
+        method = getattr(gdn_backend.GDNAttnBackend, name, None)
+        if method is not None:
+            setattr(backend, name, MethodType(method, backend))
     backend._convolve_prefill = lambda *args: (
         gdn_backend.GDNAttnBackend._convolve_prefill(backend, *args)
     )

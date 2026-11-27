@@ -46,6 +46,26 @@ SGLANG_READS = {
 }
 
 
+def _select(parts, hidden, io):
+    out = io.hidden_out
+    if (
+        "draft_select" in parts.slots
+        and hidden.dtype == torch.bfloat16
+        and hidden.dim() == 2
+        and hidden.stride(1) == 1
+        and out is not None
+        and out.dtype == torch.bfloat16
+        and out.is_contiguous()
+        and io.select_index.dim() == 1
+        and tuple(out.shape) == (io.select_index.shape[0], hidden.shape[1])
+    ):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft.rows import copy_rows
+
+        parts.note_engaged("draft_select", int(io.select_index.shape[0]))
+        return copy_rows(hidden, io.select_index, out)
+    return torch.index_select(hidden, 0, io.select_index, out=out)
+
+
 class DraftExtend:
     """The draft_extend factory's result: bs -> the step."""
 
@@ -89,7 +109,7 @@ class DraftExtend:
         )
         # the selected rows and the exchange's token go straight into SGLang's outputs: no
         # copies at the end of the graph
-        selected = torch.index_select(hidden, 0, io.select_index, out=io.hidden_out)
+        selected = _select(parts, hidden, io)
         if mkd is not None:
             local = mkd.extend_head(selected)
             if local is not None:
@@ -112,10 +132,19 @@ class DraftExtend:
         from sgl_nvidia_mega.qwen3_5.sm103.draft.top1 import NAN_KEY_TORCH_ARGMAX
 
         parts = self.parts
-        if parts.mkd is not None and io.input_ids.shape[0] <= FC_SPLIT_MAX_TOKENS:
-            x = parts.mkd.split_fc(parts.embed(io.input_ids), io.hidden_states)
-        else:
+        # slot draft_fc_tp: the column-parallel fc and all-reduce where it takes the width
+        front = (
+            parts.fc_tp(io.input_ids, io.hidden_states)
+            if parts.fc_tp is not None
+            else None
+        )
+        normed = None
+        if front is not None:
+            x, normed = front
+        elif parts.mkd is None or io.input_ids.shape[0] > FC_SPLIT_MAX_TOKENS:
             x = layer.fc_input(parts, io.input_ids, io.hidden_states)
+        else:
+            x = parts.mkd.split_fc(parts.embed(io.input_ids), io.hidden_states)
         hidden = layer.layer(
             parts,
             x,
@@ -124,8 +153,9 @@ class DraftExtend:
             io.attn,
             io.kv,
             rows_per_request=io.tokens_per_request,
+            **({} if normed is None else {"normed": normed}),
         )
-        selected = torch.index_select(hidden, 0, io.select_index, out=io.hidden_out)
+        selected = _select(parts, hidden, io)
         layer.top1_into(
             parts,
             selected,

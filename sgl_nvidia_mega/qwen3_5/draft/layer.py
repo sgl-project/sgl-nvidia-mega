@@ -78,8 +78,13 @@ SGLANG_READS = {
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_5_mtp.py:Qwen3_5ForCausalLMMTP.forward": "95a8ba199326ac1f",
+    "srt/models/qwen3_5_mtp.py:Qwen3_5ForCausalLMMTP.forward": (
+        "6d038e59d55980a6",
+        "95a8ba199326ac1f",
+    ),
     "srt/models/qwen3_5.py:Qwen3_5AttentionDecoderLayer.forward": "6473f673a1a0796b",
+    "srt/layers/flashinfer_mnnvl_cutedsl.py:_gb300_presets": "cab04d6244e82408",
+    "srt/layers/flashinfer_mnnvl_cutedsl.py:_retargeted_config": "409822bcd948c6f0",
 }
 
 
@@ -87,17 +92,38 @@ def fc_input(parts, token_ids, hidden):
     """The fc output [rows, hidden] of the tokens ``token_ids`` [rows] and the hidden
     rows ``hidden`` [rows, hidden] they follow."""
     lm = parts.lm
+    table = parts.fc_input_table
+    if table is not None and hidden.shape[0] == token_ids.reshape(-1).shape[0]:
+        from sgl_nvidia_mega.qwen3_5.draft.fc_input import mtp_fused_input
+
+        parts.note_fc_input(int(hidden.shape[0]))
+        return _fc(
+            lm,
+            mtp_fused_input(
+                token_ids.reshape(-1),
+                table,
+                hidden,
+                lm.pre_fc_norm_embedding.weight.data,
+                lm.pre_fc_norm_hidden.weight.data,
+                lm.pre_fc_norm_embedding.variance_epsilon,
+                lm.pre_fc_norm_hidden.variance_epsilon,
+            ),
+        )
     _note_fc_cat()
-    # fc is a ReplicatedLinear: it returns (output, output bias)
-    out, _ = lm.fc(
+    return _fc(
+        lm,
         norms_into_cat(
             parts.embed(token_ids),
             hidden,
             lm.pre_fc_norm_embedding,
             lm.pre_fc_norm_hidden,
-        )
+        ),
     )
-    return out
+
+
+def _fc(lm, x):
+    out = lm.fc(x)
+    return out[0] if isinstance(out, tuple) else out
 
 
 def norms_into_cat(embeds, hidden, norm_embeds, norm_hidden):
@@ -121,9 +147,12 @@ def norms_into_cat(embeds, hidden, norm_embeds, norm_hidden):
     return out
 
 
+STOCK_SUM_MAX_ROWS = 703
+
+
 def _mnnvl_workspace(parts, rows: int):
     """The target's TEP8 MNNVL workspace for ``draft_fin`` at this width."""
-    if "draft_fin" not in parts.slots:
+    if "draft_fin" not in parts.slots or rows > STOCK_SUM_MAX_ROWS:
         return None
     from sglang.srt.runtime_context import get_parallel
 
@@ -137,14 +166,34 @@ def _mnnvl_workspace(parts, rows: int):
     return workspace if workspace is not None and workspace.supports(rows) else None
 
 
+def _workspace_norm(workspace, norm, residual, *, local_contribution=None, owed=None):
+    base = torch.zeros_like(residual)
+    if owed is not None:
+        out = workspace.moe_finalize_all_reduce_rms_norm(
+            routed_output=owed.routed_output,
+            expert_weights=owed.expert_weights,
+            permuted_indices=owed.permuted_indices,
+            gated_shared_output=owed.gated_shared_output,
+            residual=base,
+            gamma=norm.gemma_weight,
+        )
+    else:
+        out = workspace.all_reduce_residual_rms_norm(
+            local_contribution=local_contribution,
+            residual=base,
+            gamma=norm.gemma_weight,
+        )
+    # the residual output on a zero residual is the all-reduced sum
+    return norm(out[1], residual)
+
+
 # Slot draft_hop on the draft extend's rows too: their FFN input all-reduce + residual +
-# norm in the hop's MNNVL rounding, which equals what 2.2 runs there (FlashInfer's MNNVL
-# fusion under DRAFT_MNNVL_AR) bit for bit at 1-7 rows
 EXTEND_MNNVL = True
 
 
-def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
-    """The decoder layer on the fc output ``x`` [rows, hidden]: the final-norm rows."""
+def layer(
+    parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int, normed=None
+):
     from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
     lay = parts.layer
@@ -173,8 +222,17 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
     cfuse = (
         _mnnvl_workspace(parts, rows) if hop is None and extend_hop is None else None
     )
+    o_push = parts.oproj_push
+    if not (
+        o_push is not None
+        and hop is not None
+        and push is None
+        and rows_per_request == 1
+        and o_push.takes(rows)
+    ):
+        o_push = None
     attn_out = parts.attention(
-        lay.input_layernorm(x),
+        lay.input_layernorm(x) if normed is None else normed,
         positions,
         cache_loc,
         meta,
@@ -185,6 +243,7 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             if push is not None and push.gemv
             else None
         ),
+        **({"o_push": o_push} if o_push is not None else {}),
     )
     # Compatible NVFP4 draft experts reuse the target MoE engines from two rows.
     mkm = (
@@ -201,6 +260,9 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         else None
     )
     if hop is not None:
+        release = (
+            push is None and mkm is None and moe is None and _early_router(parts, rows)
+        )
         moe_in, residual = hop.ffn_input(
             attn_out,
             residual,
@@ -208,16 +270,15 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
             moe_single_launch=push is not None
             and moe is not None
             and moe.single_launch(1),
+            **({"release_next": True} if release else {}),
         )
     elif extend_hop is not None:
         moe_in, residual = extend_hop.ffn_input(
             attn_out, residual, lay.post_attention_layernorm, moe_single_launch=False
         )
     elif cfuse is not None:
-        moe_in, residual = cfuse.all_reduce_residual_rms_norm(
-            local_contribution=attn_out,
-            residual=residual,
-            gamma=lay.post_attention_layernorm.gemma_weight,
+        moe_in, residual = _workspace_norm(
+            cfuse, lay.post_attention_layernorm, residual, local_contribution=attn_out
         )
     else:
         moe_in, residual = lay.post_attention_layernorm(
@@ -231,21 +292,10 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         )
         fin = False
     if fin:
-        owed = (
-            mkm(lay, moe_in)
-            if mkm is not None
-            else lay.mlp(moe_in, defer_finalize=True)
-        )
+        owed = mkm(lay, moe_in) if mkm is not None else _deferred(parts, moe_in)
         if _hop_takes(fin_hop.hop, owed):
             _note_fin(rows, "in the final norm's hop (slot draft_fin)", hop is None)
-            out, _ = fin_hop.hop.moe_finalize_all_reduce_rms_norm(
-                routed_output=owed.routed_output,
-                expert_weights=owed.expert_weights,
-                permuted_indices=owed.permuted_indices,
-                gated_shared_output=owed.gated_shared_output,
-                residual=residual,
-                gamma=parts.model.norm.gemma_weight,
-            )
+            out, _ = fin_hop.fin_norm(owed, residual, parts.model.norm)
             return out
         _note_fin(
             rows, "SGLang's: the hop does not read this deferred output", hop is None
@@ -261,16 +311,9 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         and moe is None
         and lay.mlp.supports_deferred_finalize
     ):
-        owed = lay.mlp(moe_in, defer_finalize=True)
-        _note_fin(rows, "in SGLang's MNNVL CuTe DSL final norm", True)
-        out, _ = cfuse.moe_finalize_all_reduce_rms_norm(
-            routed_output=owed.routed_output,
-            expert_weights=owed.expert_weights,
-            permuted_indices=owed.permuted_indices,
-            gated_shared_output=owed.gated_shared_output,
-            residual=residual,
-            gamma=parts.model.norm.gemma_weight,
-        )
+        owed = _deferred(parts, moe_in)
+        _note_fin(rows, "in SGLang's MNNVL CuTe DSL final norm" + _SUM_NOTE, True)
+        out, _ = _workspace_norm(cfuse, parts.model.norm, residual, owed=owed)
         return out
     elif mkm is not None:
         moe_out = mkm(lay, moe_in).complete()
@@ -287,15 +330,29 @@ def layer(parts, x, positions, cache_loc, meta, kv, *, rows_per_request: int):
         )
         return out
     if cfuse is not None:
-        _note_fin(rows, "after SGLang's MoE in the MNNVL CuTe DSL final norm", True)
-        out, _ = cfuse.all_reduce_residual_rms_norm(
-            local_contribution=moe_out,
-            residual=residual,
-            gamma=parts.model.norm.gemma_weight,
+        _note_fin(
+            rows,
+            "after SGLang's MoE in the MNNVL CuTe DSL final norm" + _SUM_NOTE,
+            True,
+        )
+        out, _ = _workspace_norm(
+            cfuse, parts.model.norm, residual, local_contribution=moe_out
         )
         return out
     out, _ = parts.model.norm(tensor_model_parallel_all_reduce(moe_out), residual)
     return out
+
+
+def _early_router(parts, rows: int) -> bool:
+    from sgl_nvidia_mega.qwen3_5.draft import early
+
+    return early.releases_router(parts, rows)
+
+
+def _deferred(parts, moe_in):
+    if parts.moe_block is not None:
+        return parts.moe_block.deferred(moe_in)
+    return parts.layer.mlp(moe_in, defer_finalize=True)
 
 
 _FIN_NOTED: set[tuple[bool, int]] = set()
@@ -322,6 +379,10 @@ def _note_fin(rows: int, where: str, extend: bool = False) -> None:
             rows,
             where,
         )
+
+
+# _note_fin's suffix: the workspace only sums and the model's GemmaRMSNorm follows
+_SUM_NOTE = " (its sum only; then the model's GemmaRMSNorm)"
 
 
 def _hop_takes(hop, owed) -> bool:
@@ -352,5 +413,21 @@ def top1_into(parts, hidden, tokens, column: int, *, nan_key: int, **outputs) ->
     rank's vocabulary shard, then the sharded argmax exchange, which writes the tokens
     into ``tokens[:, column]`` (and ``outputs``: topk_p, positions, mrope_positions)."""
     lm = parts.lm
-    logits = lm.logits_processor._compute_lm_head(hidden, lm.lm_head, None)
+    rows = int(hidden.shape[0])
+    keys = parts.head_keys
+    if keys is not None and keys.serves(hidden, tokens, outputs):
+        # option draft_head_keys: the argmax-key head and one key exchange (no logits)
+        from sgl_nvidia_mega.qwen3_5.draft.head_keys import note
+
+        note(rows)
+        keys.top1_into(hidden, tokens, column, nan_key=nan_key, **outputs)
+        return
+    head = parts.head_lowm
+    if head is not None and head.takes(rows):
+        from sgl_nvidia_mega.qwen3_5.draft.head_lowm import SLOT, note
+
+        note(SLOT, rows)
+        logits = head(hidden)
+    else:
+        logits = lm.logits_processor._compute_lm_head(hidden, lm.lm_head, None)
     parts.top1x(logits, tokens, column, nan_key=nan_key, **outputs)

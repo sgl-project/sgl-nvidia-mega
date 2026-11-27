@@ -136,7 +136,15 @@ SGLANG_MIRRORS = {
     # Without and with the early return of the GDN extend in breakable prefill graphs,
     # which target verify never takes; the first goes once all supported SGLangs have it
     # Upstream #48004 changes strided prefill staging, which target verify never takes.
-    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": "6d141f9de947654f",
+    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
+        "ab7b048fafb07d0e",
+        "12a835fc4f78af33",
+        "6ed4eb6a818f7e20",
+        "bfd997695f32d409",
+        "6d141f9de947654f",
+        "109b2f4d32797e43",
+        "590ab7ea97205370",
+    ),
     # Importing the ReplaySSM kernel from fla/ and, after sgl-project/sglang#45112, from
     # linear/; the first goes once all supported SGLangs have the move
     "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend._replayssm_target_verify": "2aec3b7168214c1d",
@@ -146,8 +154,17 @@ SGLANG_MIRRORS = {
     ),
     # The follow-up also accepts an already-quantized FP8 input, which is the path
     # _out_proj mirrors; the BF16 path remains the stock alternative.
-    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": "e93235aca0ccff7a",
-    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": "b047118af7d78abb",
+    "srt/layers/quantization/fp8_utils.py:apply_fp8_linear_bmm_flashinfer": (
+        "c66562e1de0008db",
+        "c94a4f1a622c2fe0",
+        "aaa39b9452d9df32",
+        "e93235aca0ccff7a",
+    ),
+    "srt/layers/quantization/modelopt_quant.py:ModelOptFp8LinearMethod.apply": (
+        "91b563cf074bff42",
+        "4f99db0f712ad24a",
+        "b047118af7d78abb",
+    ),
 }
 
 RING_LENGTHS, MAX_DRAFT = (16, 32), 8  # aggregate and DEP8 ReplaySSM pools
@@ -173,6 +190,9 @@ class Options(msgspec.Struct, frozen=True):
     lowm_push: bool = (
         False  # out_proj's low-M launch pushes into the hop (slot lowm_push)
     )
+    gemm_ar: bool = False
+    conv_core: bool = False
+    value_split: bool = False
 
 
 STOCK = Options(views=False, block_n=256, block_v=64, num_warps=1, norm_fp8=False)
@@ -272,6 +292,15 @@ def core_pool_reasons(pools) -> list[str]:
     return reasons
 
 
+def conv_core_pool_reasons(pools) -> list[str]:
+    conv, windows = pools.conv[0], pools.intermediate_conv_window[0]
+    return [
+        f"conv {name} are {t.dtype}"
+        for name, t in (("states", conv), ("windows", windows))
+        if t.dtype != torch.bfloat16
+    ]
+
+
 def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
     """``Qwen3_5GatedDeltaNet.forward`` of a target-verify step with the launch
     choices ``opts``: the TP-partial output [rows, hidden] of the normed input x."""
@@ -290,11 +319,21 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
         )
     from sgl_nvidia_mega.qwen3_5 import lowm
 
-    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
-    if st.slots.lowm_in:
+    x8 = lowm.take_fp8(st, x) if lowm.reads_fp8(st) else None
+    ba_tactic = lowm.ba_tactic(st, x.shape[0])
+    join = None
+    pinned = None
+    if not st.slots.lowm_in and x8 is None:
+        pinned = lowm.in_proj_pinned(gdn, x, ba_tactic)
+    if pinned is not None:
+        qkvz, ba = pinned
+    elif st.slots.lowm_in:
         qkvz, ba = lowm.in_proj(gdn, x, x8)
+    elif x8 is not None and st.slots.bt_tail and opts.views and opts.core:
+        # the split below only views ba: join in_proj_ba before gdn_core, its first reader
+        qkvz, ba, join = lowm.in_proj_fp8_deferred(gdn, x, x8, "bt_tail", ba_tactic)
     elif x8 is not None:
-        qkvz, ba = lowm.in_proj_fp8(gdn, x, x8)
+        qkvz, ba = lowm.in_proj_fp8(gdn, x, x8, ba_tactic)
     else:
         qkvz, ba = gdn._forward_input_proj(x)
     split = (
@@ -311,7 +350,10 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
         gdn.head_v_dim,
     )
     if opts.core:
-        return _fused(gdn, _conv(gdn.attn, mixed_qkv, st, opts), z, a, b, st, opts)
+        qkv = mixed_qkv if opts.conv_core else _conv(gdn.attn, mixed_qkv, st, opts)
+        if join is not None:
+            join()
+        return _fused(gdn, qkv, z, a, b, st, opts)
     core = _core(gdn.attn, mixed_qkv, a, b, st, opts)
     core = core.reshape(-1, core.shape[-1])
     nv = gdn.num_v_heads // gdn.attn_tp_size
@@ -334,7 +376,7 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
                 input_scale=gdn.out_proj.input_scale,
                 weight_scale=gdn.out_proj.weight_scale,
             )
-        return _out_proj(gdn.out_proj, x, core.dtype, st, opts.lowm_push)
+        return _out_proj(gdn.out_proj, x, core.dtype, st, opts.lowm_push, opts.gemm_ar)
     z_shape = z.shape
     core = gdn.norm(core, z if opts.views else z.reshape(-1, z.shape[-1]))
     core = core.reshape(z_shape)
@@ -343,7 +385,12 @@ def step(gdn, x: torch.Tensor, st, opts: Options = SLOT) -> torch.Tensor:
 
 
 def _out_proj(
-    out_proj, fp8: torch.Tensor, dtype: torch.dtype, st=None, push: bool = False
+    out_proj,
+    fp8: torch.Tensor,
+    dtype: torch.dtype,
+    st=None,
+    push: bool = False,
+    defer: bool = False,
 ) -> torch.Tensor:
     """``RowParallelLinear.forward`` of the FP8 ``out_proj`` on its pre-quantized input:
     ModelOpt's FlashInfer BMM with the static input scale as the activation scale (what
@@ -377,6 +424,12 @@ def _out_proj(
         get_parallel().tp_group,
         disabled=out_proj.tp_group is None or not is_allocation_symmetric(),
     ):
+        if defer and dtype == torch.bfloat16:
+            out = torch.empty(
+                (fp8.shape[0], out_proj.weight.shape[1]), dtype=dtype, device=fp8.device
+            )
+            if st.bound["boundary"].bt.gemm_ar.defer(out, fp8, out_proj, "out_proj"):
+                return out
         return flashinfer_bmm_fp8(
             fp8, out_proj.weight, out_proj.input_scale, out_proj.weight_scale, dtype
         )
@@ -416,7 +469,9 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
     from sgl_nvidia_mega.qwen3_5.sm103.gdn.core import (
         RELEASE_MAX_ROWS,
         RELEASE_MIN_ROWS,
+        Conv,
         core,
+        vsplit_for,
     )
 
     attn, pools = gdn.attn, st.view.mamba
@@ -431,19 +486,35 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
         return None if t is None else t[li]
 
     # cuBLASLt's programmatic-dependent out-projection may start at the core's entry
-    # over the validated row window.
+    in_window = RELEASE_MIN_ROWS <= rows <= RELEASE_MAX_ROWS
     release = (
-        RELEASE_MIN_ROWS <= rows <= RELEASE_MAX_ROWS
-        and not opts.push
-        and not st.slots.lowm_outproj
+        (opts.conv_core or in_window) and not opts.push and not st.slots.lowm_outproj
     )
+    conv = None
+    if opts.conv_core:
+        bound = st.bound["gdn"]
+        conv = Conv(
+            attn.conv_weights,
+            attn.bias,
+            pools.conv[0][li],
+            pools.intermediate_conv_window[0][li],
+            st.view.gdn.intermediate_indices,
+            bound.arrive[attn.layer_id],
+            bound.arrive_split.get(attn.layer_id),
+        )
+    # the value-split conv-first launch counts on counters of its own
+    split = opts.value_split and (conv is None or conv.arrive_split is not None)
+    vsplit = vsplit_for(rows, nv) if split else 1
+    if vsplit > 1:
+        engaged("gdn_core with option gdn_value_split", rows)
     if release and ("release", rows) not in _ENGAGED:
         _ENGAGED.add(("release", rows))
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot gdn_core releases out_proj's BMM at its entry at %d rows",
+            "NVIDIA megakernel: Qwen3.5 slot gdn_core releases out_proj's BMM at its entry at %d rows%s",
             rows,
+            "" if in_window else " (slot gdn_conv_core)",
         )
-    core(
+    args = (
         qkv,
         z,
         a,
@@ -465,10 +536,23 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
         gdn.out_proj.input_scale,
         gdn.norm.eps,
         x,
+    )
+    kw = dict(
         rows_per_request=st.binding.tokens_per_request,
         num_k_heads=attn.num_k_heads,
         early_dependents=opts.push or release,
     )
+    launch = core
+    if conv is None and vsplit == 1:
+        launch = _core_launch(st.bound["gdn"], rows, args, kw, core)
+    elif st.bound["gdn"].gdn_commit_fold:
+        raise RuntimeError(
+            "NVIDIA megakernel: Qwen3.5 slot gdn_commit_fold: the tcgen05 launch takes "
+            f"no conv and no value split, which this step runs at {rows} rows"
+        )
+    if launch is core:
+        kw.update(conv=conv, vsplit=vsplit)
+    launch(*args, **kw)
     if opts.push:
         hop = st.bound["boundary"].hop
         h0 = _route_lin_h0(hop, attn.layer_id, rows, st)
@@ -488,7 +572,38 @@ def _fused(gdn, qkv, z, a, b, st, opts) -> torch.Tensor:
             input_scale=gdn.out_proj.input_scale,
             weight_scale=gdn.out_proj.weight_scale,
         )
-    return _out_proj(gdn.out_proj, x, qkv.dtype, st, opts.lowm_push)
+    return _out_proj(gdn.out_proj, x, qkv.dtype, st, opts.lowm_push, opts.gemm_ar)
+
+
+def _core_launch(bound, rows: int, args, kw, core):
+    if not bound.gdn_core_tc:
+        return core
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core_tc
+
+    if bound.gdn_commit_fold:
+        kw["fold"] = True
+    if core_tc.launchable(*args, **kw):
+        if ("core_tc", rows) not in _ENGAGED:
+            _ENGAGED.add(("core_tc", rows))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot gdn_core runs on tcgen05 at %d rows%s",
+                rows,
+                " with the commit folded in" if bound.gdn_commit_fold else "",
+            )
+        return core_tc.core_tc
+    if bound.gdn_commit_fold:
+        raise RuntimeError(
+            "NVIDIA megakernel: Qwen3.5 slot gdn_commit_fold: the tcgen05 launch was "
+            f"not built for this step's operands at {rows} rows inside a capture"
+        )
+    if ("core_tc", "capture", rows) not in _ENGAGED:
+        _ENGAGED.add(("core_tc", "capture", rows))
+        logger.warning(
+            "NVIDIA megakernel: Qwen3.5 slot gdn_core_tc was not built for this step's "
+            "operands at %d rows inside a capture: slot gdn_core's launch runs there",
+            rows,
+        )
+    return core
 
 
 def _route_lin_h0(hop, layer_id: int, rows: int, st):

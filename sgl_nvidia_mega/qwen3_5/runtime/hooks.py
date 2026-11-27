@@ -23,7 +23,8 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     SpeculativeRuntimeHooks,
 )
 
-from sgl_nvidia_mega.qwen3_5.sm103 import sharded_gumbel
+from sgl_nvidia_mega.qwen3_5.sm103 import gathered_cdf, sharded_gumbel
+from sgl_nvidia_mega.qwen3_5.sm103.head import verify_head
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,13 @@ SGLANG_READS = {
         "PostVerifyStrategy",
         "ShardedLogitsView",
         "SpeculativeRuntimeHooks",
+        "verify_shard_head",
+        "draft_attention",
+        # the gathered-logits sampler and its view's fields
+        "gathered_tokens",
+        "GatheredLogitsView",
+        "values",
+        "temperatures",
     ),
     "srt/kernel_plugins/nvidia/eagle_binding.py": (
         "tp_rank",
@@ -153,9 +161,19 @@ def _topology_reason(gathered: list[tuple[_Descriptor | None, str]], binding) ->
 class _LocalKeys:
     """The graph-capturable local callback installed into the stock strategy."""
 
-    def __init__(self, descriptor: _Descriptor, default: LocalKeysFn):
+    def __init__(
+        self,
+        descriptor: _Descriptor,
+        default: LocalKeysFn,
+        *,
+        fast: bool = False,
+        head: verify_head.VerifyHeadMma | None = None,
+    ):
         self.descriptor = descriptor
         self.default = default
+        self.fast = fast
+        # the verify head whose sampled keys the fast launch may take
+        self.head = head if fast and head is not None and head.keys else None
         self._engaged = False
 
     def __call__(self, view: ShardedLogitsView) -> torch.Tensor | None:
@@ -181,20 +199,33 @@ class _LocalKeys:
         )
         # There is deliberately no catch or fallback after the RNG draw: doing so
         # would perturb stock sampling's stream.  A launch failure is a hard error.
-        keys = sharded_gumbel.gumbel_shard_keys(
-            values,
-            view.temperatures,
-            seeds,
-            vocab_start=self.descriptor.start,
-            valid=self.descriptor.valid,
-            vocab_size=self.descriptor.vocab_size,
-            splits=view.splits,
-        )
+        if self.fast:
+            keys = sharded_gumbel.gumbel_shard_keys_fast(
+                values,
+                view.temperatures,
+                seeds,
+                vocab_start=self.descriptor.start,
+                valid=self.descriptor.valid,
+                vocab_size=self.descriptor.vocab_size,
+                splits=view.splits,
+                pre=None if self.head is None else verify_head.lookup(values),
+            )
+        else:
+            keys = sharded_gumbel.gumbel_shard_keys(
+                values,
+                view.temperatures,
+                seeds,
+                vocab_start=self.descriptor.start,
+                valid=self.descriptor.valid,
+                vocab_size=self.descriptor.vocab_size,
+                splits=view.splits,
+            )
         if not self._engaged:
             self._engaged = True
             logger.info(
-                "NVIDIA megakernel: Qwen3.5 slot sharded_gumbel runs at %d rows",
+                "NVIDIA megakernel: Qwen3.5 slot sharded_gumbel runs at %d rows%s",
                 rows,
+                " (gumbel_fast)" if self.fast else "",
             )
         return keys
 
@@ -221,8 +252,122 @@ class _LocalKeys:
         )
 
 
-def build(model, binding) -> HooksFactory | None:
-    """Build the provider factory, or return ``None`` uniformly before prewarm."""
+def _fast_reason(gathered: list[tuple[_Descriptor | None, str]]) -> str:
+    for rank, (desc, _) in enumerate(gathered):
+        if desc is not None and not sharded_gumbel.fast_supported(
+            vocab_start=desc.start, valid=desc.valid, splits=desc.splits
+        ):
+            return f"rank {rank}: its key tiles do not start on multiples of 4 ids"
+    return ""
+
+
+def _offers_verify_head() -> bool:
+    """Whether this SGLang's runtime hooks take a verify-shard head."""
+    return "verify_shard_head" in getattr(
+        SpeculativeRuntimeHooks, "__struct_fields__", ()
+    )
+
+
+def _build_head(model, binding, *, keys: bool) -> verify_head.VerifyHeadMma | None:
+    """Slot verify_head's head where every rank's LM head is a plain bf16 shard."""
+    from sgl_nvidia_mega.qwen3_5.runtime import slot_supported
+
+    try:
+        why = verify_head.head_refusal(model.logits_processor, model.lm_head)
+    except (AttributeError, TypeError, ValueError) as error:
+        why = f"LM-head shard metadata is unavailable: {error}"
+    if not slot_supported("verify_head", why, cpu_group=binding.tp_cpu_group):
+        return None
+    return verify_head.build(model, keys=keys)
+
+
+class _GatheredCdf:
+    def __init__(self, device_index: int, columns: int, seeds):
+        self.device_index = device_index
+        self.columns = columns
+        self.seeds = seeds
+        self._engaged = False
+
+    def __call__(self, view) -> torch.Tensor | None:
+        if not self._supports(view):
+            return None
+        values = view.values
+        rows = int(values.shape[0])
+        seeds = self.seeds.next(rows)
+        tokens = gathered_cdf.cdf_tokens(values, view.temperatures, seeds)
+        if not self._engaged:
+            self._engaged = True
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot gathered_cdf runs at %d rows", rows
+            )
+        return tokens
+
+    def _supports(self, view) -> bool:
+        values = getattr(view, "values", None)
+        temperatures = getattr(view, "temperatures", None)
+        return bool(
+            isinstance(values, torch.Tensor)
+            and values.is_cuda
+            and values.device.index == self.device_index
+            and values.dim() == 2
+            and values.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and values.stride(1) == 1
+            and 0 < int(values.shape[0]) <= _GATHERED_MAX_ROWS
+            and int(values.shape[1]) == self.columns
+            and isinstance(temperatures, torch.Tensor)
+            and temperatures.device == values.device
+            and temperatures.dtype == torch.float32
+            and tuple(temperatures.shape) == (int(values.shape[0]),)
+            and temperatures.is_contiguous()
+        )
+
+
+# the rows one seed round numbers (gathered_cdf.RoundSeeds)
+_GATHERED_MAX_ROWS = 4096
+
+
+def _offers_draft_attention() -> bool:
+    """Whether this SGLang's runtime hooks take a draft attention."""
+    return "draft_attention" in getattr(
+        SpeculativeRuntimeHooks, "__struct_fields__", ()
+    )
+
+
+def _draft_attention():
+    """Slot draft_cp's provider where SGLang takes one and CP-lite is built, else None."""
+    from sgl_nvidia_mega.qwen3_5.attention import draft_cp, split_kv
+    from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
+
+    if not _offers_draft_attention():
+        why = "this SGLang's hooks have no draft attention"
+    else:
+        why = split_kv.cp_reason()
+    if why:
+        unavailable_slots(draft_cp.SLOT, why)
+        return None
+    return draft_cp.attend
+
+
+def _offers_gathered_tokens() -> bool:
+    """Whether this SGLang's post-verify strategy takes a gathered-logits sampler."""
+    return "gathered_tokens" in getattr(PostVerifyStrategy, "__struct_fields__", ())
+
+
+def _gathered_sampler(model) -> _GatheredCdf:
+    """Slot gathered_cdf's sampler over the model's vocabulary, built at load."""
+    device_index = torch.cuda.current_device()
+    columns = int(model.logits_processor.vocab_size)
+    seeds = gathered_cdf.build(
+        torch.device("cuda", device_index), columns, max_rows=_GATHERED_MAX_ROWS
+    )
+    return _GatheredCdf(device_index, columns, seeds)
+
+
+def _sharded_keys(
+    model, binding
+) -> tuple[_Descriptor, bool, verify_head.VerifyHeadMma | None] | None:
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS, unavailable_slots
+
     local = _descriptor(model)
     gathered = _gather_descriptors(local, binding)
     reason = _topology_reason(gathered, binding)
@@ -231,9 +376,21 @@ def build(model, binding) -> HooksFactory | None:
             "NVIDIA megakernel: Qwen3.5 slot sharded_gumbel uses stock: %s", reason
         )
         return None
-
     descriptor = local[0]
     assert descriptor is not None
+    fast = "gumbel_fast" in SLOTS
+    if fast and (why := _fast_reason(gathered)):
+        unavailable_slots("gumbel_fast", why)
+        fast = False
+    head = None
+    if "verify_head" in SLOTS and not _offers_verify_head():
+        unavailable_slots(
+            "verify_head", "this SGLang's hooks have no verify-shard head"
+        )
+    elif "verify_head" in SLOTS:
+        head = _build_head(model, binding, keys=fast and "verify_head_keys" in SLOTS)
+    if "verify_head_keys" in SLOTS and (head is None or not head.keys):
+        unavailable_slots("verify_head_keys", "gumbel_fast or verify_head uses stock")
     sharded_gumbel.build(
         descriptor.device_index,
         columns=descriptor.columns,
@@ -241,14 +398,48 @@ def build(model, binding) -> HooksFactory | None:
         valid=descriptor.valid,
         vocab_size=descriptor.vocab_size,
         splits=descriptor.splits,
+        fast=fast,
+        pre=head is not None and head.keys,
     )
+    return descriptor, fast, head
+
+
+def build(
+    model,
+    binding,
+    *,
+    sharded: bool = True,
+    gathered: bool = False,
+    draft: bool = False,
+) -> HooksFactory | None:
+    attention = _draft_attention() if draft else None
+    keys = _sharded_keys(model, binding) if sharded else None
+    sampler = None
+    if gathered and not _offers_gathered_tokens():
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot gathered_cdf uses stock: this SGLang has "
+            "no gathered-logits sampler policy"
+        )
+    elif gathered:
+        sampler = _gathered_sampler(model)
+    if keys is None and sampler is None and attention is None:
+        return None
+    descriptor, fast, head = keys if keys is not None else (None, False, None)
+    # each field is set only when its provider is built
+    extra = {} if head is None else {"verify_shard_head": head}
+    if attention is not None:
+        extra["draft_attention"] = attention
 
     def factory(defaults: SpeculativeRuntimeHooks) -> SpeculativeRuntimeHooks:
+        local_keys = defaults.post_verify.local_keys
+        if descriptor is not None:
+            local_keys = _LocalKeys(descriptor, local_keys, fast=fast, head=head)
+        post = {} if sampler is None else {"gathered_tokens": sampler}
         return SpeculativeRuntimeHooks(
             post_verify=PostVerifyStrategy(
-                run=defaults.post_verify.run,
-                local_keys=_LocalKeys(descriptor, defaults.post_verify.local_keys),
-            )
+                run=defaults.post_verify.run, local_keys=local_keys, **post
+            ),
+            **extra,
         )
 
     return factory

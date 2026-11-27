@@ -158,6 +158,8 @@ class Bound(msgspec.Struct, frozen=True):
     # its alternate-stream shared expert can overlap rows 13-16 with the 32-token engine.
     m16_max_rows: int = 16
     pre: bool = False  # TEP8's body on route_topk/route-big routing tables
+    # variant slot route_big_mid: route-big at the routed body's tier-M rows
+    big_mid: bool = False
     reason: str = ""  # why a requested slot is not built
 
 
@@ -565,18 +567,22 @@ def routed_lin(mlp, x: torch.Tensor, fused: Bound, logits, x_fp4, x_sf):
 
 def _pre_body(mlp, width, x_fp4, x_sf):
     """TEP8's MoE body on ``width``'s tables, as a deferred-finalize output."""
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    result = body.run(width, mlp.experts, x_fp4, x_sf.view(torch.float8_e4m3fn))
+    return _pre_deferred(mlp, result)
+
+
+def _pre_deferred(mlp, result):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         _make_deferred_finalize_output,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    from sgl_nvidia_mega.qwen3_5.moe import body
     from sgl_nvidia_mega.qwen3_5.sm103.moe import router
 
-    experts = mlp.experts
-    result = body.run(width, experts, x_fp4, x_sf.view(torch.float8_e4m3fn))
     deferred = _make_deferred_finalize_output(result, top_k=router.TOP_K)
-    return experts.dispatcher.combine(
+    return mlp.experts.dispatcher.combine(
         combine_input=StandardCombineInput(hidden_states=deferred)
     )
 
@@ -614,7 +620,9 @@ def _routed_experts(mlp, x, fused, logits, x_fp4, x_sf):
     return experts.dispatcher.combine(combine_input=combine_input)
 
 
-def routed_topk(mlp, x: torch.Tensor, gemm: bool = False, pre: bool = False):
+def routed_topk(
+    mlp, x: torch.Tensor, gemm: bool = False, pre: bool = False, big: bool = False
+):
     """``FusedMoE.forward_deferred_finalize`` of ``mlp``'s routed experts on ``x``
     [rows, hidden] with SGLang's router GEMM, then slot route_topk's launch (the top-10
     and the NVFP4 input), and the runner on the materialized routing. With ``gemm``
@@ -655,8 +663,11 @@ def routed_topk(mlp, x: torch.Tensor, gemm: bool = False, pre: bool = False):
         ids, weights, _, _ = router.route_topk_quant(
             logits, x, scale, quantize=False, tables=tables
         )
-    elif pre and x.shape[0] >= plan.ROUTE_BIG_MIN_ROWS:
+    elif pre and (big or x.shape[0] >= plan.ROUTE_BIG_MIN_ROWS):
         rows = x.shape[0]
+        routed = engine_route(mlp, x, width, scale)
+        if routed is not None:
+            return _pre_deferred(mlp, routed)
         if ("route_big", rows) not in _ENGAGED:
             _ENGAGED.add(("route_big", rows))
             cl, _, words = router.big_shape(rows)
@@ -668,7 +679,14 @@ def routed_topk(mlp, x: torch.Tensor, gemm: bool = False, pre: bool = False):
                 cl,
                 "W" if words > 1 else "",
             )
-        logits, _ = mlp.gate(x)
+        logits = big_router_gemm(
+            x,
+            mlp.gate.weight,
+            min_rows=plan.ROUTE_BIG_MID_MIN_ROWS if big else BIG_GEMM_MIN_ROWS,
+        )
+        if logits is None:
+            logits, _ = mlp.gate(x)
+        lean = route_lean(rows, experts.num_local_experts, x.device.index) or {}
         ids, weights, x_fp4, x_sf = router.route_big_quant(
             logits,
             x,
@@ -677,8 +695,9 @@ def routed_topk(mlp, x: torch.Tensor, gemm: bool = False, pre: bool = False):
             ctas=(
                 plan.ROUTE_BIG_WIDE_CTAS
                 if rows >= plan.ROUTE_BIG_WIDE_MIN_ROWS
-                else None
+                else lean.get("ctas")
             ),
+            **{k: v for k, v in lean.items() if k != "ctas"},
         )
     else:
         logits, _ = mlp.gate(x)
@@ -687,7 +706,11 @@ def routed_topk(mlp, x: torch.Tensor, gemm: bool = False, pre: bool = False):
         )
     if pre:
         rows = x.shape[0]
-        if rows < plan.ROUTE_BIG_MIN_ROWS and ("pre_tier", rows) not in _ENGAGED:
+        if (
+            not big
+            and rows < plan.ROUTE_BIG_MIN_ROWS
+            and ("pre_tier", rows) not in _ENGAGED
+        ):
             _ENGAGED.add(("pre_tier", rows))
             logger.info(
                 "NVIDIA megakernel: Qwen3.5 MoE front tier %s at %d rows: "
@@ -766,3 +789,371 @@ def routed_given(mlp, x: torch.Tensor, bound: Bound, slot: str):
         wide_bal=bound.wide_bal,
         m16_max_rows=bound.m16_max_rows,
     )
+
+
+_BIG_GEMM: dict = {}
+_ROUTE_LEAN: dict = {}  # "on", "said" (the lines logged), "built" (variants compiled before capture)
+_ENGINE_ROUTE: dict = {}  # "on", "said"; (m, k, n, stride) -> the compiled router GEMM (A), or None
+
+
+def configure(
+    gemm: bool = False, lean: bool = False, engine_route: bool = False
+) -> None:
+    for d in (_BIG_GEMM, _ROUTE_LEAN, _ENGINE_ROUTE):
+        d.clear()
+    _BIG_GEMM.update(on=gemm, said=set())
+    _ROUTE_LEAN.update(on=lean, said=set(), built=set())
+    _ENGINE_ROUTE.update(on=engine_route, said=set())
+
+
+BIG_GEMM_MIN_ROWS = 33
+BIG_GEMM_MAX_ROWS = 192
+BIG_GEMM_EARLY_TRIGGER = True
+
+
+def big_router_gemm(
+    x: torch.Tensor, weight: torch.Tensor, min_rows: int = BIG_GEMM_MIN_ROWS
+):
+    if not _BIG_GEMM.get("on"):
+        return None
+    m, k = x.shape
+    n = weight.shape[0]
+    if not (
+        min_rows <= m <= BIG_GEMM_MAX_ROWS
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.shape[1] == k
+        and weight.is_contiguous()
+        and x.stride(1) == 1
+        and x.stride(0) % 8 == 0
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    ):
+        return None
+    key = (m, k, n, x.stride(0))
+    fn = _BIG_GEMM.get(key, False)
+    if fn is False:
+        if torch.cuda.is_current_stream_capturing():
+            if ("capture", m) not in _BIG_GEMM["said"]:
+                _BIG_GEMM["said"].add(("capture", m))
+                logger.warning(
+                    "NVIDIA megakernel: Qwen3.5 slot route_big_gemm does not run at %d "
+                    "rows (not compiled before CUDA-graph capture); SGLang's router GEMM "
+                    "runs",
+                    m,
+                )
+            return None
+        fn = _BIG_GEMM[key] = _big_gemm_compile(
+            m, k, n, x.stride(0), BIG_GEMM_EARLY_TRIGGER
+        )
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot route_big_gemm %s at %d rows",
+            "runs" if fn is not None else "does not run",
+            m,
+        )
+    if fn is None:
+        return None
+    return big_gemm_launch(fn, x, weight)
+
+
+_NO_TOPK = (None, None, None, None)
+
+
+def big_gemm_launch(fn, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """One launch of a compiled router GEMM (``_big_gemm_compile``): the logits [m, E] bf16."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    m, n = x.shape[0], weight.shape[0]
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    fn(
+        make_ptr(
+            cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        ),
+        make_ptr(
+            cutlass.BFloat16,
+            weight.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        cutlass.Int64(out.data_ptr()),
+        *_NO_TOPK,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    return out
+
+
+def _big_gemm_compile(
+    m: int, k: int, n: int, stride: int, early_trigger: bool = False, config=None
+):
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.q35_router_gemm import (
+        MoeRouterGemmKernel,
+        router_gemm_config,
+    )
+
+    config = config or router_gemm_config(m)
+    if config is None:
+        return None
+    splits, token_tile = config
+    try:
+        kernel = MoeRouterGemmKernel(
+            num_rows=m,
+            k_extent=k,
+            num_experts=n,
+            a_stride=stride,
+            splits=splits,
+            token_tile=token_tile,
+            use_pdl=True,
+            early_trigger=early_trigger,
+        )
+    except ValueError:
+        return None
+    dev = torch.device("cuda", torch.cuda.current_device())
+    x = torch.empty((m, stride), dtype=torch.bfloat16, device=dev)
+    w = torch.empty((n, k), dtype=torch.bfloat16, device=dev)
+    xp = make_ptr(
+        cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    wp = make_ptr(
+        cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cute.compile(kernel, xp, wp, cutlass.Int64(0), *_NO_TOPK, stream)
+
+
+LEAN_WIDE_CTAS = 64
+
+
+def route_lean_ctas(rows: int) -> int | None:
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    _, tpc, _ = router.big_shape(rows)
+    return None if tpc <= 16 else LEAN_WIDE_CTAS
+
+
+def route_lean_threads(rows: int) -> int:
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    _, tpc, _ = router.big_shape(rows)
+    if tpc <= 16:
+        return 512
+    return 512 if (route_lean_ctas(rows) or 0) >= LEAN_WIDE_CTAS else router.BIG_THREADS
+
+
+def route_lean_variants(rows_list) -> set:
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    if not _ROUTE_LEAN.get("on"):
+        return set()
+    out = set()
+    for rows in rows_list:
+        threads = route_lean_threads(rows)
+        if rows > router.LEAN_WIDE_MAX_ROWS or router.big_variant_unsupported(
+            rows, threads
+        ):
+            continue
+        cl = router.big_shape(rows)[0]
+        out.add((True, False, threads, cl))
+        out.add((True, True, threads, cl))
+    return out
+
+
+def route_lean_build(device_index: int, local_count: int, rows_list) -> None:
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    variants = route_lean_variants(rows_list)
+    router.build_big(device_index, local_count, variants)
+    _ROUTE_LEAN["built"].update((device_index, local_count) + v for v in variants)
+
+
+def _route_lean_say(rows: int, key: str, message: str, warn: bool) -> None:
+    if (rows, key) not in _ROUTE_LEAN["said"]:
+        _ROUTE_LEAN["said"].add((rows, key))
+        (logger.warning if warn else logger.info)("NVIDIA megakernel: %s", message)
+
+
+def route_lean(rows: int, local_count: int, device_index: int):
+    if not _ROUTE_LEAN.get("on"):
+        return None
+    from sgl_nvidia_mega.qwen3_5.moe import body
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import router
+
+    if rows > router.LEAN_WIDE_MAX_ROWS:
+        return None
+    cl = router.big_shape(rows)[0]
+    threads = route_lean_threads(rows)
+    ctas = route_lean_ctas(rows)
+    reason = router.big_variant_unsupported(rows, threads)
+    et = body.engine_serves(rows)
+    if (
+        not reason
+        and (device_index, local_count, True, et, threads, cl)
+        not in _ROUTE_LEAN["built"]
+    ):
+        reason = "not compiled at build"
+    if reason:
+        _route_lean_say(
+            rows,
+            "fallback",
+            f"Qwen3.5 slot route_lean: route-big runs without the lean front at {rows} "
+            f"rows ({reason})",
+            True,
+        )
+        return None
+    _route_lean_say(
+        rows,
+        "engaged",
+        f"Qwen3.5 slot route_lean runs at {rows} rows: counts by bulk copies onto "
+        f"mbarriers, MoE engine released at {'the start' if et else 'the end'}, "
+        f"{threads} threads x {ctas or router.BIG_CTAS} CTAs in clusters of {cl}",
+        False,
+    )
+    return dict(lean=True, et=et, threads=threads, ctas=ctas)
+
+
+ENGINE_ROUTE_MIN_ROWS, ENGINE_ROUTE_MAX_ROWS = 33, 63
+ENGINE_ROUTE_EARLY_TRIGGER = True
+
+
+def _engine_route_fallback(rows: int, reason: str) -> None:
+    if (rows, reason) not in _ENGINE_ROUTE["said"]:
+        _ENGINE_ROUTE["said"].add((rows, reason))
+        logger.warning(
+            "NVIDIA megakernel: Qwen3.5 slot moe_engine_route falls back to route-big at "
+            "%d rows (%s)",
+            rows,
+            reason,
+        )
+
+
+def engine_route(mlp, x: torch.Tensor, width, scale: torch.Tensor):
+    rows = x.shape[0]
+    if (
+        not _ENGINE_ROUTE.get("on")
+        or not ENGINE_ROUTE_MIN_ROWS <= rows <= ENGINE_ROUTE_MAX_ROWS
+    ):
+        return None
+    from sgl_nvidia_mega.qwen3_5.moe import body
+
+    experts = mlp.experts
+    weight = mlp.gate.weight
+    reason = ""
+    if experts.top_k != 10 or weight.shape[0] != 512 or experts.num_local_experts > 128:
+        reason = "top-10 of 512 experts with at most 128 local experts only"
+    elif not (
+        x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.shape[1] == x.shape[1]
+        and weight.is_contiguous()
+        and x.stride(1) == 1
+        and x.stride(0) % 8 == 0
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+        and scale.dtype == torch.float32
+    ):
+        reason = "router GEMM operands it does not take"
+    if reason:
+        _engine_route_fallback(rows, reason)
+        return None
+    got = router_gemm_a(x, weight, scale, ENGINE_ROUTE_EARLY_TRIGGER)
+    if isinstance(got, str):
+        _engine_route_fallback(rows, got)
+        return None
+    _, cand, x_fp4, x_sf = got
+    return body.run_engine_a(width, experts, x_fp4, x_sf, cand)
+
+
+def router_gemm_a(
+    x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, early_trigger: bool
+):
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    m, k = x.shape
+    n = weight.shape[0]
+    key = (m, k, n, x.stride(0), bool(early_trigger))
+    fn = _ENGINE_ROUTE.get(key, False)
+    if fn is False:
+        if torch.cuda.is_current_stream_capturing():
+            return "not compiled before CUDA-graph capture"
+        fn = _ENGINE_ROUTE[key] = _engine_route_compile(
+            m, k, n, x.stride(0), early_trigger
+        )
+    if fn is None:
+        return "the router GEMM (A) does not take this shape"
+    dev = x.device
+    logits = torch.empty(
+        (m, n), dtype=torch.bfloat16, device=dev
+    )  # not read by the body
+    cand = torch.empty((m, n // 128, 10), dtype=torch.int32, device=dev)
+    x_fp4 = torch.empty((m, k // 2), dtype=torch.uint8, device=dev)
+    x_sf = torch.empty((m, k // 16), dtype=torch.uint8, device=dev)
+    fn(
+        make_ptr(
+            cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        ),
+        make_ptr(
+            cutlass.BFloat16,
+            weight.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        cutlass.Int64(logits.data_ptr()),
+        cutlass.Int64(cand.data_ptr()),
+        cutlass.Int64(scale.data_ptr()),
+        cutlass.Int64(x_fp4.data_ptr()),
+        cutlass.Int64(x_sf.data_ptr()),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    return logits, cand, x_fp4, x_sf
+
+
+def _engine_route_compile(m: int, k: int, n: int, stride: int, early_trigger: bool):
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    from sgl_nvidia_mega.qwen3_5.sm103.moe.q35_router_gemm import (
+        MoeRouterGemmKernel,
+        router_gemm_config,
+    )
+
+    if router_gemm_config(m) != (8, 32):
+        return None
+    try:
+        kernel = MoeRouterGemmKernel(
+            num_rows=m,
+            k_extent=k,
+            num_experts=n,
+            a_stride=stride,
+            splits=8,
+            token_tile=32,
+            use_pdl=True,
+            early_trigger=early_trigger,
+            emit_topk=True,
+            quant=True,
+        )
+    except ValueError:
+        return None
+    dev = torch.device("cuda", torch.cuda.current_device())
+    x = torch.empty((m, stride), dtype=torch.bfloat16, device=dev)
+    w = torch.empty((n, k), dtype=torch.bfloat16, device=dev)
+    xp = make_ptr(
+        cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    wp = make_ptr(
+        cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+    )
+    z = cutlass.Int64(0)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cute.compile(kernel, xp, wp, z, z, z, z, z, stream)

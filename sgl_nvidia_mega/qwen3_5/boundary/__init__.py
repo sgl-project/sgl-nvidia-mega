@@ -47,22 +47,44 @@ def open_stream(st) -> None:
     start(st.fb)
 
 
+def _engine(st):
+    if st.slots.hop:
+        return st.bound["boundary"].hop
+    if st.slots.bt_tail:
+        return st.bound["boundary"].bt
+    return None
+
+
 def pre(layer, hidden, st, capture=None):
     """``layer``'s mixer input from the stream (its input norm)."""
-    if st.slots.hop and capture is None:
-        x = hop.layer_input(st.bound["boundary"].hop, layer, hidden, st)
+    engine = _engine(st) if capture is None else None
+    if engine is not None:
+        x = hop.layer_input(engine, layer, hidden, st)
         if x is not None:
             return x
+    _refuse_lamport(st, layer)
     return layer.attn_boundary.prepare(hidden, st.fb, capture_gathered=capture)
+
+
+def _refuse_lamport(st, layer=None) -> None:
+    from sgl_nvidia_mega.qwen3_5.moe import fc2ar
+
+    if fc2ar.active() is not None:
+        point = "final norm" if layer is None else f"layer {layer.layer_id}'s input"
+        fc2ar.refuse_unconsumed(st, point)
 
 
 def post_attn(layer, part, st):
     """The mixer's partial output into the stream; returns the MoE input."""
     hidden = layer.attn_boundary.finish(part, st.fb)
-    if st.slots.hop:
-        x = hop.moe_input(st.bound["boundary"].hop, layer, hidden, st)
+    engine = _engine(st)
+    if engine is not None:
+        x = hop.moe_input(engine, layer, hidden, st)
         if x is not None:
             return x
+    if st.slots.gemm_ar:
+        # a mixer projection deferred into this all-reduce runs before SGLang's
+        st.bound["boundary"].bt.gemm_ar.settle()
     return layer.ffn_boundary.prepare(hidden, st.fb)
 
 
@@ -81,6 +103,14 @@ def close_stream(st, hidden):
         x = hop.final_norm(st.bound["boundary"].hop, hidden, st)
         if x is not None:
             return x
+    from sgl_nvidia_mega.qwen3_5.moe import fc2ar
+
+    lam = fc2ar.pending(st) if fc2ar.active() is not None else None
+    if lam is not None:
+        x = hop.final_norm(lam, hidden, st)
+        if x is not None:
+            return x
+    _refuse_lamport(st)
     m = st.model
     return final_norm(
         hidden,

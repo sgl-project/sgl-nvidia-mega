@@ -23,6 +23,8 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import _fail_late, _t_end
+
 
 def _pdl_supported() -> bool:
     """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
@@ -36,6 +38,51 @@ def _pdl_supported() -> bool:
 
 
 _ENABLE_PDL = _pdl_supported()
+
+
+@triton.jit
+def _st_relaxed_sys_b64(addr, val):
+    tl.inline_asm_elementwise(
+        "st.relaxed.sys.global.b64 [$1], $2; mov.u32 $0, 0;",
+        "=r,l,l",
+        [addr, val],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _st_relaxed_sys_b32(addr, val):
+    tl.inline_asm_elementwise(
+        "st.relaxed.sys.global.b32 [$1], $2; mov.u32 $0, 0;",
+        "=r,l,r",
+        [addr, val],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _opaque_i32(x):
+    return tl.inline_asm_elementwise(
+        "mov.b32 $0, $1;", "=r,r", [x], dtype=tl.int32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _st_lam_pair_owner(a0, v0, a1, v1, k):
+    tl.inline_asm_elementwise(
+        "{ .reg .pred p; .reg .u32 t; mov.u32 t, %tid.x; setp.eq.u32 p, t, $5; "
+        "@p st.relaxed.sys.global.b32 [$1], $2; @p st.relaxed.sys.global.b32 [$3], $4; } "
+        "mov.u32 $0, 0;",
+        "=r,l,r,l,r,r",
+        [a0, v0, a1, v1, k],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -81,6 +128,21 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     stride_v_t: tl.constexpr = 0,
     stride_v_cache_t: tl.constexpr = 0,
     FP8_CACHE: tl.constexpr = False,
+    PUSH_Q: tl.constexpr = False,
+    push_peers_ptr=None,
+    push_me=0,
+    push_off=0,
+    push_cnt_ptr=None,
+    PUSH_CP: tl.constexpr = 4,
+    PUSH_WORDS: tl.constexpr = 256,
+    PUSH_LAM: tl.constexpr = False,
+    GATHER_Q: tl.constexpr = False,
+    gq_all_ptr=None,
+    gq_seq_lens_ptr=None,
+    gq_pre_lens_ptr=None,
+    GQ_QL: tl.constexpr = 1,
+    gq_tmo=0,
+    GQ_DEADLINE: tl.constexpr = False,
 ):
     # EARLY_TRIGGER: release the dependents at entry; they must wait before reading this kernel's outputs.
     if ENABLE_PDL and EARLY_TRIGGER:
@@ -185,6 +247,96 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
         gate_out = gate_out_ptr + token * stride_gate_t + local_head * HEAD_DIM
         g = tl.load(gate_in + head_offs, mask=head_mask, other=0.0)
         tl.store(gate_out + head_offs, g, mask=head_mask)
+
+    if PUSH_Q and PUSH_LAM:
+        if not is_k:
+            tl.debug_barrier()
+            NWQ: tl.constexpr = HEAD_DIM // 4
+            tl.static_assert(PUSH_CP * NWQ == 256, "two words a thread of 128")
+            k = _opaque_i32(tl.arange(0, 128))
+            f1 = k + 128
+            qb = (q_out_ptr + token * stride_qo_t + local_head * HEAD_DIM).to(
+                tl.pointer_type(tl.int32)
+            )
+            q0 = tl.load(qb + k % NWQ)
+            q1 = tl.load(qb + f1 % NWQ)
+            row = (token * PUSH_CP + push_me) * PUSH_WORDS + local_head * NWQ
+            d0 = (
+                tl.load(push_peers_ptr + (push_me + k // NWQ) % PUSH_CP)
+                + push_off
+                + (row + k % NWQ).to(tl.int64) * 4
+            )
+            d1 = (
+                tl.load(push_peers_ptr + (push_me + f1 // NWQ) % PUSH_CP)
+                + push_off
+                + (row + f1 % NWQ).to(tl.int64) * 4
+            )
+            _st_lam_pair_owner(
+                d0,
+                tl.where(q0 == -1, 0x7FFFFFFF, q0),
+                d1,
+                tl.where(q1 == -1, 0x7FFFFFFF, q1),
+                k,
+            )
+            if GATHER_Q:
+                cc = tl.arange(0, PUSH_CP)
+                jw = tl.arange(0, NWQ)
+                own = tl.load(push_peers_ptr + push_me) + push_off
+                widx = ((token * PUSH_CP + cc) * PUSH_WORDS + local_head * NWQ).to(
+                    tl.int64
+                )
+                laddr = own + (widx[:, None] + jw[None, :].to(tl.int64)) * 4
+                src = laddr.to(tl.pointer_type(tl.int32))
+                if GQ_DEADLINE:
+                    t_end = _t_end(gq_tmo)
+                v = tl.load(src, volatile=True)
+                done = tl.min(tl.min((v != -1).to(tl.int32), axis=1), axis=0)
+                while done == 0:
+                    if GQ_DEADLINE:
+                        _fail_late(t_end, done)
+                    v = tl.load(src, volatile=True)
+                    done = tl.min(tl.min((v != -1).to(tl.int32), axis=1), axis=0)
+                slot_q = ((token // GQ_QL) * PUSH_CP + cc) * GQ_QL + token % GQ_QL
+                tl.store(
+                    gq_all_ptr
+                    + (slot_q * PUSH_WORDS + local_head * NWQ)[:, None]
+                    + jw[None, :],
+                    v,
+                )
+                if local_head == 0:
+                    if token % GQ_QL == 0:
+                        tl.store(
+                            gq_pre_lens_ptr + token // GQ_QL,
+                            tl.maximum(
+                                tl.load(gq_seq_lens_ptr + token // GQ_QL) - GQ_QL, 0
+                            ),
+                        )
+                    tl.store(push_cnt_ptr + token, tl.load(push_cnt_ptr + token) + 1)
+                _st_relaxed_sys_b32(laddr, (laddr & 0).to(tl.int32) - 1)
+    elif PUSH_Q:
+        if not is_k:
+            tl.debug_barrier()
+            e = tl.load(push_cnt_ptr + token) + 1
+            flag = e.to(tl.int64) << 32
+            wq = tl.arange(0, HEAD_DIM // 4)
+            qw = tl.load(
+                (q_out_ptr + token * stride_qo_t + local_head * HEAD_DIM).to(
+                    tl.pointer_type(tl.int32)
+                )
+                + wq
+            )
+            xw = flag | (qw.to(tl.int64) & 0xFFFFFFFF)
+            for c in tl.static_range(PUSH_CP):
+                dst = (
+                    tl.load(push_peers_ptr + (push_me + c) % PUSH_CP)
+                    + push_off
+                    + (
+                        (token * PUSH_CP + push_me) * PUSH_WORDS
+                        + local_head * (HEAD_DIM // 4)
+                    )
+                    * 8
+                )
+                _st_relaxed_sys_b64(dst + wq.to(tl.int64) * 8, xw)
 
     # PDL: signal dependent kernels (attention/allreduce) can start early.
     # Only available on NVIDIA Hopper+ (sm_90+); guarded for AMD/other backends.
@@ -350,6 +502,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     v_scale: Optional[torch.Tensor] = None,
     early_trigger: bool = False,
     pdl_wait: bool = False,
+    q_push: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
@@ -418,6 +571,38 @@ def fused_qk_gemma_rmsnorm_rope_gate(
             stride_v_cache_t=kv_cache[1].stride(0),
             FP8_CACHE=True,
         )
+    if q_push is not None:
+        assert fp8_cache and not pdl_wait, "q_push rides the FP8-cache front"
+        kwargs.update(
+            PUSH_Q=True,
+            push_peers_ptr=q_push["peers"],
+            push_me=q_push["me"],
+            push_off=q_push["off"],
+            push_cnt_ptr=q_push["cnt"],
+            PUSH_CP=q_push["cp"],
+            PUSH_WORDS=q_push["words"],
+        )
+        if q_push.get("lam", False):
+            kwargs.update(PUSH_LAM=True, num_warps=4)
+        gq = q_push.get("gather")
+        if gq is not None:
+            assert q_push.get("lam", False), "the in-front q gather polls Lamport words"
+            assert (
+                gq["seq_lens"].dtype == torch.int32 and gq["q_all"].dtype == torch.int32
+            )
+            kwargs.update(
+                GATHER_Q=True,
+                gq_all_ptr=gq["q_all"],
+                gq_seq_lens_ptr=gq["seq_lens"],
+                gq_pre_lens_ptr=gq["pre_lens"],
+                GQ_QL=int(gq["ql"]),
+                **(
+                    {"gq_tmo": int(gq["tmo"]), "GQ_DEADLINE": True}
+                    if gq.get("tmo")
+                    else {}
+                ),
+            )
+            early_trigger = True
     if pdl_wait and fp8_cache and has_gate and _ENABLE_PDL:
         _fused_qk_rmsnorm_rope_gate_pdl_kernel[grid](
             q_gate,

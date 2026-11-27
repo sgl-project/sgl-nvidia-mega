@@ -114,7 +114,7 @@ class DraftLoop:
         else:
             token, hidden = io.topk_index.view(-1), io.hidden_states
             for i in range(steps):
-                hidden = self._model_step(io, i, self._fc(token, hidden))
+                hidden = self._model_step(io, i, *self._fc(token, hidden))
                 token = layer.top1(parts, hidden)
                 tokens[:, i + 1].copy_(token)
                 positions.add_(1)
@@ -125,17 +125,19 @@ class DraftLoop:
             mrope.sub_(steps)
 
     def _fc(self, token, hidden):
-        """A step's fc output outside the exchange: slot draft_xchg's row-split fc up to
-        its widest batch, else SGLang's."""
         from sgl_nvidia_mega.qwen3_5.draft.xchg import FC_SPLIT_MAX_TOKENS
 
-        mkd = self.parts.mkd
+        parts = self.parts
+        if parts.fc_tp is not None:
+            front = parts.fc_tp(token, hidden)
+            if front is not None:
+                return front
+        mkd = parts.mkd
         if mkd is None or token.shape[0] > FC_SPLIT_MAX_TOKENS:
-            return layer.fc_input(self.parts, token, hidden)
-        return mkd.split_fc(self.parts.embed(token), hidden)
+            return layer.fc_input(parts, token, hidden), None
+        return mkd.split_fc(parts.embed(token), hidden), None
 
-    def _model_step(self, io, i: int, x):
-        """Draft step i's decoder layer on its fc output ``x``: the final-norm rows."""
+    def _model_step(self, io, i: int, x, normed=None):
         cache_loc = (
             self._locs[i] if self._locs is not None else io.out_cache_loc[i : i + 1]
         )
@@ -147,6 +149,7 @@ class DraftLoop:
             io.steps[i],
             io.kv,
             rows_per_request=1,
+            **({} if normed is None else {"normed": normed}),
         )
 
     def _multi_steps(self, io, steps: int) -> None:
@@ -159,7 +162,7 @@ class DraftLoop:
         tokens = io.draft_tokens_out
         token, hidden = io.topk_index.view(-1), io.hidden_states
         for i in range(steps):
-            hidden = self._model_step(io, i, self._fc(token, hidden))
+            hidden = self._model_step(io, i, *self._fc(token, hidden))
             layer.top1_into(
                 self.parts,
                 hidden,

@@ -161,6 +161,9 @@ class Attention:
     """The draft layer's attention buffers: trtllm-gen's zeroed workspace (SGLang's
     shared one) and multi-CTA counters, and the FP8 KV scales."""
 
+    # slot draft_gate_fold (set at build from the slots)
+    gate_fold: bool = False
+
     def __init__(self, parts):
         from sglang.srt.layers.attention.trtllm_mha_backend import (
             DEFAULT_WORKSPACE_SIZE_MB,
@@ -199,16 +202,27 @@ class Attention:
         self._noted: set = set()  # engagement lines logged (once each, under capture)
         # slot draft_front: 2.2's attention front writes the KV and FP8 q in one launch
         self.front = "draft_front" in parts.slots
-        # slot draft_skv2: the draft extend's split-KV decode (DraftExtendSplitKV)
-        self.skv2 = (
-            DraftExtendSplitKV.build(parts) if "draft_skv2" in parts.slots else None
-        )
+        self.q_push = self.front and "draft_q_push" in parts.slots
+        self.q_gather = self.q_push and "draft_q_gather" in parts.slots
+        self.gate_fold = "draft_gate_fold" in parts.slots
+        self._warned: set = set()
+        if "draft_skv2" in parts.slots:
+            DraftExtendSplitKV.note()
         # slots draft_q1_cp / draft_skv2_cp: one request's steps / extend in their
         # CP graph variant run CP-lite at one request (DraftCP)
         self.cp_b1 = DraftCP.build(parts)
 
     def __call__(
-        self, x, positions, cache_loc, meta, kv, *, rows_per_request: int, o_proj=None
+        self,
+        x,
+        positions,
+        cache_loc,
+        meta,
+        kv,
+        *,
+        rows_per_request: int,
+        o_proj=None,
+        o_push=None,
     ):
         """The TP-partial attention output [rows, hidden] of the normed input ``x``
         [rows, hidden]; writes this step's KV rows at ``cache_loc``. ``o_proj`` (the
@@ -217,14 +231,31 @@ class Attention:
 
         layer = self.layer
         if self.front:
-            q8, gate = self._front(x, positions, cache_loc, kv)
+            push = (
+                self._q_push_args(x.shape[0], rows_per_request, meta)
+                if self.q_push
+                else None
+            )
+            q8, gate = self._front(x, positions, cache_loc, kv, push)
+            folded = self._offer_gate(gate, x.shape[0], rows_per_request, o_proj)
             o = self.decode(q8, meta, kv, rows_per_request)
+            folded = folded and self._took_gate(x.shape[0])
+            if push is not None:
+                from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+                if split_kv.cp_lite()._q_pushed is not None:
+                    raise RuntimeError(
+                        "slot draft_q_push: CP-lite did not take the pushed q rows"
+                    )
         else:
             q, k, v, gate = layer.forward_prepare_cuda_fused(
                 positions=positions, hidden_states=x
             )
+            folded = self._offer_gate(gate, x.shape[0], rows_per_request, o_proj)
             o = self.core(q, k, v, cache_loc, meta, kv, rows_per_request)
-        if layer.attn_output_gate:
+            folded = folded and self._took_gate(x.shape[0])
+        # slot draft_gate_fold: when folded, o is already bf16(o * sigmoid(gate))
+        if layer.attn_output_gate and not folded:
             if (
                 o_proj is not None
                 and GATE_FOLD
@@ -238,10 +269,113 @@ class Attention:
             o = fused_sigmoid_mul(o, gate, inplace=True)
         if o_proj is not None:
             return o_proj(o)
+        if o_push is not None:
+            return o_push(o)
         out, _ = layer.o_proj(o)
         return out
 
-    def _front(self, x, positions, cache_loc, kv):
+    def _q_push_args(self, rows: int, rows_per_request: int, meta):
+        from sgl_nvidia_mega.qwen3_5.attention import split_kv
+        from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+
+        cp_b1 = self.cp_b1
+        if (
+            "cp_q_push" not in SLOTS
+            or cp_b1 is None
+            or not cp_b1.multi
+            or rows_per_request < 1
+            or rows <= rows_per_request
+            or rows % rows_per_request
+            # the decode will not try CP-lite: nothing to push to
+            or not cp_b1.takes(rows_per_request, rows)
+        ):
+            return None
+        requests = rows // rows_per_request
+        cp = split_kv.cp_lite()
+        attn = self.layer.attn
+        lengths = getattr(meta, "cache_seqlens", None)
+        if (
+            cp is None
+            or attn.tp_k_head_num != 1
+            or attn.sliding_window_size not in (None, -1)
+            or lengths is None
+            or lengths.shape[0] != requests
+        ):
+            return None
+        if self.q_gather:
+            args = cp.q_push_args(
+                rows, requests, rows_per_request, gather=True, seq_lens=lengths
+            )
+        else:
+            args = cp.q_push_args(rows, requests, rows_per_request)
+        if args is not None:
+            what = (
+                f"{rows} rows"
+                if rows_per_request == 1
+                else f"the extend's {rows} rows ({requests} x {rows_per_request})"
+            )
+            self._note(f"slot draft_q_push pushes the FP8 q of {what} from the front")
+            if "gather" in args:
+                self._note(
+                    f"slot draft_q_gather lands the group's q of {what} in the front"
+                )
+            elif self.q_gather:
+                self._warn(
+                    ("q_gather", rows),
+                    f"slot draft_q_gather: the front of {rows} rows keeps the gather's "
+                    "wait half (no Lamport q words or int32 lengths)",
+                )
+        return args
+
+    def _offer_gate(self, gate, rows: int, rows_per_request: int, o_proj) -> bool:
+        cp_b1 = self.cp_b1
+        if not (
+            self.gate_fold
+            and self.layer.attn_output_gate
+            and o_proj is None
+            and gate is not None
+            and gate.dtype == torch.bfloat16
+            and gate.dim() == 2
+            and gate.is_contiguous()
+            and cp_b1 is not None
+            and cp_b1.multi
+            and cp_b1.precise
+            and rows > rows_per_request
+            and cp_b1.takes(rows_per_request, rows)
+        ):
+            return False
+        from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+        cp = split_kv.cp_lite()
+        if cp is None:
+            return False
+        cp.offer_gate_bf16(gate)
+        return True
+
+    def _took_gate(self, rows: int) -> bool:
+        from sgl_nvidia_mega.qwen3_5.attention import split_kv
+
+        done = split_kv.cp_lite().take_gate_bf16()
+        if done:
+            self._note(
+                f"slot draft_gate_fold applies the attention output gate in CP-lite's "
+                f"merge at {rows} rows"
+            )
+        else:
+            self._warn(
+                ("gate_fold", rows),
+                f"slot draft_gate_fold: CP-lite's merge did not take the gate at {rows} "
+                "rows; the gate launch runs",
+            )
+        return done
+
+    def _warn(self, key, what: str) -> None:
+        """A slot that should engage and did not: one WARNING line per key."""
+        if key not in self._warned:
+            self._warned.add(key)
+            logger.warning("NVIDIA megakernel: Qwen3.5 MTP draft %s", what)
+
+    def _front(self, x, positions, cache_loc, kv, q_push=None):
         """Slot draft_front (2.2's ATTN_FRONT): the qkv projection, then one Triton launch for
         the q / k Gemma RMSNorm, RoPE, gate split, FP8 q, and K / V into the FP8 cache
         at ``cache_loc``: (q8 [rows, heads * head_dim], gate)."""
@@ -276,6 +410,7 @@ class Attention:
             v_scale=self.v_scale,
             early_trigger=x.shape[0] == 1 and self.q1 is not None and Q1_PDL,
             pdl_wait=x.shape[0] == 1 and QKN_PDL,
+            q_push=q_push,
         )
         if x.shape[0] == 1 and QKN_PDL and layer.attn_output_gate:
             self._note(
@@ -332,13 +467,6 @@ class Attention:
             and _q1_label() != Q1_STOCK
         ):
             return self.q1(q8, kv, meta).view(-1, self.heads * self.head_dim)
-        if (
-            self.skv2 is not None
-            and rows_per_request > 1
-            and q8.shape[0] == rows_per_request
-            and self.skv2.long()
-        ):
-            return self.skv2.run(attn, q8, kv, meta)
         kwargs = {}
         if rows_per_request != 1:
             kwargs["q_len_per_req"] = rows_per_request
@@ -379,48 +507,13 @@ class Attention:
 
 
 class DraftExtendSplitKV:
-    """Slot draft_skv2: the draft extend's 7-row decode as 2.2's SKV2 (MKA_SKV2_DRAFT,
-    from 32768 tokens of KV), through the target attention package's SKV2 op
-    (``qwen3_5.attention.split_kv``, slot skv2's) on the draft's pool."""
-
-    def __init__(self, split_kv, route):
-        self.split_kv, self.route = split_kv, route
-        self._logged = False
-
-    @classmethod
-    def build(cls, parts):
-        from sgl_nvidia_mega.qwen3_5.runtime import unavailable_slots
-
-        try:
-            from sgl_nvidia_mega.qwen3_5.attention import route, split_kv
-        except ImportError as e:
-            unavailable_slots(
-                "draft_skv2",
-                f"needs the attention package's SKV2 (qwen3_5.attention.split_kv): {e}",
-            )
-            return None
-        width = int(parts.binding.tokens_per_request)
-        why = split_kv.unsupported(parts.layer.attn, width)
-        if why:
-            unavailable_slots("draft_skv2", why)
-            return None
-        return cls(split_kv, route)
-
-    def long(self) -> bool:
-        """The draft-extend graph being captured is the split-KV one ("split_kv_long"),
-        or SGLang captures no label of ours (then every length, as for the verify)."""
-        label = _q1_label()
-        return label is None or label == self.route.SPLIT_KV_LONG
-
-    def run(self, attn, q8, kv, meta):
-        if not self._logged and torch.cuda.is_current_stream_capturing():
-            self._logged = True
-            logger.info(
-                "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_skv2 runs the draft "
-                "extend's %d rows as SKV2",
-                q8.shape[0],
-            )
-        return self.split_kv.skv2(attn, q8, kv, meta)
+    @staticmethod
+    def note() -> None:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 MTP draft slot draft_skv2 keeps the draft "
+            "extend's KV-length graph variants; one request below slot draft_skv2_cp's "
+            "length runs the stock trtllm-gen decode"
+        )
 
 
 class DraftCP:
@@ -429,11 +522,28 @@ class DraftCP:
     the decode of the request's rows as the plugin's CP-lite, which then serves one
     request through ``attention.split_kv.cp_core``. Slot
     draft_multi also preserves CP-lite on multi-request graphs where SGLang built it;
-    CP-lite's own shape gate decides whether it runs."""
+    CP-lite's own shape gate decides whether it runs.
+    """
 
-    def __init__(self, split_kv, route, steps: bool, extend: bool, multi: bool = False):
+    def __init__(
+        self,
+        split_kv,
+        route,
+        steps: bool,
+        extend: bool,
+        multi: bool = False,
+        precise: bool = False,
+        push: bool = False,
+        merge_early: bool = False,
+        hilo_trig: bool = False,
+    ):
         self.split_kv, self.route = split_kv, route
         self.steps, self.extend, self.multi = steps, extend, multi
+        self.precise = precise
+        self.push = push and precise
+        # option draft_merge_early (with the push): that call's merge runs EARLY
+        self.merge_early = merge_early and self.push
+        self.hilo_trig = hilo_trig and self.merge_early
         self._logged: set = set()
 
     @classmethod
@@ -456,10 +566,27 @@ class DraftCP:
                 return None
             unavailable_slots(parts.slots & {"draft_q1_cp", "draft_skv2_cp"}, why)
             return None
-        return cls(split_kv, route, steps, extend, multi)
+        from sgl_nvidia_mega.qwen3_5 import runtime
+
+        return cls(
+            split_kv,
+            route,
+            steps,
+            extend,
+            multi,
+            "draft_cp" in runtime.SLOTS,
+            push="draft_o_push" in parts.slots,
+            merge_early=runtime.measured_option("draft_merge_early"),
+            hilo_trig=runtime.measured_option("draft_hilo_trig"),
+        )
 
     def takes(self, rows_per_request: int, rows: int) -> bool:
-        """Whether this graph lets CP-lite try the decode."""
+        if self.precise:
+            from sgl_nvidia_mega.qwen3_5.attention import draft_cp
+
+            requests = rows // max(rows_per_request, 1)
+            if draft_cp.stock_cutover(requests, rows_per_request):
+                return False
         if self.multi and rows > rows_per_request:
             return True
         label = _q1_label()
@@ -471,6 +598,15 @@ class DraftCP:
         layer = attention.layer
         attn = layer.attn
         multi = q8.shape[0] > rows_per_request
+        options = {}
+        if self.precise:
+            options = {"merge_h": multi, "precise": True}
+            if multi and self.push:
+                options["hilo_push"] = True
+                if self.merge_early:
+                    options["hilo_early"] = True
+                if self.hilo_trig and rows_per_request == 1:
+                    options["hilo_trig"] = True
         o = self.split_kv.cp_core(
             attn,
             q8,
@@ -482,6 +618,7 @@ class DraftCP:
             # R11 orders the draft-multi exact partial and merge after their waits.
             # Keep the shared CP-lite default for target and one-request draft calls.
             early_merge=False if multi else None,
+            **options,
         )
         if o is not None and torch.cuda.is_current_stream_capturing():
             key = (rows_per_request, q8.shape[0])

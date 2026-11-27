@@ -72,8 +72,18 @@ class Parts:
         self.top1x: Optional[Any] = None
         # sm103.draft.embed.EmbedExchange: those steps' embedding rows (slot draft_embed)
         self.embedx: Optional[Any] = None
+        self.embed_local: Optional[Any] = None
         # (entry, bs) pairs whose capture logged the engagement line
         self.engaged: set = set()
+        # widths whose capture logged slot draft_fc_input's line
+        self.fc_input_noted: set = set()
+        self.head_lowm: Optional[Any] = None
+        self.head_keys: Optional[Any] = None
+        # draft.fc_tp.FcTp: the column-parallel fc front (slot draft_fc_tp)
+        self.fc_tp: Optional[Any] = None
+        # draft.oproj_push.OprojPush: the steps' o_proj pushing into the draft hop
+        self.oproj_push: Optional[Any] = None
+        self.moe_block: Optional[Any] = None
         # draft.moe_mkm.DraftMkm: compatible quantized draft experts on the target path
         self.moe_mkm: Optional[Any] = None
 
@@ -122,6 +132,50 @@ class Parts:
             parts.top1x = parts._build_top1x()
             if parts.top1x is None:
                 slots = parts.slots = slots - {"draft_multi", "draft_embed"}
+        if "draft_embed_local" in slots:
+            parts.embed_local = parts._build_embed_local()
+            if parts.embed_local is None:
+                slots = parts.slots = slots - {"draft_embed_local"}
+            elif "draft_embed" in slots:
+                # every embedding row comes from the replicated table
+                logger.info(
+                    "NVIDIA megakernel: slot draft_embed is not built: slot "
+                    "draft_embed_local serves the draft's embedding rows"
+                )
+                slots = parts.slots = slots - {"draft_embed"}
+        if "draft_fc_input" in slots and parts.embed_local is None:
+            unavailable_slots(
+                "draft_fc_input", "it reads slot draft_embed_local's replicated table"
+            )
+            slots = parts.slots = slots - {"draft_fc_input"}
+        if "draft_fc_tp" in slots:
+            if "draft_fc_input" not in slots:
+                unavailable_slots(
+                    "draft_fc_tp", "it takes slot draft_fc_input's full input"
+                )
+            else:
+                from sgl_nvidia_mega.qwen3_5.draft import fc_tp
+
+                parts.fc_tp = fc_tp.maybe_build(parts)
+            if parts.fc_tp is None:
+                slots = parts.slots = slots - {"draft_fc_tp"}
+        if parts.hop is not None:
+            from sgl_nvidia_mega.qwen3_5.draft import oproj_push
+
+            parts.oproj_push = oproj_push.maybe_build(parts)
+        if "draft_head_lowm" in slots:
+            from sgl_nvidia_mega.qwen3_5.draft import head_keys, head_lowm
+
+            parts.head_lowm = head_lowm.maybe_build(parts)
+            if parts.top1x is not None:
+                parts.head_keys = head_keys.maybe_build(parts)
+            if parts.head_lowm is None and parts.head_keys is None:
+                slots = parts.slots = slots - {"draft_head_lowm"}
+        from sgl_nvidia_mega.qwen3_5.draft import draftmoe
+
+        if draftmoe.wanted(slots):
+            parts.moe_block = draftmoe.build(parts)
+            slots = parts.slots
         if "draft_embed" in slots:
             parts.embedx = parts._build_embedx()
             if parts.embedx is None:
@@ -315,11 +369,39 @@ class Parts:
             unavailable_slots("draft_embed", exc.reason)
             return None
 
+    def _build_embed_local(self):
+        from sgl_nvidia_mega.qwen3_5.sm103.draft import embed_local
+
+        return embed_local.build(
+            name="draft_embed_local",
+            embed=self.model.embed_tokens,
+            vocab=int(self.lm.logits_processor.vocab_size),
+            binding=self.binding,
+            what="the MTP draft",
+        )
+
+    @property
+    def fc_input_table(self) -> Optional[torch.Tensor]:
+        """The replicated table slot draft_fc_input reads, or None (the slot is off)."""
+        if self.embed_local is None or "draft_fc_input" not in self.slots:
+            return None
+        return self.embed_local.table
+
+    def note_fc_input(self, rows: int) -> None:
+        """Log once per width captured: slot draft_fc_input's fused input engaged."""
+        if torch.cuda.is_current_stream_capturing() and rows not in self.fc_input_noted:
+            self.fc_input_noted.add(rows)
+            logger.info(
+                "NVIDIA megakernel: slot draft_fc_input: the MTP fc input of %d rows "
+                "in one launch (gather + pre-fc norms)",
+                rows,
+            )
+
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """The embedding rows of ``token_ids``: slot draft_embed's exchange where it is
-        built and the rows fit it, else SGLang's vocabulary-parallel embedding."""
         from sgl_nvidia_mega.qwen3_5.sm103.draft.embed import MAX_ROWS
 
+        if self.embed_local is not None:
+            return self.embed_local(token_ids)
         if self.embedx is not None and token_ids.shape[0] <= MAX_ROWS:
             return self.embedx(token_ids)
         return self.model.embed_tokens(token_ids)

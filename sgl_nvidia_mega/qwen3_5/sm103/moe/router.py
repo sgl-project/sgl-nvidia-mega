@@ -422,6 +422,7 @@ BIG_SOURCE = Path(__file__).parent / "src" / "route_big.cu"
 # TRT-LLM r3's route-only big front: one routing cluster of 8 CTAs (up to
 # 256 rows) or 16 (non-portable, up to 1024), plus quantization clusters.
 BIG_THREADS, BIG_CTAS = 1024, 32
+LEAN_MAX_ROWS, LEAN_WIDE_MAX_ROWS = 256, 448
 
 
 def big_shape(m: int) -> tuple[int, int, int]:
@@ -438,9 +439,26 @@ class BigParams(ctypes.Structure):
 
 
 @cache
-def _big_kernel(device_index: int, cl: int, mw: int, nl: int) -> jit.Kernel:
+def _big_kernel(
+    device_index: int,
+    cl: int,
+    mw: int,
+    nl: int,
+    lean: bool = False,
+    et: bool = False,
+    threads: int = BIG_THREADS,
+    bad_slot: bool = False,
+) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     defines = f"#define CL {cl}\n#define MW {mw}\n#define NL {nl}\n"
+    for name, value, default in (
+        ("LEAN", int(lean), 0),
+        ("ET", int(et), 0),
+        ("THREADS", threads, BIG_THREADS),
+        ("TEST_BAD_SLOT", int(bad_slot), 0),
+    ):
+        if value != default:
+            defines += f"#define {name} {value}\n"
     cubin = jit.compile_source(
         defines + BIG_SOURCE.read_text(),
         "q35_route_big",
@@ -448,7 +466,7 @@ def _big_kernel(device_index: int, cl: int, mw: int, nl: int) -> jit.Kernel:
         ("-std=c++17", "-default-device"),
         headers=_headers(),
     )
-    kernel = jit.load(cubin, "q35_route_big_quant", (BIG_THREADS, 1, 1), 0)
+    kernel = jit.load(cubin, "q35_route_big_quant", (threads, 1, 1), 0)
     if cl > 8:
         cu = jit.driver()
         jit.check(
@@ -462,10 +480,33 @@ def _big_kernel(device_index: int, cl: int, mw: int, nl: int) -> jit.Kernel:
     return kernel
 
 
-def build_big(device_index: int, local_count: int) -> None:
-    """Compile route_big's launches for every wide step shape (no compile inside a step)."""
+def build_big(device_index: int, local_count: int, lean_variants=()) -> None:
     for cl, mw in ((8, 1), (16, 1), (16, 2)):
         _big_kernel(device_index, cl, mw, local_count)
+    for lean, et, threads, *cl in lean_variants:
+        _big_kernel(
+            device_index,
+            cl[0] if cl else 8,
+            1,
+            local_count,
+            bool(lean),
+            bool(et),
+            int(threads),
+        )
+
+
+def big_variant_unsupported(m: int, threads: int) -> str:
+    cl, tpc, _ = big_shape(m)
+    if m > LEAN_WIDE_MAX_ROWS:
+        return (
+            f"{m} rows take clusters of {cl} (the variants: clusters of 8 up to {LEAN_MAX_ROWS} "
+            f"rows, of 16 up to {LEAN_WIDE_MAX_ROWS})"
+        )
+    if threads not in (256, 512, 1024):
+        return f"threads {threads} (256, 512 or 1024)"
+    if tpc > 2 * (threads // 32):
+        return f"{tpc} tokens a routing CTA exceed two a warp at {threads} threads"
+    return ""
 
 
 def route_big_quant(
@@ -474,10 +515,15 @@ def route_big_quant(
     global_scale: torch.Tensor,
     tables: RouteTables,
     ctas: Optional[int] = None,
+    lean: bool = False,
+    et: bool = False,
+    threads: int = BIG_THREADS,
+    bad_slot: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """route_topk_quant(logits, x, global_scale, tables=tables) as one launch of thread-block
     clusters (TRT-LLM's route-only big front): the same top-10 and NVFP4 input bit for bit, and
-    the same routing tables up to the order of an expert's rows (token order here)."""
+    the same routing tables up to the order of an expert's rows (token order here).
+    """
     m = x.shape[0]
     for t, shape in ((logits, (m, EXPERTS)), (x, (m, HIDDEN))):
         if (
@@ -488,9 +534,14 @@ def route_big_quant(
             raise ValueError(f"route_big: {t.dtype} {tuple(t.shape)}, want {shape}")
     if tables.m != m or not 1 <= m <= 1024:
         raise ValueError(f"route_big: tables of {tables.m} rows for {m}")
-    if tables.local_count % 32 or tables.local_count > BIG_THREADS:
+    if tables.local_count % 32 or tables.local_count > min(BIG_THREADS, threads):
         raise ValueError(f"route_big: {tables.local_count} local experts")
     cl, tpc, mw = big_shape(m)
+    variant = lean or et or bad_slot or threads != BIG_THREADS
+    if variant:
+        reason = big_variant_unsupported(m, threads)
+        if reason:
+            raise ValueError(f"route_big: {reason}")
     x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
     x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
     p = BigParams(
@@ -506,8 +557,15 @@ def route_big_quant(
     )
     p.tables = tables.params()
     launch_ctas = max(2 * cl, (BIG_CTAS if ctas is None else ctas) // cl * cl)
+    kernel = (
+        _big_kernel(
+            x.device.index, cl, mw, tables.local_count, lean, et, threads, bad_slot
+        )
+        if variant
+        else _big_kernel(x.device.index, cl, mw, tables.local_count)
+    )
     jit.launch(
-        _big_kernel(x.device.index, cl, mw, tables.local_count),
+        kernel,
         (launch_ctas, 1, 1),
         [p],
         torch.cuda.current_stream().cuda_stream,

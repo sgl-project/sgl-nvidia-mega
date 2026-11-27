@@ -92,7 +92,16 @@ def numerics(slots: frozenset) -> Numerics:
         "draft_hop",
         "draft_fin",
         "draft_front",
-        "draft_skv2",
+        "draft_fc_input",
+        "draft_head_lowm",
+        "draft_router_lowm",
+        "draft_moe_engine",
+        "draft_moe_wide",
+        "draft_shared_lowm",
+        "draft_fc_tp",
+        "draft_fc_push",
+        "draft_oproj_push",
+        "draft_head_keys",
     }:
         return target.NUMERICS
     return Numerics(NumericsKind.TOLERANCE, {"draft_logits.rel": 2**-7})
@@ -226,10 +235,12 @@ def _build(model, hf_config, ctx) -> MtpDraft:
     from sgl_nvidia_mega.qwen3_5 import runtime
 
     parallel = get_parallel()
+    runtime.follow_measured_plan()
     runtime.apply_expert_parallel(parallel.moe_ep_size)
     runtime.apply_cp_lite_topology(parallel.attn_tp_size)
     runtime.apply_topology(parallel)
     runtime.build_cp_lite(ctx.binding)
+    runtime.apply_cp_lite_build(ctx.deadline_s)
     return MtpDraft(
         model,
         binding=ctx.binding,

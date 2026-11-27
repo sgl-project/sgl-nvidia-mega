@@ -31,7 +31,7 @@ from sgl_nvidia_mega.qwen3_5.sm103.draft import hop as kernels
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/layers/layernorm.py": ('"gemma_weight"', "weight", "variance_epsilon"),
+    "srt/layers/layernorm.py": ("weight", "variance_epsilon"),
 }
 
 # Draft steps carry one row; the verify and extend widths keep their own kernels.
@@ -151,6 +151,7 @@ class DraftHop:
         norm,
         *,
         moe_single_launch: bool,
+        release_next: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """(the MoE input, residual) of the attention output's partial
         ``hidden_states``; ``norm`` is the layer's post-attention GemmaRMSNorm."""
@@ -158,13 +159,34 @@ class DraftHop:
             self.hop,
             local_contribution=hidden_states,
             residual=residual,
-            gamma=norm.gemma_weight,
+            gamma=norm.weight,
             eps=norm.variance_epsilon,
-            weight_bias=0.0,
-            add_norm=False,
-            early_release=self.early and moe_single_launch,
+            weight_bias=1.0,
+            early_release=(self.early and moe_single_launch) or release_next,
             delay_ns=self.delay_ns,
             pushed=self._take_pushed(hidden_states),
+        )
+
+    def layer_input(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        norm,
+        *,
+        cols: bool = False,
+        release_next: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return kernels.draft_all_reduce_rms_norm(
+            self.hop,
+            local_contribution=partial,
+            residual=residual,
+            gamma=norm.weight,
+            eps=norm.variance_epsilon,
+            weight_bias=1.0,
+            early_release=release_next,
+            delay_ns=self.delay_ns,
+            pushed=self._take_pushed(partial),
+            cols=cols,
         )
 
     def final_norm(
@@ -184,8 +206,26 @@ class DraftHop:
             gamma=norm.weight,
             eps=norm.variance_epsilon,
             weight_bias=1.0,
-            add_norm=True,
             early_release=self.early_head and head_follows,
             delay_ns=self.delay_ns,
             pushed=self._take_pushed(partial),
+        )
+
+    def fin_norm(
+        self, owed, residual: torch.Tensor, norm
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._pushed is not None:
+            raise RuntimeError("draft hop: a pushed partial was never consumed")
+        return kernels.draft_finalize_all_reduce_rms_norm(
+            self.hop,
+            routed_output=owed.routed_output,
+            expert_weights=owed.expert_weights,
+            permuted_indices=owed.permuted_indices,
+            gated_shared_output=owed.gated_shared_output,
+            residual=residual,
+            gamma=norm.weight,
+            eps=norm.variance_epsilon,
+            weight_bias=1.0,
+            early_release=True,
+            delay_ns=self.delay_ns,
         )

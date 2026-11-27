@@ -22,8 +22,16 @@ update (Apache License 2.0, Copyright contributors to the vLLM project, Copyrigh
 2024 Tri Dao); its gated RMSNorm Triton kernel, which SGLang adapted from
 flash-linear-attention (MIT License, Copyright (c) 2024 Tri Dao); and its ReplaySSM
 verify kernel, which SGLang ported from the vLLM ReplaySSM reference implementation
-(Apache License 2.0, Copyright contributors to the vLLM project). Each adapted file
-names its origin in its header.
+(Apache License 2.0, Copyright contributors to the vLLM project). Its ReplaySSM commit
+after a verify follows SGLang's commit and its compact commit kernel. Qwen3.5's TP1/PP2
+prefill body (paths under sgl_nvidia_mega/qwen3_5/) follows SGLang's model, layer and
+kernel code in the same way: gdn/prefill_fi.py (the GatedDeltaNet extend);
+moe/prefill.py (the MoE block and its stage boundaries); runtime/prefill_fp8.py (the
+static FP8 inputs of the layer's linears) and sm103/attention/gate_quant.py (the
+attention gate's FP8 store); sm103/moe/prefill_act_fp8.cuh and prefill_act_fp8.py
+(SGLang's act_and_mul_kernel with a static FP8 output); attention/prefill_rows.py and
+sm103/attention/qk_norm_rope_rows.py (the Q / K norm-RoPE rows, after SGLang's
+fused_qk_rmsnorm_rope_gate). Each adapted file names its origin in its header.
 
 Portions are adapted from SGLang (https://github.com/sgl-project/sglang): the covered
 verify step of MiniMax-M3.1 (the embedding, the dense layers' hand-off, the layer loop
@@ -75,7 +83,16 @@ Portions are adapted from FlashInfer (https://github.com/flashinfer-ai/flashinfe
 the Lamport all-reduce primitives and the low-latency all-reduce (Apache License
 2.0, Copyright (c) 2026 by FlashInfer team), and the epilogue of the wo_b GEMM
 that publishes into the all-reduce mailbox (BSD-3-Clause, Copyright (c) 2026
-NVIDIA CORPORATION & AFFILIATES; the full notice is kept in that file). Each
+NVIDIA CORPORATION & AFFILIATES; the full notice is kept in that file). Qwen3.5's
+BT tail (sgl_nvidia_mega/qwen3_5/boundary/bt_tail.py and
+sgl_nvidia_mega/qwen3_5/sm103/hop/src/bt_tail.cu) follows the launches and the RMSNorm
+stage of the MNNVL CuTe DSL balanced all-reduce of flashinfer-python 0.7.4 (Apache
+License 2.0, Copyright (c) 2026 by FlashInfer team). Qwen3.5's TP1/PP2 prefill norms
+are modified copies of FlashInfer's FusedAddRMSNormKernel
+(flashinfer/norm/kernels/fused_add_rmsnorm.py; Apache License 2.0, Copyright (c) 2025
+by FlashInfer team): sgl_nvidia_mega/qwen3_5/sm103/moe/prefill_input_nvfp4.py,
+sgl_nvidia_mega/qwen3_5/sm103/moe/prefill_output_add_norm.py and
+sgl_nvidia_mega/qwen3_5/sm103/gemma_norm_fp8.py. Each
 adapted file names its origin in its header. The Kimi K3 split-K GEMM in
 sgl_nvidia_mega/kimi_k3/sm103/gemm/splitk.py is adapted from FlashInfer's
 flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at v0.7.0.post1

@@ -23,7 +23,7 @@ import torch
 from sgl_nvidia_mega.common import jit
 
 SOURCE = Path(__file__).parent / "src" / "lowm.cu"
-MAX_ROWS = 64
+MAX_ROWS = 128
 CHUNK = 64
 
 

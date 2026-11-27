@@ -59,6 +59,8 @@ class Spec(NamedTuple):
     conv_tokens: int = 1
     conv_write_state: bool = True
     conv_shapes: tuple = ()
+    out_stride: int = 0
+    push: int = 0
 
 
 def conv_spec(
@@ -116,6 +118,8 @@ def spec(
     early_trigger: bool = True,
     release_after_wait: bool = False,
     conv: Optional[tuple] = None,
+    out_stride: Optional[int] = None,
+    push: int = 0,
 ) -> Spec:
     """A launch of ``m`` rows of K ``k`` over ``n_fp8`` FP8 and ``n_bf16`` BF16 weight rows, resolved as
     ``lowm_linear.lowm_gemm`` does. ``tactic`` / ``tactic_bf16``: (k_warps, n_tiles[, ksplit[, swap_ab[,
@@ -151,6 +155,9 @@ def spec(
     uses_a16 = n_bf16 > 0 or (n_fp8 > 0 and fp8_act != "fp8")
     uses_a8 = n_fp8 > 0 and fp8_act == "fp8"
     conv_args = conv if conv is not None else (0, 1, True, ())
+    n_out = split_out if split_out else n_logical
+    if out_stride is not None and out_stride < n_out:
+        raise ValueError(f"out_stride {out_stride} below the {n_out} output columns")
     return Spec(
         m,
         k,
@@ -165,7 +172,7 @@ def spec(
         split_out,
         n_valid,
         quant_out,
-        split_out if split_out else n_logical,
+        n_out,
         n_logical - split_out if split_out else 0,
         out_dtype,
         (a16_stride or k) if uses_a16 else 0,
@@ -178,6 +185,8 @@ def spec(
         bool(swap) and m <= 8,
         min_blocks,
         *conv_args,
+        out_stride if out_stride and out_stride != n_out else 0,
+        int(push),
     )
 
 
@@ -219,6 +228,44 @@ def prepare(s: Spec) -> None:
     )
 
 
+def push_descriptor(
+    *,
+    mailbox: int,
+    ctrl: int,
+    rank: int,
+    world: int,
+    m_cap: int,
+    row_elems: int,
+    col0: int,
+    device,
+) -> torch.Tensor:
+    from sgl_nvidia_mega.qwen3_5.sm103.trt_lowm.lowm_linear import PUSH_DESC_WORDS
+
+    if col0 % 8 or row_elems % 8 or mailbox % 16 or not 0 <= rank < world:
+        raise ValueError(
+            f"hop push: base {mailbox:#x}, column {col0}, row {row_elems}, rank {rank} of {world}"
+        )
+    stage_elems = world * m_cap * row_elems
+    if 3 * stage_elems >= 1 << 31:
+        raise ValueError(
+            f"hop push: a stage of {stage_elems} elements overflows int32 offsets"
+        )
+
+    def _lo_hi(a: int) -> tuple:
+        lo, hi = a & 0xFFFFFFFF, (a >> 32) & 0xFFFFFFFF
+        return tuple(v - (1 << 32) if v >= 1 << 31 else v for v in (lo, hi))
+
+    words = [
+        *_lo_hi(int(mailbox)),
+        *_lo_hi(int(ctrl)),
+        rank * m_cap * row_elems + col0,
+        stage_elems,
+        row_elems,
+    ]
+    words += [0] * (PUSH_DESC_WORDS - len(words))
+    return torch.tensor(words, dtype=torch.int32, device=device)
+
+
 def prepared(s: Spec) -> bool:
     return s in _PREPARED
 
@@ -253,6 +300,7 @@ def run(
     w_bf16: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
     conv: Optional[tuple] = None,
+    push: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch the prepared ``s`` on the current stream: ``out`` [m, n_out] (``out_dtype``, E4M3 with ``quant_out``)
     and ``out2`` [m, n_out2] contiguous; ``x16`` [m, k] BF16 / ``x8`` [m, k] E4M3 rows at the spec's row strides;
@@ -274,7 +322,7 @@ def run(
         out,
         "out",
         (s.m, s.n_out),
-        (s.n_out, 1),
+        (s.out_stride or s.n_out, 1),
         e4m3 if s.quant_out else (s.out_dtype,),
     )
     if s.n_out2:
@@ -302,6 +350,13 @@ def run(
             _dummy("slot", dev),
             _dummy("win", dev),
         )
+    if s.push:
+        from sgl_nvidia_mega.qwen3_5.sm103.trt_lowm.lowm_linear import PUSH_DESC_WORDS
+
+        _check(push, "push descriptor", (PUSH_DESC_WORDS,), (1,), (torch.int32,))
+        conv_tensors = (conv_tensors[0], conv_tensors[1], push, conv_tensors[3])
+    elif push is not None:
+        raise ValueError("a push descriptor for a spec that stores its output")
     ones = _dummy("s", dev)
     fn(
         _cute(x16 if s.a16_stride else _dummy("a16", dev)),

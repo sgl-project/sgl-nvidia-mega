@@ -32,8 +32,14 @@ SGLANG_READS = {"kernels/ops/attention/fla/utils.py": ("is_tf32_supported",)}
 SGLANG_MIRRORS = {
     # In fla/ before sgl-project/sglang#45112 regrouped SGLang's kernels and in linear/
     # after; the wildcard goes once all supported SGLangs have the move
-    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": "2957b47bcee2fd5b",
-    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": "8acb385876f4caf8",
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_circular_kernel": (
+        "9ad1193ce666552d",
+        "2957b47bcee2fd5b",
+    ),
+    "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:_launch_gdn_spec": (
+        "8bf89daf973334cc",
+        "8acb385876f4caf8",
+    ),
     "kernels/ops/attention/*/gdn_replayssm_spec_decode.py:gdn_replayssm_spec_decode": "c3fcd760148facd7",
 }
 

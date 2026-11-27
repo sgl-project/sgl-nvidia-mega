@@ -45,18 +45,25 @@ SGLANG_READS = {
         "forward(mixed_qkv)",
         "forward(a)",
         "forward(b)",
+        "conv_weights",
+        "bias",
+        "activation",
     ),
     "srt/layers/attention/hybrid_linear_attn_backend.py": ("linear_attn_backend",),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/layers/layer_boundary/fusions/norm.py": ("fused_norm_gamma",),
     "srt/layers/quantization/modelopt_quant.py": ("orig_dtype",),
     "srt/runtime_context.py": ("get_parallel",),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
 }
 
 # The SGLang functions whose body this module mirrors, by the digest of their code
 # (test/unit/test_contract.py recomputes them on the installed SGLang)
 SGLANG_MIRRORS = {
-    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": "604e1c2afbed13db",
+    "srt/models/qwen3_5.py:Qwen3_5GatedDeltaNet.forward": (
+        "a5e9e3bd054ff18f",
+        "604e1c2afbed13db",
+    ),
 }
 
 
@@ -69,6 +76,13 @@ class Bound(msgspec.Struct, frozen=True):
     gdn_conv: bool = (
         False  # and its conv with the x rows loaded first and one window store
     )
+    arrive: dict = msgspec.field(default_factory=dict)
+    arrive_split: dict = msgspec.field(default_factory=dict)
+    value_split: bool = False
+    # slot lowm_ba: rows -> in_proj_ba's low-M tactic, compiled at the covered widths
+    ba_lowm: dict = msgspec.field(default_factory=dict)
+    gdn_core_tc: bool = False
+    gdn_commit_fold: bool = False
     # slot gdn_push: layer id -> out_proj's weights packed for the hop's push GEMM
     packed: dict = msgspec.field(default_factory=dict)
     # slot gdn_front: layer id -> in_proj_qkvz's weights packed for the front
@@ -146,19 +160,95 @@ def build(model, ctx) -> Bound:
                 front_packed = front.build(model, gdns)
                 error = torch.zeros(1, dtype=torch.int32, device="cuda")
     core = "gdn_core" in SLOTS
+    arrive, arrive_split = {}, {}
+    if "gdn_conv_core" in SLOTS:
+        from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+
+        rows = ctx.tokens_per_request
+        reason = (
+            "requires gdn_core and gdn_conv"
+            if not (core and "gdn_conv" in SLOTS)
+            else f"{rows} rows a request"
+            if not (
+                core_kernel.CONV_MIN_ROWS_PER_REQUEST
+                <= rows
+                <= core_kernel.MAX_ROWS_PER_REQUEST
+            )
+            else next(
+                (
+                    f"layer {i}: {r}"
+                    for i, gdn in gdns
+                    if (r := conv_core_unsupported(gdn))
+                ),
+                "",
+            )
+        )
+        if reason:
+            reasons.append(f"gdn_conv_core: {reason}")
+        else:
+            import torch
+
+            from sgl_nvidia_mega.qwen3_5 import plan
+
+            requests = plan.GDN_CONV_CORE_MAX_ROWS // ctx.tokens_per_request
+            counters = torch.zeros(
+                2,
+                len(gdns),
+                max(requests, 1) * gdns[0][1].attn.num_k_heads,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            arrive = {
+                gdn.attn.layer_id: counters[0, j] for j, (_, gdn) in enumerate(gdns)
+            }
+            arrive_split = {
+                gdn.attn.layer_id: counters[1, j] for j, (_, gdn) in enumerate(gdns)
+            }
+    value_split = False
     if core:
         import torch
 
+        from sgl_nvidia_mega.qwen3_5.runtime import measured_option
         from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
 
         attn = gdns[0][1].attn
+        value_split = measured_option("gdn_value_split")
+        core_kernel.prime_gate_params(
+            *(t for _, gdn in gdns for t in (gdn.attn.A_log, gdn.attn.dt_bias))
+        )
         core_kernel.build(
             torch.cuda.current_device(),
             ctx.tokens_per_request,
             attn.num_k_heads,
             attn.num_v_heads,
             gdns[0][1].norm.weight.dtype == torch.float32,
+            **({"conv": True} if arrive else {}),
+            **({"vsplit": True} if value_split else {}),
         )
+    ba_lowm = {}
+    if "lowm_ba" in SLOTS:
+        from sgl_nvidia_mega.qwen3_5 import lowm, plan
+
+        reason = next(
+            (
+                f"layer {i}: {r}"
+                for i, gdn in gdns
+                if (r := lowm.ba_unsupported(gdn.in_proj_ba))
+            ),
+            "",
+        )
+        if reason:
+            reasons.append(f"lowm_ba: {reason}")
+        else:
+            import torch
+
+            dev = torch.cuda.current_device()
+            ba_lowm = {
+                w: lowm.prepare_ba(dev, w)
+                for w in ctx.widths
+                if plan.LOWM_BA_MIN_ROWS <= w <= plan.LOWM_BA_MAX_ROWS
+            }
+    core_tc, fold = _build_core_tc(ctx, gdns, core, reasons)
     trt_front = "gdn_trt_front" in SLOTS and bool(front_packed) and core
     if "gdn_trt_front" in SLOTS and not trt_front:
         reasons.append("gdn_trt_front: requires supported gdn_front and gdn_core")
@@ -167,6 +257,12 @@ def build(model, ctx) -> Bound:
         gdn_pdl="gdn_pdl" in SLOTS,
         gdn_core=core,
         gdn_conv="gdn_conv" in SLOTS,
+        arrive=arrive,
+        arrive_split=arrive_split,
+        value_split=value_split,
+        ba_lowm=ba_lowm,
+        gdn_core_tc=core_tc,
+        gdn_commit_fold=fold,
         packed=packed,
         front=front_packed,
         gdn_trt_front=trt_front,
@@ -174,6 +270,58 @@ def build(model, ctx) -> Bound:
         error=error,
         reason="; ".join(reasons),
     )
+
+
+def conv_core_unsupported(gdn) -> str:
+    import torch
+
+    from sgl_nvidia_mega.qwen3_5.sm103.gdn import core as core_kernel
+
+    attn = gdn.attn
+    weight, bias = attn.conv_weights, attn.bias
+    if not isinstance(weight, torch.Tensor):
+        return "conv weights in parts"
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+        return f"conv weights {weight.dtype} {tuple(weight.shape)}"
+    if weight.shape[1] != core_kernel.WIDTH:
+        return f"conv width {weight.shape[1]}"
+    if bias is not None and bias.dtype != torch.bfloat16:
+        return f"conv bias {bias.dtype}"
+    if attn.activation not in ("silu", "swish", True):
+        return f"conv activation {attn.activation!r}"
+    return ""
+
+
+def _build_core_tc(ctx, gdns, core: bool, reasons: list) -> tuple[bool, bool]:
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+
+    if "gdn_core_tc" not in SLOTS:
+        return False, False
+    if not core:
+        reasons.append("gdn_core_tc: requires gdn_core")
+        return False, False
+    fold = "gdn_commit_fold" in SLOTS
+    import torch
+
+    attn = gdns[0][1].attn
+    try:
+        from sgl_nvidia_mega.qwen3_5.sm103.gdn import core_tc
+
+        # the gate parameters' FP32 copies are gdn_core's (primed at its build)
+        core_tc.build(
+            ctx.tokens_per_request,
+            attn.num_k_heads,
+            attn.num_v_heads,
+            gdns[0][1].norm.weight.dtype == torch.float32,
+            state_index64=(False, True),
+            # slot gdn_core releases out_proj's BMM early at some widths
+            early_dependents=(False, True),
+            fold=(fold,),
+        )
+    except Exception as e:  # no CuTe DSL, or a failed compile: gdn_core's own launch
+        reasons.append(f"gdn_core_tc: {e!r}")
+        return False, False
+    return True, fold
 
 
 def step(layer, x, st):
@@ -185,11 +333,16 @@ def step(layer, x, st):
 
         opts = verify.SLOT_PDL if st.slots.gdn_pdl else verify.SLOT
         if st.slots.gdn_core:
-            opts = msgspec.structs.replace(opts, core=True)
+            opts = msgspec.structs.replace(
+                opts, core=True, value_split=st.bound["gdn"].value_split
+            )
             verify.engaged("gdn_core", x.shape[0])
         if st.slots.gdn_conv:
             opts = msgspec.structs.replace(opts, conv_rows=True)
             verify.engaged("gdn_conv", x.shape[0])
+        if st.slots.gdn_conv_core:
+            opts = msgspec.structs.replace(opts, conv_core=True)
+            verify.engaged("gdn_conv_core", x.shape[0])
         # push only where the MoE input's all-reduce will consume on the hop
         if st.slots.gdn_push and hop.takes_moe_input(
             st.bound["boundary"].hop, layer, st, x.shape[0]
@@ -201,6 +354,8 @@ def step(layer, x, st):
             st.bound["boundary"].hop, layer, st, x.shape[0]
         ):
             opts = msgspec.structs.replace(opts, lowm_push=True)
+        elif hop.gemm_ar(layer, st, x.shape[0]) is not None:
+            opts = msgspec.structs.replace(opts, gemm_ar=True)
         if st.slots.gdn_front:
             from sgl_nvidia_mega.qwen3_5.gdn import front
 
@@ -245,19 +400,19 @@ def step(layer, x, st):
 
 
 def _route_lin(m, gdns) -> tuple[dict, str]:
-    """Packed route-lin weights for every GDN layer, or why they cannot be built."""
     import torch
     import torch.distributed as dist
     from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
     from sglang.srt.runtime_context import get_parallel
 
+    from sgl_nvidia_mega.qwen3_5.runtime import agreed_decline
     from sgl_nvidia_mega.qwen3_5.sm103.hop import RL_WORLD, pack_router_lin
 
     group = get_parallel().tp_group
     if group.world_size != RL_WORLD:
         return {}, f"TP {group.world_size} (serves TP {RL_WORLD})"
     rank = dist.get_rank(group.device_group)
-    out = {}
+    out, reason = {}, ""
     for i, gdn in gdns:
         layer = m.layers[i]
         mlp = getattr(layer, "mlp", None)
@@ -271,7 +426,8 @@ def _route_lin(m, gdns) -> tuple[dict, str]:
             or layer.layer_id != gdn.attn.layer_id
             or getattr(mlp, "layer_id", layer.layer_id) != layer.layer_id
         ):
-            return {}, f"layer {i} has no router or fusible FFN-input norm"
+            reason = f"layer {i} has no router or fusible FFN-input norm"
+            break
         try:
             with torch.no_grad():
                 out[gdn.attn.layer_id] = pack_router_lin(
@@ -283,5 +439,7 @@ def _route_lin(m, gdns) -> tuple[dict, str]:
                     rank,
                 )
         except ValueError as error:
-            return {}, f"layer {i}: {error}"
-    return out, ""
+            reason = f"layer {i}: {error}"
+            break
+    reason = agreed_decline("route_lin", reason, cpu_group=group.cpu_group)
+    return ({}, reason) if reason else (out, "")

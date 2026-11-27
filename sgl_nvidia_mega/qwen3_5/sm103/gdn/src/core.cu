@@ -41,12 +41,23 @@ typedef unsigned int u32;
 #define FLAT_STORES 0
 #endif
 #ifndef NW
-#define NW 4  // warps; each owns VD / NW value columns as MT m16 tiles
+#define NW 4
 #endif
-#define MT (VD / (16 * NW))
+#ifndef VS
+#define VS 1
+#endif
+#if VS != 1 && !(VS == 2 && NW == 4)
+#error "VS 2: four warps a CTA, one m16 tile a warp"
+#endif
+#define MT (VD / (VS * 16 * NW))
+#define SXW (3 * KD + 8)
 #define FULL 0xffffffffu
 
 struct alignas(16) U4 { u32 x, y, z, w; };
+
+#ifndef CONV
+#define CONV 0
+#endif
 
 struct Params {
   const u16* x;          // convolved q | k | v rows
@@ -85,6 +96,23 @@ struct Params {
   long long y_stride;
   u16* o_out;            // [rows, HV, V] replay output (STORE_O)
   long long* prof;       // PROF: clock64 stamps [cta][warp][8]
+#if CONV
+  const u16* cw;         // conv weights: channel c, tap j at cw + c * cw_dim + j * cw_tap
+  long long cw_dim;
+  long long cw_tap;
+  const u16* cbias;      // [channels] or null
+  u16* cstate;
+  long long cs_slot;
+  long long cs_dim;
+  long long cs_tap;
+  u16* win;
+  long long win_slot;
+  long long win_dim;
+  const void* win_indices;
+  int win_index64;
+  unsigned* arrive;      // [requests, HK] arrival counters (multiples of HV / HK between launches)
+  int rows16;
+#endif
 };
 
 __device__ __forceinline__ float bflo(u32 x) { return __int_as_float(x << 16); }
@@ -148,9 +176,104 @@ __device__ __forceinline__ void pin_before_wait(u32 dep, unsigned long long neve
 }
 
 
+#if VS > 1
+__device__ __forceinline__ u32 smem_addr(const void* p) { return (u32)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void cluster_arrive_relaxed() { asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory"); }
+__device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); }
+__device__ __forceinline__ u32 mapa(const void* local, u32 rank) {
+  u32 a;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(a) : "r"(smem_addr(local)), "r"(rank));
+  return a;
+}
+__device__ __forceinline__ void st_async2(const float* local, const unsigned long long* bar, u32 rank, float a,
+                                          float b) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [%0], {%1, %2}, [%3];"
+               ::"r"(mapa(local, rank)), "f"(a), "f"(b), "r"(mapa(bar, rank)) : "memory");
+}
+__device__ __forceinline__ void bar_init_expect(unsigned long long* bar, u32 bytes) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_addr(bar)) : "memory");
+  asm volatile("{ .reg .b64 st; mbarrier.arrive.expect_tx.shared::cta.b64 st, [%0], %1; }"
+               ::"r"(smem_addr(bar)), "r"(bytes) : "memory");
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+__device__ __forceinline__ void bar_wait0(const unsigned long long* bar) {
+  asm volatile("{ .reg .pred P1; WAIT: mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], 0; @P1 bra DONE; bra WAIT; "
+               "DONE: }" ::"r"(smem_addr(bar)) : "memory");
+}
+#endif
+
 __device__ __forceinline__ long long load_index(const void* p, int i, bool i64) {
   return i64 ? reinterpret_cast<const long long*>(p)[i] : (long long)reinterpret_cast<const int*>(p)[i];
 }
+
+#if CONV
+#if NW != 4
+#error "CONV: a thread per channel of each head (NW 4)"
+#endif
+#if TT < 4 || TT > 8
+#error "CONV: the width-4 conv of 4 to 8 rows a request"
+#endif
+// two BF16 products rounded to BF16 (Triton's mul.bf16x2)
+__device__ __forceinline__ u32 bmul2(u32 a, u32 b) {
+  u32 d;
+  asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+__device__ __forceinline__ void addb2(float& a0, float& a1, u32 pr) {
+  asm("{ .reg .b16 l, h; mov.b32 {l, h}, %2; add.rn.f32.bf16 %0, l, %0; add.rn.f32.bf16 %1, h, %1; }"
+      : "+f"(a0), "+f"(a1) : "r"(pr));
+}
+__device__ __forceinline__ void addb_lo(float& a0, u32 pr) {
+  asm("{ .reg .b16 l, h; mov.b32 {l, h}, %1; add.rn.f32.bf16 %0, l, %0; }" : "+f"(a0) : "r"(pr));
+}
+__device__ __forceinline__ float silu_tr(float acc) {
+  float e, r;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(__fmul_rn(acc, -1.4426950408889634f)));
+  float d = __fadd_rn(e, 1.f), a = acc;
+  if (fabsf(d) > 8.50705917302346158658e+37f) {
+    d = __fmul_rn(d, 0.25f);
+    a = __fmul_rn(a, 0.25f);
+  }
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
+  return __fmul_rn(r, a);
+}
+__device__ __forceinline__ u32 smem_u32(const void* p) { return (u32)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void bulk_store(void* dst, const void* src, u32 bytes) {
+  asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(dst), "r"(smem_u32(src)), "r"(bytes)
+               : "memory");
+}
+__device__ __forceinline__ void conv_rows(const u16 (&u)[TT + 3], const u16 (&w)[4], float b, u16 (&out)[TT]) {
+#pragma unroll
+  for (int t = 0; t < TT; t += 2) {
+    float a0 = b, a1 = b;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const u32 hi = t + 1 + k < TT + 3 ? (u32)u[t + 1 + k] : 0u;
+      const u32 pr = bmul2((u32)u[t + k] | (hi << 16), (u32)w[k] * 0x10001u);
+      if (t + 1 < TT)
+        addb2(a0, a1, pr);
+      else
+        addb_lo(a0, pr);
+    }
+    const u32 o = pack2(silu_tr(a0), t + 1 < TT ? silu_tr(a1) : 0.f);
+    out[t] = (u16)(o & 0xffffu);
+    if (t + 1 < TT) out[t + 1] = (u16)(o >> 16);
+  }
+}
+__device__ __forceinline__ void conv_store(const Params& p, long long slot, long long wcoord, int ch,
+                                           const u16 (&u)[TT + 3], bool win, bool state) {
+  if (win) {
+    u16* wr = p.win + wcoord * p.win_slot + (long long)ch * p.win_dim;
+#pragma unroll
+    for (int i = 0; i < TT + 2; ++i) wr[i] = u[1 + i];
+  }
+  if (state) {
+    u16* sp = p.cstate + slot * p.cs_slot + (long long)ch * p.cs_dim;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) sp[j * p.cs_tap] = u[TT + j];
+  }
+}
+#endif
 
 #ifndef PROF
 #define PROF 0
@@ -174,7 +297,11 @@ __device__ __forceinline__ long long prof_time() {
 // MINB 3: three CTAs an SM (168 registers, no spill), for grids past two waves of two an SM
 extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const Params p) {
   constexpr int GRP = HV / HK;
-  const int cta = blockIdx.x;
+#if CONV
+  static_assert((GRP & (GRP - 1)) == 0, "CONV: the arrival counters wrap at a multiple of HV / HK");
+#endif
+  const int cta = blockIdx.x / VS;
+  const int crank = VS > 1 ? (int)(blockIdx.x % VS) : 0;  // the CTA's rank in its cluster (clusters of VS along x)
   const int n = cta / HV;
   const int hv = cta - n * HV;
   const int hk = hv / GRP;
@@ -183,7 +310,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
   const int lane = tid & 31;
   const int r = lane >> 2;
   const int q = lane & 3;
-  const int vb = warp * 16 * MT;
+  const int vb = crank * (VD / VS) + warp * 16 * MT;
   const int t0 = 2 * q;
   const int t1 = 2 * q + 1;
   const long long row0 = (long long)n * TT;
@@ -191,7 +318,11 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
   __shared__ float s_A[8][8];    // A[s][t] = beta_s e^{G_s - G_t} k_s.k_t, s > t
   __shared__ float s_F[8][8];    // F[s][t] = e^{G_t - G_s} k_s.q_t, s <= t
   __shared__ u32 s_sc[2][2][32]; // history scores (q / k, history tile) as BF16 B fragments
-  __shared__ float s_norm[NW][8];
+  __shared__ __align__(8) float s_norm[VS > 1 ? VD / 32 : NW][8];
+#if VS > 1
+  __shared__ unsigned long long s_bar;
+  if (threadIdx.x == 0) bar_init_expect(&s_bar, 2 * 8 * 4);
+#endif
 
 #if PROF
   long long st_[8];
@@ -213,6 +344,12 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
 #pragma unroll
       for (int c = 0; c < 4; ++c)
         H[m][h][c] = live ? ld16(sp + (vb + 16 * m + 8 * h + r) * KD + 32 * c + 8 * q) : zero4();
+#if CONV
+  long long rid = load_index(p.replay_indices, n, p.replay_index64 != 0);
+  rid = rid < 0 ? 0 : rid;
+  int wp = p.write_pos[rid], base = p.cache_base[rid];
+  const signed char flush = p.is_flush[rid];
+#else
   long long rid = 0;
   int wp = 0, base = 0;
   if (live) {
@@ -221,17 +358,91 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     base = p.cache_base[rid];
     live = p.is_flush[rid] == 0;
   }
+#endif
+#if CONV
+  const bool conv_live = slot >= 0;
+  const bool own_qk = hv % GRP == 0 && crank == 0;  // writes the key head's q / k window rows
+  const bool vown = VS == 1 || tid < VD / VS;
+  const int cch[3] = {hk * KD + tid, HK * KD + hk * KD + tid,
+                      2 * HK * KD + hv * VD + crank * (VD / VS) + (vown ? tid : 0)};
+  u16 cu[3][TT + 3], cw[3][4], cbb[3];
+  long long wcoord = 0;
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    cbb[j] = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) cw[j][k] = 0;
+#pragma unroll
+    for (int k = 0; k < TT + 3; ++k) cu[j][k] = 0;
+  }
+  if (conv_live) {
+    wcoord = load_index(p.win_indices, n, p.win_index64 != 0);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      const long long c = cch[j];
+#pragma unroll
+      for (int k = 0; k < 4; ++k) cw[j][k] = p.cw[c * p.cw_dim + k * p.cw_tap];
+      if (p.cbias) cbb[j] = p.cbias[c];
+#pragma unroll
+      for (int k = 0; k < 3; ++k) cu[j][k] = p.cstate[slot * p.cs_slot + c * p.cs_dim + k * p.cs_tap];
+    }
+  }
+  __shared__ __align__(16) u16 s_x[TT][SXW];  // the convolved rows: q | k of the key head, v of the value head
+  __shared__ int s_last;                     // this CTA arrived last for the key head's q / k state
+  __shared__ __align__(16) u16 s_win[3][KD * (TT + 2)];
+  __shared__ __align__(16) u16 s_cst[3][KD * 3];
+  // the static parameters load here too; they are used once the rows are requested
+  const float a_log = p.A_log[hv], dtb = p.dt_bias[hv], qs = p.scale[0];
+  float nw[MT][2];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int v = vb + 16 * m + 8 * h + r;
+#if NORM_F32
+      nw[m][h] = reinterpret_cast<const float*>(p.norm_w)[v];
+#else
+      nw[m][h] = bf2f(reinterpret_cast<const u16*>(p.norm_w)[v]);
+#endif
+    }
+  STAMP(1, 0.f);
+  pdl_wait();
+  STAMP(2, 0.f);
+  live = live && flush == 0;
+#endif
   if (!live) {
     // padding (or a flush row, which the verify never sees): zeros for out_proj
+#if !CONV
     pdl_wait();
-    for (int t = 0; t < TT && tid < VD; ++t) {
-      p.y[(row0 + t) * p.y_stride + hv * VD + tid] = 0;
+#else
+    if (conv_live) {
+#pragma unroll
+      for (int j = 0; j < 3; ++j) {
+        if (j == 2 && !vown) continue;  // VS 2: each rank its value channels
+#pragma unroll
+        for (int t = 0; t < TT; ++t) cu[j][3 + t] = p.x[(row0 + t) * p.x_stride + cch[j]];
+        conv_store(p, slot, wcoord, cch[j], cu[j], j == 2 || own_qk, j == 2);
+      }
+      __syncthreads();
+      if (tid == 0) s_last = atomicAdd(p.arrive + (long long)n * HK + hk, 1u) % (VS * GRP) == VS * GRP - 1;
+      __syncthreads();
+      if (s_last)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) conv_store(p, slot, wcoord, cch[j], cu[j], false, true);
+    }
+#endif
+    for (int t = 0; t < TT && tid < VD / VS; ++t) {
+      p.y[(row0 + t) * p.y_stride + hv * VD + crank * (VD / VS) + tid] = 0;
 #if STORE_O
-      p.o_out[((row0 + t) * HV + hv) * VD + tid] = 0;
+      p.o_out[((row0 + t) * HV + hv) * VD + crank * (VD / VS) + tid] = 0;
 #endif
     }
     return;
   }
+#if VS > 1
+  cluster_arrive_relaxed();
+#endif
+#if !CONV
   const float negAexp = -__expf(p.A_log[hv]);
   const float dtb = p.dt_bias[hv];
   float nw[MT][2];
@@ -247,6 +458,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
 #endif
     }
   const float rscale = rcp_rn(p.scale[0]);
+#endif
 #if EARLY_HIST
   // the committed history (ring entries j < wp, written by earlier steps; this step writes j >= wp): the history keys
   // of warps 2 / 3, and every lane's update-vector A fragments with their decays (the post-sync block's arithmetic)
@@ -319,24 +531,65 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
   }
 #endif
 
+#if !CONV
   STAMP(1, bflo(H[1][1][3].w) + bflo(H[0][0][0].x) + rscale);
   // ---------------- the wait: the step's activations from here on ----------------
   pdl_wait();
   STAMP(2, 0.f);
+#endif
 
-  const u16* xr = p.x + (row0 + (r < TT ? r : 0)) * p.x_stride;
   const bool rowok = r < TT;
   const bool ok0 = t0 < TT, ok1 = t1 < TT;
-  // every activation load is issued here, right after the wait
   U4 QN[4], KR[4];  // normalized q (BF16) and raw k rows; rows r >= TT zero
   U4 QR[4];
+  // v / z of this lane's (v, t): [m][(h, t)] = (h0, t0), (h0, t1), (h1, t0), (h1, t1)
+  u16 vr[MT][4], zr[MT][4];
+  u16 ar = 0, br_ = 0;
+#if CONV
+#pragma unroll
+  for (int j = 0; j < 3; ++j)
+#pragma unroll
+    for (int t = 0; t < TT; ++t) cu[j][3 + t] = p.x[(row0 + t) * p.x_stride + cch[j]];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const u16* zv = p.z + hv * VD + vb + 16 * m + 8 * h + r;
+      zr[m][2 * h] = ok0 ? zv[(row0 + t0) * p.z_stride] : (u16)0;
+      zr[m][2 * h + 1] = ok1 ? zv[(row0 + t1) * p.z_stride] : (u16)0;
+    }
+  if (lane < TT) {
+    ar = p.a[(row0 + lane) * p.ab_stride + hv];
+    br_ = p.b[(row0 + lane) * p.ab_stride + hv];
+  }
+  const float negAexp = -__expf(a_log);
+  const float rscale = rcp_rn(qs);
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    u16 o[TT];
+    conv_rows(cu[j], cw[j], bf2f(cbb[j]), o);
+#pragma unroll
+    for (int t = 0; t < TT; ++t) s_x[t][j * KD + tid] = o[t];
+  }
+  __syncthreads();
+  unsigned arrived = 0;
+  if (tid == 0) arrived = atomicAdd(p.arrive + (long long)n * HK + hk, 1u);
+  {
+    const u16* xs = s_x[r < TT ? r : 0];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      QR[c] = rowok ? ld16(xs + 32 * c + 8 * q) : zero4();
+      KR[c] = rowok ? ld16(xs + KD + 32 * c + 8 * q) : zero4();
+    }
+  }
+#else
+  const u16* xr = p.x + (row0 + (r < TT ? r : 0)) * p.x_stride;
+  // every activation load is issued here, right after the wait
 #pragma unroll
   for (int c = 0; c < 4; ++c) {
     QR[c] = rowok ? ld16(xr + hk * KD + 32 * c + 8 * q) : zero4();
     KR[c] = rowok ? ld16(xr + HK * KD + hk * KD + 32 * c + 8 * q) : zero4();
   }
-  // v / z of this lane's (v, t): [m][(h, t)] = (h0, t0), (h0, t1), (h1, t0), (h1, t1)
-  u16 vr[MT][4], zr[MT][4];
 #pragma unroll
   for (int m = 0; m < MT; ++m)
 #pragma unroll
@@ -349,11 +602,11 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
       zr[m][2 * h] = ok0 ? zv[(row0 + t0) * p.z_stride] : (u16)0;
       zr[m][2 * h + 1] = ok1 ? zv[(row0 + t1) * p.z_stride] : (u16)0;
     }
-  u16 ar = 0, br_ = 0;
   if (lane < TT) {
     ar = p.a[(row0 + lane) * p.ab_stride + hv];
     br_ = p.b[(row0 + lane) * p.ab_stride + hv];
   }
+#endif
   float kmul;       // 1 / |k_r|
   {
     float sq[4] = {0.f, 0.f, 0.f, 0.f}, sk[4] = {0.f, 0.f, 0.f, 0.f};
@@ -430,11 +683,34 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     HKs[m][2] *= km0;
     HKs[m][3] *= km1;
   }
+#if CONV
+  {
+    u16 o[TT];
+    conv_rows(cu[2], cw[2], bf2f(cbb[2]), o);
+    if (vown)
+#pragma unroll
+      for (int t = 0; t < TT; ++t) s_x[t][2 * KD + crank * (VD / VS) + tid] = o[t];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      if (j == 2 && !vown) continue;
+      if ((p.rows16 & 1) && (j == 2 || own_qk)) {
+#pragma unroll
+        for (int i = 0; i < TT + 2; ++i) s_win[j][tid * (TT + 2) + i] = cu[j][1 + i];
+      }
+      if (p.rows16 & 2) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) s_cst[j][tid * 3 + k] = cu[j][TT + k];
+      }
+      conv_store(p, slot, wcoord, cch[j], cu[j], !(p.rows16 & 1) && (j == 2 || own_qk), !(p.rows16 & 2) && j == 2);
+    }
+    if (p.rows16) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
+#endif
   // this step's ring entries at (base + wp + t) mod RING, t < TT, wp + t < RING: keys (warp 2) and
   // log-decays (warp 3) now, while warps 0 / 1 finish the head-common products; updates at the end
-  if (warp == 3 && lane < TT && wp + lane < RING)
+  if (warp == 3 && crank == 0 && lane < TT && wp + lane < RING)
     p.ring_g[rid * p.g_slot + hv * RING + ((base + wp + lane) & (RING - 1))] = gl;
-  if (warp == 2 && hv % GRP == 0 && r < TT && wp + r < RING) {
+  if (warp == 2 && crank == 0 && hv % GRP == 0 && r < TT && wp + r < RING) {
     const long long off = ((long long)hk * RING + ((base + wp + r) & (RING - 1))) * KD;
     u16* kp = p.ring_k + rid * p.k_slot + off;
     u16* klp = p.ring_klo ? p.ring_klo + rid * p.klo_slot + off : nullptr;
@@ -525,6 +801,27 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
   STAMP(4, HQ[MT - 1][3] + HKs[MT - 1][3]);
   __syncthreads();
   STAMP(5, 0.f);
+#if CONV
+  if (tid == 0 && p.rows16) {
+    // this step's window rows (the key head's q / k by its first CTA) and the v state
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      if ((p.rows16 & 1) && (j == 2 || own_qk))
+        bulk_store(p.win + wcoord * p.win_slot + (long long)(cch[j] - tid) * (TT + 2), s_win[j],
+                   (j == 2 ? KD / VS : KD) * (TT + 2) * 2);
+    }
+    if (p.rows16 & 2) bulk_store(p.cstate + slot * p.cs_slot + (long long)(cch[2] - tid) * 3, s_cst[2], KD / VS * 3 * 2);
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+  }
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int v = 2 * KD + vb + 16 * m + 8 * h + r;
+      vr[m][2 * h] = ok0 ? s_x[t0][v] : (u16)0;
+      vr[m][2 * h + 1] = ok1 ? s_x[t1][v] : (u16)0;
+    }
+#endif
 
   if (wp > 0) {
 #if EARLY_HIST
@@ -727,6 +1024,42 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     p0 += xb[m][0] * xb[m][0] + xb[m][2] * xb[m][2];
     p1 += xb[m][1] * xb[m][1] + xb[m][3] * xb[m][3];
   }
+#if VS > 1
+  __shared__ float s_lane[NW / 2][2][32];
+#if CONV
+  if (tid == 0) s_last = arrived % (VS * GRP) == VS * GRP - 1;
+#endif
+  if (warp & 1) {
+    s_lane[warp >> 1][0][lane] = p0;
+    s_lane[warp >> 1][1][lane] = p1;
+  }
+  __syncthreads();
+  cluster_wait();  // the partner's norm barrier is initialized
+  if (!(warp & 1)) {
+    p0 += s_lane[warp >> 1][0][lane];
+    p1 += s_lane[warp >> 1][1][lane];
+#pragma unroll
+    for (int msk = 4; msk < 32; msk <<= 1) {
+      p0 += __shfl_xor_sync(FULL, p0, msk);
+      p1 += __shfl_xor_sync(FULL, p1, msk);
+    }
+    if (r == 0) {
+      const int g = 2 * crank + (warp >> 1);
+      s_norm[g][t0] = p0;
+      s_norm[g][t1] = p1;
+      st_async2(&s_norm[g][t0], &s_bar, crank ^ 1, p0, p1);
+    }
+  }
+  __syncthreads();
+  bar_wait0(&s_bar);
+  STAMP(7, 0.f);
+  float ss0 = 0.f, ss1 = 0.f;
+#pragma unroll
+  for (int w = 0; w < VD / 32; ++w) {
+    ss0 += s_norm[w][t0];
+    ss1 += s_norm[w][t1];
+  }
+#else
 #pragma unroll
   for (int msk = 4; msk < 32; msk <<= 1) {
     p0 += __shfl_xor_sync(FULL, p0, msk);
@@ -736,6 +1069,9 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     s_norm[warp][t0] = p0;
     s_norm[warp][t1] = p1;
   }
+#if CONV
+  if (tid == 0) s_last = arrived % GRP == GRP - 1;
+#endif
   __syncthreads();
   STAMP(7, 0.f);
   float ss0 = 0.f, ss1 = 0.f;
@@ -744,6 +1080,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
     ss0 += s_norm[w][t0];
     ss1 += s_norm[w][t1];
   }
+#endif
   const float rstd0 = rsqrtf(ss0 / (float)VD + p.eps);
   const float rstd1 = rsqrtf(ss1 / (float)VD + p.eps);
 #if FLAT_STORES
@@ -786,10 +1123,25 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q35_gdn_core(const P
       }
     }
 #endif
+#if CONV
+  // the last of the key head's CTAs to consume the prior q / k state rolls it
+  if (s_last) {
+    if (!(p.rows16 & 2)) {
+#pragma unroll
+      for (int j = 0; j < 2; ++j) conv_store(p, slot, wcoord, cch[j], cu[j], false, true);
+    } else if (tid == 0) {
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+        bulk_store(p.cstate + slot * p.cs_slot + (long long)(cch[j] - tid) * 3, s_cst[j], KD * 3 * 2);
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
+  }
+  if (tid == 0 && p.rows16) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+#endif
 #if PROF
   if (lane == 0) {
     const long long end = prof_time();
-    long long* pw = p.prof + ((long long)cta * NW + warp) * 9;
+    long long* pw = p.prof + ((long long)blockIdx.x * NW + warp) * 9;
 #pragma unroll
     for (int i = 0; i < 8; ++i) pw[i] = st_[i];
     pw[8] = end;

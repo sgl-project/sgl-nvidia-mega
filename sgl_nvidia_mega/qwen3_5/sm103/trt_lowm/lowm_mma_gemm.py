@@ -285,6 +285,68 @@ def _ld_shared_cluster_f32(addr, *, loc=None, ip=None) -> Float32:
     )
 
 
+@dsl_user_op
+def _ld_volatile_u32(lo, hi, *, loc=None, ip=None) -> Int32:
+    """``ld.volatile.global.u32`` of the address (``lo``, ``hi``)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(lo).ir_value(loc=loc, ip=ip), Int32(hi).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b64 a;\n\tmov.b64 a, {$1, $2};\n\tld.volatile.global.u32 $0, [a];\n\t}\n",
+            "=r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _sanitize_asm(w: str) -> str:
+    return (
+        f"and.b32 t, {w}, 65535;\n\tsetp.eq.u32 p, t, 32768;\n\t@p and.b32 {w}, {w}, -65536;\n\t"
+        f"shr.u32 t, {w}, 16;\n\tsetp.eq.u32 p, t, 32768;\n\t@p and.b32 {w}, {w}, 65535;\n\t"
+    )
+
+
+def _push_asm(multicast: bool) -> str:
+    store = (
+        "multimem.st.relaxed.sys.global.v4.bf16x2 [a], {w0, w1, w2, w3};"
+        if multicast
+        else "st.global.v4.b32 [a], {w0, w1, w2, w3};"
+    )
+    return (
+        "{\n\t.reg .b64 a, o;\n\t.reg .b32 w0, w1, w2, w3, t;\n\t.reg .pred p;\n\t"
+        "mov.b64 a, {$0, $1};\n\tmul.wide.u32 o, $2, 2;\n\tadd.s64 a, a, o;\n\t"
+        "cvt.rn.bf16x2.f32 w0, $4, $3;\n\tcvt.rn.bf16x2.f32 w1, $6, $5;\n\t"
+        "cvt.rn.bf16x2.f32 w2, $8, $7;\n\tcvt.rn.bf16x2.f32 w3, $10, $9;\n\t"
+        + "".join(_sanitize_asm(w) for w in ("w0", "w1", "w2", "w3"))
+        + store
+        + "\n\t}\n"
+    )
+
+
+@dsl_user_op
+def _push_bf16x8(lo, hi, elem, v, multicast: bool, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            Int32(lo).ir_value(loc=loc, ip=ip),
+            Int32(hi).ir_value(loc=loc, ip=ip),
+            Int32(elem).ir_value(loc=loc, ip=ip),
+        ]
+        + [Float32(x).ir_value(loc=loc, ip=ip) for x in v],
+        _push_asm(multicast),
+        "r,r,r,f,f,f,f,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 def _mma_asm(shape_types: str):
     @dsl_user_op
     def _mma(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
@@ -361,6 +423,7 @@ class LowMMmaGemmKernel:
         conv_channels: int = 0,
         conv_tokens: int = 1,
         conv_write_state: bool = True,
+        push: int = 0,
     ) -> None:
         """``n_fp8`` / ``n_bf16``: weight rows of the FP8 / BF16 segment (multiples of ``8 * n_tiles``
         / ``8 * n_tiles_bf16``; either may be 0). ``fp8_act``: activation operand of the FP8 segment
@@ -436,6 +499,21 @@ class LowMMmaGemmKernel:
         self.conv_channels = conv_channels
         self.conv_tokens = conv_tokens
         self.conv_write_state = conv_write_state
+        if push not in (0, 1, 2):
+            raise ValueError(f"push={push} must be 0, 1 or 2")
+        if push and (
+            n_fp8
+            or swiglu_bf16
+            or split_out
+            or self.n_valid != n_bf16
+            or quant_out
+            or conv_channels
+        ):
+            raise ValueError(
+                "the hop push epilogue takes a plain BF16 GEMM (no FP8 segment, SwiGLU, split, padded columns, "
+                "quantized output or conv)"
+            )
+        self.push = push
         if conv_channels:
             fp8_cols = N_TILE * n_tiles
             if (
@@ -815,6 +893,21 @@ class LowMMmaGemmKernel:
             cv_w2 = gCw[cv_ch, 2].to(Float32)
             cv_w3 = gCw[cv_ch, 3].to(Float32)
 
+        # ---- the hop push's descriptor (static, written once at build) ----
+        push: cutlass.Constexpr = self.push > 0 and not fp8
+        p_lo = Int32(0)
+        p_hi = Int32(0)
+        p_base = Int32(0)
+        p_stage_elems = Int32(0)
+        p_row_elems = Int32(0)
+        p_stage = Int32(0)
+        if const_expr(push):
+            p_lo = gSlot[0]
+            p_hi = gSlot[1]
+            p_base = gSlot[4]
+            p_stage_elems = gSlot[5]
+            p_row_elems = gSlot[6]
+
         if const_expr(self.use_pdl and self.early_trigger):
             griddepcontrol_launch_dependents()
         if const_expr(self.use_pdl and not self.unsafe_skip_wait):
@@ -822,6 +915,9 @@ class LowMMmaGemmKernel:
         if const_expr(self.use_pdl and self.release_after_wait):
             # Every launch before this one has completed here. Do not move this above the wait.
             griddepcontrol_launch_dependents()
+        if const_expr(push):
+            if tidx < 32:
+                p_stage = _ld_volatile_u32(gSlot[2], gSlot[3])
         if const_expr(conv):
             # Slot and conv state after the wait (written by earlier kernels); these loads are in flight during
             # the main loop.
@@ -931,6 +1027,30 @@ class LowMMmaGemmKernel:
                     out_col0,
                     swiglu,
                 )
+        elif const_expr(push and self.ksplit == 1):
+            for idx in cutlass.range(tidx, num_rows * out_cols, 32 * k_warps):
+                row = idx // out_cols
+                col = idx % out_cols
+                value = Float32(0.0)
+                for w in cutlass.range_constexpr(k_warps):
+                    value = value + red[w, row, col]
+                value = value * alpha
+                red[0, row, col] = value.to(BFloat16).to(Float32)
+            cute.arch.sync_threads()
+            self._push_rows(
+                red,
+                tidx,
+                0,
+                1,
+                out_col0 + cta * out_cols,
+                out_cols,
+                p_lo,
+                p_hi,
+                p_base,
+                p_stage_elems,
+                p_row_elems,
+                p_stage,
+            )
         elif const_expr(self.ksplit == 1):
             for idx in cutlass.range(tidx, num_rows * out_cols, 32 * k_warps):
                 row = idx // out_cols
@@ -964,26 +1084,52 @@ class LowMMmaGemmKernel:
                 part[row, col] = total
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
+            if const_expr(push):
+                push_rows: cutlass.Constexpr = (
+                    num_rows + self.ksplit - 1
+                ) // self.ksplit
+                for idx in cutlass.range(tidx, push_rows * out_cols, 32 * k_warps):
+                    row = kslice + (idx // out_cols) * self.ksplit
+                    col = idx % out_cols
+                    if row < num_rows:
+                        value = self._cluster_sum(part, row, col) * alpha
+                        red[0, row, col] = value.to(BFloat16).to(Float32)
+                cute.arch.sync_threads()
+                self._push_rows(
+                    red,
+                    tidx,
+                    kslice,
+                    self.ksplit,
+                    out_col0 + cta * out_cols,
+                    out_cols,
+                    p_lo,
+                    p_hi,
+                    p_base,
+                    p_stage_elems,
+                    p_row_elems,
+                    p_stage,
+                )
             # ... summed over the cluster in rank order through distributed shared memory; rank r
             # finishes the outputs idx = r (mod ksplit).
-            for idx in cutlass.range(
-                kslice + tidx * self.ksplit,
-                num_rows * out_cols,
-                32 * k_warps * self.ksplit,
-            ):
-                row = idx // out_cols
-                col = idx % out_cols
-                value = Float32(0.0)
-                if const_expr(swiglu):
-                    gcol = (col // N_TILE) * (2 * N_TILE) + col % N_TILE
-                    gate = self._cluster_sum(part, row, gcol)
-                    up = self._cluster_sum(part, row, gcol + N_TILE)
-                    value = self._swiglu(gate, up, alpha)
-                else:
-                    value = self._cluster_sum(part, row, col) * alpha
-                self._finish(
-                    gC, gC2, row, out_col0 + cta * out_cols + col, value, out_factor
-                )
+            if const_expr(not push):
+                for idx in cutlass.range(
+                    kslice + tidx * self.ksplit,
+                    num_rows * out_cols,
+                    32 * k_warps * self.ksplit,
+                ):
+                    row = idx // out_cols
+                    col = idx % out_cols
+                    value = Float32(0.0)
+                    if const_expr(swiglu):
+                        gcol = (col // N_TILE) * (2 * N_TILE) + col % N_TILE
+                        gate = self._cluster_sum(part, row, gcol)
+                        up = self._cluster_sum(part, row, gcol + N_TILE)
+                        value = self._swiglu(gate, up, alpha)
+                    else:
+                        value = self._cluster_sum(part, row, col) * alpha
+                    self._finish(
+                        gC, gC2, row, out_col0 + cta * out_cols + col, value, out_factor
+                    )
             # Keep this CTA's shared memory alive until every peer has read it.
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
@@ -1462,6 +1608,40 @@ class LowMMmaGemmKernel:
         gate = (gate * alpha).to(BFloat16).to(Float32)
         up = (up * alpha).to(BFloat16).to(Float32)
         return gate / (Float32(1.0) + cute.math.exp(-gate, fastmath=False)) * up
+
+    @cute.jit
+    def _push_rows(
+        self,
+        red: cute.Tensor,
+        tidx,
+        row0,
+        row_step: cutlass.Constexpr,
+        col0,
+        out_cols: cutlass.Constexpr,
+        p_lo,
+        p_hi,
+        p_base,
+        p_stage_elems,
+        p_row_elems,
+        p_stage,
+    ) -> None:
+        num_rows: cutlass.Constexpr = self.num_rows
+        frags: cutlass.Constexpr = out_cols // N_TILE
+        rows_here: cutlass.Constexpr = (num_rows + row_step - 1) // row_step
+        if tidx < 32:
+            for idx in cutlass.range(tidx, rows_here * frags, 32):
+                row = row0 + (idx // frags) * row_step
+                f = idx % frags
+                if row < num_rows:
+                    v = [red[0, row, N_TILE * f + e] for e in range(N_TILE)]
+                    elem = (
+                        p_stage * p_stage_elems
+                        + p_base
+                        + row * p_row_elems
+                        + col0
+                        + N_TILE * f
+                    )
+                    _push_bf16x8(p_lo, p_hi, elem, v, self.push == 1)
 
     @cute.jit
     def _cluster_sum(self, part: cute.Tensor, row, col) -> Float32:

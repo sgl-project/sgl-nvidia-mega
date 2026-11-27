@@ -5,9 +5,7 @@
 // (branch nvidia/qwen35-agentx-gb300).
 // The draft hop: the consume of a one-row MTP draft step's all-reduce + residual + RMSNorm on the
 // decode hop's mailbox (sm103/hop/src/hop.cu, whose producer q35hop_publish pushes the partials). The
-// draft keeps the rounding of the kernels these replace; only the transport differs:
-//   mnnvl     FlashInfer's legacy MNNVL one-shot all-reduce + residual + RMSNorm (fp32 rank sum
-//             rounded to bf16, bf16 residual add, bf16 squares, its warp / block / cluster order)
+// consume keeps the rounding of SGLang's draft norm (GemmaRMSNorm); only the transport differs:
 //   add_norm  SGLang's one-shot push all-reduce, then FlashInfer's CuTe DSL FusedAddRMSNorm (fp32
 //             residual add, its per-thread fma order and butterfly)
 // The q35hop namespace below is hop.cu's, copied verbatim (Site, Ctrl and the mailbox protocol
@@ -389,15 +387,10 @@ __device__ __forceinline__ size_t row_elem(int token, int frag) {
 
 // ---------------------------------------------------------------- draft-side consume
 // The draft keeps the rounding of the stock kernels these replace; only the transport differs.
-// kDraftMnnvl: FlashInfer's legacy MNNVL one-shot all-reduce + residual + RMSNorm as it launches for
-//   M <= 16 (clusters of 8 x 64 threads, thread t of a row owning columns [8t, 8t + 8)): fp32 rank sum
-//   rounded to bf16, bf16 residual add, bf16 squares summed in fp32 per thread, a 16 -> 1 butterfly per
-//   warp, the two warps of each 64-thread block, then the 8 blocks in order from 0.
 // kDraftAddNorm: sglang's one-shot push all-reduce (fp32 rank sum rounded to bf16), then FlashInfer's
 //   CuTe DSL FusedAddRMSNorm for hidden 4096 (64 threads per row, thread t owning the 8-column chunks
 //   64b + t, b = 0..7): fp32 residual add, squares accumulated by fma per thread in (b, column) order
 //   from 0, a 1 -> 16 butterfly per 32 threads, then the two warps.
-constexpr int kDraftMnnvl = 1;
 constexpr int kDraftAddNorm = 2;
 // Test variant: FusedAddRMSNorm in FlashInfer's CUDA kernel order (512 threads x 8 columns).
 constexpr int kDraftAddNormCuda = 3;
@@ -519,9 +512,40 @@ __device__ __forceinline__ float cute_sumsq(const float x[8], int frag, DraftSme
   return __fadd_rn(__fadd_rn(ds.hs[0], ds.hs[1]), __fadd_rn(ds.hs[2], ds.hs[3]));
 }
 
+template <int W>
+__device__ __forceinline__ void pull_owned_frag(const Site& s, uint32_t stage, int token, int frag, float acc[8]) {
+  const uint16_t* uc = static_cast<const uint16_t*>(s.uc);
+  const int owner = frag / (kFrags / W);
+  uint4 v = ld_volatile_v4(uc + slot(s, stage, owner, token, frag));
+  unsigned long long t0 = 0;
+  uint32_t spins = 0;
+  while (frag_has_negzero(v)) {
+    v = ld_volatile_v4(uc + slot(s, stage, owner, token, frag));
+    if (Q35_HOP_DEADLINE_NS != 0 && frag_has_negzero(v) && ((++spins & 255u) == 0)) {
+      const unsigned long long now = gtimer();
+      if (t0 == 0) {
+        t0 = now;
+      } else if (now - t0 > Q35_HOP_DEADLINE_NS) {
+        fault_at_null();
+      }
+    }
+  }
+  float f[8];
+  unpack8(v, f);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) acc[e] = __fadd_rn(0.f, f[e]);
+}
+
+template <int W>
+__device__ __forceinline__ void rearm_owned_frag(const Site& s, uint32_t stage, int token, int frag) {
+  uint16_t* uc = static_cast<uint16_t*>(s.uc);
+  const uint4 z = make_uint4(kNegZeroPair, kNegZeroPair, kNegZeroPair, kNegZeroPair);
+  st_v4(uc + slot(s, stage, frag / (kFrags / W), token, frag), z);
+}
+
 // EARLY releases the dependents at entry, as consume_kernel does; they read only static data before
 // their own griddepcontrol.wait, which returns once this grid has completed.
-template <int W, int MODE, bool EARLY = false>
+template <int W, int MODE, bool EARLY = false, bool COLS = false>
 __device__ __forceinline__ void consume_draft_kernel(const Args& a) {
   __shared__ DraftSmem ds;
   const int token = blockIdx.x;
@@ -534,51 +558,37 @@ __device__ __forceinline__ void consume_draft_kernel(const Args& a) {
   const Hop h = hop_enter(a.site);
   const uint4 res = ld_v4(a.residual_in + row_elem(token, frag));
   float acc[8];
-  const bool ok = pull_frag<W>(a.site, h.stage, token, frag, acc);
+  bool ok = true;
+  if (COLS) {
+    pull_owned_frag<W>(a.site, h.stage, token, frag, acc);
+  } else {
+    ok = pull_frag<W>(a.site, h.stage, token, frag, acc);
+  }
   float res_f[8];
   unpack8(res, res_f);
   float x[8];
   uint4 res_out;
   float total;
-  if (MODE == kDraftMnnvl) {
+#pragma unroll
+  for (int e = 0; e < 8; ++e) x[e] = __fadd_rn(__bfloat162float(__float2bfloat16_rn(acc[e])), res_f[e]);
+  res_out = pack8(x);
+  if (MODE == kDraftAddNorm) {
+    total = cute_sumsq(x, frag, ds);
+  } else {
     float part = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-      const __nv_bfloat16 r = __hadd(__float2bfloat16_rn(acc[e]), __float2bfloat16_rn(res_f[e]));
-      x[e] = __bfloat162float(r);
-      part = add_ftz(part, __bfloat162float(__hmul(r, r)));
-    }
-    res_out = pack8(x);
+    for (int e = 0; e < 8; ++e) part = __fmaf_rn(x[e], x[e], part);
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) part = add_ftz(part, __shfl_xor_sync(0xffffffffu, part, off));
+    for (int off = 16; off > 0; off >>= 1) part = __fadd_rn(part, __shfl_xor_sync(0xffffffffu, part, off));
     row_exchange(part, ds);
-    // Global warp 2k + i is xs[k / 2][(k % 2) * 2 + i]; 64-thread block k sums its two warps.
-    total = 0.f;
+    float v[16];
 #pragma unroll
-    for (int k = 0; k < 8; ++k)
-      total = add_ftz(total, add_ftz(ds.xs[k >> 1][(k & 1) * 2], ds.xs[k >> 1][(k & 1) * 2 + 1]));
-  } else {
+    for (int i = 0; i < 16; ++i) v[i] = ds.xs[i >> 2][i & 3];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) x[e] = __fadd_rn(__bfloat162float(__float2bfloat16_rn(acc[e])), res_f[e]);
-    res_out = pack8(x);
-    if (MODE == kDraftAddNorm) {
-      total = cute_sumsq(x, frag, ds);
-    } else {
-      float part = 0.f;
+    for (int w = 8; w > 0; w >>= 1)
 #pragma unroll
-      for (int e = 0; e < 8; ++e) part = __fmaf_rn(x[e], x[e], part);
-#pragma unroll
-      for (int off = 16; off > 0; off >>= 1) part = __fadd_rn(part, __shfl_xor_sync(0xffffffffu, part, off));
-      row_exchange(part, ds);
-      float v[16];
-#pragma unroll
-      for (int i = 0; i < 16; ++i) v[i] = ds.xs[i >> 2][i & 3];
-#pragma unroll
-      for (int w = 8; w > 0; w >>= 1)
-#pragma unroll
-        for (int i = 0; i < w; ++i) v[i] = __fadd_rn(v[i], v[i + w]);
-      total = v[0];
-    }
+      for (int i = 0; i < w; ++i) v[i] = __fadd_rn(v[i], v[i + w]);
+    total = v[0];
   }
   const float inv = rsqrt_ftz(add_ftz(mul_ftz(total, 1.f / static_cast<float>(kHidden)), a.eps));
   float out[8];
@@ -594,7 +604,11 @@ __device__ __forceinline__ void consume_draft_kernel(const Args& a) {
   *reinterpret_cast<uint4*>(a.residual_out + row_elem(token, frag)) = res_out;
   *reinterpret_cast<uint4*>(a.norm_out + row_elem(token, frag)) = norm;
   if (!EARLY) pdl_trigger();
-  rearm_frag<W>(a.site, h.stage, token, frag);
+  if (COLS) {
+    rearm_owned_frag<W>(a.site, h.stage, token, frag);
+  } else {
+    rearm_frag<W>(a.site, h.stage, token, frag);
+  }
   hop_leave(a.site, h, gridDim.x * gridDim.y);
 }
 
@@ -606,16 +620,20 @@ using q35hop_draft::Args;
   extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) NAME(Args a) { \
     q35hop_draft::consume_draft_kernel<W, q35hop_draft::MODE, EARLY>(a);           \
   }
+#define Q35HOP_DRAFT_COLS_ENTRY(NAME, W, MODE, EARLY)                                    \
+  extern "C" __global__ void __launch_bounds__(q35hop::kRowThreads) NAME(Args a) {      \
+    q35hop_draft::consume_draft_kernel<W, q35hop_draft::MODE, EARLY, true>(a);          \
+  }
 
-Q35HOP_DRAFT_ENTRY(q35hop_draft_mnnvl_w2, 2, kDraftMnnvl, false)
-Q35HOP_DRAFT_ENTRY(q35hop_draft_mnnvl_w4, 4, kDraftMnnvl, false)
-Q35HOP_DRAFT_ENTRY(q35hop_draft_mnnvl_w8, 8, kDraftMnnvl, false)
-Q35HOP_DRAFT_ENTRY(q35hop_draft_mnnvl_early_w2, 2, kDraftMnnvl, true)
-Q35HOP_DRAFT_ENTRY(q35hop_draft_mnnvl_early_w4, 4, kDraftMnnvl, true)
-Q35HOP_DRAFT_ENTRY(q35hop_draft_mnnvl_early_w8, 8, kDraftMnnvl, true)
 Q35HOP_DRAFT_ENTRY(q35hop_draft_add_norm_w2, 2, kDraftAddNorm, false)
 Q35HOP_DRAFT_ENTRY(q35hop_draft_add_norm_w4, 4, kDraftAddNorm, false)
 Q35HOP_DRAFT_ENTRY(q35hop_draft_add_norm_w8, 8, kDraftAddNorm, false)
 Q35HOP_DRAFT_ENTRY(q35hop_draft_add_norm_early_w2, 2, kDraftAddNorm, true)
 Q35HOP_DRAFT_ENTRY(q35hop_draft_add_norm_early_w4, 4, kDraftAddNorm, true)
 Q35HOP_DRAFT_ENTRY(q35hop_draft_add_norm_early_w8, 8, kDraftAddNorm, true)
+Q35HOP_DRAFT_COLS_ENTRY(q35hop_draft_add_norm_cols_w2, 2, kDraftAddNorm, false)
+Q35HOP_DRAFT_COLS_ENTRY(q35hop_draft_add_norm_cols_w4, 4, kDraftAddNorm, false)
+Q35HOP_DRAFT_COLS_ENTRY(q35hop_draft_add_norm_cols_w8, 8, kDraftAddNorm, false)
+Q35HOP_DRAFT_COLS_ENTRY(q35hop_draft_add_norm_cols_early_w2, 2, kDraftAddNorm, true)
+Q35HOP_DRAFT_COLS_ENTRY(q35hop_draft_add_norm_cols_early_w4, 4, kDraftAddNorm, true)
+Q35HOP_DRAFT_COLS_ENTRY(q35hop_draft_add_norm_cols_early_w8, 8, kDraftAddNorm, true)

@@ -100,11 +100,18 @@ def build(model, ctx) -> Bound:
             reasons.append(f"slot skv2_cp: {reason}")
     route_lin = mka_on and "route_lin" in SLOTS
     if mka_on:
+        rl_reason = ""
         for i, layer in layers:
             reason = mka.pack(layer, route_lin=route_lin)
             if reason:
-                reasons.append(f"slot route_lin: layer {i}: {reason}")
+                rl_reason = f"layer {i}: {reason}"
                 route_lin = False
+        if "route_lin" in SLOTS:
+            # the pack reads this rank's own weights: every rank serves route_lin or none does
+            rl_reason = mka.agree_route_lin(rl_reason)
+            route_lin = not rl_reason
+            if rl_reason:
+                reasons.append(f"slot route_lin: {rl_reason}")
     return Bound(
         skv2=skv2_on,
         mka=mka_on,
@@ -135,10 +142,15 @@ def step(layer, x, st):
         return mka.step(layer, x, st)
     from sgl_nvidia_mega.qwen3_5 import lowm
 
-    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    x8 = lowm.take_fp8(st, x) if lowm.reads_fp8(st) else None
     if st.slots.lowm_in or x8 is not None:
         q, k, v, gate = lowm.prepare_qkv_gate(
-            layer, st.positions, x, x8, low_m=st.slots.lowm_in
+            layer,
+            st.positions,
+            x,
+            x8,
+            low_m=st.slots.lowm_in,
+            slot="bt_tail" if st.slots.bt_tail else "hop_fp8",
         )
     else:
         q, k, v, gate = layer._prepare_qkv_gate(

@@ -64,6 +64,8 @@ ROUTE_GEMM_MAX_ROWS = 32
 GDN_CORE_MAX_ROWS = (
     896  # and gdn_core's launch (TRT-L4: checked at 64 and 128 requests)
 )
+GDN_CONV_CORE_MIN_ROWS = 29
+GDN_CONV_CORE_MAX_ROWS = 224
 MKM_MAX_ROWS = 7
 MKM_WIDE_MAX_ROWS = 16
 MKM_M32_MAX_ROWS = 32
@@ -75,6 +77,12 @@ HOP_MAX_ROWS = 15
 # With hop_mid (numeric): the one-shot hop up to four requests in place of BT routes.
 HOP_MID_MAX_ROWS = 28
 GDN_PUSH_MAX_ROWS = 8
+BT_TAIL_MIN_ROWS = 16
+BT_TAIL_MAX_ROWS = 703
+GEMM_AR_MIN_ROWS = 33
+GEMM_AR_MAX_ROWS = 128
+FC2AR_MIN_ROWS = 35
+FC2AR_MAX_ROWS = 128
 # the rows slot route_shared's shared stage fits shared memory for
 ROUTE_SHARED_ROWS = 8
 MKA_MAX_ROWS = 8
@@ -89,8 +97,10 @@ LOWM_OUTPROJ_MAX_ROWS = 14
 LOWM_OPROJ_MAX_ROWS = 14
 LOWM_SE_MAX_ROWS = 21
 LOWM_SE_PRE_MAX_ROWS = 28
+LOWM_BA_MIN_ROWS, LOWM_BA_MAX_ROWS = 84, 112
 # TEP8's route-big front uses thread-block clusters to build the routed-body tables.
 ROUTE_BIG_MIN_ROWS = 33
+ROUTE_BIG_MID_MIN_ROWS = 17
 # The formal TEP8 route-big path covers every L-tier graph. Past 96 requests it uses
 # TRT-LLM r3's 64-CTA launch instead of the 32-CTA launch that overlaps the shared expert.
 ROUTE_BIG_MAX_ROWS = MAX_ROWS
@@ -125,6 +135,7 @@ class Slots(msgspec.Struct, frozen=True):
     route_pre: bool = False
     # Internal TEP8 S1/S2 path: route followed by routing-only route_topk tables
     route_pre_topk: bool = False
+    route_big_mid: bool = False
     mkm: bool = (
         False  # top-10 + FC1 + SwiGLU + FC2 on route's outputs (sm103/moe/mkm.py)
     )
@@ -141,6 +152,7 @@ class Slots(msgspec.Struct, frozen=True):
     gdn_core: bool = False
     # its conv with every x row loaded first and each window row in one store (gdn/conv.py; bitwise)
     gdn_conv: bool = False
+    gdn_conv_core: bool = False
     hop: bool = False  # the boundary's fused all-reduce points (boundary/hop.py)
     # out_proj pushes its partial into the hop from its GEMM (gdn/verify.py; numeric)
     gdn_push: bool = False
@@ -160,10 +172,18 @@ class Slots(msgspec.Struct, frozen=True):
     lowm_outproj: bool = False  # GDN out_proj on the low-M launch (lowm.py; numeric)
     lowm_oproj: bool = False  # attention o_proj on the low-M launch (lowm.py; numeric)
     lowm_se: bool = False  # the shared expert in two low-M launches (lowm.py; numeric)
+    lowm_ba: bool = False
     # the low-M output projections push their rows into the hop (lowm.py; numeric)
     lowm_push: bool = False
     # the hop also writes the next projection's static FP8 input (lowm.py; bitwise)
     hop_fp8: bool = False
+    bt_tail: bool = False
+    # its MoE-input launch releases its dependents right after its wait
+    bt_tail_early: bool = False
+    # its layer-input launch does
+    bt_tail_early_fin: bool = False
+    gemm_ar: bool = False
+    fc2ar: bool = False
 
 
 class Facts(msgspec.Struct, frozen=True):
@@ -187,6 +207,9 @@ class Facts(msgspec.Struct, frozen=True):
     gdn_pdl: bool = False  # with its dependent verify launch
     gdn_core: bool = False  # with the one-launch verify core
     gdn_conv: bool = False  # with the hoisted conv writing each window row once
+    gdn_conv_core: bool = False  # with that conv inside the core's launch
+    gdn_core_tc: bool = False  # with the core's launch on tcgen05
+    gdn_commit_fold: bool = False
     hop: bool = False  # the decode hop, built for the widest step it covers
     hop_mid: bool = False  # with its one-shot protocol up to HOP_MID_MAX_ROWS
     gdn_push: bool = False  # out_proj packed for the push GEMM on every GDN layer
@@ -203,9 +226,18 @@ class Facts(msgspec.Struct, frozen=True):
     lowm_in: bool = False  # the low-M input projections built for every layer
     lowm_out: bool = False  # the low-M output projections built for every layer
     lowm_se: bool = False  # the low-M shared expert built for every MoE layer
+    lowm_ba: bool = False  # in_proj_ba's low-M launch built for every GDN layer
     lowm_se_pre: bool = False  # also at route_pre's tier-M rows
     lowm_push: bool = False  # with the output projections' push into the hop
     hop_fp8: bool = False  # the hop's FP8 copy of the norm for the next projection
+    # variant slot route_big_mid: route-big at the routed body's tier-M rows
+    route_big_mid: bool = False
+    lowm_se_tep8: tuple = ()
+    bt_tail: bool = False  # the BT tail, bound to FlashInfer's BT points
+    bt_tail_early: bool = False  # with the MoE input's early release
+    bt_tail_early_fin: bool = False  # with the layer input's early release
+    gemm_ar: bool = False  # the BT tail holds the deferred-projection all-reduce
+    fc2ar: bool = False  # the BT tail holds the polling MoE-output all-reduce
 
 
 def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> Slots:
@@ -231,7 +263,12 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     )
     pre_front_topk = route and tep8 and not mkm and rows <= SFRONT_TOPK_MAX_ROWS
     pre_low = route_topk and tep8 and facts.lowm_se_pre and rows <= LOWM_SE_PRE_MAX_ROWS
-    lowm_se = facts.lowm_se and (rows <= LOWM_SE_MAX_ROWS or pre_low)
+    se_tep8 = (
+        tep8
+        and bool(facts.lowm_se_tep8)
+        and facts.lowm_se_tep8[0] <= rows <= facts.lowm_se_tep8[1]
+    )
+    lowm_se = facts.lowm_se and (rows <= LOWM_SE_MAX_ROWS or pre_low or se_tep8)
     # At one request lowm_se replaces both route_shared's shared stage and
     # SGLang's shared-expert tail.
     route_shared = (
@@ -244,6 +281,7 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
     pre_topk = pre_low or (
         route_topk and tep8 and ROUTE_BIG_MIN_ROWS <= rows <= ROUTE_BIG_MAX_ROWS
     )
+    bt_tail = facts.bt_tail and not hop and BT_TAIL_MIN_ROWS <= rows <= BT_TAIL_MAX_ROWS
     return Slots(
         route=route,
         route_topk=route_topk,
@@ -254,6 +292,9 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         and rows <= ROUTE_GEMM_MAX_ROWS
         and not pre_topk,
         route_pre=pre_topk,
+        route_big_mid=pre_topk
+        and facts.route_big_mid
+        and ROUTE_BIG_MID_MIN_ROWS <= rows < ROUTE_BIG_MIN_ROWS,
         route_pre_topk=pre_front_topk,
         mkm=mkm,
         mkm_m32=route_topk
@@ -280,6 +321,11 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         gdn_pdl=facts.gdn_verify and facts.gdn_pdl,
         gdn_core=facts.gdn_verify and facts.gdn_core and rows <= GDN_CORE_MAX_ROWS,
         gdn_conv=facts.gdn_verify and facts.gdn_conv,
+        gdn_conv_core=facts.gdn_verify
+        and facts.gdn_core
+        and facts.gdn_conv
+        and facts.gdn_conv_core
+        and GDN_CONV_CORE_MIN_ROWS <= rows <= GDN_CONV_CORE_MAX_ROWS,
         hop=hop,
         gdn_push=facts.gdn_verify
         and hop
@@ -302,6 +348,9 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         lowm_outproj=facts.lowm_out and rows <= LOWM_OUTPROJ_MAX_ROWS,
         lowm_oproj=facts.lowm_out and rows <= LOWM_OPROJ_MAX_ROWS,
         lowm_se=lowm_se,
+        lowm_ba=facts.gdn_verify
+        and facts.lowm_ba
+        and LOWM_BA_MIN_ROWS <= rows <= LOWM_BA_MAX_ROWS,
         lowm_push=facts.lowm_out
         and facts.lowm_push
         and hop
@@ -310,6 +359,16 @@ def slots(rows: int, facts: Facts, tokens_per_request: int = GDN_FRONT_ROWS) -> 
         hop_fp8=hop
         and facts.hop_fp8
         and rows <= (HOP_MID_MAX_ROWS if facts.hop_mid else HOP_MAX_ROWS),
+        bt_tail=bt_tail,
+        bt_tail_early=bt_tail and facts.bt_tail_early,
+        bt_tail_early_fin=bt_tail and facts.bt_tail_early_fin,
+        gemm_ar=bt_tail
+        and facts.gemm_ar
+        and GEMM_AR_MIN_ROWS <= rows <= GEMM_AR_MAX_ROWS,
+        fc2ar=bt_tail
+        and tep8
+        and facts.fc2ar
+        and FC2AR_MIN_ROWS <= rows <= FC2AR_MAX_ROWS,
     )
 
 

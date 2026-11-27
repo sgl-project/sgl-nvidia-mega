@@ -45,8 +45,10 @@ SGLANG_READS = {
         "moe_ep_rank",
         "top_k",
         "intermediate_size_per_partition",
+        # the ring fill's per-layer record (variant slot moe_ring)
+        "layer_id",
     ),
-    "srt/utils/triton_utils.py": ("next_power_of_2",),
+    "srt/utils/triton_utils.py|srt/utils/common.py": ("next_power_of_2",),
 }
 # The FlashInfer names this module reads (its DA body entry, flashinfer 0.7.1)
 FLASHINFER_READS = {
@@ -80,6 +82,9 @@ class Width:
         self.tables = None  # sm103.moe.router.RouteTables of the tactic's tile_n
         self.tactic: Optional[list] = None
         self.workspace: Optional[tuple] = None
+        self.engine: Optional[tuple] = (
+            None  # the engine's (h, hsf, out) views, first use
+        )
 
 
 _WIDTHS: dict[tuple, Width] = {}
@@ -267,6 +272,8 @@ def run(w: Width, experts, x_fp4: torch.Tensor, x_sf: torch.Tensor):
     """The body on ``w``'s tables (written by the routing launch for these rows): the
     routed op's deferred-finalize outputs [FC2 rows, routing weights, expanded ->
     permuted map]."""
+    if engine_serves(x_fp4.shape[0]):
+        return run_engine(w, experts, x_fp4, x_sf)
     kw = _kwargs(experts, x_fp4.shape[0])
     inputs = _inputs(w.tables, x_fp4, x_sf).to_list()
     metadata = w.tables.metadata()
@@ -287,3 +294,287 @@ def run(w: Width, experts, x_fp4: torch.Tensor, x_sf: torch.Tensor):
         da_body_workspace=w.workspace,
         **kw,
     )
+
+
+ENGINE_OPTIONS = {"early_unit": 1}
+RING_ROWS = (64, 128)
+RING_STAGES = 3
+RING_LAYERS = 128  # records: layer ids 0..RING_LAYERS-1
+_ENGINE: dict = {}
+_ENGINE_STATE: dict = {}
+_ENGINE_SHARED: list[torch.Tensor] = []
+
+
+def configure(engine: bool, ring: bool = False) -> None:
+    _ENGINE.clear()
+    _ENGINE.update(on=engine, ring=engine and ring, logged=set())
+
+
+def _engine_config() -> dict:
+    if "on" not in _ENGINE:
+        configure(False)
+    return _ENGINE
+
+
+def engine_unsupported(experts) -> str:
+    if experts.moe_runner_config.activation != "silu" or not getattr(
+        experts.moe_runner_config, "is_gated", True
+    ):
+        return "SwiGLU experts only"
+    w13, w2 = experts.w13_weight, experts.w2_weight
+    if w13.dim() != 3 or w2.dim() != 3 or w13.shape[0] > 128:
+        return "at most 128 local experts"
+    hidden, inter = w2.shape[1], w13.shape[1] // 2
+    if hidden % 256 or inter % 256:
+        return f"hidden {hidden} / intermediate {inter} not multiples of 256"
+    if w2.shape[2] * 2 != inter or w13.shape[2] * 2 != hidden:
+        return "NVFP4 weights only"
+    if inter != experts.intermediate_size_per_partition:
+        return "padded intermediate"
+    if torch.cuda.get_device_capability(w13.device)[0] != 10:
+        return "SM100-family GPUs only"
+    return ""
+
+
+def engine_serves(m: int) -> bool:
+    """Whether the engine runs the body at m rows (slot moe_engine built)."""
+    return _engine_config()["on"] and m >= 1
+
+
+def engine_n_max(m: int) -> int:
+    return 16 if m <= 16 else 32 if m <= 224 else 64
+
+
+def engine_tile_k(n_max: int) -> int:
+    return 512 if n_max <= 32 else 256
+
+
+def engine_rows(m: int, top_k: int, local: int, tile: int) -> int:
+    expanded = m * top_k
+    filled = min(local, expanded)
+    return (filled + (expanded - filled) // tile) * tile
+
+
+def _engine_buffers(w: Width, experts, m: int, device) -> tuple:
+    if w.engine is not None:
+        return w.engine
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "slot moe_engine: the MoE engine's buffers must exist before CUDA-graph "
+            "capture (run one eager forward of this width first)"
+        )
+    hidden = experts.w2_weight.shape[1]
+    inter = experts.w13_weight.shape[1] // 2
+    rows = engine_rows(m, experts.top_k, experts.num_local_experts, w.tables.tile)
+    want = (
+        torch.empty((rows, inter // 2), dtype=torch.uint8, device=device),
+        torch.empty((rows * inter // 16,), dtype=torch.uint8, device=device),
+        torch.empty((rows, hidden), dtype=torch.bfloat16, device=device),
+    )
+    out = []
+    for i, t in enumerate(want):
+        if i == len(_ENGINE_SHARED):
+            _ENGINE_SHARED.append(t)
+        s = _ENGINE_SHARED[i]
+        if s.dtype != t.dtype or s.shape[1:] != t.shape[1:] or s.shape[0] < t.shape[0]:
+            _ENGINE_SHARED[i] = s = t
+        out.append(s[: t.shape[0]])
+    w.engine = tuple(out)
+    return w.engine
+
+
+def _engine_state(device):
+    key = ("state", device.index)
+    s = _ENGINE_STATE.get(key)
+    if s is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "slot moe_engine: the MoE engine's call state must exist before "
+                "CUDA-graph capture"
+            )
+        from sgl_nvidia_mega.qwen3_5.runtime import persistent
+        from sgl_nvidia_mega.qwen3_5.sm103.moe import q35_moe_engine
+
+        with persistent.persistent(device):
+            s = _ENGINE_STATE[key] = q35_moe_engine.new_state(device)
+    return s
+
+
+def _ring_records(device) -> torch.Tensor:
+    key = ("ring_rec", device.index)
+    r = _ENGINE_STATE.get(key)
+    if r is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "variant slot moe_ring: the MoE engine's ring records must exist "
+                "before CUDA-graph capture"
+            )
+        from sgl_nvidia_mega.qwen3_5.runtime import persistent
+        from sgl_nvidia_mega.qwen3_5.sm103.moe import q35_moe_engine
+
+        with persistent.persistent(device):
+            r = _ENGINE_STATE[key] = q35_moe_engine.new_record(device, RING_LAYERS)
+    return r
+
+
+def front_releases_early(experts, m: int, device) -> bool:
+    from sgl_nvidia_mega.qwen3_5.moe import route
+
+    kw = route.route_lean(m, experts.num_local_experts, device.index)
+    return bool(kw and kw.get("et"))
+
+
+def ring_opts(experts, m: int, opts: dict, device) -> tuple:
+    cfg = _engine_config()
+    if not cfg["ring"] or not RING_ROWS[0] <= m <= RING_ROWS[1]:
+        return opts, None
+    layer = getattr(experts, "layer_id", None)
+    why = ""
+    if not isinstance(layer, int) or not 0 <= layer < RING_LAYERS:
+        why = f"layer id {layer!r} outside 0-{RING_LAYERS - 1}"
+    elif not front_releases_early(experts, m, device):
+        why = "route-big releases the engine at its end"
+    if why:
+        if ("ring-off", m) not in cfg["logged"]:
+            cfg["logged"].add(("ring-off", m))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 variant moe_ring is off at %d rows: %s",
+                m,
+                why,
+            )
+        return opts, None
+    return dict(opts, ring=RING_STAGES, q0=1), _ring_records(device)[layer]
+
+
+def run_engine(w: Width, experts, x_fp4: torch.Tensor, x_sf: torch.Tensor):
+    from sgl_nvidia_mega.qwen3_5.moe import fc2ar
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import q35_moe_engine
+
+    cfg = _engine_config()
+    m = x_fp4.shape[0]
+    t = w.tables
+    h, hsf, out = _engine_buffers(w, experts, m, x_fp4.device)
+    out = fc2ar.engine_out(out, m, t.tile)
+    n_max = engine_n_max(m)
+    opts = fc2ar.engine_opts(dict(ENGINE_OPTIONS), m)
+    opts, rec = ring_opts(experts, m, opts, x_fp4.device)
+    if m not in cfg["logged"]:
+        cfg["logged"].add(m)
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot moe_engine runs at %d rows (tile_n %d, N %d, "
+            "%d local experts, options %s%s)",
+            m,
+            t.tile,
+            n_max,
+            experts.num_local_experts,
+            opts,
+            ", ring fill from the layer's record" if rec is not None else "",
+        )
+    q35_moe_engine.q35_moe_engine(
+        x_fp4.view(torch.uint8),
+        x_sf.view(torch.uint8).reshape(m, -1),
+        t.permuted_to_token,
+        t.cta_expert,
+        t.cta_row_limit,
+        t.live_ctas,
+        experts.w13_weight.data.view(torch.uint8),
+        experts.w13_weight_scale.data.view(torch.uint8),
+        experts.w2_weight.data.view(torch.uint8),
+        experts.w2_weight_scale.data.view(torch.uint8),
+        experts.g1_scale_c.data,
+        experts.g1_alphas.data,
+        experts.g2_alphas.data,
+        h,
+        hsf,
+        out,
+        _engine_state(x_fp4.device),
+        tile=t.tile,
+        n_max=n_max,
+        tile_k=engine_tile_k(n_max),
+        rec=rec,
+        **opts,
+    )
+    return [out, t.weights, t.expanded_to_permuted]
+
+
+_ROUTE_P2TP: list = []
+
+
+def _route_p2tp(t, device) -> torch.Tensor:
+    grid = torch.cuda.get_device_properties(device).multi_processor_count
+    need = grid * (t.cta_expert.numel() + 1) * t.tile
+    if not _ROUTE_P2TP or _ROUTE_P2TP[-1].numel() < need:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "slot moe_engine_route: the engine's per-CTA tables must exist before "
+                "CUDA-graph capture (run one eager forward of this width first)"
+            )
+        _ROUTE_P2TP.append(torch.empty((need,), dtype=torch.int32, device=device))
+    return _ROUTE_P2TP[-1][:need]
+
+
+ROUTED_TRIGGER = 3
+TEST_ROUTE_DELAY_NS = 0
+
+
+def run_engine_a(
+    w: Width, experts, x_fp4: torch.Tensor, x_sf: torch.Tensor, cand: torch.Tensor
+):
+    from sgl_nvidia_mega.qwen3_5.moe import fc2ar
+    from sgl_nvidia_mega.qwen3_5.sm103.moe import q35_moe_engine
+
+    cfg = _engine_config()
+    m = x_fp4.shape[0]
+    t = w.tables
+    h, hsf, out = _engine_buffers(w, experts, m, x_fp4.device)
+    opts = dict(ENGINE_OPTIONS)
+    if fc2ar.armed_at(m):
+        out = fc2ar.engine_out(out, m, t.tile, ROUTED_TRIGGER)
+        opts = dict(fc2ar.engine_opts(opts, m), early_trigger=ROUTED_TRIGGER)
+    if TEST_ROUTE_DELAY_NS:
+        opts["test_route_delay_ns"] = TEST_ROUTE_DELAY_NS
+    p2tp = _route_p2tp(t, x_fp4.device)
+    n_max = engine_n_max(m)
+    if ("a", m) not in cfg["logged"]:
+        cfg["logged"].add(("a", m))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot moe_engine_route runs at %d rows (tile_n %d, "
+            "N %d, %d local experts, options %s)",
+            m,
+            t.tile,
+            n_max,
+            experts.num_local_experts,
+            opts,
+        )
+    q35_moe_engine.q35_moe_engine(
+        x_fp4.view(torch.uint8),
+        x_sf.view(torch.uint8).reshape(m, -1),
+        t.permuted_to_token,
+        t.cta_expert,
+        t.cta_row_limit,
+        t.live_ctas,
+        experts.w13_weight.data.view(torch.uint8),
+        experts.w13_weight_scale.data.view(torch.uint8),
+        experts.w2_weight.data.view(torch.uint8),
+        experts.w2_weight_scale.data.view(torch.uint8),
+        experts.g1_scale_c.data,
+        experts.g1_alphas.data,
+        experts.g2_alphas.data,
+        h,
+        hsf,
+        out,
+        _engine_state(x_fp4.device),
+        tile=t.tile,
+        n_max=n_max,
+        tile_k=engine_tile_k(n_max),
+        **opts,
+        cand=cand,
+        ids=t.ids,
+        wts=t.weights,
+        e2p=t.expanded_to_permuted,
+        total_padded=t.total_padded,
+        m=m,
+        local_start=t.local_offset,
+        p2tp=p2tp,
+    )
+    return [out, t.weights, t.expanded_to_permuted]

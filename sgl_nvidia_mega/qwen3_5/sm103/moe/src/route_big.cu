@@ -23,6 +23,22 @@
 //
 // Defines: CL (CTAs a cluster: 8, or 16, non-portable), MW (token-mask words an expert: a routing CTA takes up to
 // 32 MW <= 64 tokens, Params.tpc), NL (local experts, a multiple of 32, <= 1024). Built with NVRTC.
+//
+// The LEAN variant is adapted from TensorRT-LLM (Apache-2.0): the ``lean`` table build of
+// tensorrt_llm/_torch/kernels/blackwell/moe_route_front.py.
+
+#ifndef LEAN
+#define LEAN 0
+#endif
+#ifndef ET
+#define ET 0
+#endif
+#ifndef THREADS
+#define THREADS 1024
+#endif
+#ifndef TEST_BAD_SLOT
+#define TEST_BAD_SLOT 0
+#endif
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -40,9 +56,10 @@ namespace q35_route_big {
 
 using namespace q35_route_tables;
 
-constexpr uint32_t kThreadsBig = 1024, kWarpsBig = kThreadsBig / 32;
+constexpr uint32_t kThreadsBig = THREADS, kWarpsBig = kThreadsBig / 32;
 constexpr uint32_t kHidden = 4096, kSfVec = 16, kBlocksPerRow = kHidden / kSfVec;  // 256
-constexpr uint32_t kMaxTpc = 32 * MW;  // tokens a routing CTA takes at most
+constexpr uint32_t kMaxTpc = 32 * MW <= 2 * kWarpsBig ? 32 * MW : 2 * kWarpsBig;
+static_assert(THREADS == 256 || THREADS == 512 || THREADS == 1024, "THREADS: 256, 512 or 1024");
 static_assert(MW >= 1 && kMaxTpc <= 2 * kWarpsBig, "at most two tokens a warp");
 static_assert(NL % 32 == 0 && NL <= kThreadsBig, "one thread an expert");
 static_assert(NL * MW <= kThreadsBig, "one thread a token-mask word");
@@ -149,6 +166,32 @@ __device__ __forceinline__ int32_t ld_dsmem(const int32_t* p, uint32_t rank) {
   return v;
 }
 
+#if LEAN
+// ---- the lean count exchange (bulk copies onto mbarriers)
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ void mbar_arm(uint32_t mbar, uint32_t bytes) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(mbar) : "memory");
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(mbar), "r"(bytes) : "memory");
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+__device__ __forceinline__ void bulk_push(uint32_t dst, uint32_t mbar, uint32_t src, uint32_t rank, uint32_t bytes) {
+  asm volatile(
+      "{\n.reg .b32 rd, rb;\nmapa.shared::cluster.u32 rd, %0, %3;\nmapa.shared::cluster.u32 rb, %1, %3;\n"
+      "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [rd], [%2], %4, [rb];\n}" ::"r"(dst),
+      "r"(mbar), "r"(src), "r"(rank), "r"(bytes)
+      : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint32_t mbar, uint32_t parity) {
+  asm volatile(
+      "{\n.reg .pred P1;\nLAB_WAIT:\nmbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n@P1 bra DONE;\n"
+      "bra LAB_WAIT;\nDONE:\n}" ::"r"(mbar),
+      "r"(parity)
+      : "memory");
+}
+#endif
+
 // one token's logits (lane l: experts 16 l .. 16 l + 15)
 __device__ __forceinline__ void load_logits(const Params& p, int32_t token, uint32_t lane, uint4& v0, uint4& v1) {
   const uint4* src = reinterpret_cast<const uint4*>(p.logits + static_cast<size_t>(token) * kExperts + lane * 16);
@@ -158,13 +201,25 @@ __device__ __forceinline__ void load_logits(const Params& p, int32_t token, uint
 
 __device__ __forceinline__ void route_cta(const Params& p, uint32_t c) {
   __shared__ uint32_t s_mask[NL * MW];
+#if LEAN
+  static_assert(NL % 4 == 0, "bulk copies of 16-byte multiples");
+  __shared__ __align__(16) int32_t s_cnt[NL];
+  __shared__ __align__(16) int32_t s_rbuf[CL * NL];
+  __shared__ __align__(8) unsigned long long s_mbar;
+  __shared__ int32_t s_pre[NL], s_offs[NL], s_tot[NL], s_wsum[kWarpsBig];
+#else
   __shared__ int32_t s_cnt[NL], s_pre[NL], s_offs[NL], s_tot[NL], s_wsum[kWarpsBig];
+#endif
   __shared__ uint16_t s_pick[kMaxTpc * kTopK];
   __shared__ __align__(16) uint32_t s_cand[kWarpsBig][32];
   const uint32_t tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   const Tables& t = p.tables;
   const int32_t tile = t.tile;
   if (tid < NL * MW) s_mask[tid] = 0u;
+#if LEAN
+  if (tid == 0) mbar_arm(smem_u32(&s_mbar), CL * NL * 4);
+  cluster_arrive_release();
+#endif
   const int32_t t_first = static_cast<int32_t>(c) * p.tpc;
   const int32_t n_tok = min(p.tpc, p.num_tokens - t_first);
   asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -201,6 +256,34 @@ __device__ __forceinline__ void route_cta(const Params& p, uint32_t c) {
     for (uint32_t w = 0; w < MW; ++w) cnt += __popc(s_mask[tid * MW + w]);
     s_cnt[tid] = cnt;
   }
+#if LEAN
+  cluster_wait_acquire();
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  __syncthreads();
+  const uint32_t mbar = smem_u32(&s_mbar);
+  if (tid == 0) {
+    const uint32_t slot = TEST_BAD_SLOT ? (c + 1) % CL : c;
+    const uint32_t dst = smem_u32(s_rbuf) + slot * NL * 4, src = smem_u32(s_cnt);
+#pragma unroll
+    for (uint32_t k = 0; k < CL; ++k) bulk_push(dst, mbar, src, k, NL * 4);
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+  }
+  mbar_wait(mbar, 0);  // the CL count vectors are in this CTA's receive buffer
+  int32_t tot = 0, nct = 0;
+  if (tid < NL) {
+    int32_t v[CL];
+#pragma unroll
+    for (uint32_t k = 0; k < CL; ++k) v[k] = s_rbuf[k * NL + tid];
+    int32_t pre = 0;
+#pragma unroll
+    for (uint32_t k = 0; k < CL; ++k) {
+      tot += v[k];
+      pre += k < c ? v[k] : 0;
+    }
+    s_pre[tid] = pre;
+    nct = (tot + tile - 1) / tile;
+  }
+#else
   // ---- the cluster's per-expert counts through distributed shared memory
   cluster_arrive_release();
   cluster_wait_acquire();
@@ -219,6 +302,7 @@ __device__ __forceinline__ void route_cta(const Params& p, uint32_t c) {
     nct = (tot + tile - 1) / tile;
   }
   cluster_arrive_relaxed();  // this CTA has read its peers' counts (the matching wait is at the end)
+#endif
   // exclusive scan of the CTAs per expert, one expert a thread
   int32_t incl = nct;
 #pragma unroll
@@ -279,7 +363,11 @@ __device__ __forceinline__ void route_cta(const Params& p, uint32_t c) {
     }
     t.expanded_to_permuted[static_cast<size_t>(tok) * kTopK + (static_cast<uint32_t>(i) - tl * kTopK)] = perm;
   }
+#if LEAN
+  if (tid == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+#else
   cluster_wait_acquire();  // every peer has read this CTA's counts
+#endif
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
@@ -305,6 +393,9 @@ __device__ __forceinline__ void quant_cta(const Params& p, uint32_t qc, uint32_t
 
 extern "C" __global__ __launch_bounds__(q35_route_big::kThreadsBig, 1) void q35_route_big_quant(
     const __grid_constant__ q35_route_big::Params p) {
+#if ET
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   if (blockIdx.x < CL) {
     q35_route_big::route_cta(p, blockIdx.x);
   } else {

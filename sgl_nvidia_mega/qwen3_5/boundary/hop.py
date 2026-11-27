@@ -125,7 +125,11 @@ SGLANG_MIRRORS = {
     "srt/layers/layer_boundary/stage.py:StageBoundary._prepare_attention": "ab2768d2e68434a5",
     "srt/layers/layer_boundary/stage.py:StageBoundary._prepare_input": "53b7f2a5bd394d76",
     # sglang#50691 publishes an Ascend-only MoE input flag (read by ascend_ops)
-    "srt/layers/layer_boundary/stage.py:StageBoundary._select": "ba73d2b3981b6208",
+    "srt/layers/layer_boundary/stage.py:StageBoundary._select": (
+        "f317ed475a7672cf",
+        "a1ab3bafed24a06c",
+        "ba73d2b3981b6208",
+    ),
     "srt/layers/layer_boundary/prepare.py:_run_entry": "639740496fc09d2d",
     "srt/layers/layer_boundary/prepare.py:_reduce_update_read": "67badae13f96d80f",
     "srt/layers/layer_boundary/fusions/cutedsl.py:CuteDSLFusion._finalize_add_norm": "51d463a1cecbbb64",
@@ -133,7 +137,6 @@ SGLANG_MIRRORS = {
     "srt/layers/layer_boundary/residual/batch.py:final_norm": "13008609a1a7fd8a",
 }
 
-# the (point, rows) the slot has run at (each logged once, as engagement evidence)
 _ENGAGED: set = set()
 # the target's hop once built (active())
 _ACTIVE: Optional[object] = None
@@ -145,15 +148,85 @@ class Bound(msgspec.Struct, frozen=True):
     hop: Optional[object] = None  # sm103.hop.Hop for every covered width, or None
     mid: bool = False  # its one-shot mailbox serves past 15 rows (slot hop_mid)
     reason: str = ""  # why there is no hop
+    bt: Optional[object] = None  # bt_tail.BTTail (slot bt_tail), or None
+    bt_reason: str = ""
 
 
 def build(model, ctx) -> Bound:
     """The hop when slot ``hop`` is requested and every layer's boundary is the path
     mirrored here. A collective: every rank builds it or none does."""
+    built = _build_hop(model, ctx)
+    bt, why = _build_bt(model, ctx)
+    return msgspec.structs.replace(built, bt=bt, bt_reason=why)
+
+
+def _agree(reasons: list, what: str) -> None:
+    """SGLang's ``megakernel_agree`` on ``reasons`` across the ranks."""
     try:
         from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         from sglang.srt.megakernels.runtime import megakernel_agree
+
+    megakernel_agree(reasons, what=what)
+
+
+def _build_bt(model, ctx) -> tuple:
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5 import plan, runtime
+    from sgl_nvidia_mega.qwen3_5.boundary import bt_tail
+
+    if "bt_tail" not in runtime.SLOTS:
+        return None, "slot off"
+    if not any(plan.BT_TAIL_MIN_ROWS <= w <= plan.BT_TAIL_MAX_ROWS for w in ctx.widths):
+        return None, f"no width of {list(ctx.widths)} within its rows"
+    m = model.model
+    group = get_parallel().tp_group
+    reasons = refusals(m, group.world_size) + bt_tail.flashinfer_reasons()
+    # every rank runs the same kernels at a point
+    _agree(reasons, "bt_tail refusals")
+    if reasons:
+        return None, "; ".join(reasons)
+    service = m.flashinfer_mnnvl_cutedsl_fusion
+    early = frozenset(
+        point
+        for point, variant in (
+            ("all_reduce", "bt_tail_early"),
+            ("finalize", "bt_tail_early_fin"),
+        )
+        if variant in runtime.SLOTS
+    )
+    tail = bt_tail.BTTail(
+        service=service,
+        eps=service.rms_epsilon,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        min_rows=plan.BT_TAIL_MIN_ROWS,
+        max_rows=plan.BT_TAIL_MAX_ROWS,
+        early=early,
+    )
+    _build_tail_ar(tail, group.device_group, ctx.widths, m.layers[m.start_layer].mlp)
+    return tail, ""
+
+
+def _build_tail_ar(tail, group, widths, mlp) -> None:
+    from sgl_nvidia_mega.qwen3_5 import runtime
+    from sgl_nvidia_mega.qwen3_5.moe import fc2ar
+    from sgl_nvidia_mega.qwen3_5.sm103.hop import gemm_ar
+
+    if "gemm_ar" in runtime.SLOTS:
+        tail.twoshot, tail.gemm_ar, why = gemm_ar.build(
+            tail.eps, group, tail.device, widths
+        )
+        if why:
+            tail.ar_reasons["gemm_ar"] = why
+    if "fc2ar" in runtime.SLOTS:
+        tail.fc2ar, why = fc2ar.build(tail.eps, group, tail.device, widths, mlp.experts)
+        if why:
+            tail.ar_reasons["fc2ar"] = why
+
+
+def _build_hop(model, ctx) -> Bound:
+    """The hop's part of ``build``."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_nvidia_mega.qwen3_5 import plan, runtime
@@ -173,7 +246,7 @@ def build(model, ctx) -> Bound:
     group = get_parallel().tp_group
     reasons = refusals(m, group.world_size)
     # a rank without the hop would leave its peers' consumers waiting
-    megakernel_agree(reasons, what="hop refusals")
+    _agree(reasons, "hop refusals")
     if reasons:
         return Bound(reason="; ".join(reasons))
     try:
@@ -337,6 +410,8 @@ def layer_input(hop, layer, hidden, st):
     stream.write(residual)
     if fp8:
         lowm.stash_fp8(st, norm, fp8[0])
+    elif lowm.reads_fp8(st):
+        lowm.clear_fp8(st)
     return norm
 
 
@@ -354,6 +429,30 @@ def takes_moe_input(hop, layer, st, rows: int) -> bool:
         and plan.fusions._eligible(plan, st.fb, rows)
         and not get_exec().comm.enable_quant_communications
     )
+
+
+def gemm_ar(layer, st, rows: int):
+    if not st.slots.gemm_ar:
+        return None
+    tail = st.bound["boundary"].bt
+    if not takes_moe_input(tail, layer, st, rows):
+        return None
+    if not tail.gemm_ar.covers(rows):
+        _uncovered_gemm_ar(rows, tail.gemm_ar)
+        return None
+    return tail.gemm_ar
+
+
+def _uncovered_gemm_ar(rows: int, gar) -> None:
+    if ("gemm_ar", "uncovered", rows) not in _ENGAGED:
+        _ENGAGED.add(("gemm_ar", "uncovered", rows))
+        logger.warning(
+            "NVIDIA megakernel: Qwen3.5 slot gemm_ar covers %d-%d rows; the projection "
+            "at %d rows stays on cuBLAS",
+            gar.lo,
+            gar.hi,
+            rows,
+        )
 
 
 def moe_input(hop, layer, hidden, st):
@@ -383,7 +482,7 @@ def moe_input(hop, layer, hidden, st):
         return None
     from sgl_nvidia_mega.qwen3_5 import lowm
 
-    _engage("MoE input", rows)
+    _engage("MoE input", rows, hop)
     scale = lowm.moe_input_fp8_scale(layer, st)
     if st.slots.route_lin and hop._pushed_rl:
         # Slot route_lin: the mixer pushed its router partial too; this hop also gives
@@ -396,7 +495,7 @@ def moe_input(hop, layer, hidden, st):
                     f"layer {layer.layer_id}'s residual is not the one its router partials read",
                 )
             )
-        _engage("MoE input + router (route-lin)", rows)
+        _engage("MoE input + router (route-lin)", rows, hop)
         (norm, residual, *fp8), rl = hop.all_reduce_residual_rms_norm_rl(
             local_contribution=part,
             residual=residual,
@@ -415,6 +514,8 @@ def moe_input(hop, layer, hidden, st):
     stream.write(residual)
     if fp8:
         lowm.stash_fp8(st, norm, fp8[0])
+    elif lowm.reads_fp8(st):
+        lowm.clear_fp8(st)
     return norm
 
 
@@ -463,7 +564,7 @@ def _takes(hop, owed) -> bool:
 
 
 def _finalize(hop, point, owed, residual, gamma, fp8_scale=None):
-    _engage(point, owed.m)
+    _engage(point, owed.m, hop)
     return hop.moe_finalize_all_reduce_rms_norm(
         routed_output=owed.routed_output,
         expert_weights=owed.expert_weights,
@@ -475,9 +576,13 @@ def _finalize(hop, point, owed, residual, gamma, fp8_scale=None):
     )
 
 
-def _engage(point: str, rows: int) -> None:
-    if (point, rows) not in _ENGAGED:
-        _ENGAGED.add((point, rows))
+def _engage(point: str, rows: int, hop=None) -> None:
+    slot = getattr(hop, "slot", "hop")
+    if (slot, point, rows) not in _ENGAGED:
+        _ENGAGED.add((slot, point, rows))
         logger.info(
-            "NVIDIA megakernel: Qwen3.5 slot hop runs the %s at %d rows", point, rows
+            "NVIDIA megakernel: Qwen3.5 slot %s runs the %s at %d rows",
+            slot,
+            point,
+            rows,
         )

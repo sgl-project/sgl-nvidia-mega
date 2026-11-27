@@ -227,9 +227,8 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
 
     rows = x.shape[0]
     requests = rows // ROWS
-    # TensorRT-LLM's front may read the hop's E4M3 copy of x (slot hop_fp8).
     trt = st.slots.gdn_trt_front and opts.core
-    x8 = lowm.take_fp8(st, x) if trt and st.slots.hop_fp8 else None
+    x8 = lowm.take_fp8(st, x) if trt and lowm.reads_fp8(st) else None
     # the L2 prefetch of the checkpoint / ring in front of slot gdn_core is left out with the early history (the core
     # holds those loads ahead of its wait) and for the pinned one-request front (which completes later with it)
     prefetch = not (opts.core and (core_kernel.EARLY or (front.PIN and requests == 1)))
@@ -379,4 +378,4 @@ def step(gdn, x: torch.Tensor, st, opts) -> torch.Tensor:
             input_scale=gdn.out_proj.input_scale,
             weight_scale=gdn.out_proj.weight_scale,
         )
-    return _out_proj(gdn.out_proj, x_fp8, x.dtype, st, opts.lowm_push)
+    return _out_proj(gdn.out_proj, x_fp8, x.dtype, st, opts.lowm_push, opts.gemm_ar)

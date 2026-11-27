@@ -57,6 +57,104 @@ MAX_BATCH = _TWO_SLOT_MAX_BATCH
 MAX_BATCH_Q1 = _WIDE_PLAN_MAX_BATCH
 # Pack every two-slot call; the unpacked form remains available as a test hook.
 _TWO_SLOT_PACK = True
+_MIN_CTAS = 6
+_SMV2 = 0
+_PTXAS = ""
+_BUILD_LOGGED: set = set()
+
+
+def set_partial_build(softmax_v2: int = 0, ptxas: str = "") -> None:
+    global _SMV2, _PTXAS
+    assert int(softmax_v2) in (0, 1, 2), softmax_v2
+    _SMV2, _PTXAS = int(softmax_v2), str(ptxas).strip()
+    if _SMV2 or _PTXAS:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 CP-lite partial build options: softmax v2 = %d, "
+            "ptxas options '%s' (slots cp_smv2 / cp_ptxas_o1)",
+            _SMV2,
+            _PTXAS,
+        )
+
+
+_LEAN_PHASE = False
+_PLAN_CACHE = False
+_COMB_W = False
+_EP_EARLY = False
+_PC_ROW_WORDS = 40
+_PC_SLOTS = 16
+
+
+def set_cp_phase(
+    on: bool, plan_cache: bool = True, comb_w: bool = True, ep_early: bool = True
+) -> None:
+    global _LEAN_PHASE, _PLAN_CACHE, _COMB_W, _EP_EARLY
+    _LEAN_PHASE = bool(on)
+    _PLAN_CACHE = _LEAN_PHASE and bool(plan_cache)
+    _COMB_W = _LEAN_PHASE and bool(comb_w)
+    _EP_EARLY = _LEAN_PHASE and bool(ep_early)
+    if _PLAN_CACHE:
+        for state in _STATES.values():
+            state.alloc_plan_cache_pool()
+    if _LEAN_PHASE:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 CP-lite partial lean fixed phase on (one-slot balanced "
+            "calls; plan cache %s, LSE-first combine %s, early push epochs %s)",
+            _PLAN_CACHE,
+            _COMB_W,
+            _EP_EARLY,
+        )
+
+
+def _plan_cache_rows(state: "_DeviceState", key: tuple, n_ctas: int) -> torch.Tensor:
+    t = state.plan_cache.get(key)
+    if t is None:
+        pool = state.plan_cache_pool
+        if (
+            pool is not None
+            and len(state.plan_cache) < pool.shape[0]
+            and n_ctas <= pool.shape[1]
+        ):
+            t = pool[len(state.plan_cache), :n_ctas]
+        else:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "q35_cp_fused_partial (plan cache): more variants than the preallocated slots; "
+                    "make one eager call of this variant before CUDA graph capture"
+                )
+            t = torch.zeros(
+                n_ctas, _PC_ROW_WORDS, dtype=torch.int64, device=state.workspace.device
+            )
+        state.plan_cache[key] = t
+    return t
+
+
+def _push_opts(
+    o_push: bool, ql_real: int, hq_real: int, late_trigger: bool, o_hilo: bool = False
+) -> dict:
+    if not o_push:
+        return {}
+    return dict(
+        o_push=True,
+        ql_real=int(ql_real),
+        hq_real=int(hq_real),
+        late_trigger=bool(late_trigger),
+        **({"ep_early": True} if _EP_EARLY and not o_hilo else {}),
+    )
+
+
+def _build_opts(q_len: int, b: int, p_hilo: bool = False) -> tuple:
+    if (_SMV2 or _PTXAS) and (q_len, p_hilo) not in _BUILD_LOGGED:
+        _BUILD_LOGGED.add((q_len, p_hilo))
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slots cp_smv2 / cp_ptxas_o1 build CP-lite's partial "
+            "with softmax v2 = %d, ptxas options '%s' (q_len %d, batch %d%s)",
+            _SMV2,
+            _PTXAS,
+            q_len,
+            b,
+            ", precise" if p_hilo else "",
+        )
+    return _SMV2, _PTXAS
 
 
 # Mirror of q35_cp_partial_attn.MAX_COMB_ROWS (rows one CTA's combine chunk may touch).
@@ -125,7 +223,9 @@ def cp_partial_balanced_ws_bytes(rows: int, n_ctas: int, slots: int = 1) -> int:
     return slots * n_ctas * (16 * ((slot_o + 15) // 16) + 16 * rows)
 
 
-def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
+def balanced_split_plan(
+    seq_lens, cp_rank: int, cp_size: int, n_ctas: int, min_ctas: int | None = None
+):
     """Host mirror of the balanced split's in-kernel plan (q35_cp_partial_attn.Q35CpPartialAttnKernel._plan).
 
     Returns (T, c, ctas): T = the largest tile count of a CTA's block, c[r] = CTAs of request r, ctas[i] = (request,
@@ -137,16 +237,23 @@ def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
     ]
     b = len(t)
     assert 1 <= b < n_ctas and b <= _QUAD_PLAN_MAX_BATCH
+    kf = max(
+        min(_MIN_CTAS if min_ctas is None else int(min_ctas), (n_ctas - 1) // b), 1
+    )
     total, tmax = sum(t), max(t)
     lo = max(-(-total // n_ctas), 1)
-    hi = max(min(tmax, -(-total // (n_ctas - b))), lo)
+    hi = max(min(tmax, -(-total // (n_ctas - b * kf))), lo)
+
+    def need(x, T):
+        return max(-(-x // T), min(x, kf), 1)
+
     while lo < hi:
         mid = (lo + hi) // 2
-        if sum(max(-(-x // mid), 1) for x in t) <= n_ctas:
+        if sum(need(x, mid) for x in t) <= n_ctas:
             hi = mid
         else:
             lo = mid + 1
-    c = [max(-(-x // lo), 1) for x in t]
+    c = [need(x, lo) for x in t]
     top = max(r for r in range(b) if t[r] == tmax)
     c[top] += n_ctas - sum(c)
     ctas = []
@@ -326,12 +433,26 @@ class _DeviceState:
         self.counters = torch.zeros(
             MAX_BATCH + 1, MAX_BATCH, dtype=torch.int64, device=device
         )
+        self.plan_cache = {}
+        self.plan_cache_pool = None
+        if _PLAN_CACHE:
+            self.alloc_plan_cache_pool()
         self.dbg_ring = None
         if _DBG_SLOTS > 0:
             self.dbg_ring = torch.zeros(
                 _DBG_SLOTS * _DBG_RING_CTAS * 8, dtype=torch.int64, device=device
             )
             _start_dbg_dump(self.dbg_ring, device)
+
+    def alloc_plan_cache_pool(self) -> None:
+        if self.plan_cache_pool is None:
+            self.plan_cache_pool = torch.zeros(
+                _PC_SLOTS,
+                _num_ctas(self.sm_count),
+                _PC_ROW_WORDS,
+                dtype=torch.int64,
+                device=self.counters.device,
+            )
 
 
 def _start_dbg_dump(ring: torch.Tensor, device: torch.device) -> None:
@@ -420,6 +541,20 @@ def _compiled(
     quad_plan: bool = False,
     two_slot: bool = False,
     two_slot_pack: bool = False,
+    min_ctas: int = 1,
+    softmax_v2: int = 0,
+    ptxas: str = "",
+    lean_phase: bool = False,
+    plan_cache: bool = False,
+    comb_w: bool = False,
+    o_push: bool = False,
+    ql_real: int = 7,
+    hq_real: int = 4,
+    late_trigger: bool = False,
+    ep_early: bool = False,
+    o_hilo: bool = False,
+    p_hilo: bool = False,
+    o_f16: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -455,6 +590,19 @@ def _compiled(
             quad_plan=quad_plan,
             two_slot=two_slot,
             two_slot_pack=two_slot_pack,
+            min_ctas=min_ctas,
+            softmax_v2=softmax_v2,
+            lean_phase=lean_phase,
+            plan_cache=plan_cache,
+            comb_w=comb_w,
+            o_push=o_push,
+            ql_real=ql_real,
+            hq_real=hq_real,
+            late_trigger=late_trigger,
+            ep_early=ep_early,
+            o_hilo=o_hilo,
+            p_hilo=p_hilo,
+            o_f16=o_f16,
         )
         assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(
             q_len * gh, n_splits, 2 if two_slot else 1
@@ -480,6 +628,7 @@ def _compiled(
             l_from_p8=l_from_p8,
             len_sub=len_sub,
             early_trigger=early_trigger,
+            softmax_v2=softmax_v2,
         )
         assert (
             kernel.ws_req_bytes
@@ -522,7 +671,11 @@ def _compiled(
         _ptr(i64, cutlass.Int64, a["cnt"]),
         _ptr(i64, cutlass.Int64, a["dbg"]),
         I32(1),
+        _ptr(i64, cutlass.Int64, 16),
+        _ptr(i32, I32, 4),
+        _ptr(i64, cutlass.Int64, 16),
         stream,
+        **({"options": f"--ptxas-options {ptxas}"} if ptxas else {}),
     )
 
 
@@ -555,6 +708,15 @@ def q35_cp_fused_partial(
     early_trigger: bool = False,
     plan: str | None = None,
     pack: bool | None = None,
+    o_push: bool = False,
+    ll: torch.Tensor | None = None,
+    cnt_h: torch.Tensor | None = None,
+    ql_real: int = 7,
+    hq_real: int = 4,
+    late_trigger: bool = False,
+    o_hilo: bool = False,
+    p_hilo: bool = False,
+    o_f16: bool = False,
 ) -> None:
     """This CP rank's partial attention of every group head over the pages it owns (q35_cp_fused_partial_ref).
 
@@ -733,7 +895,28 @@ def q35_cp_fused_partial(
     assert out_o.data_ptr() % 4 == 0 and all(
         out_o.stride(i) % 2 == 0 for i in range(3)
     ), "out_o: 4-byte aligned rows (alltoall_merge reads it as int32)"
+    if o_push:
+        assert q_len == 1 and hq == ql_real * hq_real and bal and not two, (
+            "o_push: the folded one-slot balanced call"
+        )
+        assert o_vec16, "o_push: 16-byte rows"
+        assert ll is not None and ll.dtype == torch.int64 and ll.numel() == 4 >= cp
+        assert cnt_h is not None and cnt_h.dtype == torch.int32
+    if o_hilo:
+        assert bal and not two and o_vec16, (
+            "o_hilo: a one-slot balanced plan, 16-byte aligned out_o rows"
+        )
+    if p_hilo:
+        assert bal and not two and not l_from_p8, (
+            "p_hilo: a one-slot balanced plan, l from the FP32 p"
+        )
+    if o_f16:
+        assert bal and not two and not o_hilo, (
+            "o_f16: a one-slot balanced plan, BF16 + residual partials excluded"
+        )
     ring = state.dbg_ring if debug is None else None
+    lean = bal and _LEAN_PHASE and not two
+    cached = lean and _PLAN_CACHE and not wide and not quad
     if bal:
         fn = _compiled(
             q_len,
@@ -760,8 +943,19 @@ def q35_cp_fused_partial(
             quad,
             two,
             two_pack,
+            1 if two else _MIN_CTAS,
+            *_build_opts(q_len, b, bool(p_hilo)),
+            **({"lean_phase": True} if lean else {}),
+            **({"plan_cache": True} if cached else {}),
+            **({"comb_w": True} if (lean and _COMB_W) else {}),
+            **_push_opts(o_push, ql_real, hq_real, late_trigger, bool(o_hilo)),
+            **({"o_hilo": True} if o_hilo else {}),
+            **({"p_hilo": True} if p_hilo else {}),
+            **({"o_f16": True} if o_f16 else {}),
         )
+        pc = _plan_cache_rows(state, (fn, cp_rank), splits) if cached else None
     else:
+        pc = None
         fn = _compiled(
             q_len,
             gh,
@@ -783,6 +977,7 @@ def q35_cp_fused_partial(
             bool(l_from_p8),
             int(len_sub),
             bool(early_trigger),
+            **dict(zip(("softmax_v2", "ptxas"), _build_opts(q_len, b))),
         )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
@@ -820,5 +1015,8 @@ def q35_cp_fused_partial(
             a["dbg"],
         ),
         I32(b),
+        _ptr(ll if o_push else cnt[b], cutlass.Int64, 16),
+        _ptr(cnt_h if o_push else seq_lens, I32, 4),
+        _ptr(pc if pc is not None else cnt[b], cutlass.Int64, 16),
         stream,
     )

@@ -108,6 +108,9 @@ def default_tactic(
     return best[1]
 
 
+PUSH_DESC_WORDS = 8
+
+
 class _GraphSafeDlpack:
     """DLPack export that does not synchronize streams (CUDA-graph capture safe)."""
 
@@ -164,6 +167,12 @@ def _row_view(rows: int, cols: int, stride: int, dtype, device) -> torch.Tensor:
     return torch.empty((rows, stride), dtype=dtype, device=device)[:, :cols]
 
 
+def _out_operand(m: int, n_out: int, out_stride: int, dtype, device) -> torch.Tensor:
+    if out_stride:
+        return _row_view(m, n_out, out_stride, dtype, device)
+    return torch.empty((m, n_out), dtype=dtype, device=device)
+
+
 @functools.lru_cache(maxsize=None)
 def _compiled(
     m: int,
@@ -195,6 +204,8 @@ def _compiled(
     conv_tokens: int = 1,
     conv_write_state: bool = True,
     conv_shapes: tuple = (),
+    out_stride: int = 0,
+    push: int = 0,
 ):
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
@@ -225,6 +236,7 @@ def _compiled(
         conv_channels=conv_channels,
         conv_tokens=conv_tokens,
         conv_write_state=conv_write_state,
+        push=push,
     )
     dev = torch.device("cuda")
     if conv_channels:
@@ -244,6 +256,8 @@ def _compiled(
             _dummy("slot", dev),
             _dummy("win", dev),
         )
+    if push:
+        slots = torch.zeros((PUSH_DESC_WORDS,), dtype=torch.int32, device=dev)
     a16 = (
         _row_view(m, k, a16_stride, torch.bfloat16, dev)
         if a16_stride
@@ -263,9 +277,7 @@ def _compiled(
         else _dummy("b16", dev)
     )
     s = _dummy("s", dev)
-    c = torch.empty(
-        (m, n_out), dtype=torch.uint8 if quant_out else out_dtype, device=dev
-    )
+    c = _out_operand(m, n_out, out_stride, torch.uint8 if quant_out else out_dtype, dev)
     c2 = (
         torch.empty((m, n_out2), dtype=out_dtype, device=dev)
         if n_out2

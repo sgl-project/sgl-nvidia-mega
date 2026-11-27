@@ -20,7 +20,7 @@ from __future__ import annotations
 import ctypes
 from functools import cache
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -33,6 +33,15 @@ THREADS, K, V, RING, MAX_ROWS_PER_REQUEST = 128, 128, 128, 16, 8
 EARLY = False
 RELEASE_MIN_ROWS, RELEASE_MAX_ROWS = 35, 56
 FLAT = True
+WIDTH, CONV_MIN_ROWS_PER_REQUEST = 4, 4
+# The value split runs at the TP8 shard's value heads and these rows (inclusive).
+VSPLIT_HV = 8
+VSPLIT_ROWS = (7, 112)
+
+
+def vsplit_for(rows: int, hv: int) -> int:
+    lo, hi = VSPLIT_ROWS
+    return 2 if hv == VSPLIT_HV and lo <= rows <= hi else 1
 
 
 class Params(ctypes.Structure):
@@ -78,6 +87,38 @@ class Params(ctypes.Structure):
     ]
 
 
+class ConvParams(ctypes.Structure):
+    _fields_ = Params._fields_ + [
+        ("cw", ctypes.c_void_p),
+        ("cw_dim", ctypes.c_int64),
+        ("cw_tap", ctypes.c_int64),
+        ("cbias", ctypes.c_void_p),
+        ("cstate", ctypes.c_void_p),
+        ("cs_slot", ctypes.c_int64),
+        ("cs_dim", ctypes.c_int64),
+        ("cs_tap", ctypes.c_int64),
+        ("win", ctypes.c_void_p),
+        ("win_slot", ctypes.c_int64),
+        ("win_dim", ctypes.c_int64),
+        ("win_indices", ctypes.c_void_p),
+        ("win_index64", ctypes.c_int),
+        ("arrive", ctypes.c_void_p),
+        ("rows16", ctypes.c_int),
+    ]
+
+
+class Conv(NamedTuple):
+    """The causal conv update (SiLU) the launch runs first (slot gdn_conv_core)."""
+
+    weight: torch.Tensor  # [channels, WIDTH] BF16
+    bias: Optional[torch.Tensor]  # [channels] BF16, or None
+    state: torch.Tensor  # [slots, channels, WIDTH - 1] BF16, by the state indices
+    windows: torch.Tensor
+    window_indices: torch.Tensor
+    arrive: torch.Tensor
+    arrive_split: Optional[torch.Tensor] = None
+
+
 @cache
 def _kernel(
     device_index: int,
@@ -92,6 +133,8 @@ def _kernel(
     min_blocks: int = 1,
     early_hist: bool = False,
     flat: bool = False,
+    conv: bool = False,
+    vsplit: int = 1,
 ) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
     defines = dict(
@@ -109,6 +152,10 @@ def _kernel(
         defines["EARLY_HIST"] = 1
     if flat:
         defines["FLAT_STORES"] = 1
+    if conv:
+        defines["CONV"] = 1
+    if vsplit > 1:
+        defines["VS"] = vsplit
     source = "".join(f"#define {k} {v}\n" for k, v in defines.items())
     cubin = jit.compile_source(
         source + SOURCE.read_text(),
@@ -119,34 +166,48 @@ def _kernel(
     return jit.load(cubin, "q35_gdn_core", (32 * warps, 1, 1), 0)
 
 
-def build(device_index: int, rows: int, hk: int, hv: int, norm_f32: bool) -> None:
+def build(
+    device_index: int,
+    rows: int,
+    hk: int,
+    hv: int,
+    norm_f32: bool,
+    conv: bool = False,
+    vsplit: bool = False,
+) -> None:
     """Compile the core for a step shape, both dependent releases and both register caps
     (no compile inside a step: CUDA-graph capture refuses it)."""
+    splits = (1, 2) if vsplit and hv == VSPLIT_HV else (1,)
     for trigger in (0, 2):
-        for min_blocks in (1, 3):
-            _kernel(
-                device_index,
-                rows,
-                hk,
-                hv,
-                norm_f32,
-                trigger,
-                False,
-                min_blocks=min_blocks,
-                flat=FLAT,
-            )
-        if EARLY:
-            _kernel(
-                device_index,
-                rows,
-                hk,
-                hv,
-                norm_f32,
-                trigger,
-                False,
-                early_hist=True,
-                flat=FLAT,
-            )
+        for split in splits:
+            for min_blocks in (1, 3):
+                for with_conv in (False, True) if conv else (False,):
+                    _kernel(
+                        device_index,
+                        rows,
+                        hk,
+                        hv,
+                        norm_f32,
+                        trigger,
+                        False,
+                        min_blocks=min_blocks,
+                        flat=FLAT,
+                        conv=with_conv,
+                        vsplit=split,
+                    )
+            if EARLY:
+                _kernel(
+                    device_index,
+                    rows,
+                    hk,
+                    hv,
+                    norm_f32,
+                    trigger,
+                    False,
+                    early_hist=True,
+                    flat=FLAT,
+                    vsplit=split,
+                )
 
 
 @cache
@@ -162,6 +223,48 @@ def _min_blocks(device_index: int, ctas: int) -> int:
 
 def _slot_stride(t: Optional[torch.Tensor]) -> int:
     return 0 if t is None else t.stride(0)
+
+
+_F32: dict = {}
+_F32_IN_CAPTURE: set = set()
+
+
+def _gate_key(t: torch.Tensor):
+    return (t.data_ptr(), t.numel(), t.dtype, t.device.index, t._version)
+
+
+def _capturing(t: torch.Tensor) -> bool:
+    """Whether ``t``'s copy would be made inside a CUDA graph capture."""
+    return t.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
+def gate_f32(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.float32 and t.is_contiguous():
+        return t
+    if t.dtype not in (torch.bfloat16, torch.float16, torch.float32) or t.dim() != 1:
+        raise ValueError(
+            f"gate parameter {t.dtype} {tuple(t.shape)}: a [HV] float tensor"
+        )
+    key = _gate_key(t)
+    c = _F32.get(key)
+    if c is None:
+        c = t.detach().float().contiguous()
+        if not _capturing(t):
+            _F32[key] = c
+        elif key not in _F32_IN_CAPTURE:
+            import logging
+
+            _F32_IN_CAPTURE.add(key)
+            logging.getLogger(__name__).warning(
+                "gdn_core: a %s gate parameter first seen inside a capture; its FP32 copy runs in the graph",
+                t.dtype,
+            )
+    return c
+
+
+def prime_gate_params(*tensors: torch.Tensor) -> None:
+    for t in tensors:
+        gate_f32(t)
 
 
 def core(
@@ -196,6 +299,8 @@ def core(
     min_blocks: Optional[int] = None,
     early_hist: Optional[bool] = None,
     flat: Optional[bool] = None,
+    conv: Optional[Conv] = None,
+    vsplit: int = 1,
 ) -> torch.Tensor:
     """Write the gated RMSNorm of the verify output as FP8 into ``out`` [rows, HV * V].
 
@@ -210,6 +315,11 @@ def core(
     rows, T = qkv.shape[0], rows_per_request
     n = rows // T
     HV = checkpoint.shape[1]
+    A_log, dt_bias = gate_f32(A_log), gate_f32(dt_bias)
+    if A_log.numel() < HV or dt_bias.numel() < HV:
+        raise ValueError(
+            f"A_log / dt_bias of {A_log.numel()} / {dt_bias.numel()} heads for {HV}"
+        )
     H = num_k_heads
     if (
         qkv.dtype != torch.bfloat16
@@ -256,7 +366,23 @@ def core(
         raise ValueError("ring cursors must be int32")
     if is_flush.dtype != torch.int8:
         raise ValueError("is_flush must be int8")
-    p = Params(
+    if vsplit not in (1, 2):
+        raise ValueError(f"value split {vsplit}: 1 or 2")
+    if vsplit == 2 and conv is not None and conv.arrive_split is None:
+        raise ValueError(
+            "the value-split conv-first launch counts on its own counters (Conv.arrive_split)"
+        )
+    fields = {}
+    if conv is not None and early_hist:
+        raise ValueError("the conv-first launch keeps the history loads after its wait")
+    if conv is not None:
+        # the conv-first launch reads every request's replay index, padded ones included
+        if replay_indices.numel() < n:
+            raise ValueError(
+                f"{replay_indices.numel()} replay indices for {n} requests"
+            )
+        fields = _conv_fields(conv, T, n, H, (2 * H + HV) * K, vsplit)
+    p = (ConvParams if conv is not None else Params)(
         x=qkv.data_ptr(),
         x_stride=qkv.stride(0),
         z=z.data_ptr(),
@@ -293,11 +419,16 @@ def core(
         y_stride=out.stride(0),
         o_out=0 if o_out is None else o_out.data_ptr(),
         prof=0 if _profile is None else _profile.data_ptr(),
+        **fields,
     )
     min_blocks = (
-        _min_blocks(qkv.device.index, n * HV) if min_blocks is None else min_blocks
+        _min_blocks(qkv.device.index, n * HV * vsplit)
+        if min_blocks is None
+        else min_blocks
     )
-    early_hist = (EARLY if early_hist is None else early_hist) and min_blocks == 1
+    early_hist = (
+        (EARLY and conv is None) if early_hist is None else early_hist
+    ) and min_blocks == 1
     kernel = _kernel(
         qkv.device.index,
         T,
@@ -311,8 +442,81 @@ def core(
         min_blocks,
         early_hist,
         FLAT if flat is None else flat,
+        conv is not None,
+        vsplit,
     )
     jit.launch(
-        kernel, (n * HV, 1, 1), [p], torch.cuda.current_stream(qkv.device).cuda_stream
+        kernel,
+        (n * HV * vsplit, 1, 1),
+        [p],
+        torch.cuda.current_stream(qkv.device).cuda_stream,
+        cluster=(vsplit, 1, 1) if vsplit > 1 else None,
     )
     return out
+
+
+def _conv_fields(
+    conv: Conv, T: int, n: int, H: int, channels: int, vsplit: int = 1
+) -> dict:
+    weight, bias, state, windows = conv.weight, conv.bias, conv.state, conv.windows
+    if not CONV_MIN_ROWS_PER_REQUEST <= T <= MAX_ROWS_PER_REQUEST:
+        raise ValueError(f"the conv runs {T} rows a request")
+    if weight.dtype != torch.bfloat16 or tuple(weight.shape) != (channels, WIDTH):
+        raise ValueError(f"conv weight {weight.dtype} {tuple(weight.shape)}")
+    if bias is not None and (
+        bias.dtype != torch.bfloat16
+        or tuple(bias.shape) != (channels,)
+        or bias.stride(0) != 1
+    ):
+        raise ValueError(f"conv bias {bias.dtype} {tuple(bias.shape)}")
+    if (
+        state.dtype != torch.bfloat16
+        or state.dim() != 3
+        or tuple(state.shape[1:]) != (channels, WIDTH - 1)
+    ):
+        raise ValueError(f"conv state {state.dtype} {tuple(state.shape)}")
+    st = windows.stride()
+    if (
+        windows.dtype != torch.bfloat16
+        or windows.dim() != 4
+        or tuple(windows.shape[1:]) != (T, channels, WIDTH - 1)
+        or not (st[1] == 1 and st[3] == 1 and st[2] >= T + 2)
+    ):
+        raise ValueError(
+            f"conv windows {tuple(windows.shape)} {st} are not deduplicated rows"
+        )
+    if conv.window_indices.dtype not in (torch.int32, torch.int64) or (
+        conv.window_indices.numel() < n
+    ):
+        raise ValueError("window indices must be int32 / int64, one a request")
+    arrive = conv.arrive_split if vsplit == 2 else conv.arrive
+    if (
+        arrive.dtype != torch.int32
+        or not arrive.is_contiguous()
+        or arrive.numel() < n * H
+    ):
+        raise ValueError("arrival counters must be int32, one a request and key head")
+    runs = int(
+        st[2] == T + 2 and windows.data_ptr() % 16 == 0 and st[0] * 2 % 16 == 0
+    ) | 2 * int(
+        state.stride()[1:] == (WIDTH - 1, 1)
+        and state.data_ptr() % 16 == 0
+        and state.stride(0) * 2 % 16 == 0
+    )
+    return dict(
+        cw=weight.data_ptr(),
+        cw_dim=weight.stride(0),
+        cw_tap=weight.stride(1),
+        cbias=0 if bias is None else bias.data_ptr(),
+        cstate=state.data_ptr(),
+        cs_slot=state.stride(0),
+        cs_dim=state.stride(1),
+        cs_tap=state.stride(2),
+        win=windows.data_ptr(),
+        win_slot=st[0],
+        win_dim=st[2],
+        win_indices=conv.window_indices.data_ptr(),
+        win_index64=int(conv.window_indices.dtype == torch.int64),
+        arrive=arrive.data_ptr(),
+        rows16=runs,
+    )

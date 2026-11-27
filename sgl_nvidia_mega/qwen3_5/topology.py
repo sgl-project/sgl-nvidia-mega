@@ -13,14 +13,12 @@ import msgspec
 
 SGLANG_READS = {
     "srt/runtime_context.py": ('"tp_size"', '"attn_dp_size"', '"moe_ep_size"'),
-    "srt/arg_groups/fields/*.py": (
-        "tp_size",
-        "attn_dp_size",
-        "ep_size",
-    ),
+    "srt/arg_groups/fields/*.py": ("tp_size", "attn_dp_size", "ep_size"),
 }
 
 TOPOLOGIES = frozenset({"tp2", "tp4", "tp8", "tep8", "dep8"})
+# (tp_size, attn_dp_size, moe_ep_size) of each attention-DP topology
+DEP_SHAPES = {"dep8": (8, 8, 8), "dep4": (4, 4, 4)}
 LEGACY = frozenset({"tp8", "tep8"})
 PREFILL_TOPOLOGIES = frozenset({"p_tp1_pp4"})
 
@@ -83,8 +81,31 @@ SLOT_TOPOLOGIES.update(
     gdn_pdl=TOPOLOGIES,
     gdn_conv=TOPOLOGIES,
     gdn_core=frozenset({"tp2", "tp4", "tp8", "tep8"}),
+    # gdn_core's launch with gdn_conv's conv first: the same local head counts
+    gdn_conv_core=frozenset({"tp2", "tp4", "tp8", "tep8"}),
+    lowm_ba=frozenset({"tp8", "tep8"}),
 )
 SLOT_TOPOLOGIES["gdn_prefill_split_conv"] = PREFILL_TOPOLOGIES
+SLOT_TOPOLOGIES["gdn_prefill_front"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES["gdn_prefill_track_snapshot"] = frozenset({"p_tp1_pp2"})
+# The NVFP4 norm runs in that prefill's body, on the CuTe DSL MoE at TP1
+SLOT_TOPOLOGIES["moe_prefill_input_nvfp4"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES["moe_prefill_add_norm"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES["moe_prefill_noclone"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES["prefill_gate_fp8"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES["prefill_act_fp8"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES["gdn_prefill_norm_fp8"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES["prefill_norm_fp8"] = frozenset({"p_tp1_pp2"})
+# The Q / K norm + RoPE row tiles of the TP1/PP2 prefill's full-attention layers
+SLOT_TOPOLOGIES["attn_prefill_qk_rows"] = frozenset({"p_tp1_pp2"})
+SLOT_TOPOLOGIES.update(
+    bt_tail=frozenset({"tp4", "tp8", "tep8"}),
+    bt_tail_early=frozenset({"tp4", "tp8", "tep8"}),
+    bt_tail_early_fin=frozenset({"tp4", "tp8", "tep8"}),
+    # its MoE input's all-reduce also runs the mixer projection
+    gemm_ar=frozenset({"tp4", "tp8", "tep8"}),
+    fc2ar=frozenset({"tep8"}),
+)
 # a9212216c6 already serves these TP4 shapes. Preserve that baseline support:
 # MoE's small engine accepts I=256, GDN uses the layer's local head counts,
 # the hop serves world 4, attention serves 8 Q / 1 KV heads, and the draft's
@@ -136,6 +157,14 @@ SLOT_TOPOLOGIES.update(
     multi_request=TOPOLOGIES,
     sharded_gumbel=TOPOLOGIES,
 )
+# sharded_gumbel's provider options, on the TP8 / TEP8 vocabulary shards
+SLOT_TOPOLOGIES.update(
+    gumbel_fast=LEGACY,
+    verify_head=LEGACY,
+    verify_head_keys=LEGACY,
+)
+# the draft worker's attention on CP-lite (the CP slots' topologies)
+SLOT_TOPOLOGIES["draft_cp"] = frozenset({"tp8", "tep8"})
 # Full-step AB+BA prefers v2's stock draft on TP2. Keep every draft entry
 # filtered there, including PD decode TP2; TP4/TP8 retain the BF16 entries.
 for _name in (
@@ -150,6 +179,20 @@ for _name in (
 SLOT_TOPOLOGIES["draft_xchg"] = frozenset({"tp4", "tp8", "tep8"})
 SLOT_TOPOLOGIES["draft_moe"] = frozenset({"tp4", "tp8"})
 SLOT_TOPOLOGIES["draft_q1"] = frozenset({"tp4", "tp8", "tep8"})
+# A row copy: no topology-specific shape.
+SLOT_TOPOLOGIES["draft_select"] = frozenset({"tp4", "tp8", "tep8"})
+# A replicated table's gather: the same rows on any vocabulary-parallel TP group.
+SLOT_TOPOLOGIES["draft_embed_local"] = frozenset({"tp4", "tp8", "tep8"})
+SLOT_TOPOLOGIES["draft_fc_input"] = frozenset({"tp4", "tp8", "tep8"})
+SLOT_TOPOLOGIES["draft_head_lowm"] = frozenset({"tp4", "tp8", "tep8"})
+SLOT_TOPOLOGIES["draft_router_lowm"] = frozenset({"tp4", "tp8", "tep8"})
+SLOT_TOPOLOGIES["draft_fc_tp"] = frozenset({"tep8"})
+# The draft's q rows on the CP-lite q push of the multi-request target verify.
+SLOT_TOPOLOGIES["draft_q_push"] = frozenset({"tp8", "tep8"})
+SLOT_TOPOLOGIES["draft_q_gather"] = frozenset({"tp8", "tep8"})
+# The precise draft call's merge (slot draft_cp's topologies).
+SLOT_TOPOLOGIES["draft_gate_fold"] = frozenset({"tp8", "tep8"})
+SLOT_TOPOLOGIES["draft_o_push"] = frozenset({"tp8", "tep8"})
 # Router-only fronts leave expert GEMMs with the stock TRTLLM runner. Their
 # 4096-hidden / 512-expert routing does not depend on TP's intermediate width.
 SLOT_TOPOLOGIES.update(
@@ -157,12 +200,44 @@ SLOT_TOPOLOGIES.update(
     route_topk=frozenset({"tp2", "tp4", "tp8", "tep8"}),
     route_gemm=frozenset({"tp2", "tp4", "tp8", "tep8"}),
 )
+SLOT_TOPOLOGIES.update(
+    {
+        name: frozenset({"tep8"})
+        for name in (
+            "moe_engine",
+            "moe_ring",
+            "route_big_gemm",
+            "route_lean",
+            "moe_engine_route",
+            "route_big_mid",
+            "lowm_se_tep8",
+            "lowm_se_wide",
+            "lowm_se_coresident",
+        )
+    }
+)
 # ATTN: the generic front uses stock projection GEMMs on TP2 and DEP8.
 SLOT_TOPOLOGIES.update(
     mka=TOPOLOGIES,
     skv2=frozenset({"tp4", "tp8", "tep8"}),
     skv2_cp=frozenset({"tp4", "tp8", "tep8"}),
+    cp_smv2=frozenset({"tp8", "tep8"}),
+    cp_ptxas_o1=frozenset({"tp8", "tep8"}),
+    # the multi-request target verify's CP-lite merge wait and q push
+    cp_merge_plain_wait=frozenset({"tp8", "tep8"}),
+    cp_q_push=frozenset({"tp8", "tep8"}),
+    cp_qw_entry=frozenset({"tp8", "tep8"}),
+    cp_merge_cg=frozenset({"tp8", "tep8"}),
+    cp_lam_q=frozenset({"tp8", "tep8"}),
+    cp_q_gather=frozenset({"tp8", "tep8"}),
+    cp_o_push=frozenset({"tp8", "tep8"}),
 )
+
+DEP4_SLOTS = frozenset(
+    {"gdn_verify", "gdn_core", "gdn_core_tc", "gdn_commit_fold", "gathered_cdf"}
+)
+for _name in DEP4_SLOTS:
+    SLOT_TOPOLOGIES[_name] = SLOT_TOPOLOGIES.get(_name, frozenset()) | {"dep4"}
 
 
 class Topology(msgspec.Struct, frozen=True):
@@ -173,11 +248,11 @@ class Topology(msgspec.Struct, frozen=True):
     @property
     def name(self) -> str:
         if self.attn_dp_size > 1:
-            return (
-                "dep8"
-                if (self.tp_size, self.attn_dp_size, self.moe_ep_size) == (8, 8, 8)
-                else "unsupported"
-            )
+            shape = (self.tp_size, self.attn_dp_size, self.moe_ep_size)
+            for name, dep in DEP_SHAPES.items():
+                if shape == dep:
+                    return name
+            return "unsupported"
         if self.tp_size == 8 and self.moe_ep_size > 1:
             return "tep8"
         return f"tp{self.tp_size}"
@@ -185,7 +260,23 @@ class Topology(msgspec.Struct, frozen=True):
     @property
     def stock_widths(self) -> bool:
         """New topologies cover all offered widths even with every slot off."""
-        return self.name in {"tp2", "tp4", "dep8"}
+        return self.name in {"tp2", "tp4"} | DEP_SHAPES.keys()
+
+
+class Sku(msgspec.Struct, frozen=True):
+    major: int
+    minor: int
+    sms: int
+
+
+GB300 = Sku(10, 3, 152)
+
+
+def device_sku() -> Sku:
+    import torch
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return Sku(props.major, props.minor, props.multi_processor_count)
 
 
 def from_parallel(parallel) -> Topology:
@@ -196,7 +287,15 @@ def from_parallel(parallel) -> Topology:
     )
 
 
+def plan_key_name(parallel) -> str:
+    pp_size = getattr(parallel, "pp_size", 1)
+    if pp_size > 1:
+        return f"p_tp{parallel.tp_size}_pp{pp_size}"
+    return from_parallel(parallel).name
+
+
 def from_config(cfg) -> Topology:
+    # attn_dp_size is the attention-DP width; dp_size counts replicas.
     return Topology(cfg.tp_size, cfg.attn_dp_size or 1, cfg.ep_size or 1)
 
 

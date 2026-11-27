@@ -318,6 +318,13 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
     assert _on(plan.slots(7, every)) == sorted(
         set(plan.Slots.__struct_fields__)
         - {
+            "bt_tail",
+            "bt_tail_early",
+            "bt_tail_early_fin",
+            "gemm_ar",
+            "fc2ar",
+            "gdn_conv_core",
+            "lowm_ba",
             "mkm_m32",
             "mkm_m64",
             "mkm_m128",
@@ -328,6 +335,7 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             "route_pre_topk",
             "route_shared",
             "route_topk",
+            "route_big_mid",
         }
     )
     # Two requests also take every measured low-M launch and the hop's FP8 copy.
@@ -368,6 +376,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         ]
         if rows <= plan.GDN_TRT_FRONT_MAX_ROWS:
             expected.extend(("gdn_front", "gdn_trt_front"))
+        if plan.GDN_CONV_CORE_MIN_ROWS <= rows <= plan.GDN_CONV_CORE_MAX_ROWS:
+            expected.append("gdn_conv_core")
+        if plan.LOWM_BA_MIN_ROWS <= rows <= plan.LOWM_BA_MAX_ROWS:
+            expected.append("lowm_ba")
         if rows <= plan.MKM_M32_MAX_ROWS:
             expected.append("mkm_m32")
         if plan.MKM_M32_MAX_ROWS < rows <= plan.MKM_M64_MAX_ROWS:
@@ -380,6 +392,10 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
             expected.append("route_gemm")
         if rows <= plan.HOP_MID_MAX_ROWS:
             expected.extend(("hop", "hop_fp8", "mka_push"))
+        else:
+            expected.extend(("bt_tail", "bt_tail_early", "bt_tail_early_fin"))
+        if plan.GEMM_AR_MIN_ROWS <= rows <= plan.GEMM_AR_MAX_ROWS:
+            expected.append("gemm_ar")
         assert _on(plan.slots(rows, every)) == sorted(expected)
     for rows in (448, 896):
         expected = [
@@ -392,6 +408,8 @@ def test_the_slot_plan_gates_each_slot_by_the_rows_its_kernels_serve():
         ]
         if rows <= plan.MKM_M512_MAX_ROWS:
             expected.append("mkm_m512")
+        if rows <= plan.BT_TAIL_MAX_ROWS:
+            expected.extend(("bt_tail", "bt_tail_early", "bt_tail_early_fin"))
         assert _on(plan.slots(rows, every)) == sorted(expected)
     assert _on(plan.slots(28, plan.Facts(route_topk=True))) == ["route_topk"]
     assert _on(plan.slots(7, plan.Facts(route_topk=True))) == ["route_topk"]

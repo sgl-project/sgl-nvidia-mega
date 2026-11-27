@@ -854,8 +854,7 @@ namespace q35mka {
 // The attention layers' form of sm103/hop/src/rlin.cu (numeric): after the o_proj epilogue of a TP8 B1
 // step, 16 CTAs compute this rank's router partial
 // (A W_o,r * sx * sw on the gated FP8 o_proj input, plus A[:, K_r] on the layer's residual input) and push it, fp32,
-// into the hop's router mailbox; the MoE input's consume_rl sums the partials into the logits. The epilogue CTAs are
-// unchanged.
+// into the hop's router mailbox.
 struct RlArgs {  // = q35rl::RlArgs (sm103/hop/src/rlin.cu)
   void* rmc;
   void* ruc;
@@ -868,10 +867,39 @@ struct RlArgs {  // = q35rl::RlArgs (sm103/hop/src/rlin.cu)
   const float* gs;
   unsigned long long* trace;
 };
-constexpr int kRlExperts = 512, kRlCoreK = 1024, kRlSliceK = 512, kRlSteps = 12, kRlCtas = 16;
+constexpr int kRlExperts = 512, kRlCoreK = 1024, kRlSliceK = 512, kRlCtas = 16;
+constexpr int kRlCoreSteps = 8, kRlSliceSteps = 4, kRlSteps = kRlCoreSteps + kRlSliceSteps;
+constexpr int kRlFrags = kRlCtas * 8 * kRlSteps * 2 * 32;
 constexpr uint32_t kRlSent = 0x80000000u;
+constexpr int kRlCells = 4096 / 32;
+__device__ __forceinline__ size_t rl_cslot(const q35hop::Site& s, uint32_t stage, int src, int token, int g) {
+  return (size_t)q35hop::kStages * s.world * s.m_cap * kRlExperts +
+         (((size_t)stage * s.world + src) * kRlCells + g) * (size_t)((s.m_cap + 3) & ~3) + token;
+}
+__device__ __forceinline__ uint32_t rl_cell_key(float e, float h0, float v, int idx) {
+  const float w = __fmul_rn(fabsf(e), __fadd_rn(fabsf(h0), fabsf(v)));
+  return (__float_as_uint(w) & ~31u) | (uint32_t)idx;
+}
+__device__ __forceinline__ uint32_t rl_cell_entry(float e, int idx) {
+  const uint32_t b = __float_as_uint(e) & ~31u;
+  return (b == kRlSent ? 0u : b) | (uint32_t)idx;
+}
+__device__ __forceinline__ void rl_mc_st_b32(uint32_t* mc, uint32_t v) {
+  asm volatile("multimem.st.relaxed.sys.global.b32 [%0], %1;" ::"l"(mc), "r"(v) : "memory");
+}
+__device__ __forceinline__ uint32_t rl_stage_peek_if(const q35hop::Site& s, bool on) {
+  uint32_t v;
+  asm volatile("{ .reg .pred q; setp.ne.u32 q, %1, 0; @q ld.volatile.global.u32 %0, [%2]; }"
+               : "=r"(v) : "r"((uint32_t)on), "l"(&s.ctrl->stage) : "memory");
+  return v;
+}
+__device__ __forceinline__ uint32_t rl_warp_max(uint32_t v) {
+  uint32_t out;
+  asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(out) : "r"(v));
+  return out;
+}
 struct RlSmem {
-  uint32_t xb[8][(kRlCoreK + kRlSliceK) / 2 + 4];
+  uint32_t xb[8][kRlCoreK / 2 + kRlSliceK + 4];
 };
 __device__ __forceinline__ void rl_mma_bf16(float (&d)[4], const uint4& a, uint32_t b0, uint32_t b1) {
   asm volatile(
@@ -880,25 +908,28 @@ __device__ __forceinline__ void rl_mma_bf16(float (&d)[4], const uint4& a, uint3
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
 }
-__device__ __forceinline__ uint32_t rl_e4m3x2_bf16x2(uint16_t v) {
-  float lo, hi;
-  asm("{\n\t.reg .b32 h2;\n\t.reg .b16 l, h;\n\t"
-      "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-      "mov.b32 {l, h}, h2;\n\t"
-      "cvt.f32.f16 %0, l;\n\t"
-      "cvt.f32.f16 %1, h;\n\t}"
-      : "=f"(lo), "=f"(hi)
-      : "h"(v));
-  __nv_bfloat162 b = __floats2bfloat162_rn(lo, hi);
-  return *reinterpret_cast<uint32_t*>(&b);
+__device__ __forceinline__ void rl_mma_f16(float (&d)[4], const uint4& a, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t rl_e4m3x2_f16x2(uint16_t v) {
+  uint32_t h2;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(v));
+  return h2;
+}
+__device__ __forceinline__ void rl_mul_split_bf16x2(uint32_t h, uint32_t g, uint32_t& hi, uint32_t& lo) {
+  const float p0 = __fmul_rn(q35hop::bf_lo(h), q35hop::bf_lo(g)), p1 = __fmul_rn(q35hop::bf_hi(h), q35hop::bf_hi(g));
+  hi = q35hop::pack_bf16x2(p0, p1);
+  lo = q35hop::pack_bf16x2(__fsub_rn(p0, q35hop::bf_lo(hi)), __fsub_rn(p1, q35hop::bf_hi(hi)));
 }
 __device__ __forceinline__ void rl_mc_st_v4f(float* mc, float a, float b, float c, float d) {
   asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(mc), "f"(a), "f"(b), "f"(c), "f"(d)
                : "memory");
 }
 
-// Router partial rows [32c, 32c + 32); K is the gated FP8 o_proj input (1024),
-// then h0[K_r] (512).
 __device__ __forceinline__ uint2 rl_ld_cg2(const void* p) {
   uint2 v;
   asm volatile("ld.global.cg.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p) : "memory");
@@ -922,6 +953,8 @@ __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const
 #pragma unroll
       for (int mt = 0; mt < 2; ++mt) a[st][mt] = ldg_nc_v4(wb + (st * 2 + mt) * 32);
   }
+  const uint4 g2s = ldg_nc_v4(r.rw + kRlFrags + (tid & 63));
+  const float unscale = __uint_as_float(ldg_nc_v4(r.rw + kRlFrags + kRlSliceK / 8).x);
   const float sx = __ldg(p.sx);
   pdl_trigger();
   const float inv_sx = div_full(1.0f, sx);
@@ -949,16 +982,17 @@ __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const
   for (int u = 0; u < 8; ++u) {
     const int q = tid + u * 256, row = q >> 8, col = (q & 255) * 4;
     const uint32_t f8 = row < m ? gate_quant4_r(ao[u], ag[u], inv_sx) : 0u;
-    sm.xb[row][col / 2] = rl_e4m3x2_bf16x2((uint16_t)(f8 & 0xFFFFu));
-    sm.xb[row][col / 2 + 1] = rl_e4m3x2_bf16x2((uint16_t)(f8 >> 16));
+    sm.xb[row][col / 2] = rl_e4m3x2_f16x2((uint16_t)(f8 & 0xFFFFu));
+    sm.xb[row][col / 2 + 1] = rl_e4m3x2_f16x2((uint16_t)(f8 >> 16));
   }
 #pragma unroll
   for (int u = 0; u < 2; ++u) {
     const int q = tid + u * 256, row = q >> 6, chk = q & 63;
-    sm.xb[row][kRlCoreK / 2 + chk * 4 + 0] = hv[u].x;
-    sm.xb[row][kRlCoreK / 2 + chk * 4 + 1] = hv[u].y;
-    sm.xb[row][kRlCoreK / 2 + chk * 4 + 2] = hv[u].z;
-    sm.xb[row][kRlCoreK / 2 + chk * 4 + 3] = hv[u].w;
+    const uint32_t hw[4] = {hv[u].x, hv[u].y, hv[u].z, hv[u].w}, gw[4] = {g2s.x, g2s.y, g2s.z, g2s.w};
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+      rl_mul_split_bf16x2(hw[k], gw[k], sm.xb[row][kRlCoreK / 2 + chk * 4 + k],
+                          sm.xb[row][kRlCoreK / 2 + kRlSliceK / 2 + chk * 4 + k]);
   }
   __syncthreads();
   float ch[2][4][4];
@@ -969,12 +1003,22 @@ __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const
 #pragma unroll
       for (int e = 0; e < 4; ++e) ch[mt][k][e] = 0.f;
 #pragma unroll
-  for (int st = 0; st < kRlSteps; ++st) {
-    const int kk = (warp * kRlSteps + st) * 16;
-    const uint32_t b0 = sm.xb[g][kk / 2 + t];
-    const uint32_t b1 = sm.xb[g][kk / 2 + 4 + t];
-    rl_mma_bf16(ch[0][st & 3], a[st][0], b0, b1);
-    rl_mma_bf16(ch[1][st & 3], a[st][1], b0, b1);
+  for (int st = 0; st < kRlCoreSteps; ++st) {
+    const int kw = (warp * kRlCoreSteps + st) * 8;
+    const uint32_t b0 = sm.xb[g][kw + t];
+    const uint32_t b1 = sm.xb[g][kw + 4 + t];
+    rl_mma_f16(ch[0][st & 3], a[st][0], b0, b1);
+    rl_mma_f16(ch[1][st & 3], a[st][1], b0, b1);
+  }
+#pragma unroll
+  for (int st = 0; st < kRlSliceSteps; ++st) {
+    const int kw = kRlCoreK / 2 + (warp * kRlSliceSteps + st) * 8;
+    const uint32_t hi0 = sm.xb[g][kw + t], hi1 = sm.xb[g][kw + 4 + t];
+    const uint32_t lo0 = sm.xb[g][kw + kRlSliceK / 2 + t], lo1 = sm.xb[g][kw + kRlSliceK / 2 + 4 + t];
+    rl_mma_bf16(ch[0][st & 3], a[kRlCoreSteps + st][0], hi0, hi1);
+    rl_mma_bf16(ch[1][st & 3], a[kRlCoreSteps + st][1], hi0, hi1);
+    rl_mma_bf16(ch[0][(st + 2) & 3], a[kRlCoreSteps + st][0], lo0, lo1);
+    rl_mma_bf16(ch[1][(st + 2) & 3], a[kRlCoreSteps + st][1], lo0, lo1);
   }
   {
     float4* dst = reinterpret_cast<float4*>(&red[warp][lane][0]);
@@ -999,6 +1043,7 @@ __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const
       float x = red[0][l][e];
 #pragma unroll
       for (int w = 1; w < 8; ++w) x = __fadd_rn(x, red[w][l][e]);
+      x = __fmul_rn(x, unscale);
       v[q] = __float_as_uint(x) == kRlSent ? 0.f : x;
     }
     const q35hop::Site& s = p.site;
@@ -1008,6 +1053,128 @@ __device__ __forceinline__ void mka_epilogue_rl_router(const EpiParams& p, const
     rl_mc_st_v4f(dst, v[0], v[1], v[2], v[3]);
     rl_mc_st_v4f(dst + 4, v[4], v[5], v[6], v[7]);
   }
+}
+
+__device__ __forceinline__ void mka_epilogue_rl_kernel(const EpiParams p, const RlArgs r) {
+  constexpr int NQ = 4;
+  constexpr bool kEarlyTrigger = true;
+  constexpr int kSteps = NQ;
+  constexpr int kK = NQ * kHeadDim;
+  constexpr int kWarpU4 = kSteps * 2 * 32;
+  __shared__ __align__(16) float inbox[kCluster][256];
+  __shared__ __align__(16) uint2 bfr[kSteps][32];
+  __shared__ __align__(16) __nv_bfloat16 ob[256];
+  __shared__ __align__(8) uint64_t ibar;
+  __shared__ uint32_t cell_s[8];  // each warp's cell entry (warp w: group 8 unit + w)
+  const int rank = (int)cluster_ctarank();
+  const int unit = blockIdx.x / kCluster;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  if (tid == 0) {
+    mbar_init(&ibar, 1);
+    mbar_init_fence();
+  }
+  __syncthreads();
+  cluster_arrive_relaxed();
+
+  uint4 a[kSteps][2];
+  {
+    const uint4* wb = p.w + (size_t)(unit * kCluster + rank) * (8 * kWarpU4) + warp * kWarpU4 + lane;
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s)
+#pragma unroll
+      for (int b = 0; b < 2; ++b) a[s][b] = ldg_nc_v4(wb + (s * 2 + b) * 32);
+  }
+  const float sx = __ldg(p.sx), sw = __ldg(p.sw);
+  uint32_t weight_dep = __float_as_uint(sx) ^ __float_as_uint(sw);
+#pragma unroll
+  for (int s = 0; s < kSteps; ++s) weight_dep ^= a[s][0].x ^ a[s][1].x;
+  q35hop::pin_before_wait(weight_dep, reinterpret_cast<uint64_t>(p.w));
+
+  pdl_wait();
+  if (kEarlyTrigger) pdl_trigger();
+  const float inv_sx = div_full(1.0f, sx);
+  const float alpha = __fmul_rn(sx, sw);
+  const int m = p.m;
+  const uint16_t h0raw = r.h0[(size_t)(rank < m ? rank : 0) * 4096 + unit * kHeadDim + slot_row(tid)];
+  const uint32_t pstage = rl_stage_peek_if(p.site, warp == 0);  // read by warp 0 only
+  {
+    const bool tok_ok = g < m;
+    const size_t off = (size_t)g * kK + rank * (kSteps * 32) + 4 * t;
+    uint32_t* bw = reinterpret_cast<uint32_t*>(&bfr[0][0]);
+#pragma unroll
+    for (int i = warp; i < 2 * kSteps; i += 8) {
+      const int s = i >> 1, h = i & 1;
+      bw[(s * 32 + lane) * 2 + h] =
+          tok_ok ? gate_quant4(p.attn + off + s * 32 + h * 16, p.gate + off + s * 32 + h * 16, inv_sx) : 0u;
+    }
+  }
+  __syncthreads();
+  constexpr int kCh = kSteps < 4 ? kSteps : 4;
+  float ch[2][kCh][4];
+#pragma unroll
+  for (int b = 0; b < 2; ++b)
+#pragma unroll
+    for (int c = 0; c < kCh; ++c)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) ch[b][c][i] = 0.f;
+#pragma unroll
+  for (int s = 0; s < kSteps; ++s) {
+    const uint2 bb = bfr[s][lane];
+    mma_e4m3(ch[0][s % kCh], a[s][0], bb.x, bb.y);
+    mma_e4m3(ch[1][s % kCh], a[s][1], bb.x, bb.y);
+  }
+  float acc[2][4];
+#pragma unroll
+  for (int b = 0; b < 2; ++b)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float x = ch[b][0][i];
+#pragma unroll
+      for (int c = 1; c < kCh; ++c) x = __fadd_rn(x, ch[b][c][i]);
+      acc[b][i] = x;
+    }
+  const bool owner = rank < m;
+  if (tid == 0 && owner) mbar_expect_tx(&ibar, kCluster * 256 * 4);
+  cluster_wait();
+  {
+    const uint32_t src = smem_u32(&inbox[rank][warp * 32 + g * 4]);
+    const uint32_t bar = smem_u32(&ibar);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int tok = 2 * t + j;
+      if (tok < m) st_async_v4(mapa(src, tok), acc[0][j], acc[0][2 + j], acc[1][j], acc[1][2 + j], mapa(bar, tok));
+    }
+  }
+  if (!owner) {
+    if (!kEarlyTrigger) pdl_trigger();
+    return;
+  }
+  uint32_t* const cdst = static_cast<uint32_t*>(r.rmc) + rl_cslot(p.site, pstage, p.site.rank, rank, unit * 8 + (lane & 7));
+  mbar_wait(&ibar, 0);
+  float v = 0.f;
+#pragma unroll
+  for (int r = 0; r < kCluster; ++r) v = __fadd_rn(v, inbox[r][tid]);
+  const float vf = __fmul_rn(v, alpha);  // the unrounded partial (the template rounds this same value)
+  const __nv_bfloat16 o = __float2bfloat16_rn(vf);
+  {
+    const int idx = slot_row(tid) & 31;
+    const float e = __fsub_rn(vf, __bfloat162float(o));  // exact
+    const uint32_t key = rl_cell_key(e, __uint_as_float((uint32_t)h0raw << 16), vf, idx);
+    if (key == rl_warp_max(key)) cell_s[warp] = rl_cell_entry(e, idx);
+  }
+  if (p.push) {
+    // fragments are 8 consecutive columns, so regroup the row through smem; push before the store
+    ob[slot_row(tid)] = o;
+    __syncthreads();
+    if (warp == 0) {
+      const uint32_t cell = cell_s[lane & 7];
+      q35hop::push_frag(p.site, pstage, rank, unit * 32 + lane, *reinterpret_cast<const uint4*>(&ob[8 * lane]));
+      if (lane < 8) rl_mc_st_b32(cdst, cell);
+    }
+  }
+  p.out[(size_t)rank * 4096 + unit * kHeadDim + slot_row(tid)] = o;
+  if (!kEarlyTrigger) pdl_trigger();
 }
 }  // namespace q35mka
 
@@ -1020,7 +1187,10 @@ extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_gate(co
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogue_q4(const q35mka::EpiParams p) {
   q35mka::mka_epilogue_kernel<4, true>(p);
 }
-// The router partial runs immediately after q35mka_epilogue_q4 (16 CTAs, no cluster).
+extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_epilogue_rl_q4(const q35mka::EpiParams p,
+                                                                                    const q35mka::RlArgs r) {
+  q35mka::mka_epilogue_rl_kernel(p, r);
+}
 extern "C" __global__ void __launch_bounds__(q35mka::kThreads, 1) q35mka_rl_router(const q35mka::EpiParams p,
                                                                                const q35mka::RlArgs r) {
   __shared__ __align__(16) float red[8][32][8];

@@ -35,11 +35,26 @@ logger = logging.getLogger(__name__)
 
 PAGE, HEAD_DIM = 64, CP_LITE_HEAD_DIM
 _MAX_ROWS = 896  # widest call: rows = requests * q_len (TP8 verify at B128: 896)
+_PRECISE_MAX_BATCH = 64
 _KINDS = 2  # flag regions: q gather, partial exchange
 # exact path's fused partial: E4M3 P with shift 8 against the exact running max (lazy rescale threshold 0), so the
 # row max maps to 2^8, exact in E4M3
 _EXACT_P_SHIFT, _EXACT_RESCALE_THRESHOLD = 8.0, 0.0
 _LL_PWORDS = 520  # LL words of one (row, source) partial: 4 heads x 128 bf16 pairs + 4 LSE, padded to 16 B
+_PUSHED_MERGE_SLEEP_NS = 64
+
+
+def _lam_q_layout(base: int, cp: int, q_heads: int) -> tuple[int, int]:
+    off = (base + 15) // 16 * 16
+    return off, off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 4
+
+
+_LSE_STATS_Q_SLOTS, _LSE_STATS_GUARD = 256, 1 << 20
+
+
+def _lse_workspace_bytes(rows: int, heads: int, sms: int) -> int:
+    stats = 8 * rows * heads * _LSE_STATS_Q_SLOTS + _LSE_STATS_GUARD
+    return stats + sms * 128 * (256 * 2 * 2 + 8)
 
 
 @triton.jit
@@ -101,24 +116,102 @@ def _wait_acquire(addrs):
 
 
 @triton.jit
-def _group_barrier(peers, me, flags_off, slot, CP: tl.constexpr):
-    """CTA-level release / acquire with the same CTA of every group rank."""
+def _send_release_dl(addrs, t_end):
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .u32 %t, %n, %ev;
+            .reg .pred %p;
+            .reg .b64 %g, %z;
+            mov.u32 %n, 0;
+            send:
+                atom.global.release.sys.cas.b32 %t, [$1], 0, 1;
+                setp.eq.u32 %p, %t, 0;
+                @%p bra sent;
+                add.u32 %n, %n, 1;
+                and.b32 %ev, %n, 255;
+                setp.ne.u32 %p, %ev, 0;
+                @%p bra send;
+                mov.u64 %g, %globaltimer;
+                setp.le.u64 %p, %g, $2;
+                @%p bra send;
+                mov.u64 %z, 0;
+                st.volatile.global.u32 [%z], 0;
+                trap;
+            sent:
+            mov.u32 $0, 0;
+        }
+        """,
+        "=r, l, l",
+        [addrs, (addrs.to(tl.int64) & 0) + t_end],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_acquire_dl(addrs, t_end):
+    # _wait_acquire bounded by t_end, as _send_release_dl
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .u32 %t, %n, %ev;
+            .reg .pred %p;
+            .reg .b64 %g, %z;
+            mov.u32 %n, 0;
+            wait:
+                atom.global.sys.acquire.cas.b32 %t, [$1], 1, 0;
+                setp.eq.u32 %p, %t, 1;
+                @%p bra got;
+                add.u32 %n, %n, 1;
+                and.b32 %ev, %n, 255;
+                setp.ne.u32 %p, %ev, 0;
+                @%p bra wait;
+                mov.u64 %g, %globaltimer;
+                setp.le.u64 %p, %g, $2;
+                @%p bra wait;
+                mov.u64 %z, 0;
+                st.volatile.global.u32 [%z], 0;
+                trap;
+            got:
+            mov.u32 $0, 0;
+        }
+        """,
+        "=r, l, l",
+        [addrs, (addrs.to(tl.int64) & 0) + t_end],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _group_barrier(
+    peers, me, flags_off, slot, CP: tl.constexpr, t_end=0, DL: tl.constexpr = False
+):
     c = tl.arange(0, CP)
     peer = tl.load(peers + c)
     own = tl.load(peers + me)
     send = (peer + flags_off + (slot * CP + me) * 4).to(tl.pointer_type(tl.uint32))
     wait = (own + flags_off + (slot * CP + c) * 4).to(tl.pointer_type(tl.uint32))
     if _flat_tid() < CP:
-        _send_release(send)
-        _wait_acquire(wait)
+        if DL:
+            _send_release_dl(send, t_end)
+            _wait_acquire_dl(wait, t_end)
+        else:
+            _send_release(send)
+            _wait_acquire(wait)
 
 
 @triton.jit
-def _gate_on(seq_lens, nb, thr, NB: tl.constexpr, GMAX: tl.constexpr):
+def _gate_on(
+    seq_lens, nb, thr, NB: tl.constexpr, GMAX: tl.constexpr, CG: tl.constexpr = False
+):
     """CP for this call: the sum (GMAX: the max) of the batch's KV lengths reaches thr. Every rank of the group
     reads the same lengths, so all of them take the same branch."""
     k = tl.arange(0, NB)
-    L = tl.load(seq_lens + k, mask=k < nb, other=0)
+    L = tl.load(seq_lens + k, mask=k < nb, other=0, cache_modifier=".cg" if CG else "")
     if GMAX:
         return tl.max(L, axis=0) >= thr
     else:
@@ -323,8 +416,9 @@ def _cp_gather_q(
     flags_off,
     CP: tl.constexpr,
     WORDS: tl.constexpr,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
 ):
-    """Row i of this rank's queries into row i, slot me of every group rank's buffer."""
     i = tl.program_id(0)
     w = tl.arange(0, WORDS)
     x = tl.load(q + i * q_stride + w)
@@ -332,7 +426,10 @@ def _cp_gather_q(
         base = tl.load(peers + c) + q_off + (i * CP + me) * WORDS * 4
         tl.store(base.to(tl.pointer_type(tl.int32)) + w, x)
     _sync_threads()
-    _group_barrier(peers, me, flags_off, i, CP)
+    if DEADLINE:
+        _group_barrier(peers, me, flags_off, i, CP, _t_end(tmo), True)
+    else:
+        _group_barrier(peers, me, flags_off, i, CP)
 
 
 @triton.jit
@@ -363,6 +460,8 @@ def _cp_a2a_merge(
     CP: tl.constexpr,
     D: tl.constexpr,
     PG: tl.constexpr,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
 ):
     i = tl.program_id(0)
     h = tl.arange(0, HQ)
@@ -378,7 +477,10 @@ def _cp_a2a_merge(
         ldst = (base + l_off).to(tl.pointer_type(tl.float32)) + (i * CP + me) * HQ
         tl.store(ldst + h, lse)
     _sync_threads()
-    _group_barrier(peers, me, flags_off, slot0 + i, CP)
+    if DEADLINE:
+        _group_barrier(peers, me, flags_off, slot0 + i, CP, _t_end(tmo), True)
+    else:
+        _group_barrier(peers, me, flags_off, slot0 + i, CP)
     _sync_threads()
     own = tl.load(peers + me)
     own_p = (own + p_off).to(tl.pointer_type(tl.bfloat16)) + i * CP * HQ * D
@@ -438,6 +540,35 @@ def _ll_pack(flag, w):
 
 
 @triton.jit
+def _st_relaxed_sys_b32(addr, val):
+    tl.inline_asm_elementwise(
+        "st.relaxed.sys.global.b32 [$1], $2; mov.u32 $0, 0;",
+        "=r,l,r",
+        [addr, val],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _st_relaxed_sys_b64(addr, val):
+    tl.inline_asm_elementwise(
+        "st.relaxed.sys.global.b64 [$1], $2; mov.u32 $0, 0;",
+        "=r,l,l",
+        [addr, val],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _lam_rearm(addr):
+    _st_relaxed_sys_b32(addr, (addr & 0).to(tl.int32) - 1)
+
+
+@triton.jit
 def _ll_spin(addr, e):
     # one thread per word: volatile reads until the word's high half is e
     return tl.inline_asm_elementwise(
@@ -461,24 +592,167 @@ def _ll_spin(addr, e):
 
 
 @triton.jit
-def _ll_wait(src, n: tl.constexpr, e):
-    """Poll n LL words (data in the low, epoch in the high half) until all carry epoch e."""
+def _gtimer(dep):
+    return tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer; // $1",
+        "=l,r",
+        [dep],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _t_end(tmo):
+    return _gtimer(tl.program_id(0)) + tmo.to(tl.int64)
+
+
+@triton.jit
+def _fail_late(t_end, dep):
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p;
+            .reg .b64 %t, %z;
+            mov.u64 %t, %globaltimer;
+            setp.gt.u64 %p, %t, $1;
+            mov.u64 %z, 0;
+            @%p st.volatile.global.u32 [%z], 0;
+            @%p trap;
+            mov.u32 $0, 0;
+        }
+        """,
+        "=r,l",
+        [(dep & 0).to(tl.int64) + t_end],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _ll_spin_dl(addr, e, t_end):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p;
+            .reg .b32 %lo, %hi, %n, %ev;
+            .reg .b64 %t, %z;
+            mov.b32 %n, 0;
+            spin:
+            ld.volatile.global.b64 $0, [$1];
+            mov.b64 {%lo, %hi}, $0;
+            setp.eq.b32 %p, %hi, $2;
+            @%p bra done;
+            add.u32 %n, %n, 1;
+            and.b32 %ev, %n, 255;
+            setp.ne.u32 %p, %ev, 0;
+            @%p bra spin;
+            mov.u64 %t, %globaltimer;
+            setp.le.u64 %p, %t, $3;
+            @%p bra spin;
+            mov.u64 %z, 0;
+            st.volatile.global.u32 [%z], 0;
+            trap;
+            done:
+        }
+        """,
+        "=l,l,r,l",
+        args=[addr, e, t_end],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _ll_wait(src, n: tl.constexpr, e, t_end=0, DL: tl.constexpr = False):
     # each thread waits for the words it returns: with a block-wide count, a warp could leave holding a stale copy of
     # a word another warp also held (polls narrower than the CTA); the barrier keeps every warp before the epoch store
-    v = _ll_spin(src + tl.arange(0, n), e)
+    if DL:
+        v = _ll_spin_dl(src + tl.arange(0, n), e, t_end)
+    else:
+        v = _ll_spin(src + tl.arange(0, n), e)
     if n > 32:
         tl.debug_barrier()
     return v
 
 
 @triton.jit
-def _ll_wait_plain(src, n: tl.constexpr, e):
-    """R11's volatile-load wait, used only by the R11 plain merge."""
+def _ll_wait_plain(src, n: tl.constexpr, e, t_end=0, DL: tl.constexpr = False):
     k = tl.arange(0, n)
     v = tl.load(src + k, volatile=True)
-    while tl.min(((v >> 32) == e).to(tl.int32), axis=0) == 0:
-        v = tl.load(src + k, volatile=True)
+    if DL:
+        ok = tl.min(((v >> 32) == e).to(tl.int32), axis=0)
+        while ok == 0:
+            _fail_late(t_end, ok)
+            v = tl.load(src + k, volatile=True)
+            ok = tl.min(((v >> 32) == e).to(tl.int32), axis=0)
+    else:
+        while tl.min(((v >> 32) == e).to(tl.int32), axis=0) == 0:
+            v = tl.load(src + k, volatile=True)
     return v
+
+
+@triton.jit
+def _ll_wait_plain_ee(addr, ee, src_l, e, t_end=0, DL: tl.constexpr = False):
+    k1 = tl.arange(0, 1)
+    v = tl.load(addr, volatile=True)
+    lv = tl.load(src_l + k1, volatile=True)
+    ok = tl.min(
+        tl.min(((v >> 32) == ee).to(tl.int32), axis=1) * ((lv >> 32) == e).to(tl.int32),
+        axis=0,
+    )
+    while ok == 0:
+        if DL:
+            _fail_late(t_end, ok)
+        v = tl.load(addr, volatile=True)
+        lv = tl.load(src_l + k1, volatile=True)
+        ok = tl.min(
+            tl.min(((v >> 32) == ee).to(tl.int32), axis=1)
+            * ((lv >> 32) == e).to(tl.int32),
+            axis=0,
+        )
+    return v, lv
+
+
+@triton.jit
+def _nsleep(dep, NS: tl.constexpr):
+    # nanosleep, tied to ``dep`` so the compiler keeps it in the loop
+    tl.inline_asm_elementwise(
+        "nanosleep.u32 $1; mov.u32 $0, 0;",
+        "=r,r",
+        [(dep & 0).to(tl.int32) + NS],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _ll_wait_all(
+    daddr, laddr, e, SLEEP: tl.constexpr, t_end=0, DL: tl.constexpr = False
+):
+    v = tl.load(daddr, volatile=True)
+    lv = tl.load(laddr, volatile=True)
+    ok = tl.min(
+        tl.min(((v >> 32) == e).to(tl.int32), axis=1) * ((lv >> 32) == e).to(tl.int32),
+        axis=0,
+    )
+    while ok == 0:
+        if DL:
+            _fail_late(t_end, ok)
+        if SLEEP > 0:
+            _nsleep(lv, SLEEP)
+        v = tl.load(daddr, volatile=True)
+        lv = tl.load(laddr, volatile=True)
+        ok = tl.min(
+            tl.min(((v >> 32) == e).to(tl.int32), axis=1)
+            * ((lv >> 32) == e).to(tl.int32),
+            axis=0,
+        )
+    return v, lv
 
 
 @triton.jit
@@ -509,6 +783,8 @@ def _cp_gather_q_ll(
     vstart=None,
     vcnt=None,
     CHUNK: tl.constexpr = False,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
@@ -538,14 +814,20 @@ def _cp_gather_q_ll(
     w = tl.arange(0, WORDS)
     x = _ll_pack(flag, tl.load(q + i * q_stride + w))
     for c in tl.static_range(CP):
-        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8).to(
-            tl.pointer_type(tl.int64)
-        )
-        tl.store(dst + w, x)
+        dst = tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8
+        _st_relaxed_sys_b64(dst + w.to(tl.int64) * 8, x)
     own = tl.load(peers + me) + ll_off
+    if DEADLINE:
+        t_end = _t_end(tmo)
+    else:
+        t_end = 0
     for c in tl.static_range(CP):
         v = _ll_wait(
-            (own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)), WORDS, e
+            (own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)),
+            WORDS,
+            e,
+            t_end,
+            DEADLINE,
         )
         if FOLD:
             slot = ((i // QL) * CP + c) * QL + i % QL
@@ -570,6 +852,160 @@ def _cp_gather_q_ll(
                     tl.maximum(tl.load(seq_lens + i // QL) - QL, 0),
                 )
     tl.store(cnt + i, e)
+
+
+@triton.jit
+def _cp_gather_q_wait(
+    peers,
+    me,
+    ll_off,
+    q_all,
+    cnt,
+    seq_lens,
+    pre_lens,
+    CP: tl.constexpr,
+    WORDS: tl.constexpr,
+    QL: tl.constexpr,
+    TRIG: tl.constexpr = True,
+    LAM: tl.constexpr = False,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
+):
+    if TRIG:
+        tl.extra.cuda.gdc_launch_dependents()
+    _gdc_wait_clobber()
+    i = tl.program_id(0)
+    e = tl.load(cnt + i) + 1
+    w = tl.arange(0, WORDS)
+    cc = tl.arange(0, CP)
+    own = tl.load(peers + me) + ll_off
+    if DEADLINE:
+        t_end = _t_end(tmo)
+    else:
+        t_end = 0
+    if LAM:
+        laddr = (own + (i * CP + cc) * WORDS * 4)[:, None] + w[None, :].to(tl.int64) * 4
+        src = laddr.to(tl.pointer_type(tl.int32))
+    else:
+        src = (own + (i * CP + cc) * WORDS * 8).to(tl.pointer_type(tl.int64))
+        src = src[:, None] + w[None, :]
+    v = tl.load(src, volatile=True)
+    if LAM:
+        done = tl.min(tl.min((v != -1).to(tl.int32), axis=1), axis=0)
+    else:
+        done = tl.min(tl.min(((v >> 32) == e).to(tl.int32), axis=1), axis=0)
+    while done == 0:
+        if DEADLINE:
+            _fail_late(t_end, done)
+        v = tl.load(src, volatile=True)
+        if LAM:
+            done = tl.min(tl.min((v != -1).to(tl.int32), axis=1), axis=0)
+        else:
+            done = tl.min(tl.min(((v >> 32) == e).to(tl.int32), axis=1), axis=0)
+    slot = ((i // QL) * CP + cc) * QL + i % QL
+    if LAM:
+        tl.store(q_all + slot[:, None] * WORDS + w[None, :], v)
+    else:
+        tl.store(
+            q_all + slot[:, None] * WORDS + w[None, :], (v & 0xFFFFFFFF).to(tl.int32)
+        )
+    if i % QL == 0:
+        tl.store(pre_lens + i // QL, tl.maximum(tl.load(seq_lens + i // QL) - QL, 0))
+    tl.store(cnt + i, e)
+    if LAM:
+        _lam_rearm(laddr)
+
+
+class _WaitOnlyGather:
+    def __getitem__(self, grid):
+        def run(
+            q,
+            q_stride,
+            peers,
+            me,
+            ll_off,
+            q_all,
+            cnt,
+            seq_lens,
+            pre_lens,
+            stock_lens,
+            nb,
+            thr,
+            CP,
+            WORDS,
+            QL,
+            FOLD,
+            GATE,
+            NB,
+            GMAX,
+            GWRITE,
+            TRIG=False,
+            WAIT=False,
+            num_warps=4,
+            launch_pdl=False,
+            LAM=False,
+            tmo=0,
+            DEADLINE=False,
+        ):
+            assert FOLD and WAIT and launch_pdl and not GATE and not GWRITE, (
+                "the wait half serves the ungated exact call only"
+            )
+            assert CP * WORDS >= 2 * num_warps * 32, (
+                "the CTA-wide wait needs >= 2 words a thread"
+            )
+            return _cp_gather_q_wait[grid](
+                peers,
+                me,
+                ll_off,
+                q_all,
+                cnt,
+                seq_lens,
+                pre_lens,
+                CP=CP,
+                WORDS=WORDS,
+                QL=QL,
+                TRIG=TRIG,
+                num_warps=num_warps,
+                launch_pdl=True,
+                **({"LAM": True} if LAM else {}),
+                **({"tmo": tmo, "DEADLINE": True} if DEADLINE else {}),
+            )
+
+        return run
+
+
+_WAIT_ONLY_GATHER = _WaitOnlyGather()
+
+_TMO_NS = 0
+
+
+def set_wait_deadline(deadline_s: float | None) -> None:
+    global _TMO_NS
+    if deadline_s is not None and deadline_s < 0:
+        raise ValueError(f"wait deadline {deadline_s} s")
+    _TMO_NS = int(round(float(deadline_s) * 1e9)) if deadline_s else 0
+
+
+def _dl_args() -> dict:
+    """The wait deadline's launch arguments (none while it is off)."""
+    if not _TMO_NS:
+        return {}
+    return {"tmo": _TMO_NS, "DEADLINE": True}
+
+
+def _cp_gather_q_ll_or_wait(cp, rows: int):
+    pushed, cp._q_pushed = cp._q_pushed, None
+    cp._q_pushed_lam = False
+    gathered, cp._q_gathered = cp._q_gathered, None
+    if pushed is None:
+        assert gathered is None, "slot cp_q_gather: a gathered call is a pushed call"
+        return _cp_gather_q_ll
+    assert pushed == rows, (pushed, rows)
+    if gathered is not None:
+        # slot cp_q_gather: the q writer landed q_all, the prefix lengths and the epochs
+        assert gathered == rows, (gathered, rows)
+        return None
+    return _WAIT_ONLY_GATHER
 
 
 @triton.jit
@@ -608,6 +1044,8 @@ def _cp_a2a_merge_ll(
     GATE: tl.constexpr,
     NB: tl.constexpr,
     GMAX: tl.constexpr,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
 ):
     """LL variant of _cp_a2a_merge; po / plse are read as int32 words, row / member strides po_sr / po_sc (words)
     and pl_sr / pl_sc. Online LSE merge of the causal block and the CP partials as they arrive.
@@ -626,11 +1064,9 @@ def _cp_a2a_merge_ll(
     for c in tl.static_range(CP):
         w = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + hw))
         lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h))
-        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
-            tl.pointer_type(tl.int64)
-        )
-        tl.store(dst + hw, w)
-        tl.store(dst + NO + h, lw)
+        dst = tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8
+        _st_relaxed_sys_b64(dst + hw.to(tl.int64) * 8, w)
+        _st_relaxed_sys_b64(dst + (NO + h).to(tl.int64) * 8, lw)
     b = i // QL
     t = i % QL
     L = tl.load(seq_lens + b)
@@ -658,10 +1094,14 @@ def _cp_a2a_merge_ll(
     wsum = ld
     n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
     own = tl.load(peers + me) + ll_off
+    if DEADLINE:
+        t_end = _t_end(tmo)
+    else:
+        t_end = 0
     for c in tl.static_range(CP):
         src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait(src, NO, e)
-        lv = _ll_wait(src + NO, HQ, e)
+        v = _ll_wait(src, NO, e, t_end, DEADLINE)
+        lv = _ll_wait(src + NO, HQ, e, t_end, DEADLINE)
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
             tl.float32, bitcast=True
         ) * 0.6931471805599453
@@ -696,6 +1136,8 @@ def _cp_a2a_merge4_ll(
     CP: tl.constexpr,
     D: tl.constexpr,
     NWP: tl.constexpr,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll for fused partials, which already hold the causal block (O = 0 / LSE = -inf where a rank
     sees no key): push, then a base-2 online LSE merge of the CP partials only."""
@@ -709,19 +1151,21 @@ def _cp_a2a_merge4_ll(
     for c in tl.static_range(CP):
         w = _ll_pack(flag, tl.load(po + (i * CP * HQ + c * HQ) * (D // 2) + hw))
         lw = _ll_pack(flag, tl.load(plse + i * CP * HQ + c * HQ + h))
-        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
-            tl.pointer_type(tl.int64)
-        )
-        tl.store(dst + hw, w)
-        tl.store(dst + NO + h, lw)
+        dst = tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8
+        _st_relaxed_sys_b64(dst + hw.to(tl.int64) * 8, w)
+        _st_relaxed_sys_b64(dst + (NO + h).to(tl.int64) * 8, lw)
     m = tl.full([HQ], float("-inf"), tl.float32)
     wsum = tl.zeros([HQ], dtype=tl.float32)
     acc = tl.zeros([HQ, D], dtype=tl.float32)
     own = tl.load(peers + me) + ll_off
+    if DEADLINE:
+        t_end = _t_end(tmo)
+    else:
+        t_end = 0
     for c in tl.static_range(CP):
         src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait(src, NO, e)
-        lv = _ll_wait(src + NO, HQ, e)
+        v = _ll_wait(src, NO, e, t_end, DEADLINE)
+        lv = _ll_wait(src + NO, HQ, e, t_end, DEADLINE)
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True)
         wd = (v & 0xFFFFFFFF).to(tl.uint32)
         lo = (wd << 16).to(tl.float32, bitcast=True)
@@ -770,6 +1214,7 @@ def _causal_block_h(
     QL: tl.constexpr,
     D: tl.constexpr,
     PG: tl.constexpr,
+    CG: tl.constexpr = False,
 ):
     """Head h of row i: the fp32 causal block over this step's QL keys as _cp_a2a_merge_ll starts its merge, i.e.
     unnormalized O (x bmm2) [D], the natural-log max [1] (-inf: no key) and the row sum [1]."""
@@ -780,15 +1225,24 @@ def _causal_block_h(
     pos = L - QL + j
     valid = (j <= t) & (pos >= 0)
     pos = tl.maximum(pos, 0)
-    page = tl.load(table + b * t_stride + pos // PG, mask=valid, other=0)
+    CM: tl.constexpr = ".cg" if CG else ""
+    page = tl.load(
+        table + b * t_stride + pos // PG, mask=valid, other=0, cache_modifier=CM
+    )
     koff = page.to(tl.int64) * kv_page_stride + (pos % PG) * kv_tok_stride
     kk = tl.load(
-        k_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0
+        k_cache + koff[:, None] + d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+        cache_modifier=CM,
     ).to(tl.float32)
     vv = tl.load(
-        v_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0
+        v_cache + koff[:, None] + d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+        cache_modifier=CM,
     ).to(tl.float32)
-    qv = tl.load(q + i * q_stride + h * D + d).to(tl.float32)
+    qv = tl.load(q + i * q_stride + h * D + d, cache_modifier=CM).to(tl.float32)
     s = tl.sum(qv[None, :] * kk, axis=1) * bmm1
     s = tl.where(valid, s, float("-inf"))
     md = tl.max(s, axis=0)
@@ -848,6 +1302,17 @@ def _cp_merge_h_ll(
     o_proj_input=None,
     o_proj_input_stride=0,
     GATE_EPILOGUE: tl.constexpr = False,
+    PLAIN_WAIT: tl.constexpr = False,
+    PUSH_ROT: tl.constexpr = False,
+    CG: tl.constexpr = False,
+    NOPUSH: tl.constexpr = False,
+    MSLEEP: tl.constexpr = 0,
+    HILO: tl.constexpr = False,
+    F16: tl.constexpr = False,
+    GATE_BF16: tl.constexpr = False,
+    TRIG: tl.constexpr = False,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
@@ -858,20 +1323,43 @@ def _cp_merge_h_ll(
     CHUNK (fold layout): a request with chunk rows sends the base-2 LSE combine of its rows' partials
     (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse.
     GATE_EPILOGUE also writes the gated, statically scaled FP8 input of o_proj."""
+    tl.static_assert(
+        not NOPUSH or (WAIT and PLAIN_WAIT and not CHUNK and (HILO or (EARLY and CG))),
+        "NOPUSH: the early, plain-wait, L2-read merge of the partial's push, or a HILO merge",
+    )
+    tl.static_assert(not (HILO and CHUNK), "HILO: no fold layout")
+    tl.static_assert(not TRIG or WAIT, "TRIG: a programmatic dependent")
+    tl.static_assert(
+        not (F16 and (HILO or CHUNK)),
+        "F16 partials: no residual words, no fold layout",
+    )
+    tl.static_assert(
+        not (GATE_BF16 and GATE_EPILOGUE),
+        "GATE_BF16: the bf16 output gate, no FP8 input",
+    )
     i = tl.program_id(0)
     h = tl.program_id(1)
+    if TRIG:
+        tl.extra.cuda.gdc_launch_dependents()
     if WAIT and not EARLY:
         _gdc_wait_clobber()
-    if _gate_on(seq_lens, nb, thr, NB, GMAX).to(tl.int32) == 0:
+    CGM: tl.constexpr = ".cg" if CG else ""
+    if _gate_on(seq_lens, nb, thr, NB, GMAX, CG).to(tl.int32) == 0:
+        if WAIT and EARLY:
+            _gdc_wait_clobber()
         return
     one = tl.arange(0, 1)
-    e = tl.load(cnt + i * HQ + h) + 1
+    e = tl.load(cnt + i * HQ + h, cache_modifier=CGM) + 1
     flag = e.to(tl.int64) << 32
+    if HILO:
+        R = tl.num_programs(0)
+        e_lo = tl.load(cnt + (R + i) * HQ + h, cache_modifier=CGM) + 1
+        flag_lo = e_lo.to(tl.int64) << 32
     DW: tl.constexpr = D // 2
     NO: tl.constexpr = HQ * D // 2
     H: tl.constexpr = QL * CP * HQ
     w = tl.arange(0, DW)
-    L = tl.load(seq_lens + i // QL)
+    L = tl.load(seq_lens + i // QL, cache_modifier=CGM)
     if EARLY:
         acc, m, wsum = _causal_block_h(
             q,
@@ -890,16 +1378,21 @@ def _cp_merge_h_ll(
             QL,
             D,
             PG,
+            CG,
         )
-        if WAIT:
+        if WAIT and not NOPUSH:
             _gdc_wait_clobber()
     if CHUNK:
         n_v = tl.load(vcnt + i // QL)
         v0 = tl.load(vstart + i // QL)
-    for c in tl.static_range(CP):
+    for c in tl.static_range(0 if NOPUSH else CP):
+        if PUSH_ROT:
+            cs = (me + c) % CP
+        else:
+            cs = c
         if CHUNK:
             if n_v > 0:
-                hh = (i % QL) * (CP * HQ) + c * HQ + h
+                hh = (i % QL) * (CP * HQ) + cs * HQ + h
                 mx = tl.full([1], float("-inf"), tl.float32)
                 sw = tl.zeros([1], tl.float32)
                 acc_lo = tl.zeros([DW], tl.float32)
@@ -934,16 +1427,20 @@ def _cp_merge_h_ll(
                 ow = _ll_pack(flag, lo16 | (hi16 << 16))
                 lw = _ll_pack(flag, lse2.to(tl.int32, bitcast=True))
             else:
-                ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
-                lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+                ow = _ll_pack(flag, tl.load(po + i * po_sr + cs * po_sc + h * DW + w))
+                lw = _ll_pack(flag, tl.load(plse + i * pl_sr + cs * pl_sc + h + one))
         else:
-            ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
-            lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
-        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
-            tl.pointer_type(tl.int64)
-        )
-        tl.store(dst + h * DW + w, ow)
-        tl.store(dst + NO + h + one, lw)
+            ow = _ll_pack(flag, tl.load(po + i * po_sr + cs * po_sc + h * DW + w))
+            lw = _ll_pack(flag, tl.load(plse + i * pl_sr + cs * pl_sc + h + one))
+        dst = tl.load(peers + cs) + ll_off + (i * CP + me) * NWP * 8
+        _st_relaxed_sys_b64(dst + (h * DW + w).to(tl.int64) * 8, ow)
+        _st_relaxed_sys_b64(dst + (NO + h + one).to(tl.int64) * 8, lw)
+        if HILO:
+            owl = _ll_pack(
+                flag_lo, tl.load(po + (R + i) * po_sr + cs * po_sc + h * DW + w)
+            )
+            dst_lo = tl.load(peers + cs) + ll_off + ((R + i) * CP + me) * NWP * 8
+            _st_relaxed_sys_b64(dst_lo + (h * DW + w).to(tl.int64) * 8, owl)
     if not EARLY:
         acc, m, wsum = _causal_block_h(
             q,
@@ -965,30 +1462,101 @@ def _cp_merge_h_ll(
         )
     n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
     own = tl.load(peers + me) + ll_off
+    if DEADLINE:
+        t_end = _t_end(tmo)
+    else:
+        t_end = 0
+    if NOPUSH and not HILO:
+        cc = tl.arange(0, CP)
+        sbase = own + (i * CP + cc) * NWP * 8
+        daddr = (sbase[:, None] + (h * DW + w[None, :]) * 8).to(
+            tl.pointer_type(tl.int64)
+        )
+        laddr = (sbase + (NO + h) * 8).to(tl.pointer_type(tl.int64))
+        vall, lall = _ll_wait_all(daddr, laddr, e, MSLEEP, t_end, DEADLINE)
     for c in tl.static_range(CP):
         src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait(src + h * DW, DW, e)
-        lv = _ll_wait(src + NO + h, 1, e)
+        if NOPUSH and not HILO:
+            v = tl.sum(tl.where(cc[:, None] == c, vall, 0), axis=0)
+            lv = tl.sum(tl.where(cc == c, lall, 0), axis=0) + tl.zeros([1], tl.int64)
+        elif HILO:
+            two = tl.arange(0, 2)
+            base = tl.where(
+                two == 0,
+                own + (i * CP + c) * NWP * 8,
+                own + ((R + i) * CP + c) * NWP * 8,
+            )
+            addr = (base[None, :] + (h * DW + w[:, None]) * 8).to(
+                tl.pointer_type(tl.int64)
+            )
+            ee = tl.where(two == 0, e, e_lo)[None, :] + w[:, None] * 0
+            if PLAIN_WAIT:
+                vv, lv = _ll_wait_plain_ee(addr, ee, src + NO + h, e, t_end, DEADLINE)
+            else:
+                if DEADLINE:
+                    vv = _ll_spin_dl(addr, ee, t_end)
+                else:
+                    vv = _ll_spin(addr, ee)
+                tl.debug_barrier()
+                lv = _ll_wait(src + NO + h, 1, e, t_end, DEADLINE)
+            v, vl = tl.split(vv)
+        elif PLAIN_WAIT:
+            v = _ll_wait_plain(src + h * DW, DW, e, t_end, DEADLINE)
+            lv = _ll_wait_plain(src + NO + h, 1, e, t_end, DEADLINE)
+        else:
+            v = _ll_wait(src + h * DW, DW, e, t_end, DEADLINE)
+            lv = _ll_wait(src + NO + h, 1, e, t_end, DEADLINE)
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
             tl.float32, bitcast=True
         ) * 0.6931471805599453
         lc = tl.where(n_pages > c, lc, float("-inf"))
         wd = (v & 0xFFFFFFFF).to(tl.uint32)
-        lo = (wd << 16).to(tl.float32, bitcast=True)
-        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+        if F16:
+            lo = (wd & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(
+                tl.float32
+            ) * bmm2
+            hi = (wd >> 16).to(tl.uint16).to(tl.float16, bitcast=True).to(
+                tl.float32
+            ) * bmm2
+        else:
+            lo = (wd << 16).to(tl.float32, bitcast=True)
+            hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
         oc = tl.reshape(tl.join(lo, hi), (D,))
+        if HILO:
+            wl = (vl & 0xFFFFFFFF).to(tl.uint32)
+            oc = oc + tl.reshape(
+                tl.join(
+                    (wl << 16).to(tl.float32, bitcast=True),
+                    (wl & 0xFFFF0000).to(tl.float32, bitcast=True),
+                ),
+                (D,),
+            )
         mn = tl.maximum(m, lc)
         mn0 = tl.where(mn > float("-inf"), mn, 0.0)
         a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
         a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
-        acc = acc * a_old + oc * a_new
-        wsum = wsum * a_old + a_new
+        if PLAIN_WAIT:
+            # the update as explicit FMAs, so its rounding does not depend on the wait's code
+            acc = tl.fma(acc, a_old, oc * a_new)
+            wsum = tl.fma(wsum, a_old, a_new)
+        else:
+            acc = acc * a_old + oc * a_new
+            wsum = wsum * a_old + a_new
         m = mn
     o = (acc / tl.where(wsum > 0, wsum, 1.0)).to(tl.bfloat16)
+    if NOPUSH and EARLY:
+        _gdc_wait_clobber()
     d = tl.arange(0, D)
+    if GATE_BF16:
+        g = tl.load(gate + i * gate_stride + h * D + d, cache_modifier=CGM).to(
+            tl.float32
+        )
+        o = (o.to(tl.float32) * tl.sigmoid(g)).to(tl.bfloat16)
     tl.store(out + i * out_stride + h * D + d, o)
     if GATE_EPILOGUE:
-        g = tl.load(gate + i * gate_stride + h * D + d).to(tl.float32)
+        g = tl.load(gate + i * gate_stride + h * D + d, cache_modifier=CGM).to(
+            tl.float32
+        )
         gated = (o.to(tl.float32) * tl.sigmoid(g)).to(tl.bfloat16).to(tl.float32)
         scale_inv = 1.0 / tl.load(o_proj_input_scale).to(tl.float32)
         tl.store(
@@ -996,6 +1564,8 @@ def _cp_merge_h_ll(
             tl.clamp(gated * scale_inv, -448.0, 448.0).to(tl.float8e4nv),
         )
     tl.store(cnt + i * HQ + h + one, e)
+    if HILO:
+        tl.store(cnt + (R + i) * HQ + h + one, e_lo)
 
 
 @triton.jit
@@ -1039,6 +1609,8 @@ def _cp_merge_h_ll_plain(
     vstart=None,
     vcnt=None,
     CHUNK: tl.constexpr = False,
+    tmo=0,
+    DEADLINE: tl.constexpr = False,
 ):
     """R11's plain non-EARLY merge, kept separate from EARLY/gate epilogues.
 
@@ -1105,11 +1677,9 @@ def _cp_merge_h_ll_plain(
         else:
             ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
             lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
-        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
-            tl.pointer_type(tl.int64)
-        )
-        tl.store(dst + h * DW + w, ow)
-        tl.store(dst + NO + h + one, lw)
+        dst = tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8
+        _st_relaxed_sys_b64(dst + (h * DW + w).to(tl.int64) * 8, ow)
+        _st_relaxed_sys_b64(dst + (NO + h + one).to(tl.int64) * 8, lw)
     L = tl.load(seq_lens + i // QL)
     acc, m, wsum = _causal_block_h(
         q,
@@ -1131,10 +1701,14 @@ def _cp_merge_h_ll_plain(
     )
     n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
     own = tl.load(peers + me) + ll_off
+    if DEADLINE:
+        t_end = _t_end(tmo)
+    else:
+        t_end = 0
     for c in tl.static_range(CP):
         src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait_plain(src + h * DW, DW, e)
-        lv = _ll_wait_plain(src + NO + h, 1, e)
+        v = _ll_wait_plain(src + h * DW, DW, e, t_end, DEADLINE)
+        lv = _ll_wait_plain(src + NO + h, 1, e, t_end, DEADLINE)
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
             tl.float32, bitcast=True
         ) * 0.6931471805599453
@@ -1160,6 +1734,17 @@ class CpLite:
     draft slots; built collectively on the plugin binding's TP group."""
 
     _instance: CpLite | None = None
+    _q_pushed: int | None = None
+    merge_cg: bool = False
+    lam_q: bool = False
+    lamq_off: int = 0
+    lam_q_end: int = 0
+    _q_pushed_lam: bool = False
+    o_push: bool = False
+    _ll_tab_t: torch.Tensor | None = None
+    _q_gathered: int | None = None
+    _gate_bf16: torch.Tensor | None = None
+    _gate_bf16_done: bool = False
 
     def __init__(
         self, group, tp_rank: int, tp_size: int, cp: int, q_heads: int, device
@@ -1190,6 +1775,10 @@ class CpLite:
         self.fold_fuse = True
         self.llh_off = total
         total += _MAX_ROWS * cp * _LL_PWORDS * 8
+        if self.lam_q:
+            # filled with the sentinel below, before the rendezvous and the group barrier
+            self.lamq_off, self.lam_q_end = _lam_q_layout(total, cp, q_heads)
+            total = self.lam_q_end
         self.ll = q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -1204,6 +1793,8 @@ class CpLite:
             symm_mem.set_backend("NCCL")
         self.buf = symm_mem.empty((total,), dtype=torch.uint8, device=self.device)
         self.buf.zero_()
+        if self.lam_q:
+            self.buf[self.lamq_off : self.lam_q_end].fill_(0xFF)
         torch.cuda.synchronize(self.device)
         handle = symm_mem.rendezvous(self.buf, group)
         assert handle.rank == tp_rank, (handle.rank, tp_rank)
@@ -1213,6 +1804,8 @@ class CpLite:
             device=self.device,
         )
         self._handle = handle
+        if cp <= 4:
+            self._ll_tab()
         self.q_all = (
             self.buf[: self.q_bytes]
             .view(torch.float8_e4m3fn)
@@ -1225,7 +1818,6 @@ class CpLite:
         self.plse = torch.empty(
             rows, cp * q_heads, dtype=torch.float32, device=self.device
         )
-        # multi-CTA counters of the trtllm-gen calls: rows x heads (the chunk rows: up to 8 B x 112 at q_len 7)
         self.counter = torch.zeros(1 << 20, dtype=torch.int32, device=self.device)
         # exact path: the fused kernel's [cp, rows, heads, D] partials and the prefix lengths the gather writes
         self.po_x = torch.empty(
@@ -1248,6 +1840,9 @@ class CpLite:
         )
         self._side = torch.cuda.Stream(device=self.device)
         self._ws = None
+        self._ws_bytes: dict = {}
+        self._ws_captured: list = []
+        self._ws_in_graph = False
         if self.min_kv and self.gate_overlap:
             self._own_workspace()
         # (lengths, b, q_len, threshold) -> [(stock lengths, prefix lengths), forward, last layer id that used them]
@@ -1281,6 +1876,13 @@ class CpLite:
         logger.info(
             "TRT-L1 CP-lite KV gate: minimum mean KV per request %s", self.min_kv
         )
+        if self.lam_q:
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 CP-lite Lamport q region of %d B at %d, "
+                "sentinel-filled (slot cp_lam_q)",
+                self.lam_q_end - self.lamq_off,
+                self.lamq_off,
+            )
 
     def offer_gate_epilogue(
         self, gate: torch.Tensor, scale: torch.Tensor, out: torch.Tensor
@@ -1289,11 +1891,74 @@ class CpLite:
         self._gate_epilogue = (gate, scale, out)
         self._gate_epilogue_done = False
 
+    def q_push_args(
+        self,
+        rows: int,
+        b: int,
+        q_len: int,
+        gather: bool = False,
+        seq_lens: torch.Tensor | None = None,
+    ) -> dict | None:
+        if not (
+            self.ll
+            and self.cp_ungated
+            and self.exact
+            and not self.min_kv
+            and b >= self.min_bs
+            and rows == b * q_len
+            and rows <= _MAX_ROWS
+            and self._exact_supported(q_len, b)
+        ):
+            return None
+        lam = bool(self.lam_q)
+        if lam and self.lam_q_end <= self.lamq_off:
+            raise RuntimeError(
+                "slot cp_lam_q: CP-lite was built without its Lamport regions"
+            )
+        self._q_pushed = rows
+        self._q_pushed_lam = lam
+        args = {
+            "peers": self.peers,
+            "me": self.me,
+            "off": self.lamq_off if lam else self.llq_off,
+            "cnt": self.cnt[0],
+            "cp": self.cp,
+            "words": self.hq * HEAD_DIM // 4,
+            **({"lam": True} if lam else {}),
+        }
+        if gather and (
+            lam
+            and seq_lens is not None
+            and seq_lens.shape[0] == b
+            and seq_lens.dtype == torch.int32
+        ):
+            self._q_gathered = rows
+            args["gather"] = {
+                "q_all": self.q_all.view(torch.int32),
+                "seq_lens": seq_lens,
+                "pre_lens": self.pre_lens,
+                "ql": q_len,
+                # the in-front gather's poll takes the wait deadline (set_wait_deadline)
+                **({"tmo": _TMO_NS} if _TMO_NS else {}),
+            }
+        return args
+
     def take_gate_epilogue(self) -> bool:
         """Return whether the last CP-lite call wrote the offered o_proj input."""
         done = self._gate_epilogue_done
         self._gate_epilogue = None
         self._gate_epilogue_done = False
+        return done
+
+    def offer_gate_bf16(self, gate: torch.Tensor) -> None:
+        self._gate_bf16 = gate
+        self._gate_bf16_done = False
+
+    def take_gate_bf16(self) -> bool:
+        """Return whether the last CP-lite call applied the offered gate, and drop the offer."""
+        done = self._gate_bf16_done
+        self._gate_bf16 = None
+        self._gate_bf16_done = False
         return done
 
     def _gate_thr(self, b: int) -> int | None:
@@ -1378,6 +2043,14 @@ class CpLite:
         stock=None,
         min_bs: int | None = None,
         early_merge: bool | None = None,
+        plain_wait: bool = False,
+        merge_h: bool = False,
+        out: torch.Tensor | None = None,
+        precise: bool = False,
+        p2f16: bool = False,
+        hilo_push: bool = False,
+        hilo_early: bool = False,
+        hilo_trig: bool = False,
     ) -> torch.Tensor | None:
         """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
         where the call is not served (decided by shapes only, so every rank agrees).
@@ -1402,6 +2075,12 @@ class CpLite:
             or rows > _MAX_ROWS
             or not isinstance(bmm1_scale, float)
             or not isinstance(bmm2_scale, float)
+        ):
+            return None
+        if out is not None and not (
+            out.dtype == torch.bfloat16
+            and tuple(out.shape) == (rows, self.hq, HEAD_DIM)
+            and out.is_contiguous()
         ):
             return None
         if (b, q_len) not in self._logged:
@@ -1430,6 +2109,37 @@ class CpLite:
             "NB": triton.next_power_of_2(b),
             "GMAX": self.gate_max,
         }
+        into = out
+        if into is not None and not (
+            exact and thr is None and self.ll and self.cp_ungated
+        ):
+            # only the exact ungated path writes into the caller's tensor; the others copy
+            res = self.attend(
+                q,
+                kv_cache,
+                page_table,
+                seq_lens,
+                q_len,
+                bmm1_scale,
+                bmm2_scale,
+                workspace,
+                layer,
+                forward_batch,
+                stock=stock,
+                min_bs=min_bs,
+                early_merge=early_merge,
+                plain_wait=plain_wait,
+                merge_h=merge_h,
+                precise=precise,
+                p2f16=p2f16,
+                hilo_push=hilo_push,
+                hilo_early=hilo_early,
+                hilo_trig=hilo_trig,
+            )
+            if res is None:
+                return None
+            into.copy_(res)
+            return into
         out = None
         if thr is not None and self.gate_overlap:
             return self._gated_overlap(
@@ -1463,6 +2173,16 @@ class CpLite:
                 bmm2_scale,
                 gate,
                 early_merge=early_merge,
+                # precise calls poll with the plain wait (slot cp_merge_plain_wait's)
+                plain_wait=plain_wait or precise,
+                merge_h=merge_h,
+                out=into,
+                hilo=precise and b <= _PRECISE_MAX_BATCH and 2 * rows <= _MAX_ROWS,
+                p_hilo=(precise or p2f16) and b <= _PRECISE_MAX_BATCH,
+                f16=p2f16 and not precise and b <= _PRECISE_MAX_BATCH,
+                hilo_push=hilo_push,
+                hilo_early=hilo_early,
+                hilo_trig=hilo_trig,
             )
         if self.ll:
             _cp_gather_q_ll[(rows,)](
@@ -1483,6 +2203,7 @@ class CpLite:
                 FOLD=exact,
                 GWRITE=True,
                 num_warps=4,
+                **_dl_args(),
             )
             if thr is not None:
                 out = torch.empty(
@@ -1500,6 +2221,7 @@ class CpLite:
                 CP=self.cp,
                 WORDS=words,
                 num_warps=4,
+                **_dl_args(),
             )
         if exact:
             return self._exact(
@@ -1608,6 +2330,7 @@ class CpLite:
                 D=HEAD_DIM,
                 PG=PAGE,
                 num_warps=8,
+                **_dl_args(),
             )
         return out
 
@@ -1808,6 +2531,7 @@ class CpLite:
                         "CHUNK": True,
                     }
                 ),
+                **_dl_args(),
             )
             if exact:
                 self._exact_partial(
@@ -1835,7 +2559,9 @@ class CpLite:
                     forward_batch,
                     layer_id,
                     gate,
-                    self._own_workspace(),
+                    self._own_workspace(
+                        triton.cdiv(page_table.shape[1], self.cp), q_len
+                    ),
                     fused,
                 )
         main.wait_stream(self._side)
@@ -1907,6 +2633,7 @@ class CpLite:
             GWRITE=False,
             TRIG=self.cp_pdl,
             num_warps=4,
+            **_dl_args(),
         )
         self._exact_partial(
             k_cache,
@@ -1969,32 +2696,123 @@ class CpLite:
         bmm2_scale,
         gate,
         early_merge=None,
+        plain_wait=False,
+        merge_h=False,
+        out=None,
+        hilo=False,
+        p_hilo=False,
+        f16=False,
+        hilo_push=False,
+        hilo_early=False,
+        hilo_trig=False,
     ):
-        """Run an ungated exact call with PDL and the per-head merge."""
+        r11 = early_merge is False and not merge_h and self._gate_epilogue is None
+        if hilo and r11:
+            hilo = False
+        assert not (f16 and hilo), "f16: no residual words"
+        if f16 and r11:
+            f16 = p_hilo = False
+        hl = hilo or (p_hilo and not f16)
         early = self.early_merge if early_merge is None else early_merge
         words = self.hq * HEAD_DIM // 4
-        _cp_gather_q_ll[(rows,)](
-            q.view(torch.int32),
-            words,
-            self.peers,
-            self.me,
-            self.llq_off,
-            self.q_all.view(torch.int32),
-            self.cnt[0],
-            seq_lens,
-            self.pre_lens,
-            self.stock_lens,
-            **gate,
-            CP=self.cp,
-            WORDS=words,
-            QL=q_len,
-            FOLD=True,
-            GWRITE=False,
-            TRIG=True,
-            WAIT=self.gather_pdl,
-            num_warps=4,
-            launch_pdl=self.gather_pdl,
+        pushed = self._q_pushed is not None
+        q_lam = pushed and self._q_pushed_lam
+        gather = _cp_gather_q_ll_or_wait(self, rows)
+        if q_lam and ("lam_q", rows) not in self._logged:
+            self._logged.add(("lam_q", rows))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot cp_lam_q moves the pushed q rows as "
+                "Lamport words at %d rows",
+                rows,
+            )
+        if gather is not None:
+            gather[(rows,)](
+                q.view(torch.int32),
+                words,
+                self.peers,
+                self.me,
+                self.lamq_off if q_lam else self.llq_off,
+                self.q_all.view(torch.int32),
+                self.cnt[0],
+                seq_lens,
+                self.pre_lens,
+                self.stock_lens,
+                **gate,
+                CP=self.cp,
+                WORDS=words,
+                QL=q_len,
+                FOLD=True,
+                GWRITE=False,
+                TRIG=True,
+                WAIT=self.gather_pdl,
+                num_warps=4,
+                launch_pdl=self.gather_pdl,
+                **({"LAM": True} if q_lam else {}),
+                **_dl_args(),
+            )
+        epilogue = self._gate_epilogue
+        if epilogue is not None and not (
+            tuple(epilogue[0].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[0].stride(1) == 1
+            and tuple(epilogue[2].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[2].stride(1) == 1
+        ):
+            epilogue = None
+        plain = early_merge is False and epilogue is None and not merge_h
+        draft_hilo = hilo and merge_h and not early and epilogue is None and plain_wait
+        # slot draft_gate_fold: that merge applies the offered attention output gate
+        gate_bf16 = self._gate_bf16
+        if gate_bf16 is not None and not (
+            draft_hilo
+            and gate_bf16.dtype == torch.bfloat16
+            and tuple(gate_bf16.shape) == (rows, self.hq * HEAD_DIM)
+            and gate_bf16.stride(1) == 1
+        ):
+            gate_bf16 = None
+        o_push = (
+            self.o_push
+            and pushed
+            and plain_wait
+            and early
+            and not plain
+            and not hl
+            and b <= 64
         )
+        hilo_nopush = bool(hilo_push) and draft_hilo and b <= 64
+        hilo_early = hilo_nopush and bool(hilo_early)
+        hilo_trig = hilo_early and bool(hilo_trig) and q_len == 1
+        if hilo_nopush:
+            o_push = True
+            if ("hilo_push", rows) not in self._logged:
+                self._logged.add(("hilo_push", rows))
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 slot draft_o_push: CP-lite's partial "
+                    "pushes the (O, LSE) and residual words of its precise merge at %d rows "
+                    "(merge %s)",
+                    rows,
+                    (
+                        "early, wait at its end, o_proj released at entry: options "
+                        "draft_merge_early, draft_hilo_trig"
+                        if hilo_trig
+                        else "early, wait at its end: option draft_merge_early"
+                    )
+                    if hilo_early
+                    else "after its wait",
+                )
+        elif hilo_push and ("hilo_push", rows) not in self._logged:
+            self._logged.add(("hilo_push", rows))
+            logger.warning(
+                "NVIDIA megakernel: Qwen3.5 slot draft_o_push: the call of %d rows is not "
+                "the precise multi-request call; its merge pushes",
+                rows,
+            )
+        if o_push and not hilo_nopush and ("o_push", rows) not in self._logged:
+            self._logged.add(("o_push", rows))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot cp_o_push: CP-lite's partial pushes "
+                "the (O, LSE) words of its merge at %d rows",
+                rows,
+            )
         self._exact_partial(
             k_cache,
             v_cache,
@@ -2007,20 +2825,29 @@ class CpLite:
             bmm2_scale,
             pdl=True,
             len_sub=q_len,
-            early_trigger=early,
+            early_trigger=early and not o_push,
+            o_push=o_push,
+            o_hilo=hilo,
+            p_hilo=p_hilo,
+            o_f16=f16,
+            # the precise draft merge after its wait: released at the partial's end
+            late_trigger=hilo_early or not hilo_nopush,
         )
-        out = torch.empty(
-            rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device
-        )
-        epilogue = self._gate_epilogue
-        if epilogue is not None and not (
-            tuple(epilogue[0].shape) == (rows, self.hq * HEAD_DIM)
-            and epilogue[0].stride(1) == 1
-            and tuple(epilogue[2].shape) == (rows, self.hq * HEAD_DIM)
-            and epilogue[2].stride(1) == 1
-        ):
-            epilogue = None
-        plain = early_merge is False and epilogue is None
+        if (hilo or p_hilo) and ("hilo", rows, f16, o_push) not in self._logged:
+            self._logged.add(("hilo", rows, f16, o_push))
+            logger.info(
+                "TRT-L1 CP-lite precise call at %d rows: two-term E4M3 P %s, BF16 + "
+                "residual partials %s, FP16 partials %s (partial pushes %s)",
+                rows,
+                p_hilo,
+                hilo,
+                f16,
+                o_push,
+            )
+        if out is None:
+            out = torch.empty(
+                rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device
+            )
         self._merge_h(
             q,
             k_cache,
@@ -2034,10 +2861,26 @@ class CpLite:
             out,
             {**gate, "thr": 0},
             pdl=True,
-            early=early,
+            early=early or hilo_early,
             plain=plain,
             gate_epilogue=epilogue,
+            plain_wait=plain_wait,
+            push_rot=pushed,
+            nopush=o_push,
+            hilo=hilo,
+            f16=f16,
+            gate_bf16=gate_bf16,
+            trig=hilo_trig,
         )
+        if gate_bf16 is not None:
+            self._gate_bf16_done = True
+            if ("gate_bf16", rows) not in self._logged:
+                self._logged.add(("gate_bf16", rows))
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 slot draft_gate_fold: CP-lite's precise "
+                    "merge applies the attention output gate at %d rows",
+                    rows,
+                )
         if epilogue is not None:
             self._gate_epilogue_done = True
             if ("gate_epilogue", rows) not in self._logged:
@@ -2065,6 +2908,13 @@ class CpLite:
         early=False,
         plain=False,
         gate_epilogue=None,
+        plain_wait=False,
+        push_rot=False,
+        nopush=False,
+        hilo=False,
+        f16=False,
+        gate_bf16=None,
+        trig=False,
     ):
         pdl = self.cp_pdl if pdl is None else pdl
         hq = self.hq
@@ -2082,6 +2932,53 @@ class CpLite:
         )
         merge_kernel = _cp_merge_h_ll_plain if plain else _cp_merge_h_ll
         merge_options = {} if plain else {"EARLY": early and pdl, **epilogue_args}
+        if (self.merge_cg or nopush) and early and pdl and not plain:
+            merge_options["CG"] = True
+        if nopush and not early:
+            assert hilo and pdl and plain_wait and not plain, (
+                "NOPUSH after the wait: the precise call's per-head merge"
+            )
+            merge_options["NOPUSH"] = True
+        elif nopush:
+            assert early and pdl and plain_wait and not plain, (
+                "NOPUSH: the early plain-wait merge"
+            )
+            merge_options.update(NOPUSH=True, MSLEEP=_PUSHED_MERGE_SLEEP_NS)
+        if hilo:
+            assert not plain and 2 * rows <= _MAX_ROWS, (
+                "HILO: the per-head merge, rows <= _MAX_ROWS / 2"
+            )
+            merge_options["HILO"] = True
+        if f16:
+            assert not plain and not hilo, "F16: the per-head merge, no residual words"
+            merge_options["F16"] = True
+        if trig:
+            assert hilo and early and nopush and pdl and not plain, (
+                "TRIG: the EARLY pushed precise merge"
+            )
+            merge_options["TRIG"] = True
+        if gate_bf16 is not None:
+            assert hilo and (not early or nopush) and gate_epilogue is None, (
+                "GATE_BF16: the precise call's per-head merge, the gate after its wait"
+            )
+            merge_options.update(
+                gate=gate_bf16, gate_stride=gate_bf16.stride(0), GATE_BF16=True
+            )
+        if plain_wait and not plain:
+            assert HEAD_DIM // 2 == 4 * 32, (
+                "PLAIN_WAIT needs one LL word a merge thread"
+            )
+            merge_options["PLAIN_WAIT"] = True
+            if push_rot:
+                # slot cp_q_push's call: the sources start their pushes on different members
+                merge_options["PUSH_ROT"] = True
+            if ("plain_wait", rows) not in self._logged:
+                self._logged.add(("plain_wait", rows))
+                logger.info(
+                    "NVIDIA megakernel: Qwen3.5 slot cp_merge_plain_wait polls "
+                    "CP-lite's merge with the plain wait at %d rows",
+                    rows,
+                )
         merge_kernel[(rows, hq)](
             self.po_x.view(torch.int32),
             self.pl_x.view(torch.int32),
@@ -2120,15 +3017,48 @@ class CpLite:
             num_warps=4,
             launch_pdl=pdl,
             **merge_options,
+            **_dl_args(),
         )
 
-    def _own_workspace(self):
-        """The overlapped trtllm-gen partial's workspace (the caller's belongs to the stock call)."""
-        if self._ws is None:
-            # the chunked fold partial's workspace grows with its rows (~0.23 MiB a row at q_len 7: 225 MiB at B128)
-            mb = 384 if self.fold_chunk else 128
-            self._ws = torch.empty(mb << 20, dtype=torch.uint8, device=self.device)
+    def _own_workspace(self, ncols: int = 0, q_len: int = 1):
+        capturing = (
+            self.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        )
+        need = self._fold_ws_bytes(ncols, q_len)
+        if self._ws is None or self._ws.numel() < need:
+            if self._ws is not None:
+                if capturing or self._ws_in_graph:
+                    self._ws_captured.append(self._ws)
+                elif self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+            self._ws = torch.empty(need, dtype=torch.uint8, device=self.device)
+            self._ws_in_graph = False
+            logger.info(
+                "CP-lite own trtllm-gen workspace: %.1f MiB (%d owned pages a request, q_len %d)",
+                need / (1 << 20),
+                ncols,
+                q_len,
+            )
+        self._ws_in_graph |= capturing
         return self._ws
+
+    def _fold_ws_bytes(self, ncols: int, q_len: int) -> int:
+        spec = self.fold_chunk_q1 if q_len == 1 else self.fold_chunk
+        key = (ncols, q_len, tuple(sorted(spec.items())))
+        if key not in self._ws_bytes:
+            rows = 0
+            for b in range(1, _MAX_ROWS // q_len + 1):
+                c = self._chunk_cols(b, q_len)
+                k = ncols // c if c and ncols > c and ncols % c == 0 else 1
+                rows = max(rows, b * k)
+            heads = q_len * self.cp * self.hq
+            self._ws_bytes[key] = _lse_workspace_bytes(rows, heads, self.sms)
+        return self._ws_bytes[key]
+
+    def _chunk_cols(self, b: int, q_len: int) -> int:
+        spec = self.fold_chunk_q1 if q_len == 1 else self.fold_chunk
+        keys = [k for k in spec if k <= b]
+        return spec[max(keys)] if keys else 0
 
     def _fold_partial(
         self,
@@ -2205,7 +3135,7 @@ class CpLite:
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=qv,
             kv_cache=(k_cache, v_cache),
-            workspace_buffer=self._own_workspace(),
+            workspace_buffer=self._own_workspace(tab.shape[1], q_len),
             block_tables=vtab,
             seq_lens=vlens,
             max_seq_len=C * PAGE,
@@ -2227,9 +3157,7 @@ class CpLite:
         Draft calls use their own chunk policy. Ragged batches clear the one-row
         lengths and use dense ``[B * K, C]`` chunk rows instead.
         """
-        spec = self.fold_chunk_q1 if q_len == 1 else self.fold_chunk
-        keys = [k for k in spec if k <= b]
-        C = spec[max(keys)] if keys else 0
+        C = self._chunk_cols(b, q_len)
         ncols = tab.shape[1]
         if not C or ncols <= C or ncols % C:
             return None
@@ -2323,6 +3251,7 @@ class CpLite:
             PG=PAGE,
             NWP=_LL_PWORDS,
             num_warps=8,
+            **_dl_args(),
         )
         return out
 
@@ -2392,6 +3321,7 @@ class CpLite:
                     "CHUNK": True,
                 }
             ),
+            **_dl_args(),
         )
         return out
 
@@ -2409,10 +3339,25 @@ class CpLite:
         pdl=False,
         len_sub=0,
         early_trigger=False,
+        o_push=False,
+        o_hilo=False,
+        p_hilo=False,
+        o_f16=False,
+        late_trigger=True,
     ):
         from sgl_nvidia_mega.qwen3_5.sm103.attention import q35_cp_fused as F
 
         cp, hq = self.cp, self.hq
+        push = {}
+        if o_push:
+            push = dict(
+                o_push=True,
+                ll=self._ll_tab(),
+                cnt_h=self.cnt_h,
+                ql_real=q_len,
+                hq_real=hq,
+                late_trigger=bool(late_trigger),
+            )
         F.q35_cp_fused_partial(
             self.q_all[:rows].view(b, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
             k_cache,
@@ -2432,7 +3377,19 @@ class CpLite:
             rescale_threshold=_EXACT_RESCALE_THRESHOLD,
             len_sub=len_sub,
             early_trigger=early_trigger,
+            **push,
+            **({"o_hilo": True} if o_hilo else {}),
+            **({"p_hilo": True} if p_hilo else {}),
+            **({"o_f16": True} if o_f16 else {}),
         )
+
+    def _ll_tab(self) -> torch.Tensor:
+        if self._ll_tab_t is None:
+            assert self.cp <= 4
+            t = torch.zeros(4, dtype=torch.int64, device=self.device)
+            t[: self.cp] = self.peers + self.llh_off
+            self._ll_tab_t = t
+        return self._ll_tab_t
 
     def _exact_merge(
         self,
@@ -2485,6 +3442,7 @@ class CpLite:
             PG=PAGE,
             NWP=_LL_PWORDS,
             num_warps=8,
+            **_dl_args(),
         )
         return out
 
@@ -2538,5 +3496,6 @@ class CpLite:
             D=HEAD_DIM,
             NWP=_LL_PWORDS,
             num_warps=8,
+            **_dl_args(),
         )
         return out

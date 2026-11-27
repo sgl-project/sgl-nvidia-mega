@@ -26,12 +26,28 @@
 
 namespace sglang {
 
+#ifndef TOP1_THREADS
+#define TOP1_THREADS 256
+#endif
+#ifndef TOP1_VEC
+#define TOP1_VEC 8
+#endif
+#ifndef TOP1_P2P
+#define TOP1_P2P 0
+#endif
+#ifndef TOP1_LEAN
+#define TOP1_LEAN 0
+#endif
+
 namespace draft_top1 {
 
 inline constexpr int kSlots = 3;
 inline constexpr int kMaxRows = 128;  // the draft graphs' widest batch
-inline constexpr int kThreads = 256;
-inline constexpr int kVec = 8;  // bf16 per 16-byte load
+inline constexpr int kThreads = TOP1_THREADS;
+inline constexpr int kVec = TOP1_VEC;
+inline constexpr int kLoad = 8;        // bf16 per 16-byte load
+static_assert(kVec % kLoad == 0, "whole 16-byte loads");
+static_assert(kThreads % 32 == 0 && kThreads >= 32 && kThreads <= 1024, "whole warps");
 inline constexpr uint32_t kSpinLimit = 1u << 27;
 
 SGL_DEVICE uint32_t value_key(float v, uint32_t nan_key) {
@@ -52,6 +68,17 @@ SGL_DEVICE uint64_t max64(uint64_t a, uint64_t b) {
 SGL_DEVICE void mc_store(uint64_t* addr, uint32_t payload, uint32_t tag) {
   const uint64_t w = static_cast<uint64_t>(payload) | (static_cast<uint64_t>(tag) << 32);
   asm volatile("multimem.st.relaxed.sys.global.b64 [%0], %1;" ::"l"(addr), "l"(w) : "memory");
+}
+
+SGL_DEVICE void p2p_store(uint64_t* addr, uint32_t payload, uint32_t tag) {
+  const uint64_t w = static_cast<uint64_t>(payload) | (static_cast<uint64_t>(tag) << 32);
+  asm volatile("st.relaxed.sys.global.b64 [%0], %1;" ::"l"(addr), "l"(w) : "memory");
+}
+
+SGL_DEVICE uint32_t ticket_acq_rel(uint32_t* addr) {
+  uint32_t old;
+  asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], 1;" : "=r"(old) : "l"(addr) : "memory");
+  return old;
 }
 
 SGL_DEVICE uint32_t poll(const uint64_t* src, uint32_t tag) {
@@ -86,6 +113,9 @@ struct DraftTop1Params {
   int32_t column;
   int32_t rank;
   uint32_t nan_key;
+#if TOP1_P2P
+  uint64_t* peers[8];
+#endif
 };
 
 // grid (chunks, m): chunk c of row r scans columns [c * kThreads * kVec, ...) of the row.
@@ -93,7 +123,7 @@ template <int kWorld>
 SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
   using namespace device;
   using namespace draft_top1;
-  using vec_t = AlignedVector<bf16_t, kVec>;
+  using vec_t = AlignedVector<bf16_t, kLoad>;
   constexpr int kWarps = kThreads / kWarpThreads;
   __shared__ uint64_t s_red[kWarps];
   __shared__ bool s_last;
@@ -101,24 +131,40 @@ SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
   const int row = static_cast<int>(blockIdx.y);
   const int chunk = static_cast<int>(blockIdx.x);
   const int span = kThreads * kVec;
-  const int col0 = chunk * span + static_cast<int>(threadIdx.x) * kVec;
+  const int base = chunk * span + static_cast<int>(threadIdx.x) * kLoad;
+  constexpr int kStep = kThreads * kLoad;
   const int ids_end = min(p.vocab_local, p.vocab_size - p.vocab_start);
   const bf16_t* src = p.logits + static_cast<int64_t>(row) * p.row_stride;
 
+  __shared__ uint32_t s_tag;
   PDLWaitPrimary<true>();
+#if TOP1_LEAN
+  if (threadIdx.x == 0) {
+    uint32_t e;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(e) : "l"(p.epoch) : "memory");
+    s_tag = e;
+  }
+#endif
   uint64_t best = 0;
-  if (col0 + kVec <= ids_end && (p.row_stride % kVec) == 0) {
-    vec_t v;
-    v.load(src + col0);
+  if (base + (kVec / kLoad - 1) * kStep + kLoad <= ids_end && (p.row_stride % kLoad) == 0) {
+    vec_t v[kVec / kLoad];
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) {
-      best = max64(best, pack(value_key(cast<fp32_t>(v[j]), p.nan_key),
-                              static_cast<uint32_t>(p.vocab_start + col0 + j)));
+    for (int l = 0; l < kVec / kLoad; ++l) v[l].load(src + base + l * kStep);
+#pragma unroll
+    for (int l = 0; l < kVec / kLoad; ++l) {
+#pragma unroll
+      for (int j = 0; j < kLoad; ++j) {
+        best = max64(best, pack(value_key(cast<fp32_t>(v[l][j]), p.nan_key),
+                                static_cast<uint32_t>(p.vocab_start + base + l * kStep + j)));
+      }
     }
   } else {
-    for (int j = 0; j < kVec && col0 + j < ids_end; ++j) {
-      best = max64(best, pack(value_key(cast<fp32_t>(src[col0 + j]), p.nan_key),
-                              static_cast<uint32_t>(p.vocab_start + col0 + j)));
+    for (int l = 0; l < kVec / kLoad; ++l) {
+      const int c0 = base + l * kStep;
+      for (int j = 0; j < kLoad && c0 + j < ids_end; ++j) {
+        best = max64(best, pack(value_key(cast<fp32_t>(src[c0 + j]), p.nan_key),
+                                static_cast<uint32_t>(p.vocab_start + c0 + j)));
+      }
     }
   }
 #pragma unroll
@@ -133,30 +179,57 @@ SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
 #pragma unroll
     for (int w = 1; w < kWarps; ++w) b = max64(b, s_red[w]);
     atomicMax(p.keys + row, static_cast<unsigned long long>(b));
-    __threadfence();
     const uint32_t total = gridDim.x * gridDim.y;
+#if TOP1_LEAN
+    s_last = ticket_acq_rel(p.epoch + 1) == total - 1;
+#else
+    __threadfence();
     s_last = atomicAdd(p.epoch + 1, 1u) == total - 1;
+#endif
   }
   __syncthreads();
   if (!s_last) return;
 
   // the last CTA: this rank's row keys -> every rank, then the largest key of each row
-  __shared__ uint32_t s_tag;
+#if !TOP1_LEAN
   if (threadIdx.x == 0) {
     __threadfence();
     s_tag = *reinterpret_cast<volatile uint32_t*>(p.epoch);
   }
   __syncthreads();
+#endif
   const uint32_t tag = s_tag;
   const int64_t slot = static_cast<int64_t>(tag % kSlots);
-  const int t = static_cast<int>(threadIdx.x);
-  if (t < p.m) {
+  // one thread a row (a CTA narrower than kMaxRows loops over the rows)
+#if TOP1_THREADS >= 128
+#define TOP1_FOR_ROWS(t) if (const int t = static_cast<int>(threadIdx.x); t < p.m)
+#else
+#define TOP1_FOR_ROWS(t) for (int t = static_cast<int>(threadIdx.x); t < p.m; t += kThreads)
+#endif
+  TOP1_FOR_ROWS(t) {
     const uint64_t k = atomicExch(p.keys + t, 0ull);  // read the fold and leave it zero
-    uint64_t* dst = p.mc + ((slot * kWorld + p.rank) * kMaxRows + t) * 2;
+    const int64_t off = ((slot * kWorld + p.rank) * kMaxRows + t) * 2;
+#if TOP1_P2P
+#pragma unroll
+    for (int r = 0; r < kWorld; ++r) {
+      p2p_store(p.peers[r] + off, static_cast<uint32_t>(k), tag);
+      p2p_store(p.peers[r] + off + 1, static_cast<uint32_t>(k >> 32), tag);
+    }
+#else
+    uint64_t* dst = p.mc + off;
     mc_store(dst, static_cast<uint32_t>(k), tag);
     mc_store(dst + 1, static_cast<uint32_t>(k >> 32), tag);
+#endif
   }
-  if (t < p.m) {
+  TOP1_FOR_ROWS(t) {
+#if TOP1_LEAN
+    const int64_t pos0 = p.positions != nullptr ? p.positions[t] : 0;
+    int64_t mr0[3] = {0, 0, 0};
+    if (p.mrope != nullptr) {
+#pragma unroll
+      for (int a = 0; a < 3; ++a) mr0[a] = p.mrope[a * p.mrope_stride + t];
+    }
+#endif
     // every rank's two words of this row in flight together, then each re-polled only while its tag
     // is stale: the keys that already landed cost one round trip, not one each
     uint64_t v[2 * kWorld];
@@ -177,12 +250,21 @@ SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
     const int64_t id = static_cast<int64_t>(0xFFFFFFFFu - static_cast<uint32_t>(win));
     p.tokens[t * p.tokens_stride + p.column] = id;
     if (p.topk_p != nullptr) p.topk_p[t] = 1.0f;
+#if TOP1_LEAN
+    if (p.positions != nullptr) p.positions[t] = pos0 + 1;
+    if (p.mrope != nullptr) {
+#pragma unroll
+      for (int a = 0; a < 3; ++a) p.mrope[a * p.mrope_stride + t] = mr0[a] + 1;
+    }
+#else
     if (p.positions != nullptr) p.positions[t] += 1;
     if (p.mrope != nullptr) {
 #pragma unroll
       for (int a = 0; a < 3; ++a) p.mrope[a * p.mrope_stride + t] += 1;
     }
+#endif
   }
+#undef TOP1_FOR_ROWS
   __syncthreads();
   if (threadIdx.x == 0) {
     p.epoch[1] = 0u;
@@ -194,6 +276,6 @@ SGL_DEVICE void draft_top1_xchg_kernel(const DraftTop1Params& p) {
 
 using sglang::DraftTop1Params;
 
-extern "C" __global__ void __launch_bounds__(256) draft_top1_xchg(const DraftTop1Params __grid_constant__ p) {
+extern "C" __global__ void __launch_bounds__(TOP1_THREADS) draft_top1_xchg(const DraftTop1Params __grid_constant__ p) {
   sglang::draft_top1_xchg_kernel<MKD_WORLD>(p);
 }

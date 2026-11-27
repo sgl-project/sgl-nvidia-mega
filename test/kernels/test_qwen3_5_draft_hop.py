@@ -169,14 +169,9 @@ def test_draft_hop_rounding(rank, draft):
     world = torch.distributed.get_world_size()
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     hop = draft.hop
-    calls = [
-        (m, add_norm, early)
-        for m in (1, 2, 7)
-        for add_norm in (False, True)
-        for early in (False, True)
-    ]
+    calls = [(m, early) for m in (1, 2, 7) for early in (False, True)]
     with torch.inference_mode():
-        for i, (m, add_norm, early) in enumerate(calls):
+        for i, (m, early) in enumerate(calls):
             x = _operands(m, device, rank, seed=i)
             norm = _Norm(x["weight"])
             summed = _rank_sum(x["partial"])
@@ -186,24 +181,14 @@ def test_draft_hop_rounding(rank, draft):
                 hop,
                 local_contribution=x["partial"],
                 residual=x["residual"],
-                gamma=norm.weight if add_norm else norm.gemma_weight,
+                gamma=norm.weight,
                 eps=EPS,
-                weight_bias=1.0 if add_norm else 0.0,
-                add_norm=add_norm,
+                weight_bias=1.0,
                 early_release=early,
             )
-            if add_norm:
-                want_x, want_r = summed.clone(), x["residual"].clone()
-                gemma_fused_add_rmsnorm(want_x, want_r, norm.weight, EPS)
-                _same(got, (want_x, want_r))
-            else:
-                pre = summed + x["residual"]  # bf16 add, as __hadd
-                _same(got[1:], (pre,))
-                f = pre.float()
-                ref = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + EPS)
-                ref = (ref * norm.gemma_weight.float()).bfloat16().float()
-                # bf16 squares and an approximate rsqrt: at most one bf16 ulp off
-                assert ((got[0].float() - ref).abs() <= ref.abs() * 2**-7).all()
+            want_x, want_r = summed.clone(), x["residual"].clone()
+            gemma_fused_add_rmsnorm(want_x, want_r, norm.weight, EPS)
+            _same(got, (want_x, want_r))
             # the decode hop's own hop in between keeps the stage order shared
             y = _operands(m, device, rank, seed=1000 + i)
             hop.all_reduce_residual_rms_norm(
@@ -230,10 +215,9 @@ def test_draft_gemv_and_push(rank, draft):
                 draft.hop,
                 local_contribution=plain,
                 residual=x["residual"],
-                gamma=norm.gemma_weight,
+                gamma=norm.weight,
                 eps=EPS,
-                weight_bias=0.0,
-                add_norm=False,
+                weight_bias=1.0,
             )
             pushed = draft.o_proj(x["attn"], x["o_proj"])  # pushes into the hop
             assert draft.has_pushed(pushed)
@@ -299,7 +283,6 @@ def test_draft_step_replays_from_a_cuda_graph(rank, draft):
                 fresh = _operands(1, device, rank, seed=400 + 10 * replay + i)
                 for name, tensor in x.items():
                     tensor.copy_(fresh[name])
-                norms[i].gemma_weight.copy_(torch.add(x["weight"], 1.0))
             graph.replay()
             for x, norm, got in zip(static, norms, outputs):
                 _same(got, step(x, norm))

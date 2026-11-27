@@ -132,3 +132,24 @@ The stamps cost about 18 us per step (client step p50 with them on vs off, 2 + 2
 launches, 95 % [12, 24]), the same in both arms; an A/B that changes the boundary between
 the plugin's forward and SGLang's code may interact with it, so check such a result on
 the client's p50 too (`--no-stamps`).
+
+## Qwen3.5 BT tail (slot bt_tail)
+
+`bench_qwen3_5_bt_tail.py` times slot `bt_tail` against SGLang's FlashInfer MNNVL CuTe
+DSL fusion on one node (one rank per GPU), at verify widths where both boundary points
+run FlashInfer's BT protocol. Each arm is a CUDA graph of 30 layers with distinct
+inputs, replayed 50 times; the reported time is the max over ranks of each rank's
+median, per point (`hop`) or per layer (`layer`), over ABBA rounds of the arms.
+
+```
+torchrun --nproc_per_node 4 benchmark/bench_qwen3_5_bt_tail.py --rows 42,56,84 --out bt_tail.json
+```
+
+- `hop`: the two points alternated, each one's residual output the next one's residual:
+  `stock`, `tail`, `tail_fp8` (with the finalize's FP8 output). Their difference is
+  the third launch's cost.
+- `layer`: each point followed by the GEMM that reads its norm at TP8's shapes (the
+  finalize by in_proj_qkvz: SGLang's static FP8 quantize + FlashInfer's BMM, or the BMM
+  on the tail's FP8; the all-reduce by the router GEMM): `stock`, `tail_fp8`,
+  `tail_fp8_early` (the all-reduce's tail releases the router at its wait),
+  `tail_fp8_early2` (both tails do).

@@ -82,7 +82,18 @@ SGLANG_MIRRORS = {
     # this module mirrors is unchanged by the dispatch around the fixed-q-length call.
     # sgl-project/sglang#53185/#53249/#53314 size its trtllm-gen max_seq_len from the
     # req_to_token row width (max_kv_len); this module passes no max_seq_len of its own.
-    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": "4e969397e09f4fed",
+    "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend.forward_extend": (
+        "8e36076dafabff66",
+        "1445b85387928caf",
+        "d7e7c1fe125739e6",
+        "066a1e0aa5bd6e5c",
+        "10bd9120d713848b",
+        "37c7c1fa55956740",
+        "1445b85387928caf",
+        "9ddde6d7d3f6d4be",
+        "e942a907f0f10d78",
+        "4e969397e09f4fed",
+    ),
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._should_use_fused_fp8_path": "e0b14791d523a019",
     "srt/layers/attention/trtllm_mha_backend.py:TRTLLMHAAttnBackend._fused_fp8_qkv_kv_cache": (
         "363661c3585e6a0f",
@@ -99,6 +110,9 @@ _PLANS: dict = {}
 _ONES: dict = {}
 # the rows the slot has run at, by route (each logged once, as engagement evidence)
 _ENGAGED: set = set()
+Q1_MAX_REQUESTS = 64
+# the q_len-1 widths cp_core declined (each warned once)
+_REFUSED: set = set()
 
 
 def unsupported(attn, tokens_per_request: int) -> str:
@@ -186,6 +200,8 @@ def core(attn, q, st):
             st.fb,
             ROWS,
             min_bs=None,
+            p2f16=True,
+            **merge_options(),
         )
         if o is not None:
             key = (route.SPLIT_KV_CP, q.shape[0])
@@ -219,7 +235,7 @@ def core(attn, q, st):
     if label == route.SPLIT_KV_STOCK:
         return attn(q, None, None, st.fb)
     if label == route.SPLIT_KV_CP:
-        o = cp_core(attn, q, st.view.kv, st.view.attn, st.fb, ROWS)
+        o = cp_core(attn, q, st.view.kv, st.view.attn, st.fb, ROWS, precise=True)
         if o is not None:
             return o
     return skv2(attn, q, st.view.kv, st.view.attn)
@@ -242,6 +258,12 @@ def cp_multi(rows: int) -> bool:
     )
 
 
+def merge_options() -> dict:
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+
+    return {"plain_wait": True} if "cp_merge_plain_wait" in SLOTS else {}
+
+
 def cp_reason() -> str:
     """Why the CP graph variants cannot run ("" when they can)."""
     return "" if cp_lite() is not None else "the plugin did not build CP-lite"
@@ -256,6 +278,14 @@ def cp_core(
     q_len: int,
     min_bs: int | None = 1,
     early_merge: bool | None = None,
+    plain_wait: bool = False,
+    merge_h: bool = False,
+    pad_rows: bool = False,
+    precise: bool = False,
+    p2f16: bool = False,
+    hilo_push: bool = False,
+    hilo_early: bool = False,
+    hilo_trig: bool = False,
 ):
     """CP-lite on requests of ``q_len`` FP8 query rows over the pool ``kv``:
     [rows, heads * head_dim] bf16, or None where CP-lite declines. ``min_bs`` overrides
@@ -263,6 +293,8 @@ def cp_core(
     the configured gate for a multi-request graph. ``early_merge=False`` restores the
     R11 plain merge for both exact and fold paths when no fused gate epilogue was
     offered; ``None`` preserves CP-lite's default."""
+    if refuses_q1(int(meta.cache_seqlens.shape[0]), q_len):
+        return None
     from sglang.kernels.ops.attention.utils import canonicalize_stride
     from sglang.srt.layers.attention.trtllm_mha_backend import (
         DEFAULT_WORKSPACE_SIZE_MB,
@@ -287,6 +319,33 @@ def cp_core(
         ),
     )
     options = {} if early_merge is None else {"early_merge": early_merge}
+    if plain_wait:
+        options["plain_wait"] = True
+    if merge_h:
+        options["merge_h"] = True
+    if precise:
+        options["precise"] = True
+    if p2f16:
+        options["p2f16"] = True
+    if hilo_push:
+        options["hilo_push"] = True
+    if hilo_early:
+        options["hilo_early"] = True
+    if hilo_trig:
+        options["hilo_trig"] = True
+    rows, real = q.shape[0], meta.cache_seqlens.shape[0] * q_len
+    if rows < real:
+        return None
+    full = None
+    if rows > real:
+        if not pad_rows:
+            return None
+        q = q[:real]
+        width = attn.tp_q_head_num * attn.head_dim
+        full = torch.empty(rows, width, dtype=torch.bfloat16, device=q.device)
+        full[real:].zero_()
+        options["out"] = full[:real].view(real, attn.tp_q_head_num, attn.head_dim)
+        _pad_epilogue(cp, rows, real)
     o = cp.attend(
         q.reshape(-1, attn.tp_q_head_num, attn.head_dim),
         caches,
@@ -301,14 +360,49 @@ def cp_core(
         min_bs=min_bs,
         **options,
     )
-    return None if o is None else o.view(-1, attn.tp_q_head_num * attn.head_dim)
+    if o is None:
+        return None
+    if full is not None:
+        if (real, rows) not in _ENGAGED:
+            _ENGAGED.add((real, rows))
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 CP-lite serves %d of %d rows (%d requests x "
+                "%d); the pad rows are zero",
+                real,
+                rows,
+                real // q_len,
+                q_len,
+            )
+        return full
+    return o.view(-1, attn.tp_q_head_num * attn.head_dim)
+
+
+def _pad_epilogue(cp, rows: int, real: int) -> None:
+    epilogue = cp._gate_epilogue
+    if epilogue is None:
+        return
+    gate, scale, out = epilogue
+    if gate.shape[0] != rows or out.shape[0] != rows:
+        return
+    out[real:].zero_()
+    cp.offer_gate_epilogue(gate[:real], scale, out[:real])
+
+
+def refuses_q1(requests: int, q_len: int) -> bool:
+    if q_len != 1 or requests <= Q1_MAX_REQUESTS:
+        return False
+    if requests not in _REFUSED:
+        _REFUSED.add(requests)
+        logger.warning(
+            "NVIDIA megakernel: Qwen3.5 CP-lite refuses %d requests x 1 row (its one-row "
+            "calls stop at %d requests); the stock attention serves the call",
+            requests,
+            Q1_MAX_REQUESTS,
+        )
+    return True
 
 
 def skv2(attn, q, kv, meta):
-    """SKV2 on one request's 7 FP8 query rows ``q`` of ``attn`` over the pool ``kv``
-    (KvPoolBuffers) at ``meta``'s pages and lengths (AttnStepMetadata), whose rows for
-    this step are written: [rows, heads * head_dim] in bf16. The draft extend's
-    attention (``EXTEND``'s route) runs it on the draft's pool too."""
     from sglang.kernels.ops.attention.utils import canonicalize_stride
 
     from sgl_nvidia_mega.qwen3_5.sm103.attention.skv2 import StockSplitPlan

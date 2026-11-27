@@ -82,6 +82,34 @@ SGLANG_READS = {
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
         "tokens_per_request",
         "mamba",
+        "conv",
+        "intermediate_conv_window",
+        "ring_d",
+        "ring_write_pos",
+        "ring_cache_base",
+        "ring_is_flush",
+    ),
+    # SupportsRecurrentCommit / SupportsStateSlotReset of the fold build
+    "kernels/plugin_kernels/nvidia/spec.py": (
+        "commit_recurrent_state",
+        "track_slots",
+        "request_rows",
+        "accept_lens",
+        "last_step",
+        "state_slots",
+        "src_indices_raw",
+        "state_bytes_per_slot",
+        "state_bytes_per_request_row",
+        "keeps_draft_ssm",
+        "tracks_decode_state",
+        "backs_up_state",
+        "reset_state_slots",
+    ),
+    "kernels/ops/attention/linear/gdn_replayssm_spec_decode.py": (
+        "commit_gdn_replayssm_spec",
+    ),
+    "kernels/ops/mamba/mamba_state_scatter_triton.py": (
+        "fused_conv_window_scatter_with_mask",
     ),
 }
 
@@ -108,6 +136,18 @@ class Qwen35Verify:
     draft_extend = None
     begin_draft_round = None
 
+    def plan_body(self, input_ids, forward_batch, *args, **kwargs):
+        return None
+
+    def forward_body(self, step, original, *args, **kwargs):
+        return original(*args, **kwargs)
+
+    def linear_prefill_graph_seqs(self, backend):
+        return None
+
+    def refill_prefill_graph(self, metadata, forward_batch):
+        return None
+
     def __init__(
         self,
         lm,
@@ -118,6 +158,7 @@ class Qwen35Verify:
         summary: str = "",
         parity=None,
         speculative_runtime_hooks=None,
+        recurrent_commit=None,
     ):
         from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
 
@@ -129,6 +170,9 @@ class Qwen35Verify:
         # A factory over SGLang's stock strategy, or None.  The binding reads this
         # optional BuiltMegakernel member once when it wires speculative verify.
         self.speculative_runtime_hooks = speculative_runtime_hooks
+        self.recurrent_commit = recurrent_commit
+        if recurrent_commit is not None:
+            self.commit_recurrent_state = recurrent_commit
         # the attention graph variants per SGLang runner ("target_verify"), which it
         # captures once it takes a megakernel's (attention/route.py)
         self.graph_variants = (
@@ -202,6 +246,10 @@ class Qwen35Verify:
             reasons = gdn.verify.core_pool_reasons(view.mamba)
             if reasons:
                 raise RuntimeError(slot_failure("gdn_core", "; ".join(reasons)))
+        if any(s.gdn_conv_core for s in self.slots.values()):
+            reasons = gdn.verify.conv_core_pool_reasons(view.mamba)
+            if reasons:
+                raise RuntimeError(slot_failure("gdn_conv_core", "; ".join(reasons)))
         if any(s.gdn_front for s in self.slots.values()):
             from sgl_nvidia_mega.qwen3_5.gdn import front
 
@@ -213,6 +261,8 @@ class Qwen35Verify:
                 view.mamba,
                 trt=any(s.gdn_trt_front for s in self.slots.values()),
             )
+        if any(s.bt_tail for s in self.slots.values()):
+            self.bound["boundary"].bt.bind()
         skv2 = any(s.skv2 for s in self.slots.values())
         mka = any(s.mka for s in self.slots.values())
         if skv2 or mka:
@@ -224,6 +274,8 @@ class Qwen35Verify:
                         "; ".join(reasons),
                     )
                 )
+        if self.recurrent_commit is not None:
+            self.recurrent_commit.bind(view.mamba)
         self._pools_checked = True
 
     @torch.no_grad()
@@ -279,3 +331,64 @@ class Qwen35Verify:
         with boundary.ffn_exit(layer, st) as ffn_exit:
             out = moe.step(layer, x, st, defer=ffn_exit.defer_moe_finalize)
         return ffn_exit.finish(out)
+
+
+class Qwen35FoldVerify(Qwen35Verify):
+    state_bytes_per_slot = 0
+    state_bytes_per_request_row = 0
+    keeps_draft_ssm = True
+    tracks_decode_state = True
+    backs_up_state = False
+
+    _mamba = None
+
+    def reset_state_slots(self, slots, request_rows) -> None:
+        return None
+
+    def plan(self, input_ids, forward_batch, *args, **kwargs) -> Step | None:
+        step = super().plan(input_ids, forward_batch, *args, **kwargs)
+        if step is None and forward_batch.forward_mode.is_target_verify():
+            raise RuntimeError(
+                "NVIDIA megakernel: Qwen3.5 slot gdn_commit_fold: a target verify of "
+                f"{int(input_ids.shape[0])} rows is not covered (widths "
+                f"{list(self.widths)}), and SGLang's verify cannot read the folded ring"
+            )
+        return step
+
+    def _check_pools(self, view):
+        super()._check_pools(view)
+        self._mamba = view.mamba
+
+    def commit_recurrent_state(self, io) -> bool:
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_spec,
+        )
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_conv_window_scatter_with_mask,
+        )
+
+        if io.track_slots is not None:
+            return False
+        pools = self._mamba
+        if pools is None:
+            raise RuntimeError(
+                "NVIDIA megakernel: Qwen3.5 slot gdn_commit_fold: a commit before any "
+                "covered verify"
+            )
+        commit_gdn_replayssm_spec(
+            write_pos=pools.ring_write_pos,
+            cache_base=pools.ring_cache_base,
+            is_flush=pools.ring_is_flush,
+            num_accepted=io.accept_lens,
+            replay_indices=io.request_rows,
+            state_batch_indices=io.state_slots,
+            max_cache_len=pools.ring_d.shape[-2],
+            max_spec_len=None,
+            fold_every_commit=True,
+            null_block_id=-1,
+        )
+        for conv, windows in zip(pools.conv, pools.intermediate_conv_window):
+            fused_conv_window_scatter_with_mask(
+                conv, windows, io.state_slots, io.last_step, io.src_indices_raw
+            )
+        return True

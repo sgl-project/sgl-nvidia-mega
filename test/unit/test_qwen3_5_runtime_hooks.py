@@ -166,6 +166,8 @@ def test_build_collects_descriptors_then_prebuilds_exact_local_shard(monkeypatch
                 "valid": 4,
                 "vocab_size": 8,
                 "splits": 2,
+                "fast": False,
+                "pre": False,
             },
         )
     ]
@@ -220,6 +222,8 @@ def test_padded_columns_keep_splits_uniform_across_an_uneven_valid_tail(monkeypa
                 "valid": tail,
                 "vocab_size": vocab_size,
                 "splits": 4,
+                "fast": False,
+                "pre": False,
             },
         )
     ]
@@ -480,3 +484,6 @@ def test_failure_after_rng_is_hard_and_does_not_set_engagement(monkeypatch, capl
         assert "slot sharded_gumbel runs" not in caplog.text
         local(view)
     assert caplog.text.count("slot sharded_gumbel runs at 2 rows") == 1
+
+
+# ------------------------------------------------------------- slot gathered_cdf

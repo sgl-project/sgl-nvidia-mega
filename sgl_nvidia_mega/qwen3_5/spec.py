@@ -130,6 +130,14 @@ NUMERIC_TOLERANCES = {
     "sharded_gumbel": {
         "sharded_gumbel.categorical.chi_square_p_value_min": 1e-4,
     },
+    # Another noise stream (four draws per Philox call), the same categorical law.
+    "gumbel_fast": {"gumbel_fast.categorical.chi_square_p_value_min": 1e-4},
+    # An empty row: the slot changes the arithmetic; no bound is stated here.
+    "verify_head": {},
+    # gumbel_fast's keys on the head's logits, from the head's own per-round seeds.
+    "verify_head_keys": {
+        "verify_head_keys.categorical.chi_square_p_value_min": 1e-4,
+    },
     # Same FP8 norm bound as v2 gdn_core; output-store layout can change the
     # FP32 reduction and the final BF16 rounding at a midpoint.
     "gdn_verify": {"gdn_verify.norm_fp8.rel_l2_vs_stock": 2e-2},
@@ -137,6 +145,8 @@ NUMERIC_TOLERANCES = {
     "route": {"route.router_logits.bf16_ulp_vs_stock": 1.0},
     # The tiled router front stays within one BF16 ULP of SGLang's whole-M GEMM.
     "route_gemm": {"route_gemm.router_logits.bf16_ulp_vs_stock": 1.0},
+    "route_big_gemm": {},
+    "route_big_mid": {},
     "gdn_push": {
         "gdn_push.out_proj.rel_l2_vs_stock": 1.05,
         "gdn_push.out_proj.max_abs_vs_stock": 2.0,
@@ -162,13 +172,23 @@ NUMERIC_TOLERANCES = {
         "gdn_core.ring_k.rel_l2_vs_gdn_verify": 1e-5,
         "gdn_core.ring_g.max_abs_vs_gdn_verify": 1e-5,
     },
+    "gdn_core_tc": {
+        "gdn_core_tc.replay.rel_l2_vs_gdn_verify": 4e-3,
+        "gdn_core_tc.norm_fp8.rel_l2_vs_gdn_verify": 2e-2,
+        "gdn_core_tc.ring_d.rel_l2_vs_gdn_verify": 5e-3,
+        "gdn_core_tc.ring_k.rel_l2_vs_gdn_verify": 1e-5,
+        "gdn_core_tc.ring_g.max_abs_vs_gdn_verify": 1e-5,
+    },
+    "gdn_commit_fold": {
+        "gdn_commit_fold.checkpoint.bf16_equal_fraction_min": 0.99,
+    },
+    "gathered_cdf": {
+        "gathered_cdf.categorical.chi_square_p_value_min": 1e-4,
+    },
     "route_shared": {
         "route_shared.gate_up.rel_l2_vs_stock": 1.05,
         "route_shared.gate_up.max_abs_vs_stock": 2.0,
     },
-    # The hidden, norm, FP8 and NVFP4 paths are bitwise; only the router partial's
-    # FP32 reduction order changes. Its RMS error stayed within 1.05x stock against
-    # FP64 on the same quantized operands (the TP8 GDN and attention tests).
     "route_lin": {
         "route_lin.router_logits.rms_vs_fp64_relative_to_stock": 1.05,
     },
@@ -178,7 +198,7 @@ NUMERIC_TOLERANCES = {
     "skv2_cp": {"skv2_cp.attention.rel_l2_vs_stock": 2.0},
     "draft_q1_cp": {"draft_q1_cp.attention.rel_l2_vs_stock": 2.0},
     "draft_skv2_cp": {"draft_skv2_cp.attention.rel_l2_vs_stock": 2.0},
-    # MKA's own qkv / o_proj GEMMs; the GEMM slots' bounds, no fp64 kernel test yet
+    "draft_cp": {},
     "mka": {
         "mka.qkv_proj.rel_l2_vs_stock": 1.05,
         "mka.qkv_proj.max_abs_vs_stock": 2.0,
@@ -196,10 +216,39 @@ NUMERIC_TOLERANCES = {
         "lowm_out.o_proj.rel_max_vs_stock": 1.05,
     },
     "lowm_se": {"lowm_se.shared_expert.rel_l2_vs_stock": 2e-2},
+    "lowm_se_tep8": {},
+    "lowm_se_wide": {},
+    "lowm_ba": {},
     # the pushed partial is lowm_out's; the all-reduce that consumes it is the fusion's (test_qwen3_5_hop.py)
     "lowm_push": {
         "lowm_push.out_proj.rel_max_vs_stock": 1.05,
         "lowm_push.o_proj.rel_max_vs_stock": 1.05,
+    },
+    "gdn_commit": {},
+    "attn_prefill_qk_rows": {
+        "attn_prefill_qk_rows.q_k.bf16_differ_fraction_max": 1e-4,
+    },
+}
+
+NUMERIC_EXCEPTIONS = {
+    "skv2_cp": {
+        "two_slot_plans": {
+            "topologies": ("tp8", "tep8"),
+            "requests": (65, 128),
+            "rounding": (
+                "one E4M3 term of P in GEMM2 and BF16 partials (CP-lite's two-slot plans)"
+            ),
+            "worst_request": "unbounded",
+        },
+        "tp4_fold_path": {
+            "topologies": ("tp4",),
+            "requests": (1, 128),
+            "rounding": (
+                "trtllm-gen's FP8 decode over each rank's owned pages and BF16 partials, "
+                "merged with the causal block in FP32 (CP-lite's fold path)"
+            ),
+            "worst_request": "unbounded",
+        },
     },
 }
 
@@ -217,7 +266,7 @@ def numerics(slots) -> Numerics:
     return Numerics(kind=NumericsKind.TOLERANCE, tolerances=tolerances)
 
 
-NUMERICS = numerics(topology.plannable(runtime.SLOTS))
+NUMERICS = numerics(topology.plannable(runtime.SLOTS) | runtime.measured_options())
 
 
 def text_config_reasons(hf_config) -> list[str]:
@@ -246,7 +295,6 @@ def binding_reasons() -> list[str]:
 
 
 def pd_reasons(cfg) -> list[str]:
-    """The P role is TP1/PP4; decode retains its established TP/PP contract."""
     if (cfg.disaggregation_mode or "null") != "prefill":
         reasons = []
         if cfg.tp_size not in (2, 4, 8):
@@ -259,8 +307,14 @@ def pd_reasons(cfg) -> list[str]:
             reasons.append("enable_linear_replayssm_spec must be True for decode")
         return reasons
     reasons = []
-    if (cfg.tp_size, cfg.pp_size, cfg.ep_size or 1) != (1, 4, 1):
-        reasons.append("PD prefill requires TP1/PP4 without expert parallelism")
+    shape = (cfg.tp_size, cfg.pp_size, cfg.ep_size or 1)
+    measured = runtime._measured_stack_on()
+    if shape != (1, 4, 1) and not (measured and shape == (1, 2, 1)):
+        reasons.append(
+            "PD prefill requires TP1/PP4"
+            + (" or TP1/PP2" if measured else "")
+            + " without expert parallelism"
+        )
     if cfg.enable_linear_replayssm_spec:
         reasons.append("PD prefill does not use the speculative ReplaySSM ring")
     try:
@@ -284,9 +338,10 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         )
     )
     configured = topology.from_config(cfg)
+    dep4 = configured.name == "dep4" and runtime._measured_stack_on()
     topology_reasons = (
         ["Qwen3.5 DP attention requires DEP8 (TP8, attention DP8, MoE EP8)"]
-        if configured.attn_dp_size > 1 and configured.name != "dep8"
+        if configured.attn_dp_size > 1 and configured.name != "dep8" and not dep4
         else []
     )
     if configured.name != "dep8" and cfg.disaggregation_mode != "prefill":
@@ -295,6 +350,8 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             ("moe_runner_backend", "flashinfer_trtllm"),
             ("flashinfer_allreduce_fusion_backend", "cutedsl"),
         ):
+            if dep4 and name != "moe_runner_backend":
+                continue
             value = getattr(cfg, name)
             if value != want:
                 topology_reasons.append(f"{name} {value!r} is not {want!r}")
@@ -311,6 +368,13 @@ def _build(model, hf_config, ctx):
     from sgl_nvidia_mega.qwen3_5 import runtime
 
     return runtime.build(model, ctx)
+
+
+def _offers_prefill_body() -> bool:
+    return (
+        "prefill_graph" in MegakernelSpec.__struct_fields__
+        and runtime._measured_stack_on()
+    )
 
 
 SPEC = MegakernelSpec(
@@ -336,4 +400,10 @@ SPEC = MegakernelSpec(
     build=_build,
     api_version=API_VERSION,
     config_disable_reasons=_config_disable_reasons,
+    **({"prefill_graph": True} if _offers_prefill_body() else {}),
 )
+
+
+def prefill_body_offered() -> bool:
+    """Whether SGLang runs this process's prefill body through the build (SPEC)."""
+    return getattr(SPEC, "prefill_graph", False)

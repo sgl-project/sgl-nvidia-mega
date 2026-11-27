@@ -54,7 +54,10 @@ SGLANG_READS = {
         "num_kv_heads",
         "head_dim",
         "alt_stream",
+        "_gdn_use_alt_stream",
+        "get_is_capture_mode",
     ),
+    "kernels/ops/quantization/fp8_kernel.py": ("static_quant_fp8",),
     "srt/models/qwen2_moe.py": (
         "mlp",
         "shared_expert",
@@ -147,7 +150,44 @@ class Bound(msgspec.Struct, frozen=True):
     hop_fp8: bool = False  # the hop also writes the next projection's E4M3 input
     # lowm_se: id(mlp) -> (gate_up rows paired for the SwiGLU, the shared gate zero-padded to 8 rows)
     shared: dict = msgspec.field(default_factory=dict)
+    se_tep8: tuple = ()
     reason: str = ""
+
+
+TEP8_SE_ROWS = (33, 128)
+TEP8_SE_TAIL_ROWS = 32
+# variant slot lowm_se_wide's bound: two launch pairs
+TEP8_SE_WIDE_HI = 128 + TEP8_SE_TAIL_ROWS
+TEP8_SE_T1 = (8, 2, 4)
+TEP8_SE_T2 = (2, 1, 1)
+TEP8_SE_CORESIDENT_ROWS = (84, 128)
+TEP8_SE_CORESIDENT_SMEM = 23 * 1024
+_TEP8_SE: dict = {}
+
+
+def _configure_tep8_se(rows: tuple, coresident: bool) -> None:
+    from sgl_nvidia_mega.qwen3_5.sm103 import lowm as sm
+
+    _TEP8_SE.clear()
+    _TEP8_SE.update(
+        rows=rows,
+        t1=sm.Tactic(TEP8_SE_T1[0], TEP8_SE_T1[1], 1, 1, TEP8_SE_T1[2]),
+        t2=sm.Tactic(TEP8_SE_T2[0], TEP8_SE_T2[1], 1, 1, TEP8_SE_T2[2]),
+        coresident=TEP8_SE_CORESIDENT_ROWS if rows and coresident else (),
+        said=set(),
+    )
+
+
+def tep8_se_config() -> dict:
+    if "rows" not in _TEP8_SE:
+        _configure_tep8_se((), False)
+    return _TEP8_SE
+
+
+def tep8_se_down_smem(t2, rows: int) -> int:
+    nc = t2.nt8 * 8
+    smem = t2.kw * ((rows + 15) // 16) * 16 * nc * 4
+    return smem + (rows * nc * 4 if t2.ksplit > 1 else 0)
 
 
 def engaged(slot: str, what: str, rows: int) -> None:
@@ -234,6 +274,7 @@ def build(model, ctx) -> Bound:
         "lowm_se" in SLOTS,
     )
     se_rows = plan.LOWM_SE_MAX_ROWS
+    se_tep8: tuple = ()
     if want_se and {"route", "route_topk"} <= SLOTS:
         from sglang.srt.runtime_context import get_parallel
 
@@ -244,6 +285,10 @@ def build(model, ctx) -> Bound:
             and {"route", "route_topk"} <= SLOTS
         )
         se_rows = plan.lowm_se_pre_rows(par.tp_size, tep8_m) or se_rows
+        if tep8_m and "lowm_se_tep8" in SLOTS:
+            wide = "lowm_se_wide" in SLOTS
+            se_tep8 = (TEP8_SE_ROWS[0], TEP8_SE_WIDE_HI if wide else TEP8_SE_ROWS[1])
+    _configure_tep8_se(se_tep8, "lowm_se_coresident" in SLOTS)
     want_push = want_out and "lowm_push" in SLOTS and "hop" in SLOTS
     want_fp8 = "hop_fp8" in SLOTS and "hop" in SLOTS
     fp8_rows = plan.HOP_MID_MAX_ROWS if "hop_mid" in SLOTS else plan.HOP_MAX_ROWS
@@ -254,6 +299,7 @@ def build(model, ctx) -> Bound:
     dev = torch.cuda.current_device()
     layers = [(i, m.layers[i]) for i in range(m.start_layer, m.end_layer)]
     launches = set()  # (m, k, n8, n16, act, epi8, out2_f32)
+    chunked = set()
     if want:
         for i, layer in layers:
             if isinstance(layer, Qwen3_5LinearDecoderLayer):
@@ -326,14 +372,33 @@ def build(model, ctx) -> Bound:
             n, k = gu.shape
             nd, kd = _w8(se.down_proj).shape
             for w in ctx.widths:
-                if w <= se_rows:
+                if w > sm.MAX_ROWS and _in(se_tep8, w):
+                    t1 = _tep8_se_tactics(se_tep8, w, 8, 1)
+                    t2 = _tep8_se_tactics(se_tep8, w, 0, 2)
+                    for a, b, trig_gu, trig_dn in se_launches(se_tep8, w):
+                        chunked.add((b - a, k, n, 8, 1, 1, True, t1, trig_gu))
+                        chunked.add((b - a, kd, nd, 0, 0, 2, False, t2, trig_dn))
+                elif w <= se_rows or _in(se_tep8, w):
                     launches.add((w, k, n, 8, 1, 1, True))
                     if want_fp8 and w <= fp8_rows:
                         launches.add((w, k, n, 8, 0, 1, True))
                     launches.add((w, kd, nd, 0, 0, 2, False))
     for w, k, n8, n16, act, epi8, f32 in sorted(launches):
-        tactic = TACTICS.get((n8, n16, k, w, act == 0))
-        sm.prepare(dev, w, k, n8, n16, act, epi8, f32, tactic=tactic)
+        tactic = _tep8_se_tactics(se_tep8, w, n16, epi8) or TACTICS.get(
+            (n8, n16, k, w, act == 0)
+        )
+        sm.prepare(
+            dev,
+            w,
+            k,
+            n8,
+            n16,
+            act,
+            epi8,
+            f32,
+            tactic=tactic,
+            trigger=_tep8_se_trigger(se_tep8, w) if n16 and epi8 == 1 else True,
+        )
         if (
             want_push
             and n8 == HIDDEN
@@ -342,29 +407,87 @@ def build(model, ctx) -> Bound:
             and w <= plan.HOP_MAX_ROWS
         ):
             sm.prepare(dev, w, k, n8, n16, act, epi8, f32, tactic=tactic, push=True)
+    for w, k, n8, n16, act, epi8, f32, tactic, trig in sorted(chunked, key=str):
+        sm.prepare(dev, w, k, n8, n16, act, epi8, f32, tactic=tactic, trigger=trig)
     logger.info(
         "NVIDIA megakernel: Qwen3.5 low-M launches built: %s",
         sorted((w, n8, n16, k) for w, k, n8, n16, *_ in launches),
     )
+    if se_tep8:
+        logger.info(
+            "NVIDIA megakernel: Qwen3.5 slot lowm_se_tep8 serves %d-%d rows (co-resident rows %s; "
+            "%d row-chunked launches above %d rows)",
+            *se_tep8,
+            tep8_se_config()["coresident"] or "none",
+            len(chunked),
+            sm.MAX_ROWS,
+        )
     return Bound(
         lowm_in=want_in,
         lowm_out=want_out,
         se=want_se,
         se_pre=want_se and se_rows > plan.LOWM_SE_MAX_ROWS,
+        se_tep8=se_tep8,
         push=want_push,
         hop_fp8=want_fp8,
         shared=shared,
     )
 
 
-def _gemm(rows: int, **kwargs):
+def _gemm(rows: int, tactic=None, **kwargs):
     from sgl_nvidia_mega.qwen3_5.sm103 import lowm as sm
 
     fp8_in = kwargs.get("x8") is not None and kwargs.get("w8") is not None
     xa = kwargs["x8"] if fp8_in else kwargs["x16"]
     n8 = 0 if kwargs.get("w8") is None else kwargs["w8"].shape[0]
     n16 = 0 if kwargs.get("w16") is None else kwargs["w16"].shape[0]
-    return sm.gemm(tactic=TACTICS.get((n8, n16, xa.shape[1], rows, fp8_in)), **kwargs)
+    if tactic is None:
+        tactic = TACTICS.get((n8, n16, xa.shape[1], rows, fp8_in))
+    return sm.gemm(tactic=tactic, **kwargs)
+
+
+def _in(rows_range: tuple, rows: int) -> bool:
+    return bool(rows_range) and rows_range[0] <= rows <= rows_range[1]
+
+
+def _tep8_se_trigger(se_tep8: tuple, rows: int) -> bool:
+    if not _in(se_tep8, rows):
+        return True
+    cfg = tep8_se_config()
+    if not _in(cfg["coresident"], rows):
+        return True
+    return tep8_se_down_smem(cfg["t2"], rows) > TEP8_SE_CORESIDENT_SMEM
+
+
+def se_launches(se_tep8: tuple, rows: int, tail: int = 0) -> tuple:
+    from sgl_nvidia_mega.qwen3_5.sm103 import lowm as sm
+
+    if rows <= sm.MAX_ROWS or not _in(se_tep8, rows):
+        return ((0, rows, _tep8_se_trigger(se_tep8, rows), True),)
+    tail = int(tail or TEP8_SE_TAIL_ROWS)
+    cuts = [0] + list(range(sm.MAX_ROWS, rows, tail)) + [rows]
+    cfg = tep8_se_config()
+    out = []
+    for a, b in zip(cuts, cuts[1:]):
+        n = b - a
+        # within a pair: the co-residency rule at the chunk's rows
+        late = (
+            _in(cfg["coresident"], n)
+            and tep8_se_down_smem(cfg["t2"], n) <= TEP8_SE_CORESIDENT_SMEM
+        )
+        out.append((a, b, not late, b == rows))
+    return tuple(out)
+
+
+def _tep8_se_tactics(se_tep8: tuple, rows: int, n16: int, epi8: int):
+    if not _in(se_tep8, rows):
+        return None
+    cfg = tep8_se_config()
+    if n16 and epi8 == 1:
+        return cfg["t1"]
+    if not n16 and epi8 == 2:
+        return cfg["t2"]
+    return None
 
 
 def in_proj(gdn, x: torch.Tensor, x8=None):
@@ -392,26 +515,105 @@ def in_proj(gdn, x: torch.Tensor, x8=None):
     return qkvz, ba
 
 
-def in_proj_fp8(gdn, x: torch.Tensor, x8: torch.Tensor):
+def in_proj_fp8(gdn, x: torch.Tensor, x8: torch.Tensor, ba_tactic=None):
     """``Qwen3_5GatedDeltaNet._forward_input_proj`` of a captured step with in_proj_qkvz on the hop's E4M3 rows
     (FlashInfer's BMM, no quantize kernel) and in_proj_ba on the alternate stream, as SGLang orders them."""
-    from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
+    qkvz, ba, join = in_proj_fp8_deferred(gdn, x, x8, "hop_fp8", ba_tactic)
+    join()
+    return qkvz, ba
+
+
+def in_proj_fp8_deferred(
+    gdn, x: torch.Tensor, x8: torch.Tensor, slot: str, ba_tactic=None
+):
+    from sgl_nvidia_mega.qwen3_5 import gemm_tactics
 
     lin = gdn.in_proj_qkvz
-    engaged("hop_fp8", "in_proj_qkvz bmm", x.shape[0])
+    engaged(slot, "in_proj_qkvz bmm", x.shape[0])
     current = torch.cuda.current_stream()
     alt = gdn.alt_stream
     if alt is not None:
         alt.wait_stream(current)
-    qkvz = flashinfer_bmm_fp8(
-        x8, lin.weight, lin.input_scale, lin.weight_scale, x.dtype
-    )
+    qkvz = gemm_tactics.bmm(x8, lin.weight, lin.input_scale, lin.weight_scale, x.dtype)
     if alt is None:
-        return qkvz, gdn.in_proj_ba(x)[0]
+        return qkvz, in_proj_ba(gdn, x, ba_tactic), lambda: None
     with torch.cuda.stream(alt):
-        ba, _ = gdn.in_proj_ba(x)
+        ba = in_proj_ba(gdn, x, ba_tactic)
+    return qkvz, ba, lambda: current.wait_stream(alt)
+
+
+def reads_fp8(st) -> bool:
+    return st.slots.hop_fp8 or st.slots.bt_tail
+
+
+def in_proj_pinned(gdn, x: torch.Tensor, ba_tactic=None):
+    from sgl_nvidia_mega.qwen3_5 import gemm_tactics
+
+    if ba_tactic is None and not gemm_tactics.enabled():
+        return None
+    lin = gdn.in_proj_qkvz
+    if x.dtype != torch.bfloat16 or fp8_unsupported(lin):
+        return None
+    rows = x.shape[0]
+    pinned = gemm_tactics.entry(rows, _w8(lin).shape[0], x.shape[1]) is not None
+    if not pinned and ba_tactic is None:
+        return None
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+    from sglang.srt.models.qwen3_5 import _gdn_use_alt_stream, get_is_capture_mode
+
+    current = torch.cuda.current_stream()
+    alt = gdn.alt_stream if _gdn_use_alt_stream and get_is_capture_mode() else None
+    if alt is not None:
+        alt.wait_stream(current)
+    if pinned:
+        engaged(gemm_tactics.OPTION, "in_proj_qkvz", rows)
+    x8, _ = static_quant_fp8(x, lin.input_scale, repeat_scale=False)
+    qkvz = gemm_tactics.bmm(x8, lin.weight, lin.input_scale, lin.weight_scale, x.dtype)
+    if alt is None:
+        return qkvz, in_proj_ba(gdn, x, ba_tactic)
+    with torch.cuda.stream(alt):
+        ba = in_proj_ba(gdn, x, ba_tactic)
     current.wait_stream(alt)
     return qkvz, ba
+
+
+BA_TACTIC = (4, 1, 8)
+BA_N, BA_K = 16, 4096
+
+
+def ba_unsupported(linear) -> str:
+    reason = _bf16_unsupported(linear)
+    if reason:
+        return reason
+    if tuple(linear.weight.shape) != (BA_N, BA_K):
+        return f"weight {tuple(linear.weight.shape)}"
+    return ""
+
+
+def ba_tactic(st, rows: int):
+    """Slot lowm_ba's tactic for in_proj_ba at ``rows`` (compiled at the build), else None."""
+    return st.bound["gdn"].ba_lowm.get(rows) if st.slots.lowm_ba else None
+
+
+def prepare_ba(device_index: int, rows: int):
+    from sgl_nvidia_mega.qwen3_5.sm103 import lowm as sm
+
+    kw, nt16, ksplit = BA_TACTIC
+    tactic = sm.Tactic(kw, 1, nt16, 1, ksplit)
+    return sm.prepare(device_index, rows, BA_K, 0, BA_N, 1, 0, False, tactic=tactic)
+
+
+def in_proj_ba(gdn, x: torch.Tensor, tactic=None) -> torch.Tensor:
+    lin = gdn.in_proj_ba
+    if tactic is None or x.stride(1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16:
+        return lin(x)[0]
+    from sgl_nvidia_mega.qwen3_5.sm103 import lowm as sm
+
+    rows = x.shape[0]
+    ba = torch.empty((rows, lin.weight.shape[0]), dtype=x.dtype, device=x.device)
+    engaged("lowm_ba", "in_proj_ba", rows)
+    sm.gemm(x16=x, w16=lin.weight, out2=ba, tactic=tactic)
+    return ba
 
 
 def stash_fp8(st, x: torch.Tensor, x8: torch.Tensor) -> None:
@@ -419,8 +621,11 @@ def stash_fp8(st, x: torch.Tensor, x8: torch.Tensor) -> None:
     st.scratch["lowm.fp8"] = (x.data_ptr(), x.shape[0], x8)
 
 
+def clear_fp8(st) -> None:
+    st.scratch.pop("lowm.fp8", None)
+
+
 def take_fp8(st, x: torch.Tensor):
-    """The hop's E4M3 copy of ``x`` (slot hop_fp8), or None."""
     held = st.scratch.pop("lowm.fp8", None)
     if held is None or held[0] != x.data_ptr() or held[1] != x.shape[0]:
         return None
@@ -428,14 +633,11 @@ def take_fp8(st, x: torch.Tensor):
 
 
 def layer_input_fp8_scale(layer, st, rows: int):
-    """The static input scale of ``layer``'s mixer projection that reads the layer input in this step (slot
-    hop_fp8), or None where none would read an E4M3 copy (gdn_front's and MKA's fused entries quantize
-    in their own launch, except slot gdn_trt_front, which reads it)."""
     from sglang.srt.models.qwen3_5 import Qwen3_5LinearDecoderLayer
 
     from sgl_nvidia_mega.qwen3_5.attention import mka
 
-    if not st.slots.hop_fp8:
+    if not reads_fp8(st):
         return None
     if isinstance(layer, Qwen3_5LinearDecoderLayer):
         if not st.slots.gdn_verify:
@@ -498,14 +700,20 @@ def row_parallel(
 
 
 def prepare_qkv_gate(
-    layer, positions: torch.Tensor, x: torch.Tensor, x8=None, low_m: bool = True
+    layer,
+    positions: torch.Tensor,
+    x: torch.Tensor,
+    x8=None,
+    low_m: bool = True,
+    slot: str = "hop_fp8",
 ):
     """``Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused`` with qkv_proj on the low-M launch (slot
     lowm_in; with ``x8`` on the hop's E4M3 rows), or FlashInfer's BMM on ``x8`` (slot hop_fp8)."""
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
     )
-    from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
+
+    from sgl_nvidia_mega.qwen3_5 import gemm_tactics
 
     rows = x.shape[0]
     lin = layer.qkv_proj
@@ -523,8 +731,8 @@ def prepare_qkv_gate(
             **act,
         )
     else:
-        engaged("hop_fp8", "qkv_proj bmm", rows)
-        qkv = flashinfer_bmm_fp8(
+        engaged(slot, "qkv_proj bmm", rows)
+        qkv = gemm_tactics.bmm(
             x8, lin.weight, lin.input_scale, lin.weight_scale, x.dtype
         )
     if layer.attn_output_gate:
@@ -565,27 +773,42 @@ def shared_expert(mlp, x: torch.Tensor, bound: Bound, x8=None) -> torch.Tensor:
     h8 = torch.empty((rows, inter), dtype=torch.float8_e4m3fn, device=x.device)
     logits = torch.empty((rows, 8), dtype=torch.float32, device=x.device)
     engaged("lowm_se", "shared_expert" + ("(e4m3 in)" if x8 is not None else ""), rows)
-    _gemm(
-        rows,
-        x8=x8,
-        x16=x,
-        w8=pairs,
-        w_scale=gu.weight_scale,
-        in_scale=gu.input_scale,
-        w16=gate8,
-        out=h8,
-        out2=logits,
-        swiglu_scale=dn.input_scale,
-    )
+    t1 = _tep8_se_tactics(bound.se_tep8, rows, 8, 1)
+    t2 = _tep8_se_tactics(bound.se_tep8, rows, 0, 2)
+    pairs_at = se_launches(bound.se_tep8, rows)
+    if t1 is not None:
+        engaged(
+            "lowm_se_tep8",
+            f"shared_expert ({len(pairs_at)} launch pair(s), gate_up released "
+            f"{'after its weight loads' if pairs_at[0][2] else 'at its end'})",
+            rows,
+        )
     w8 = _w8(dn)
     out = torch.empty((rows, w8.shape[0]), dtype=x.dtype, device=x.device)
-    _gemm(
-        rows,
-        x8=h8,
-        w8=w8,
-        w_scale=dn.weight_scale,
-        in_scale=dn.input_scale,
-        out=out,
-        gate=logits[:, 0],
-    )
+    for a, b, trig_gu, trig_dn in pairs_at:
+        _gemm(
+            b - a,
+            tactic=t1,
+            x8=None if x8 is None else x8[a:b],
+            x16=x[a:b],
+            w8=pairs,
+            w_scale=gu.weight_scale,
+            in_scale=gu.input_scale,
+            w16=gate8,
+            out=h8[a:b],
+            out2=logits[a:b],
+            swiglu_scale=dn.input_scale,
+            trigger=trig_gu,
+        )
+        _gemm(
+            b - a,
+            tactic=t2,
+            x8=h8[a:b],
+            w8=w8,
+            w_scale=dn.weight_scale,
+            in_scale=dn.input_scale,
+            out=out[a:b],
+            gate=logits[a:b, 0],
+            trigger=trig_dn,
+        )
     return out

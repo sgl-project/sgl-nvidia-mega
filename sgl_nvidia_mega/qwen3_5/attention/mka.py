@@ -65,6 +65,7 @@ SGLANG_READS = {
     ),
     "srt/layers/dp_attention.py": ("is_allocation_symmetric",),
     "srt/runtime_context.py": ("get_parallel",),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/layers/layer_boundary/fusions/norm.py": ("fused_norm_gamma",),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc",),
     "srt/kernel_plugins/nvidia/eagle_binding.py|srt/megakernels/eagle_binding.py": (
@@ -79,6 +80,8 @@ SGLANG_READS = {
 # the widest step the fused kernels serve; wider steps take the front path, which measured
 # faster from four requests on (TP8, results/trt-1022/l2a micro e58d29c)
 FUSED_MAX_ROWS = 14
+
+CP_Q_GATHER_MAX_ROWS = 63
 
 # the packed (qkv, o_proj) weights per full-attention layer id, filled at build
 WEIGHTS: dict = {}
@@ -155,6 +158,19 @@ def pack(layer, route_lin: bool = False) -> str:
 
 # Slot route_lin (numeric): layer id -> router-before-all-reduce weights on this TP8 rank.
 RL_WEIGHTS: dict = {}
+
+
+def agree_route_lin(reason: str) -> str:
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_nvidia_mega.qwen3_5.runtime import agreed_decline
+
+    reason = agreed_decline(
+        "route_lin", reason, cpu_group=get_parallel().tp_group.cpu_group
+    )
+    if reason:
+        RL_WEIGHTS.clear()
+    return reason
 
 
 def _pack_route_lin(layer) -> str:
@@ -276,7 +292,7 @@ def step(layer, x, st):
             site=hop.site,
             rl_args=hop.rl_push_args(RL_WEIGHTS[attn.layer_id], h0),
         )
-        hop.mark_pushed_rl(out)
+        hop.mark_pushed_rl(out, cells=True)
         # the router launch does not wait on the epilogue: keep its output's memory out of reuse for the whole step
         st.scratch.setdefault("rlin.keep", []).append(out)
         return out
@@ -320,7 +336,7 @@ def _front_step(layer, x, st):
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_bmm_fp8
     from sglang.srt.runtime_context import get_parallel
 
-    from sgl_nvidia_mega.qwen3_5 import lowm
+    from sgl_nvidia_mega.qwen3_5 import gemm_tactics, lowm
     from sgl_nvidia_mega.qwen3_5.attention import split_kv
     from sgl_nvidia_mega.qwen3_5.sm103.attention.gate_quant import gate_quant
     from sgl_nvidia_mega.qwen3_5.sm103.attention.q35_cp_lite import CpLite
@@ -331,11 +347,10 @@ def _front_step(layer, x, st):
     m = x.shape[0]
     attn = layer.attn
     width = layer.num_heads * layer.head_dim
-    # slot hop_fp8: qkv_proj reads the hop's E4M3 copy of x (no quantize kernel)
-    x8 = lowm.take_fp8(st, x) if st.slots.hop_fp8 else None
+    x8 = lowm.take_fp8(st, x) if lowm.reads_fp8(st) else None
     if x8 is not None:
-        lowm.engaged("hop_fp8", "qkv_proj bmm", m)
-        qkv = flashinfer_bmm_fp8(
+        lowm.engaged("bt_tail" if st.slots.bt_tail else "hop_fp8", "qkv_proj bmm", m)
+        qkv = gemm_tactics.bmm(
             x8,
             layer.qkv_proj.weight,
             layer.qkv_proj.input_scale,
@@ -355,6 +370,7 @@ def _front_step(layer, x, st):
     i = st.view.kv.layer_ids.index(attn.layer_id)
     k_scale, v_scale = split_kv.kv_scales(attn, x.device)
     rope = layer.rotary_emb
+    q_push = _q_push(layer, st, m)
     q, _, gate = fused_qk_gemma_rmsnorm_rope_gate(
         q_gate,
         k,
@@ -374,6 +390,8 @@ def _front_step(layer, x, st):
         cache_loc=st.fb.out_cache_loc,
         k_scale=k_scale,
         v_scale=v_scale,
+        q_push=q_push,
+        early_trigger=_qw_entry(q_push),
     )
     gate = gate.reshape(m, width)
     cp_lite = CpLite._instance if split_kv.cp_multi(m) else None
@@ -387,6 +405,8 @@ def _front_step(layer, x, st):
         if cp_lite is not None
         else attn(q, None, None, st.fb)
     ).reshape(m, width)
+    if q_push is not None and CpLite._instance._q_pushed is not None:
+        raise RuntimeError("slot cp_q_push: CP-lite did not take the pushed q rows")
     if cp_lite is None or not cp_lite.take_gate_epilogue():
         oq = gate_quant(o.contiguous(), gate, layer.o_proj.input_scale)
     if st.slots.lowm_oproj:
@@ -398,10 +418,19 @@ def _front_step(layer, x, st):
             if boundary_hop.takes_moe_input(st.bound["boundary"].hop, layer, st, m):
                 hop = st.bound["boundary"].hop
         return lowm.row_parallel(layer.o_proj, oq, torch.bfloat16, "o_proj", hop)
+    from sgl_nvidia_mega.qwen3_5.boundary import hop as boundary_hop
+
+    gar = boundary_hop.gemm_ar(layer, st, m)
     # the same allocation as RowParallelLinear's output, which the boundary all-reduces
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
     ):
+        if gar is not None:
+            out = torch.empty(
+                (m, layer.o_proj.weight.shape[1]), dtype=torch.bfloat16, device=x.device
+            )
+            if gar.defer(out, oq, layer.o_proj, "o_proj"):
+                return out
         return flashinfer_bmm_fp8(
             oq,
             layer.o_proj.weight,
@@ -423,3 +452,49 @@ def _push_hop(layer, st, m: int):
         _ENGAGED.add(("push", m))
         logger.info("NVIDIA megakernel: Qwen3.5 slot mka_push runs at %d rows", m)
     return hop
+
+
+def _q_push(layer, st, m: int):
+    from sgl_nvidia_mega.qwen3_5.attention import split_kv
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+
+    if "cp_q_push" not in SLOTS or not split_kv.cp_multi(m):
+        return None
+    attn = layer.attn
+    lengths = st.view.attn.cache_seqlens
+    if (
+        attn.tp_k_head_num != 1
+        or attn.sliding_window_size not in (None, -1)
+        or m % split_kv.ROWS
+        or lengths.shape[0] != m // split_kv.ROWS
+    ):
+        return None
+    cp = split_kv.cp_lite()
+    b = m // split_kv.ROWS
+    gather = "cp_q_gather" in SLOTS and m <= CP_Q_GATHER_MAX_ROWS
+    if gather:
+        args = cp.q_push_args(m, b, split_kv.ROWS, gather=True, seq_lens=lengths)
+    else:
+        args = cp.q_push_args(m, b, split_kv.ROWS)
+    if args is not None and ("q_push", m) not in _ENGAGED:
+        _ENGAGED.add(("q_push", m))
+        logger.info("NVIDIA megakernel: Qwen3.5 slot cp_q_push runs at %d rows", m)
+    if args is not None and gather and ("q_gather", m) not in _ENGAGED:
+        _ENGAGED.add(("q_gather", m))
+        if "gather" in args:
+            logger.info(
+                "NVIDIA megakernel: Qwen3.5 slot cp_q_gather runs at %d rows", m
+            )
+        else:
+            logger.warning(
+                "NVIDIA megakernel: Qwen3.5 slot cp_q_gather keeps the gather's wait half "
+                "at %d rows (no Lamport q words or int32 lengths)",
+                m,
+            )
+    return args
+
+
+def _qw_entry(q_push) -> bool:
+    from sgl_nvidia_mega.qwen3_5.runtime import SLOTS
+
+    return q_push is not None and "cp_qw_entry" in SLOTS

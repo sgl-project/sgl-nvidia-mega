@@ -77,7 +77,14 @@ SGLANG_READS = {
 SGLANG_MIRRORS = {
     # Upstream #48004 reserves staging row 0 for padding; this slot rejects strided
     # pools before writes and passes the native pool indices unchanged.
-    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": "6d141f9de947654f",
+    "srt/layers/attention/linear/gdn_backend.py:GDNAttnBackend.forward_extend": (
+        "12a835fc4f78af33",
+        "6ed4eb6a818f7e20",
+        "bfd997695f32d409",
+        "6d141f9de947654f",
+        "109b2f4d32797e43",
+        "590ab7ea97205370",
+    ),
     "srt/layers/attention/hybrid_linear_attn_backend.py:MambaAttnBackendBase._track_mamba_state_extend": "84c447ca707eba64",
 }
 

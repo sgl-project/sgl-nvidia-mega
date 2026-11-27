@@ -3,11 +3,13 @@
 """The sharded top-1 of a multi-row MTP draft step (``src/draft_top1.cu``): the argmax of
 every row over the TP group's vocabulary shards in one launch, without the logits'
 all-gather. It writes the token into a column of the draft tokens, 1.0 into the top-k
-probability, and advances the positions (and M-RoPE positions) by one."""
+probability, and advances the positions (and M-RoPE positions) by one.
+"""
 
 from __future__ import annotations
 
 import ctypes
+import logging
 from functools import cache
 from typing import Optional
 
@@ -24,11 +26,36 @@ from sgl_nvidia_mega.qwen3_5.sm103.draft.xchg import (
 
 __all__ = ["NAN_KEY_SPLIT_ARGMAX", "NAN_KEY_TORCH_ARGMAX", "Top1Exchange"]
 
+logger = logging.getLogger(__name__)
+
 # draft_top1::kSlots / kMaxRows / kThreads * kVec
 SLOTS = 3
 MAX_ROWS = 128
 THREADS = 256
 CHUNK = THREADS * 8
+
+OPTION = "draft_top1_cfg"
+DEFAULT_CFG = (256, 8, True, True)
+SHIPPED_CFG = (THREADS, 8, False, False)
+_SAID: set = set()
+
+
+def config() -> tuple:
+    from sgl_nvidia_mega.qwen3_5 import runtime
+
+    return DEFAULT_CFG if runtime.measured_option(OPTION) else SHIPPED_CFG
+
+
+def peer_table(ptrs, uc: int, rank: int, world: int) -> tuple:
+    ptrs = [int(v) for v in ptrs]
+    if len(ptrs) != world:
+        return None, f"buffer_ptrs {len(ptrs)} for world {world}"
+    off = uc - ptrs[rank]
+    if not 0 <= off < (1 << 40):
+        return None, f"buffer offset {off}"
+    if any(v == 0 for v in ptrs) or len(set(ptrs)) != world:
+        return None, "buffer_ptrs has a null or repeated peer address"
+    return [v + off for v in ptrs], ""
 
 
 class DraftTop1Params(ctypes.Structure):
@@ -61,24 +88,39 @@ class DraftTop1Params(ctypes.Structure):
     ]
 
 
+class DraftTop1P2PParams(ctypes.Structure):
+    _fields_ = list(DraftTop1Params._fields_) + [("peers", ctypes.c_void_p * 8)]
+
+
 @cache
-def _kernel(device_index: int, world: int) -> jit.Kernel:
+def _kernel(device_index: int, world: int, cfg: tuple = SHIPPED_CFG) -> jit.Kernel:
     major, minor = torch.cuda.get_device_capability(device_index)
+    threads, vec, p2p, lean = cfg
+    options = ("-std=c++17", "-default-device", f"-DMKD_WORLD={world}")
+    name = f"q35_draft_top1_{world}"
+    if cfg != SHIPPED_CFG:
+        options += (
+            f"-DTOP1_THREADS={threads}",
+            f"-DTOP1_VEC={vec}",
+            f"-DTOP1_P2P={int(p2p)}",
+            f"-DTOP1_LEAN={int(lean)}",
+        )
+        name += f"_{threads}_{vec}_{int(p2p)}_{int(lean)}"
     cubin = jit.compile_source(
         (SRC / "draft_top1.cu").read_text(),
-        f"q35_draft_top1_{world}",
+        name,
         f"sm_{major}{minor}a",
-        ("-std=c++17", "-default-device", f"-DMKD_WORLD={world}"),
+        options,
         headers={"mkd_common.cuh": (SRC / "mkd_common.cuh").read_text()},
     )
-    return jit.load(cubin, "draft_top1_xchg", (THREADS, 1, 1), 0)
+    return jit.load(cubin, "draft_top1_xchg", (threads, 1, 1), 0)
 
 
-def build(device_index: int, world: int) -> None:
+def build(device_index: int, world: int, cfg: tuple = SHIPPED_CFG) -> None:
     """Compile the kernel (no compile inside a capture)."""
     if world not in WORLDS:
         raise ValueError(f"the sharded top-1 serves TP {WORLDS}, not {world}")
-    _kernel(device_index, world)
+    _kernel(device_index, world, cfg)
 
 
 class Top1Exchange:
@@ -96,10 +138,11 @@ class Top1Exchange:
         group,
         cpu_group,
         device: torch.device,
+        cfg: Optional[tuple] = None,
     ):
         import torch.distributed as dist
 
-        build(device.index, world)
+        cfg = config() if cfg is None else tuple(cfg)
         self.world, self.rank, self.device = world, rank, device
         self.vocab_local, self.vocab_start = vocab_local, vocab_start
         self.vocab_size = vocab_size
@@ -107,6 +150,25 @@ class Top1Exchange:
             SLOTS * world * MAX_ROWS * 2, group, device, slot="draft_multi"
         )
         self.uc = self._buf.data_ptr()
+        self.peers = None
+        if cfg[2]:
+            why = ""
+            try:
+                self.peers, why = peer_table(
+                    self._handle.buffer_ptrs, self.uc, rank, world
+                )
+            except Exception as exc:  # no buffer_ptrs on this handle
+                why = f"{type(exc).__name__}: {exc}"
+            if why:
+                logger.warning(
+                    "NVIDIA megakernel: %s: the draft top-1 exchange keeps the multicast "
+                    "store (%s)",
+                    OPTION,
+                    why,
+                )
+                cfg = (cfg[0], cfg[1], False, cfg[3])
+        self.cfg = cfg
+        build(device.index, world, cfg)
         # [epoch from 1, CTA arrivals]
         self.epoch = torch.tensor([1, 0], dtype=torch.int32, device=device)
         self.keys = torch.zeros(MAX_ROWS, dtype=torch.int64, device=device)
@@ -155,7 +217,8 @@ class Top1Exchange:
             or mrope_positions.stride(1) != 1
         ):
             raise ValueError(f"sharded top-1: M-RoPE {tuple(mrope_positions.shape)}")
-        p = DraftTop1Params(
+        params_t = DraftTop1P2PParams if self.peers is not None else DraftTop1Params
+        p = params_t(
             logits=local_logits.data_ptr(),
             keys=self.keys.data_ptr(),
             epoch=self.epoch.data_ptr(),
@@ -176,8 +239,27 @@ class Top1Exchange:
             rank=self.rank,
             nan_key=nan_key,
         )
-        kernel = _kernel(self.device.index, self.world)
-        chunks = (self.vocab_local + CHUNK - 1) // CHUNK
+        if self.peers is not None:
+            p.peers = (ctypes.c_void_p * 8)(*(self.peers + [0] * (8 - self.world)))
+        kernel = _kernel(self.device.index, self.world, self.cfg)
+        chunk = self.cfg[0] * self.cfg[1]
+        chunks = (self.vocab_local + chunk - 1) // chunk
+        if (
+            self.cfg != SHIPPED_CFG
+            and torch.cuda.is_current_stream_capturing()
+            and m not in _SAID
+        ):
+            _SAID.add(m)
+            logger.info(
+                "NVIDIA megakernel: %s: draft top-1 exchange at %d rows: %d CTAs a row "
+                "of %d threads, %s%s",
+                OPTION,
+                m,
+                chunks,
+                self.cfg[0],
+                "peer stores" if self.peers is not None else "multicast store",
+                ", lean last CTA" if self.cfg[3] else "",
+            )
         _launch_2d(kernel, (chunks, m), p, self.device)
 
 

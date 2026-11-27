@@ -40,6 +40,7 @@ ENTRIES = {
     "q35mka_gate": 0,
     "q35mka_epilogue_q4": 0,
     "q35mka_rl_router": 0,
+    "q35mka_epilogue_rl_q4": 0,
     "q35mka_epilogue_q4_late": 0,
     "q35mka_epilogue_q8": 0,
     "q35mka_epilogue_q8_late": 0,
@@ -287,9 +288,6 @@ def epilogue(
 
 
 def epilogue_rl(attn, gate, w_packed, sx, sw, out, site: Site, rl_args) -> None:
-    """``epilogue`` of a TP8 B1 step (4 q heads a rank, early trigger, pushing into the hop) plus the router partial
-    (slot ``route_lin``): 16 CTAs push this rank's router partial into the hop's router mailbox
-    (``rl_args``: sm103/hop RlArgs, from ``Hop.rl_push_args``)."""
     m = int(attn.shape[0])
     if not (attn.is_contiguous() and gate.is_contiguous() and out.is_contiguous()):
         raise ValueError("MKA epilogue: attn, gate and out must be contiguous")
@@ -309,9 +307,9 @@ def epilogue_rl(attn, gate, w_packed, sx, sw, out, site: Site, rl_args) -> None:
     stream = torch.cuda.current_stream(attn.device).cuda_stream
     kernels = _kernels(attn.device.index)
     jit.launch(
-        kernels["q35mka_epilogue_q4"],
+        kernels["q35mka_epilogue_rl_q4"],
         (16 * CLUSTER, 1, 1),
-        [p],
+        [p, rl_args],
         stream,
         (CLUSTER, 1, 1),
     )
