@@ -16,7 +16,7 @@ scores 0.975 with the megakernel and 0.960 without it.
 
 ## Requirements
 
-- An SGLang with GLM-5.3's DSA binding view (`ForwardView.dsa` in `sglang/srt/kernel_plugins/nvidia/binding.py`); without it the spec refuses at startup. Slot `draft` also needs `SGLANG_ENABLE_EMBED_REPLICATION=1`, set by the user: SGLang's `FLAG_SETS_ENV` (`sglang/kernels/plugin_kernels/nvidia/spec.py`) sets only the variables of a spec's `Requirements.env`, and this spec checks its environment per TP size instead
+- An SGLang with GLM-5.3's DSA binding view (`ForwardView.dsa` in `sglang/srt/kernel_plugins/nvidia/binding.py`); without it the spec refuses at startup. With it the flag also turns on the embedding replication slot `draft` needs (`SGLANG_ENABLE_EMBED_REPLICATION`, see below)
 - 8 x B300, or 8 GPUs over two trays of one NVLink domain (GB300 NVL72, Rubin VR NVL72), or 4 x GB300 or 4 x Rubin (TP4, one tray or node)
 
 ## Launch
@@ -24,7 +24,6 @@ scores 0.975 with the megakernel and 0.960 without it.
 GLM-5.3 or GLM-5.2 (NVFP4) on 8 x B300, with an NVFP4 GLM-5.3 or GLM-5.2 checkpoint (for example `nvidia/GLM-5.2-NVFP4`) whose config has the shapes in `glm5_3/__init__.py` (`HF_CONFIG`; the spec checks them at startup):
 
 ```bash
-SGLANG_ENABLE_EMBED_REPLICATION=1 \
 python -m sglang.launch_server \
   --model-path <NVFP4 GLM-5.3 or GLM-5.2 checkpoint> \
   --trust-remote-code \
@@ -38,7 +37,7 @@ python -m sglang.launch_server \
   --enable-nvidia-megakernel
 ```
 
-Every GLM-5.3 slot runs with `--enable-nvidia-megakernel` and `SGLANG_ENABLE_EMBED_REPLICATION=1`; no slot list is needed. The GLM-5.3 NextN draft step (slot `draft`) reads the replicated embedding table, so it needs `SGLANG_ENABLE_EMBED_REPLICATION=1`; the flag does not set it (the spec checks its environment per TP size, so SGLang's resolution step does not set the variable for it), and without it the server stops at startup, naming it. The draft step also needs greedy draft acceptance (no `--speculative-use-rejection-sampling`, SGLang's default); without it the server stops at startup, naming it. SGLang's defaults give the rest of the environment the spec needs; a setup it does not serve stops at startup, naming each reason. Serving with HiCache (`--enable-hierarchical-cache`) is supported: the covered steps read only the running requests' device KV pages. At TP4 so is the decode role of a PD-disaggregated deployment (`--disaggregation-mode decode`): the KV arrives through the transfer backend before a request's first verify step, outside the covered step; the prefill role runs without the flag.
+Every GLM-5.3 slot runs with `--enable-nvidia-megakernel` alone; no slot list and no environment variable are needed. The GLM-5.3 NextN draft step (slot `draft`) reads the replicated embedding table, which the flag turns on at TP8 and TP4: it sets `SGLANG_ENABLE_EMBED_REPLICATION` when it is unset and logs it, and keeps a value you set (`0` stops the server at startup, naming it). The draft step also needs greedy draft acceptance (no `--speculative-use-rejection-sampling`, SGLang's default); without it the server stops at startup, naming it. SGLang's defaults give the rest of the environment the spec needs; a setup it does not serve stops at startup, naming each reason. Serving with HiCache (`--enable-hierarchical-cache`) is supported: the covered steps read only the running requests' device KV pages. At TP4 so is the decode role of a PD-disaggregated deployment (`--disaggregation-mode decode`): the KV arrives through the transfer backend before a request's first verify step, outside the covered step; the prefill role runs without the flag.
 
 On two trays (GB300 NVL72, Rubin VR NVL72), launch the same command on each tray with `--nnodes 2 --node-rank <0|1> --dist-init-addr <tray-0 host>:<port>`. The covered steps need SGLang's FlashInfer all-reduce + RMSNorm fusion at verify sizes, which needs NVLink multicast; on nodes without it, set `SGLANG_NVIDIA_MEGAKERNEL_GLM_ALLOW_NO_AR_FUSION=1`: the covered steps then run anyway, the stock residual steps on SGLang's unfused all-reduce and slot `hops` on its own symmetric-memory all-reduce.
 
@@ -66,7 +65,7 @@ The units' plans (GEMM ranges, hop caps, row caps) were measured on GB300 (`glm5
 
 The TP4 split-K GEMMs (`ll.gemm`) run FlashInfer's split-K kernel (`mm_bf16(..., tactic=)`) when the installed FlashInfer has it with the synchronization fixes (`SplitKTactic.SYNC_FIXED`); otherwise, and on Rubin (SM107), where FlashInfer's explicit tactics do not run, they run the plugin's vendored copy (`ll/kernels/cute/splitk.py`). The startup log names the source. `SGLANG_NVIDIA_MEGAKERNEL_GLM_GEMM_SPLITK` switches it: `auto` (the default), `flashinfer` (FlashInfer's kernel even without the fixes; the server stops if FlashInfer has no such API) or `vendored`.
 
-With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting only; a list without a slot another needs (`dnorm` needs `qkv_a_small_m_shared` and `hops`, `qkv_a_small_m_shared` needs `attention`, `draft_rowselect` needs `draft`) stops the server at startup, naming it. Slot `draft` needs `SGLANG_ENABLE_EMBED_REPLICATION=1` (set it yourself; the flag does not), greedy draft acceptance and an SGLang whose EAGLE draft graph runners run a draft spec's capture check; the server stops at startup, naming each one that is missing.
+With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting only; a list without a slot another needs (`dnorm` needs `qkv_a_small_m_shared` and `hops`, `qkv_a_small_m_shared` needs `attention`, `draft_rowselect` needs `draft`) stops the server at startup, naming it. Slot `draft` needs embedding replication, which the flag turns on (it sets `SGLANG_ENABLE_EMBED_REPLICATION` when it is unset), greedy draft acceptance and an SGLang whose EAGLE draft graph runners run a draft spec's capture check; the server stops at startup, naming each one that is missing (an explicit `SGLANG_ENABLE_EMBED_REPLICATION=0` too).
 
 ## TP16 on Rubin
 

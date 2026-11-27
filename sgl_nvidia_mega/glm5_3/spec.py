@@ -35,6 +35,7 @@ Stated limits of this spec:
 from __future__ import annotations
 
 import importlib.util
+import logging
 
 try:
     from sglang.kernels.plugin_kernels.nvidia.spec import (
@@ -60,6 +61,8 @@ from sgl_nvidia_mega.glm5_3.profile import MAX_ROWS as SPEC_MAX_ROWS
 from sgl_nvidia_mega.glm5_3.profile import profile_reasons
 from sgl_nvidia_mega.glm5_3.runtime import SLOTS, parity
 from sgl_nvidia_mega.glm5_3.sm103.hop.constants import CLUSTER, TIMEOUT_NS
+
+logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -227,10 +230,34 @@ ENV = {
     "SGLANG_DSA_TOPK_BROADCAST": False,
     "SGLANG_EXPERIMENTAL_LORA_OPTI": False,
     "SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q": False,
-    # slot draft: the draft's fused embedding reads the replicated table (with the
-    # flag, SGLang sets the variable when it is unset: megakernels FLAG_SETS_ENV)
+    # slot draft: the draft's fused embedding reads the replicated table (the flag
+    # sets the variable when it is unset: FLAG_SETS_ENV)
     **({"SGLANG_ENABLE_EMBED_REPLICATION": True} if "draft" in SLOTS else {}),
 }
+
+# The variables of ENV that the flag sets to their pinned value when they are unset, at
+# argument resolution, as SGLang's FLAG_SETS_ENV does for a spec's Requirements.env.
+# ENV is pinned per TP size (TP16 runs glm5_3/sm107, whose draft reads the
+# vocab-sharded embedding), so Requirements.env stays empty and SGLang sets nothing
+# for this spec: config_disable_reasons sets them at TP8 / TP4. A value the user set is
+# kept and checked.
+FLAG_SETS_ENV = frozenset({"SGLANG_ENABLE_EMBED_REPLICATION"})
+
+
+def set_flag_env(env) -> list[str]:
+    """Set each variable of FLAG_SETS_ENV that ``env`` pins and the user left unset to
+    its pinned value; return their names. The model processes, started after argument
+    resolution, inherit them."""
+    from sglang.srt.environ import envs
+
+    names = [
+        name
+        for name in env
+        if name in FLAG_SETS_ENV and not getattr(envs, name).is_set()
+    ]
+    for name in names:
+        getattr(envs, name).set(env[name])
+    return names
 
 
 def decode_graph_backends() -> frozenset:
@@ -499,6 +526,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         return sm107.config_reasons(cfg, hf_config)
     from sgl_nvidia_mega.glm5_3 import runtime
 
+    env_set = set_flag_env(ENV)
     reasons = (
         pinned_reasons(cfg, SERVER_ARGS, ENV)
         + toolchain_reasons()
@@ -515,6 +543,18 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             "decode CUDA graphs are disabled: the covered step runs only inside "
             "captured decode graphs; enable decode CUDA graphs"
         )
+    from sglang.srt.environ import envs
+
+    for name in env_set:
+        if reasons:  # a refused setup leaves the environment as it was
+            getattr(envs, name).clear()
+        else:
+            logger.info(
+                "--enable-nvidia-megakernel: set %s=%s for %s",
+                name,
+                getattr(envs, name).get(),
+                SPEC.name,
+            )
     return reasons
 
 
